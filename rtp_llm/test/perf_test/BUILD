@@ -765,6 +765,59 @@ py_test(
     tags = ["manual"],
 )
 
+# DeepSeek V4-Pro CP=8 + EP=8 prefill handoff baseline (1M, batch=1).
+py_test(
+    name = "dsv4_pro_prefill_handoff",
+    main = "batch_decode_test.py",
+    srcs = ["batch_decode_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/data5/nanjun.cp/DeepSeek-V4-Pro",
+        "--tokenizer_path", "/data5/nanjun.cp/DeepSeek-V4-Pro",
+        "--batch_size", "1",
+        "--input_len", "256,512,1024,2048,4096,8192,16384,32768,65536,131072,262144,524288,786432,1048575",
+        "--partial", "2",
+        "--decode_test_length", "1",
+        "--max_seq_len", "1048576",
+        "--max_batch_tokens_size", "1048576",
+        "--max_context_batch_size", "1",
+        "--concurrency_limit", "1",
+        "--tp_size", "8",
+        "--dp_size", "1",
+        "--ep_size", "8",
+        "--world_size", "8",
+        "--cp_rotate_method", "ALL_GATHER",
+        "--seq_size_per_block", "512",
+        "--kernel_seq_size_per_block", "128",
+        "--fp8_kv_cache", "1",
+        "--reuse_cache", "1",
+        "--enable_device_cache", "1",
+        "--use_deepep_moe", "1",
+        "--use_deepep_low_latency", "0",
+        "--act_type", "BF16",
+        "--load_method", "fastsafetensors",
+        "--enable_cuda_graph", "0",
+        "--reserver_runtime_mem_mb", "81920",
+    ],
+    env = {
+        "WORLD_SIZE": "8",
+        "DG_JIT_CPP_STANDARD": "20",
+        "DSV4_USE_MEGA_MOE": "1",
+        "DSV4_CHUNK_TOKENS": "8192",
+        "DG_JIT_CACHE_DIR": "/data7/zhouhaiyu.zhy/dsv4_perf_work/jit_cache",
+        "TRITON_CACHE_DIR": "/data7/zhouhaiyu.zhy/dsv4_perf_work/triton_cache",
+        "TILELANG_CACHE_DIR": "/data7/zhouhaiyu.zhy/dsv4_perf_work/tilelang_cache",
+    },
+    tags = ["manual"],
+)
+
 # DeepSeek V4-Pro DP=8 + EP=8 captured-graph decode grid sweep.
 py_test(
     name = "v4_pro_dp8_decode_grid_perf",

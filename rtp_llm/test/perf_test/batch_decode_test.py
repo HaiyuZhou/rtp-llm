@@ -333,7 +333,9 @@ def _load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
         ]
         block = int(config.get("cache_block_size", 4096))
         if block <= 0 or any(ratio < 0.0 or ratio >= 1.0 for ratio in ratios):
-            raise ValueError("cache_ratios must be in [0, 1) and block must be positive")
+            raise ValueError(
+                "cache_ratios must be in [0, 1) and block must be positive"
+            )
         raw_cases = []
         case_id = 0
         for seq_len in seq_lens:
@@ -473,10 +475,27 @@ def _effective_grid_max_seq_len(
     return max(needed_seq_len, args.max_seq_len)
 
 
+def _ensure_xgrammar_lib_path() -> None:
+    import sys
+
+    so_name = "libxgrammar_bindings.so"
+    for p in sys.path:
+        xgrammar_dir = os.path.join(p, "xgrammar")
+        if os.path.isfile(os.path.join(xgrammar_dir, so_name)):
+            current = os.environ.get("LD_LIBRARY_PATH", "")
+            if xgrammar_dir not in current.split(":"):
+                os.environ["LD_LIBRARY_PATH"] = (
+                    f"{xgrammar_dir}:{current}" if current else xgrammar_dir
+                )
+                logging.info(f"Added {xgrammar_dir} to LD_LIBRARY_PATH")
+            return
+
+
 def main() -> str:
     from rtp_llm.config.log_config import setup_logging
 
     setup_logging()
+    _ensure_xgrammar_lib_path()
 
     args, remaining = parse_args()
     engine_env_names = _apply_engine_env(args.engine_env)

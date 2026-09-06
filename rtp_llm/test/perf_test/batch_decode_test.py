@@ -1,5 +1,6 @@
 import argparse
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -8,7 +9,11 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from rtp_llm.test.perf_test.cache_grid_runner import CacheGridRunner
+from rtp_llm.test.perf_test.cache_grid_runner import (
+    CacheGridRunner,
+    MaterializedCaseStore,
+    PrefixPromptFactory,
+)
 from rtp_llm.test.perf_test.dataset import KNOWN_DATASETS, extract_arg
 from rtp_llm.test.perf_test.distribution_runner import DistributionRunner
 from rtp_llm.test.perf_test.grid_runner import GridRunner
@@ -157,6 +162,41 @@ def parse_args(argv: Optional[List[str]] = None):
     perf.add_argument(
         "--engine_env", action="append", default=[], metavar="NAME=VALUE",
         help="Repeatable engine environment default; --test_env wins.",
+    )
+    perf.add_argument(
+        "--expected_cache_block_size",
+        type=int,
+        default=0,
+        help=(
+            "Physical prefix-cache reuse granularity in tokens: "
+            "--seq_size_per_block (DSV4 defaults to 256 when unset), "
+            "multiplied by CP size when PREFILL_CP_KV_CACHE_SHARDED=1. "
+            "0 = read from the grid JSON generator metadata, or skip. "
+            "Used to drop cases collapsing onto the same block bucket and "
+            "to probe reuse_len before measuring."
+        ),
+    )
+    perf.add_argument(
+        "--materialize_cache_cases",
+        type=str,
+        default="",
+        help=(
+            "Cache-grid mode: build every case's prompts once with the "
+            "tokenizer, store them compactly in this directory, and exit "
+            "without starting the engine.  Later runs with "
+            "--cache_case_files reuse the store and skip per-case prompt "
+            "construction entirely."
+        ),
+    )
+    perf.add_argument(
+        "--cache_case_files",
+        type=str,
+        default="",
+        help=(
+            "Cache-grid mode: read prompts from a store directory created "
+            "by --materialize_cache_cases instead of constructing them with "
+            "the tokenizer at run time.  Requires the same --cache_grid_json."
+        ),
     )
 
     engine = parser.add_argument_group(
@@ -392,6 +432,107 @@ def _load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
     return cases
 
 
+def _resolve_cache_block_size(grid_payload: Any, cli_value: int) -> int:
+    """Resolve the physical reuse granularity for dedup and probing.
+
+    Prefer the explicit CLI value; otherwise fall back to the alignment the
+    grid was generated with (generate_cache_grid.py records it as
+    generator.cache_alignment or generator.cache_sampling.alignment).  0
+    means unknown — skip dedup and probing.
+    """
+    if cli_value > 0:
+        return cli_value
+    generator = (
+        grid_payload.get("generator") if isinstance(grid_payload, dict) else None
+    )
+    if not isinstance(generator, dict):
+        return 0
+    for source in (
+        generator.get("cache_alignment"),
+        (
+            generator.get("cache_sampling", {}).get("alignment")
+            if isinstance(generator.get("cache_sampling"), dict)
+            else None
+        ),
+    ):
+        try:
+            value = int(source or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0
+
+
+def _dedupe_cache_grid_cases(
+    cases: List[Dict[str, int]], block_size: int
+) -> List[Dict[str, int]]:
+    """Collapse cases whose requested cache lengths share one physical bucket.
+
+    The engine reuses prefix KV only in whole block_size chunks, so requests
+    whose cache_len floors to the same block count measure the identical
+    geometry.  Keep one representative per bucket: prefer the aligned request
+    (its observed reuse then equals what it asked for), otherwise the largest
+    request in the bucket, which stays closest to the next boundary if the
+    block-size assumption is slightly off.
+    """
+    buckets: Dict[tuple, Dict[str, int]] = {}
+    order: List[tuple] = []
+    for case in cases:
+        key = (case["batch_size"], case["input_len"], case["cache_len"] // block_size)
+        kept = buckets.get(key)
+        if kept is None:
+            buckets[key] = case
+            order.append(key)
+        elif kept["cache_len"] % block_size and not case["cache_len"] % block_size:
+            buckets[key] = case
+        elif (
+            kept["cache_len"] % block_size
+            and case["cache_len"] % block_size
+            and case["cache_len"] > kept["cache_len"]
+        ):
+            buckets[key] = case
+    return [buckets[key] for key in order]
+
+
+def _load_materialized_case_store(
+    root: str,
+    cases: List[Dict[str, int]],
+    measure_runs: int,
+    grid_sha256: str,
+) -> MaterializedCaseStore:
+    """Load a precomputed prompt store and prove it matches this grid."""
+    store = MaterializedCaseStore(root)
+    stored = store.load_cases()
+    if store.run_count != measure_runs:
+        raise ValueError(
+            f"case store {root} was materialized with run_count="
+            f"{store.run_count}, but --cache_measure_runs={measure_runs}"
+        )
+    if store.grid_sha256 and store.grid_sha256 != grid_sha256:
+        raise ValueError(
+            f"case store {root} was materialized from a different grid JSON "
+            f"(sha256 {store.grid_sha256[:12]} != {grid_sha256[:12]}); "
+            "rerun --materialize_cache_cases"
+        )
+
+    def geometry(case: Dict[str, int]) -> tuple:
+        return (
+            case["case_id"],
+            case["batch_size"],
+            case["input_len"],
+            case["cache_len"],
+        )
+
+    if [geometry(c) for c in stored] != [geometry(c) for c in cases]:
+        raise ValueError(
+            f"case store {root} holds {len(stored)} cases but this run plans "
+            f"{len(cases)}; the grid JSON or block-size dedup changed since "
+            "materialization. Rerun --materialize_cache_cases."
+        )
+    return store
+
+
 def _collect_timeline_files(result_dir: str) -> None:
     """Wait for async profiler saves and collect timeline JSON files into a timelines/ subdirectory."""
     # C++ engine's ProfilerSaveWorker writes timeline JSONs asynchronously in a
@@ -420,6 +561,7 @@ def _write_test_info(
     remaining_args: List[str],
     engine_env_names: Optional[List[str]] = None,
     status: str = "completed",
+    expected_cache_block_size: int = 0,
 ) -> None:
     """Persist a reproducible, credential-safe test configuration."""
     model_type = extract_arg(remaining_args, "model_type") or os.environ.get(
@@ -456,6 +598,10 @@ def _write_test_info(
         "warmup_runs": int(os.environ.get("PERF_FORMAL_WARMUP_RUNS", "1")),
         "measure_runs": int(os.environ.get("PERF_MEASURE_RUNS", "1")),
         "profile_runs": int(os.environ.get("PERF_PROFILE_RUNS", "1")),
+        "expected_cache_block_size": (
+            expected_cache_block_size if args.cache_grid_json else None
+        ),
+        "cache_case_store": args.cache_case_files or None,
         "dataset_name": args.dataset_name or None,
         "dataset_path": args.dataset_path or args.dataset or None,
         "engine_args": _redact_argv(remaining_args),
@@ -524,8 +670,43 @@ def main() -> str:
             raise ValueError("--cache_request_timeout must be positive")
         if args.cache_commit_tail_tokens <= 0:
             raise ValueError("--cache_commit_tail_tokens must be positive")
+        if args.materialize_cache_cases and args.cache_case_files:
+            raise ValueError(
+                "--materialize_cache_cases and --cache_case_files are mutually "
+                "exclusive"
+            )
 
         cases = _load_cache_grid_cases(args.cache_grid_json)
+        with open(args.cache_grid_json, "rb") as stream:
+            grid_bytes = stream.read()
+        grid_payload = json.loads(grid_bytes)
+        grid_metadata = {
+            key: grid_payload.get(key)
+            for key in ("schema_version", "kind", "generator", "summary")
+            if key in grid_payload
+        }
+        grid_sha256 = hashlib.sha256(grid_bytes).hexdigest()
+        expected_block_size = _resolve_cache_block_size(
+            grid_payload, args.expected_cache_block_size
+        )
+        if expected_block_size > 0:
+            deduped = _dedupe_cache_grid_cases(cases, expected_block_size)
+            if len(deduped) < len(cases):
+                logging.warning(
+                    "cache grid: dropped %d of %d cases that collapse onto the same "
+                    "%d-token physical block bucket",
+                    len(cases) - len(deduped),
+                    len(cases),
+                    expected_block_size,
+                )
+                cases = deduped
+        logging.info(
+            "cache grid plan: cases=%d sha256=%s expected_block_size=%d metadata=%s",
+            len(cases),
+            grid_sha256,
+            expected_block_size,
+            grid_metadata,
+        )
         for case in cases:
             cache_len = int(case["cache_len"])
             input_len = int(case["input_len"])
@@ -551,6 +732,42 @@ def main() -> str:
                 "cache-grid mode requires --tokenizer_path or --checkpoint_path"
             )
 
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path, trust_remote_code=True
+        )
+
+        if args.materialize_cache_cases:
+            store = MaterializedCaseStore(args.materialize_cache_cases)
+            stats = store.materialize(
+                cases,
+                PrefixPromptFactory(tokenizer),
+                args.cache_measure_runs,
+                grid_metadata=grid_metadata,
+                grid_sha256=grid_sha256,
+            )
+            logging.info(
+                "materialized %d cache-grid cases (%d cached) to %s: %s",
+                stats["cases"],
+                stats["cached_cases"],
+                args.materialize_cache_cases,
+                stats,
+            )
+            return args.result_dir
+
+        case_store = None
+        if args.cache_case_files:
+            case_store = _load_materialized_case_store(
+                args.cache_case_files,
+                cases,
+                args.cache_measure_runs,
+                grid_sha256,
+            )
+            logging.info(
+                "cache grid: using materialized case store %s", args.cache_case_files
+            )
+
         server = EngineServer(args, remaining)
         server.start(
             max_seq_len=max(max_input_len + args.decode_test_length, args.max_seq_len),
@@ -560,11 +777,6 @@ def main() -> str:
             max_concurrency=args.concurrency_limit,
         )
         try:
-            from transformers import AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_path, trust_remote_code=True
-            )
             CacheGridRunner(
                 server.port,
                 tokenizer,
@@ -573,11 +785,21 @@ def main() -> str:
                 request_timeout=args.cache_request_timeout,
                 measure_runs=args.cache_measure_runs,
                 cache_commit_tail_tokens=args.cache_commit_tail_tokens,
+                grid_metadata=grid_metadata,
+                grid_sha256=grid_sha256,
+                expected_block_size=expected_block_size,
+                case_store=case_store,
             ).run()
             _collect_timeline_files(args.result_dir)
         finally:
             server.stop()
-        _write_test_info(args, remaining, engine_env_names, status="completed")
+        _write_test_info(
+            args,
+            remaining,
+            engine_env_names,
+            status="completed",
+            expected_cache_block_size=expected_block_size,
+        )
         return args.result_dir
 
     distribution_mode = (

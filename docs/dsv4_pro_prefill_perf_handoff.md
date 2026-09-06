@@ -365,9 +365,9 @@ python3 "$CHART" \
 当前图的坐标约定固定为：
 
 ```text
-X = measured TTFT / prefill RT (ms)
+X = uncached compute tokens = input_len - observed_cache_len
 Y = observed cached tokens
-Z = uncached compute tokens = input_len - observed_cache_len
+Z = measured TTFT / prefill RT (ms)
 ```
 
 浅灰点是全部可用 geometry；实线是近固定 cache 的中位数趋势，虚线是近固定 compute 的中位数趋势。颜色只区分趋势线，不表示 RT 数值。
@@ -384,3 +384,68 @@ Z = uncached compute tokens = input_len - observed_cache_len
 | 公式在 FlexLB 解析失败 | 是否混入 `sum`、`max`、`batchSize`、`computeTokens` 或 Python 语法 |
 
 交接时至少提供：代码 commit、模型目录、完整 argv/env、GPU 型号、结果 JSON、`process.log`、拟合报告和 SHA256。不要只交一张截图或一行平均 RT。
+
+## 11. 生成 128-token 对齐的密集 cache grid
+
+不要把 1M 范围内所有 `input_len × cache_len` 的 128-token 组合全部展开；
+完整三角网格约有 3355 万个 geometry。仓库提供分层采样生成器，使候选点按
+128 token 对齐，同时限制实际 case 数：
+
+```bash
+bazelisk run //rtp_llm/test/perf_test:generate_cache_grid -- \
+  --min-input-len 256 \
+  --max-input-len 1048575 \
+  --alignment 128 \
+  --cache-alignment 512 \
+  --input-points 1024 \
+  --cache-points-per-input 16 \
+  --cache-ratio-points 7 \
+  --seed 104729 \
+  --max-cases 20000 \
+  --output /path/to/cache_grid_128.json
+```
+
+默认使用固定质数 `104729` 作为随机种子。同一组参数会生成相同的计划；每个
+input 同时包含 cold、near-full、按 cache ratio 分层以及按 compute tokens
+分层的点。普通点均按 128 对齐，严格 1M 的 `input_len=1048575` 是唯一保留的
+非对齐边界例外。
+
+`--cache-alignment` 是 cache 维度的对齐，应等于引擎的物理复用粒度：
+`seq_size_per_block`（DSV4 未显式传入时默认 256），开启
+`PREFILL_CP_KV_CACHE_SHARDED=1` 时再乘以 CP size。它与 `--alignment`
+（input 维度）解耦：handoff 基线 `--seq_size_per_block 512` 对应
+`--cache-alignment 512`。cache 长度按物理 block 对齐后，每个点的 requested
+与 observed reuse 一致；若 cache 对齐小于物理 block（例如 128 对齐 × 512
+block），同桶点测的是同一几何，白付 seed 和测量轮次。`--cache-alignment 0`
+（默认）保持旧行为，即跟随 `--alignment`。
+
+如果需要枚举范围内每个 128-token input 候选点，可增加
+`--input-mode=stride`。这通常会突破默认 20000 case 保护，生成器会拒绝输出；
+只有确认预计请求量后才使用 `--allow-large-grid`。
+
+运行密集计划：
+
+```bash
+bazelisk test //rtp_llm/test/perf_test:cache_grid_perf_test \
+  --config=cuda13 --config=sm10x \
+  --test_timeout=345600 --test_output=streamed --nocache_test_results \
+  --test_arg=--cache_grid_json=/path/to/cache_grid_128.json \
+  --test_arg=--partial=2 \
+  --test_arg=--cache_measure_runs=3 \
+  --test_arg=--expected_cache_block_size=512 \
+  --test_arg=--result_dir=/path/to/results
+```
+
+`--expected_cache_block_size`（缺省 0 时自动读取计划里的
+`generator.cache_alignment`）有两个作用：加载时把落到同一物理 block 桶的
+case 去重；服务启动后先做一次探测——写入恰好一个 block 的前缀、发送两
+block 的命中请求并校验 `reuse_len` 等于 block size。粒度不一致（比如
+`seq_size_per_block` 算错或 CP 分片开关与预期不符）会立即终止测试，避免
+整轮 cache-hit 数据全部作废。引擎实际生效的粒度也可以从启动日志确认：
+`cache config: ... seq_size_per_block=N`（通用）或
+`DSV4 physical block=N, kernel block=M`（DSV4）。
+
+生成计划中的 `generator`、`summary` 和输入文件 SHA256 会写入
+`cache_grid_results.json`。采样坐标使用 requested cache；拟合和三维图必须
+继续使用引擎报告的 observed cache。三维图坐标为 X=compute tokens、
+Y=observed cached tokens、Z=TTFT。

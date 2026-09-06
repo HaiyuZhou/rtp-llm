@@ -5,8 +5,23 @@ runner adds a cache dimension without adding an engine/server argument: each
 case first inserts a unique prefix into the normal prefix cache, then sends
 three unique continuations sharing exactly that prefix.  The measured
 ``aux_info.reuse_len`` is recorded, so a requested cache length is never
-silently treated as a hit.  End-to-end TTFT is measured around the HTTP call;
-the server's auxiliary timing remains available as a separate diagnostic.
+silently treated as a hit.
+
+When ``expected_block_size`` is set (the engine's ``--seq_size_per_block``,
+multiplied by CP size under ``PREFILL_CP_KV_CACHE_SHARDED=1``), a probe runs
+before any case: it seeds exactly one block of tokens and verifies a 2-block
+request reports ``reuse_len == block_size``.  A mismatch would silently
+invalidate every cache-hitting case, so the runner aborts immediately instead
+of burning GPU-hours on a misaligned grid.
+
+Prompt construction happens at the token-id layer (``build_case_prompts``):
+every prompt is ``marker + " hello" * k``, so the exact-length ids are marker
+ids plus filler repeats, and the text is the same string concatenation.  The
+structure is proven once per shape by probing the tokenizer and by fully
+re-encoding the first built case; tokenizers that do not tokenize the filler
+pattern structurally fall back to the legacy text-layer construction.
+Precomputed prompts can also be materialized to disk once and reloaded
+without a tokenizer (``MaterializedCaseStore``).
 """
 
 from __future__ import annotations
@@ -17,6 +32,7 @@ import os
 import statistics
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -39,8 +55,30 @@ def _encode(tokenizer: Any, text: str) -> List[int]:
     return list(tokenizer.encode(text))
 
 
+class FastConstructionUnavailable(Exception):
+    """Internal: the id-layer prompt construction cannot be trusted here."""
+
+
+@dataclass
+class CasePrompts:
+    """All prompts needed to execute one cache-grid case.
+
+    ``run_ids`` and ``prefix_ids`` may be empty when the prompts were loaded
+    from a precomputed store (geometry was verified at materialization time).
+    """
+
+    seed_text: str
+    prefix_ids: List[int] = field(default_factory=list)
+    run_texts: List[str] = field(default_factory=list)
+    run_ids: List[List[int]] = field(default_factory=list)
+    built_len: int = 0
+    run_specs: Optional[List[Dict[str, Any]]] = None
+
+
 class PrefixPromptFactory:
     """Build exact-length prompts and verify their shared token prefix."""
+
+    SHARED_PREFIX_MARKER = "cache_grid_shared_prefix_"
 
     def __init__(self, tokenizer: Any):
         self.tokenizer = tokenizer
@@ -55,6 +93,12 @@ class PrefixPromptFactory:
         self._last_exact_key = None
         self._last_exact_ids = None
         self._last_exact_text = None
+        # Id-layer caches: marker -> ids (None when the marker is unsafe) and
+        # the set of prompt shapes whose first fully verified case passed.
+        self._marker_ids_cache: Dict[str, Optional[List[int]]] = {}
+        self._tail_ids_cache: Dict[str, Optional[List[int]]] = {}
+        self._verified_shapes: set = set()
+        self._unsafe_shapes: set = set()
 
     def _store_exact(self, key, text, ids):
         self._last_exact_key = key
@@ -123,15 +167,17 @@ class PrefixPromptFactory:
         text, _ = self._exact_text_and_ids(target_len, prefix)
         return text
 
-    def make_case(self, case_id: int, total_len: int, cache_len: int) -> Tuple[str, str, int]:
+    def make_case(
+        self, case_id: int, total_len: int, cache_len: int
+    ) -> Tuple[str, str, int]:
         if cache_len < 0 or cache_len >= total_len:
             raise ValueError(
                 f"cache_len must satisfy 0 <= cache_len < total_len, "
                 f"got {cache_len}/{total_len}"
             )
-        # Keep cases independent. A shared prefix makes the observed reuse
-        # depend on which earlier case happened to populate the prefix tree.
-        marker = f"cache_grid_case_{case_id}_prefix_"
+        # Isolate every geometry. Reusing one marker across cases lets a larger
+        # previously seeded prefix contaminate later, smaller cache requests.
+        marker = f"{self.SHARED_PREFIX_MARKER}{case_id}_"
         if cache_len == 0:
             target, target_ids = self._exact_text_and_ids(total_len, marker)
             return target, "", len(target_ids)
@@ -165,6 +211,364 @@ class PrefixPromptFactory:
                 f"prefix={cache_len}, seed={len(seed_ids)}"
             )
         return seed
+
+    def _safe_marker_ids(self, marker: str) -> Optional[List[int]]:
+        """Marker ids when ``marker + filler*k`` tokenizes structurally.
+
+        The probe encodes ``marker`` plus eight fillers once; when the result
+        is exactly the marker ids followed by eight filler ids, any filler
+        count shares the same structure and prompts of every length can be
+        assembled without re-encoding them.
+        """
+        if not self._fast_path:
+            return None
+        if marker in self._marker_ids_cache:
+            return self._marker_ids_cache[marker]
+        marker_ids = _encode(self.tokenizer, marker)
+        probe = _encode(self.tokenizer, marker + self._word * 8)
+        result = marker_ids if probe == marker_ids + self._filler_ids * 8 else None
+        self._marker_ids_cache[marker] = result
+        return result
+
+    def _safe_tail_ids(self, tail: str) -> Optional[List[int]]:
+        """Tail ids when filler->tail->filler boundaries tokenize structurally."""
+        if not self._fast_path:
+            return None
+        if tail in self._tail_ids_cache:
+            return self._tail_ids_cache[tail]
+        tail_ids = _encode(self.tokenizer, tail)
+        probe = _encode(self.tokenizer, self._word * 4 + tail + self._word * 4)
+        expected = self._filler_ids * 4 + tail_ids + self._filler_ids * 4
+        result = tail_ids if probe == expected else None
+        self._tail_ids_cache[tail] = result
+        return result
+
+    def build_case_prompts(
+        self, case_id: int, total_len: int, cache_len: int, run_count: int
+    ) -> CasePrompts:
+        """Build the seed prefix and the measured run prompts for one case.
+
+        The fast path assembles exact-length token ids and texts from the
+        marker ids plus filler repeats, costing string/list concatenation only.
+        The first built case of each shape (cached / cold) is fully re-encoded
+        and compared token by token; any mismatch, or a tokenizer without the
+        structural filler property, falls back to the legacy text-layer path.
+        """
+        if cache_len < 0 or cache_len >= total_len:
+            raise ValueError(
+                f"cache_len must satisfy 0 <= cache_len < total_len, "
+                f"got {cache_len}/{total_len}"
+            )
+        if run_count <= 0:
+            raise ValueError(f"run_count must be positive, got {run_count}")
+        shape = "cached" if cache_len else "cold"
+        if shape not in self._unsafe_shapes:
+            try:
+                prompts = self._fast_case_prompts(
+                    case_id, total_len, cache_len, run_count
+                )
+                if shape not in self._verified_shapes:
+                    self._verify_case_prompts(shape, prompts)
+                return prompts
+            except FastConstructionUnavailable:
+                pass
+        return self._legacy_case_prompts(case_id, total_len, cache_len, run_count)
+
+    def _fast_case_prompts(
+        self, case_id: int, total_len: int, cache_len: int, run_count: int
+    ) -> CasePrompts:
+        if cache_len == 0:
+            run_texts: List[str] = []
+            run_ids: List[List[int]] = []
+            run_specs: List[Dict[str, Any]] = []
+            for run_idx in range(run_count):
+                marker = f"case_{case_id}_cold_run_{run_idx}_"
+                marker_ids = self._safe_marker_ids(marker)
+                if marker_ids is None or len(marker_ids) > total_len:
+                    raise FastConstructionUnavailable()
+                fillers = total_len - len(marker_ids)
+                run_texts.append(marker + self._word * fillers)
+                run_ids.append(marker_ids + self._filler_ids * fillers)
+                run_specs.append({"marker": marker, "fillers": fillers})
+            return CasePrompts("", [], run_texts, run_ids, total_len, run_specs)
+
+        marker = f"{self.SHARED_PREFIX_MARKER}{case_id}_"
+        marker_ids = self._safe_marker_ids(marker)
+        if marker_ids is None or len(marker_ids) > cache_len:
+            raise FastConstructionUnavailable()
+        prefix_fillers = cache_len - len(marker_ids)
+        prefix_ids = marker_ids + self._filler_ids * prefix_fillers
+        seed_text = marker + self._word * prefix_fillers
+        run_texts = []
+        run_ids = []
+        run_specs = []
+        for run_idx in range(run_count):
+            tail = f" __run_{run_idx}_"
+            tail_ids = self._safe_tail_ids(tail)
+            if tail_ids is None:
+                raise FastConstructionUnavailable()
+            fillers = total_len - cache_len - len(tail_ids)
+            if fillers < 0:
+                raise FastConstructionUnavailable()
+            run_texts.append(seed_text + tail + self._word * fillers)
+            run_ids.append(prefix_ids + tail_ids + self._filler_ids * fillers)
+            run_specs.append({"tail": tail, "fillers": fillers})
+        return CasePrompts(
+            seed_text, prefix_ids, run_texts, run_ids, total_len, run_specs
+        )
+
+    def _verify_case_prompts(self, shape: str, prompts: CasePrompts) -> None:
+        """Fully re-encode the first case of a shape to prove the id layer."""
+        texts = ([prompts.seed_text] if prompts.seed_text else []) + prompts.run_texts
+        ids_lists = (
+            [prompts.prefix_ids] if prompts.seed_text else []
+        ) + prompts.run_ids
+        for text, ids in zip(texts, ids_lists):
+            if _encode(self.tokenizer, text) != ids:
+                self._unsafe_shapes.add(shape)
+                logging.warning(
+                    "cache grid: id-layer prompt construction failed full "
+                    "verification for shape=%s; falling back to text layer",
+                    shape,
+                )
+                raise FastConstructionUnavailable()
+        self._verified_shapes.add(shape)
+        logging.info(
+            "cache grid: id-layer construction verified for shape=%s "
+            "(seed=%d tokens, %d runs, %d run tokens)",
+            shape,
+            len(prompts.prefix_ids),
+            len(prompts.run_ids),
+            sum(len(x) for x in prompts.run_ids),
+        )
+
+    def _legacy_case_prompts(
+        self, case_id: int, total_len: int, cache_len: int, run_count: int
+    ) -> CasePrompts:
+        _, prefix, built_len = self.make_case(case_id, total_len, cache_len)
+        prefix_ids = _encode(self.tokenizer, prefix) if cache_len else []
+        run_texts: List[str] = []
+        run_ids: List[List[int]] = []
+        for run_idx in range(run_count):
+            if cache_len:
+                run_target, ids = self._exact_text_and_ids(
+                    total_len, prefix + f" __run_{run_idx}_"
+                )
+                if ids[:cache_len] != prefix_ids:
+                    raise ValueError(f"run {run_idx} did not preserve cache prefix")
+            else:
+                run_target, ids = self._exact_text_and_ids(
+                    total_len, f"case_{case_id}_cold_run_{run_idx}_"
+                )
+            run_texts.append(run_target)
+            run_ids.append(ids)
+        return CasePrompts(prefix, prefix_ids, run_texts, run_ids, built_len, None)
+
+
+class MaterializedCaseStore:
+    """Precomputed cache-grid prompts persisted on disk (plan A).
+
+    All cached-case seed prefixes share one marker and a filler pattern, so
+    every seed text is a character prefix of the longest one.  The store keeps
+    that single base text under ``prefixes/base.txt`` plus one tiny JSON
+    record per case (tail markers and filler counts); a case is rebuilt by
+    string slicing and concatenation without touching the tokenizer.  Cases
+    whose prompts could not be decomposed (legacy fallback) fall back to
+    verbatim text records.
+    """
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, root: str):
+        self.root = Path(root)
+        self.manifest_path = self.root / "manifest.jsonl"
+        self.info_path = self.root / "store_info.json"
+        self._records: Dict[int, Dict[str, Any]] = {}
+        self._loaded = False
+        self._word = " hello"
+        self._marker = PrefixPromptFactory.SHARED_PREFIX_MARKER
+        self._marker_ids_len = -1
+        self._base_text: Optional[str] = None
+        self.run_count = -1
+        self.grid_metadata: Dict[str, Any] = {}
+        self.grid_sha256 = ""
+
+    def materialize(
+        self,
+        cases: Iterable[Dict[str, int]],
+        factory: PrefixPromptFactory,
+        run_count: int,
+        *,
+        grid_metadata: Optional[Dict[str, Any]] = None,
+        grid_sha256: str = "",
+    ) -> Dict[str, Any]:
+        if run_count <= 0:
+            raise ValueError("run_count must be positive")
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "prefixes").mkdir(exist_ok=True)
+        stats = {
+            "cases": 0,
+            "cached_cases": 0,
+            "verbatim_seed": 0,
+            "verbatim_runs": 0,
+            "bytes": 0,
+        }
+        base_text = ""
+        base_cache_len = -1
+        case_list = list(cases)
+        marker_ids = _encode(factory.tokenizer, factory.SHARED_PREFIX_MARKER)
+        for case in case_list:
+            prompts = factory.build_case_prompts(
+                int(case["case_id"]),
+                int(case["input_len"]),
+                int(case["cache_len"]),
+                run_count,
+            )
+            record = {
+                "schema_version": self.SCHEMA_VERSION,
+                "case_id": int(case["case_id"]),
+                "batch_size": int(case.get("batch_size", 1)),
+                "input_len": int(case["input_len"]),
+                "cache_len": int(case["cache_len"]),
+            }
+            if prompts.seed_text:
+                stats["cached_cases"] += 1
+                cache_len = int(case["cache_len"])
+                marker = f"{factory.SHARED_PREFIX_MARKER}{int(case['case_id'])}_"
+                case_marker_ids = _encode(factory.tokenizer, marker)
+                fillers = cache_len - len(case_marker_ids)
+                decomposed = marker + factory._word * fillers
+                if fillers >= 0 and prompts.seed_text == decomposed:
+                    record["seed_marker"] = marker
+                    record["seed_fillers"] = fillers
+                else:
+                    record["seed_text"] = prompts.seed_text
+                    stats["verbatim_seed"] += 1
+            runs = []
+            for idx, text in enumerate(prompts.run_texts):
+                spec = None
+                if prompts.run_specs and idx < len(prompts.run_specs):
+                    spec = prompts.run_specs[idx]
+                if spec is not None and "tail" in spec and prompts.seed_text:
+                    runs.append(spec)
+                elif spec is not None and "marker" in spec:
+                    runs.append(spec)
+                else:
+                    runs.append({"text": text})
+                    stats["verbatim_runs"] += 1
+            record["runs"] = runs
+            self._records[int(case["case_id"])] = record
+            stats["cases"] += 1
+        with self.manifest_path.open("w", encoding="utf-8") as manifest:
+            for record in self._records.values():
+                manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
+        (self.root / "prefixes" / "base.txt").write_text(base_text, encoding="utf-8")
+        self.info_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": self.SCHEMA_VERSION,
+                    "run_count": run_count,
+                    "word": factory._word,
+                    "marker": factory.SHARED_PREFIX_MARKER,
+                    "marker_ids_len": len(marker_ids),
+                    "max_cache_len": base_cache_len,
+                    "case_count": stats["cases"],
+                    "grid_metadata": grid_metadata or {},
+                    "grid_sha256": grid_sha256,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        stats["bytes"] = sum(
+            f.stat().st_size for f in self.root.rglob("*") if f.is_file()
+        )
+        self._loaded = True
+        self.run_count = run_count
+        self.grid_metadata = grid_metadata or {}
+        self.grid_sha256 = grid_sha256
+        self._marker_ids_len = len(marker_ids)
+        self._base_text = base_text
+        return stats
+
+    def load_cases(self) -> List[Dict[str, int]]:
+        self._ensure_loaded()
+        return [
+            {
+                "case_id": record["case_id"],
+                "batch_size": record["batch_size"],
+                "input_len": record["input_len"],
+                "cache_len": record["cache_len"],
+            }
+            for record in self._records.values()
+        ]
+
+    def load_case(self, case: Dict[str, int]) -> CasePrompts:
+        self._ensure_loaded()
+        record = self._records[int(case["case_id"])]
+        cache_len = int(record["cache_len"])
+        seed_text = ""
+        if cache_len:
+            if "seed_text" in record:
+                seed_text = record["seed_text"]
+            elif "seed_marker" in record:
+                seed_text = record["seed_marker"] + self._word * int(
+                    record["seed_fillers"]
+                )
+            else:
+                seed_text = self._base_prefix_text(cache_len)
+        run_texts: List[str] = []
+        for spec in record["runs"]:
+            if "text" in spec:
+                run_texts.append(spec["text"])
+            elif "tail" in spec:
+                run_texts.append(
+                    seed_text + spec["tail"] + self._word * int(spec["fillers"])
+                )
+            else:
+                run_texts.append(spec["marker"] + self._word * int(spec["fillers"]))
+        return CasePrompts(seed_text, [], run_texts, [], int(record["input_len"]))
+
+    def _base_prefix_text(self, cache_len: int) -> str:
+        if self._base_text is None:
+            path = self.root / "prefixes" / "base.txt"
+            self._base_text = path.read_text(encoding="utf-8")
+        if self._marker_ids_len < 0:
+            raise ValueError("store_info.json is missing marker_ids_len")
+        chars = len(self._marker) + len(self._word) * (cache_len - self._marker_ids_len)
+        if chars < 0 or chars > len(self._base_text):
+            raise ValueError(
+                f"prefix of {cache_len} tokens needs {chars} chars but the "
+                f"materialized base text only has {len(self._base_text)}"
+            )
+        return self._base_text[:chars]
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        if not self.manifest_path.exists():
+            raise FileNotFoundError(
+                f"{self.root} is not a materialized case store "
+                f"(missing manifest.jsonl)"
+            )
+        if self.info_path.exists():
+            info = json.loads(self.info_path.read_text(encoding="utf-8"))
+            self._word = info.get("word", self._word)
+            self._marker = info.get("marker", self._marker)
+            self._marker_ids_len = int(info.get("marker_ids_len", -1))
+            self.run_count = int(info.get("run_count", -1))
+            self.grid_metadata = info.get("grid_metadata", {})
+            self.grid_sha256 = info.get("grid_sha256", "")
+        with self.manifest_path.open(encoding="utf-8") as manifest:
+            for line in manifest:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                self._records[int(record["case_id"])] = record
+        self._loaded = True
 
 
 def _post_prefill(
@@ -242,10 +646,21 @@ class CacheGridRunner:
         checkpoint_every: int = 1,
         cache_commit_tail_tokens: int = 4096,
         fail_fast: bool = True,
+        grid_metadata: Dict[str, Any] | None = None,
+        grid_sha256: str | None = None,
+        expected_block_size: int = 0,
+        case_store: "MaterializedCaseStore | None" = None,
     ):
         self.port = port
         self.factory = PrefixPromptFactory(tokenizer)
         self.cases = list(cases)
+        self.case_store = case_store
+        if case_store is not None and case_store.run_count not in (-1, measure_runs):
+            raise ValueError(
+                f"materialized case store was built for run_count="
+                f"{case_store.run_count} but the runner uses measure_runs="
+                f"{measure_runs}"
+            )
         self.result_dir = Path(result_dir)
         self.result_dir.mkdir(parents=True, exist_ok=True)
         if request_timeout <= 0:
@@ -254,11 +669,16 @@ class CacheGridRunner:
             raise ValueError("measure_runs must be positive")
         if cache_commit_tail_tokens <= 0:
             raise ValueError("cache_commit_tail_tokens must be positive")
+        if expected_block_size < 0:
+            raise ValueError("expected_block_size must be non-negative")
         self.request_timeout = request_timeout
         self.measure_runs = measure_runs
         self.checkpoint_every = max(1, checkpoint_every)
         self.cache_commit_tail_tokens = cache_commit_tail_tokens
         self.fail_fast = fail_fast
+        self.grid_metadata = grid_metadata or {}
+        self.grid_sha256 = grid_sha256
+        self.expected_block_size = expected_block_size
         self.result_path = self.result_dir / "cache_grid_results.json"
         self._results: Dict[str, Dict[str, Any]] = {}
         self._http_session = _make_http_session()
@@ -269,9 +689,7 @@ class CacheGridRunner:
         if self.result_path.exists():
             with self.result_path.open(encoding="utf-8") as f:
                 payload = json.load(f)
-            self._results = {
-                str(x["case_key"]): x for x in payload.get("metrics", [])
-            }
+            self._results = {str(x["case_key"]): x for x in payload.get("metrics", [])}
 
     @staticmethod
     def case_key(case: Dict[str, int]) -> str:
@@ -292,6 +710,8 @@ class CacheGridRunner:
             "completed_cases": sum(
                 row.get("status") == "ok" for row in self._results.values()
             ),
+            "grid_metadata": self.grid_metadata,
+            "grid_sha256": self.grid_sha256,
             "metrics": list(self._results.values()),
         }
         if asynchronous:
@@ -313,6 +733,71 @@ class CacheGridRunner:
         self._checkpoint_executor.shutdown(wait=True)
         self._http_session.close()
 
+    def _probe_reuse_granularity(self) -> None:
+        """Fail fast when the assumed physical reuse granularity is wrong."""
+        block = self.expected_block_size
+        if block <= 0:
+            return
+        prefix_text, prefix_ids = self.factory._exact_text_and_ids(
+            block, PrefixPromptFactory.SHARED_PREFIX_MARKER
+        )
+        seed_text = self.factory.make_seed(
+            -1, prefix_text, block, self.cache_commit_tail_tokens
+        )
+        hit_text, hit_ids = self.factory._exact_text_and_ids(
+            2 * block, prefix_text + " __block_probe_"
+        )
+        if hit_ids[:block] != prefix_ids:
+            hit_text, hit_ids = self.factory._exact_text_and_ids(2 * block, prefix_text)
+        if hit_ids[:block] != prefix_ids:
+            raise RuntimeError(
+                "block-size probe could not build a prompt preserving its own prefix"
+            )
+        seed = _post_prefill(
+            self.port,
+            seed_text,
+            self.request_timeout,
+            "block_size_probe:seed",
+            self._http_session,
+        )
+        if not seed.get("success"):
+            raise RuntimeError(f"block-size probe seed failed: {seed.get('error')}")
+        hit = _post_prefill(
+            self.port,
+            hit_text,
+            self.request_timeout,
+            "block_size_probe:hit",
+            self._http_session,
+        )
+        if not hit.get("success"):
+            raise RuntimeError(f"block-size probe request failed: {hit.get('error')}")
+        observed = int(hit.get("reuse_len", -1))
+        if observed != block:
+            raise RuntimeError(
+                f"cache reuse granularity mismatch: probe observed reuse_len={observed}, "
+                f"expected {block} tokens per physical block. Every cache-hitting case "
+                "would be reported as invalid_reuse. Check --seq_size_per_block (x CP "
+                "size when PREFILL_CP_KV_CACHE_SHARDED=1) or fix "
+                "--expected_cache_block_size and rerun."
+            )
+        logging.info("[CACHE_GRID] block-size probe passed: reuse_len=%d", block)
+
+    def _build_prompts(
+        self, case: Dict[str, int], total_len: int, cache_len: int
+    ) -> CasePrompts:
+        if self.case_store is not None:
+            prompts = self.case_store.load_case(case)
+        else:
+            prompts = self.factory.build_case_prompts(
+                int(case["case_id"]), total_len, cache_len, self.measure_runs
+            )
+        if len(prompts.run_texts) != self.measure_runs:
+            raise ValueError(
+                f"expected {self.measure_runs} run prompts, got "
+                f"{len(prompts.run_texts)}"
+            )
+        return prompts
+
     def _prepare_case_payload(self, case: Dict[str, int]) -> Dict[str, Any]:
         """Build prompts for one case without issuing a model request."""
         key = self.case_key(case)
@@ -331,9 +816,9 @@ class CacheGridRunner:
                 f"cache_len must leave at least {self.cache_commit_tail_tokens} "
                 f"tokens for seed commit, got {cache_len}/{total_len}"
             )
-        target, prefix, built_len = self.factory.make_case(
-            int(case["case_id"]), total_len, cache_len
-        )
+        prompts = self._build_prompts(case, total_len, cache_len)
+        prefix = prompts.seed_text
+        built_len = prompts.built_len
         seed = (
             self.factory.make_seed(
                 int(case["case_id"]),
@@ -344,20 +829,6 @@ class CacheGridRunner:
             if cache_len
             else ""
         )
-        prefix_ids = _encode(self.factory.tokenizer, prefix) if cache_len else []
-        run_targets: List[str] = []
-        for run_idx in range(self.measure_runs):
-            if cache_len:
-                run_target, run_ids = self.factory._exact_text_and_ids(
-                    total_len, prefix + f" __run_{run_idx}_"
-                )
-                if run_ids[:cache_len] != prefix_ids:
-                    raise ValueError(f"run {run_idx} did not preserve cache prefix")
-            else:
-                run_target, _ = self.factory._exact_text_and_ids(
-                    total_len, f"case_{case['case_id']}_cold_run_{run_idx}_"
-                )
-            run_targets.append(run_target)
         return {
             "key": key,
             "total_len": total_len,
@@ -365,10 +836,11 @@ class CacheGridRunner:
             "batch_size": batch_size,
             "built_len": built_len,
             "seed": seed,
-            "run_targets": run_targets,
+            "run_targets": prompts.run_texts,
         }
 
     def run(self) -> List[Dict[str, Any]]:
+        self._probe_reuse_granularity()
         pending = [
             case
             for case in self.cases

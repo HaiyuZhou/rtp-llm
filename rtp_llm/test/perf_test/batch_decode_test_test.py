@@ -3,18 +3,23 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.batch_decode_test import (
+    _dedupe_cache_grid_cases,
     _effective_grid_max_seq_len,
     _engine_arg_argv,
     _load_cache_grid_cases,
+    _load_materialized_case_store,
     _parse_name_value,
     _redact_argv,
+    _resolve_cache_block_size,
     parse_args,
 )
 from rtp_llm.test.perf_test.cache_grid_runner import (
     CacheGridRunner,
+    MaterializedCaseStore,
     PrefixPromptFactory,
     _post_prefill,
 )
@@ -23,6 +28,27 @@ from rtp_llm.test.perf_test.cache_grid_runner import (
 class _WhitespaceTokenizer:
     def encode(self, text):
         return text.split()
+
+
+class _WordTokenizer:
+    """Minimal stand-in: every whitespace-separated word is one token."""
+
+    def encode(self, text):
+        return text.split()
+
+
+class _TailMergingTokenizer:
+    """Whitespace tokenizer that fuses a ``__run_`` tail into the previous token."""
+
+    def encode(self, text):
+        words = text.split()
+        out = []
+        for word in words:
+            if word.startswith("__run_") and out and out[-1] == "hello":
+                out[-1] = "hello" + word
+            else:
+                out.append(word)
+        return out
 
 
 class BatchDecodeTest(unittest.TestCase):
@@ -70,6 +96,9 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertGreater(args.cache_request_timeout, 0)
         self.assertEqual(args.cache_commit_tail_tokens, 4096)
         self.assertEqual(args.cache_grid_json, "")
+        self.assertEqual(args.expected_cache_block_size, 0)
+        self.assertEqual(args.materialize_cache_cases, "")
+        self.assertEqual(args.cache_case_files, "")
         self.assertIsInstance(remaining, list)
 
     def test_generated_cache_grid_uses_independent_seq_and_cache_alignment(self):
@@ -246,6 +275,278 @@ class BatchDecodeTest(unittest.TestCase):
             ),
             ["--engine_env=***", "--engine_arg=tp_size=8"],
         )
+
+    def test_resolve_cache_block_size_prefers_cli_value(self):
+        payload = {"generator": {"cache_alignment": 512}}
+        self.assertEqual(_resolve_cache_block_size(payload, 256), 256)
+        self.assertEqual(_resolve_cache_block_size(payload, 0), 512)
+
+    def test_resolve_cache_block_size_handles_missing_metadata(self):
+        self.assertEqual(_resolve_cache_block_size({}, 0), 0)
+        self.assertEqual(_resolve_cache_block_size({"generator": {}}, 0), 0)
+        self.assertEqual(_resolve_cache_block_size(None, 0), 0)
+        self.assertEqual(
+            _resolve_cache_block_size({"generator": {"cache_alignment": "junk"}}, 0), 0
+        )
+
+    def test_dedupe_collapses_cases_in_same_block_bucket(self):
+        cases = [
+            {"case_id": 0, "batch_size": 1, "input_len": 4096, "cache_len": 2048},
+            {"case_id": 1, "batch_size": 1, "input_len": 4096, "cache_len": 2304},
+            {"case_id": 2, "batch_size": 1, "input_len": 4096, "cache_len": 2400},
+        ]
+        deduped = _dedupe_cache_grid_cases(cases, 512)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["cache_len"], 2048)
+
+    def test_dedupe_prefers_aligned_representative(self):
+        cases = [
+            {"case_id": 0, "batch_size": 1, "input_len": 4096, "cache_len": 2304},
+            {"case_id": 1, "batch_size": 1, "input_len": 4096, "cache_len": 2048},
+        ]
+        deduped = _dedupe_cache_grid_cases(cases, 512)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["cache_len"], 2048)
+
+    def test_dedupe_prefers_cold_over_partial_first_block(self):
+        cases = [
+            {"case_id": 0, "batch_size": 1, "input_len": 4096, "cache_len": 300},
+            {"case_id": 1, "batch_size": 1, "input_len": 4096, "cache_len": 0},
+        ]
+        deduped = _dedupe_cache_grid_cases(cases, 512)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["cache_len"], 0)
+
+    def test_dedupe_keeps_distinct_inputs_and_buckets(self):
+        cases = [
+            {"case_id": 0, "batch_size": 1, "input_len": 4096, "cache_len": 2048},
+            {"case_id": 1, "batch_size": 1, "input_len": 8192, "cache_len": 2048},
+            {"case_id": 2, "batch_size": 1, "input_len": 4096, "cache_len": 4096 - 512},
+        ]
+        deduped = _dedupe_cache_grid_cases(cases, 512)
+        self.assertEqual(len(deduped), 3)
+
+
+class CacheGridRunnerBlockProbeTest(unittest.TestCase):
+    def _make_runner(self, tmp, block_size):
+        cases = [{"case_id": 0, "batch_size": 1, "input_len": 1024, "cache_len": 512}]
+        return CacheGridRunner(
+            0,
+            _WordTokenizer(),
+            cases,
+            tmp,
+            expected_block_size=block_size,
+        )
+
+    def test_probe_passes_on_matching_reuse_len(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self._make_runner(tmp, 512)
+            with mock.patch(
+                "rtp_llm.test.perf_test.cache_grid_runner._post_prefill",
+                return_value={"success": True, "reuse_len": 512},
+            ) as post:
+                runner._probe_reuse_granularity()
+            self.assertEqual(post.call_count, 2)
+
+    def test_probe_aborts_on_granularity_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self._make_runner(tmp, 512)
+            with mock.patch(
+                "rtp_llm.test.perf_test.cache_grid_runner._post_prefill",
+                return_value={"success": True, "reuse_len": 0},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "granularity mismatch"):
+                    runner._probe_reuse_granularity()
+
+    def test_probe_aborts_on_failed_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self._make_runner(tmp, 512)
+            with mock.patch(
+                "rtp_llm.test.perf_test.cache_grid_runner._post_prefill",
+                return_value={"success": False, "error": "HTTP 500"},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "probe seed failed"):
+                    runner._probe_reuse_granularity()
+
+    def test_probe_skipped_without_block_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self._make_runner(tmp, 0)
+            with mock.patch(
+                "rtp_llm.test.perf_test.cache_grid_runner._post_prefill"
+            ) as post:
+                runner._probe_reuse_granularity()
+            post.assert_not_called()
+
+
+class PrefixPromptFactoryFastPathTest(unittest.TestCase):
+    GEOMETRIES = [(5, 100, 50), (5, 100, 0), (9, 7, 3), (9, 7, 0)]
+
+    def test_fast_prompts_match_legacy_construction(self):
+        for case_id, total_len, cache_len in self.GEOMETRIES:
+            fast = PrefixPromptFactory(_WordTokenizer()).build_case_prompts(
+                case_id, total_len, cache_len, 3
+            )
+            legacy = PrefixPromptFactory(_WordTokenizer())._legacy_case_prompts(
+                case_id, total_len, cache_len, 3
+            )
+            self.assertEqual(fast.seed_text, legacy.seed_text)
+            self.assertEqual(fast.prefix_ids, legacy.prefix_ids)
+            self.assertEqual(fast.run_texts, legacy.run_texts)
+            self.assertEqual(fast.run_ids, legacy.run_ids)
+            self.assertEqual(fast.built_len, total_len)
+
+    def test_first_case_of_each_shape_is_fully_verified(self):
+        factory = PrefixPromptFactory(_WordTokenizer())
+        factory.build_case_prompts(1, 100, 50, 3)
+        factory.build_case_prompts(2, 100, 0, 3)
+        self.assertEqual(factory._verified_shapes, {"cached", "cold"})
+        self.assertEqual(factory._unsafe_shapes, set())
+
+    def test_merging_tail_falls_back_to_legacy_path(self):
+        factory = PrefixPromptFactory(_TailMergingTokenizer())
+        # The legacy path itself cannot preserve the prefix for this tokenizer,
+        # so the fallback surfaces its original safety error.
+        with self.assertRaisesRegex(ValueError, "preserve cache prefix"):
+            factory.build_case_prompts(1, 100, 50, 3)
+
+
+class MaterializedCaseStoreTest(unittest.TestCase):
+    CASES = [
+        {"case_id": 0, "batch_size": 1, "input_len": 100, "cache_len": 0},
+        {"case_id": 1, "batch_size": 1, "input_len": 100, "cache_len": 50},
+        {"case_id": 2, "batch_size": 1, "input_len": 60, "cache_len": 40},
+    ]
+
+    def test_round_trip_reproduces_constructed_prompts(self):
+        factory = PrefixPromptFactory(_WordTokenizer())
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MaterializedCaseStore(tmp)
+            stats = store.materialize(self.CASES, factory, 3, grid_sha256="s" * 64)
+            self.assertEqual(stats["cases"], 3)
+            self.assertEqual(stats["cached_cases"], 2)
+            self.assertEqual(stats["verbatim_seed"], 0)
+            self.assertEqual(stats["verbatim_runs"], 0)
+
+            loaded = MaterializedCaseStore(tmp)
+            self.assertEqual(loaded.load_cases(), self.CASES)
+            self.assertEqual(loaded.run_count, 3)
+            self.assertEqual(loaded.grid_sha256, "s" * 64)
+            for case in self.CASES:
+                expected = factory.build_case_prompts(
+                    case["case_id"], case["input_len"], case["cache_len"], 3
+                )
+                got = loaded.load_case(case)
+                self.assertEqual(got.seed_text, expected.seed_text)
+                self.assertEqual(got.run_texts, expected.run_texts)
+
+    def test_load_missing_store_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                FileNotFoundError, "not a materialized case store"
+            ):
+                MaterializedCaseStore(tmp).load_cases()
+
+
+class MaterializedStoreValidationTest(unittest.TestCase):
+    CASES = [
+        {"case_id": 0, "batch_size": 1, "input_len": 100, "cache_len": 0},
+        {"case_id": 1, "batch_size": 1, "input_len": 100, "cache_len": 50},
+    ]
+
+    def _materialize(self, tmp, run_count=3, sha="a" * 64):
+        store = MaterializedCaseStore(tmp)
+        store.materialize(
+            self.CASES,
+            PrefixPromptFactory(_WordTokenizer()),
+            run_count,
+            grid_sha256=sha,
+        )
+
+    def test_accepts_matching_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._materialize(tmp)
+            store = _load_materialized_case_store(tmp, self.CASES, 3, "a" * 64)
+            self.assertEqual(store.run_count, 3)
+
+    def test_rejects_run_count_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._materialize(tmp)
+            with self.assertRaisesRegex(ValueError, "run_count"):
+                _load_materialized_case_store(tmp, self.CASES, 2, "a" * 64)
+
+    def test_rejects_grid_sha_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._materialize(tmp)
+            with self.assertRaisesRegex(ValueError, "different grid JSON"):
+                _load_materialized_case_store(tmp, self.CASES, 3, "b" * 64)
+
+    def test_rejects_geometry_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._materialize(tmp)
+            other = [dict(self.CASES[0])]
+            with self.assertRaisesRegex(
+                ValueError, r"holds 2 cases but this run plans 1"
+            ):
+                _load_materialized_case_store(tmp, other, 3, "a" * 64)
+
+
+class CacheGridRunnerStoreTest(unittest.TestCase):
+    def test_run_sends_materialized_prompts_without_tokenizer_construction(self):
+        cases = [
+            {"case_id": 0, "batch_size": 1, "input_len": 100, "cache_len": 0},
+            {"case_id": 1, "batch_size": 1, "input_len": 100, "cache_len": 50},
+        ]
+        factory = PrefixPromptFactory(_WordTokenizer())
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MaterializedCaseStore(str(Path(tmp) / "store"))
+            store.materialize(cases, factory, 2)
+            expected = {
+                case["case_id"]: factory.build_case_prompts(
+                    case["case_id"], case["input_len"], case["cache_len"], 2
+                )
+                for case in cases
+            }
+            runner = CacheGridRunner(
+                0,
+                _WordTokenizer(),
+                cases,
+                str(Path(tmp) / "results"),
+                measure_runs=2,
+                cache_commit_tail_tokens=10,
+                fail_fast=False,
+                case_store=store,
+            )
+            with mock.patch(
+                "rtp_llm.test.perf_test.cache_grid_runner._post_prefill",
+                return_value={
+                    "success": True,
+                    "reuse_len": 50,
+                    "input_len": 100,
+                    "output_len": 1,
+                },
+            ) as post:
+                runner.run()
+            sent = [call.args[1] for call in post.call_args_list]
+            self.assertEqual(
+                sent,
+                [
+                    expected[0].run_texts[0],
+                    expected[0].run_texts[1],
+                    factory.make_seed(1, expected[1].seed_text, 50, 10),
+                    expected[1].run_texts[0],
+                    expected[1].run_texts[1],
+                ],
+            )
+
+    def test_runner_rejects_store_built_for_other_run_count(self):
+        cases = [{"case_id": 0, "batch_size": 1, "input_len": 100, "cache_len": 0}]
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MaterializedCaseStore(str(Path(tmp) / "store"))
+            store.materialize(cases, PrefixPromptFactory(_WordTokenizer()), 3)
+            with self.assertRaisesRegex(ValueError, "run_count"):
+                CacheGridRunner(
+                    0, _WordTokenizer(), cases, tmp, measure_runs=2, case_store=store
+                )
 
 
 if __name__ == "__main__":

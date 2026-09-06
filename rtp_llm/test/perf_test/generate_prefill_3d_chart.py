@@ -7,8 +7,8 @@ Examples::
     --input /path/Prefill_Result.final.json \
     --output /tmp/deepseek_v4_prefill_3d.svg --batch-size 1
 
-The plot has exactly three data coordinates: X=measured prefill RT (TTFT) in
-milliseconds, Y=cached tokens, Z=compute tokens.  Every usable row for the
+The plot has exactly three data coordinates: X=compute tokens, Y=cached
+tokens, Z=measured prefill RT (TTFT) in milliseconds. Every usable row for the
 selected batch is emitted; there is no point decimation and colour is uniform
 so it cannot be mistaken for a fourth data dimension.
 """
@@ -613,7 +613,7 @@ def render_clean(
 ) -> str:
     """Render a legible 3-D view without the old dense drop-line clutter.
 
-    X is TTFT, Y is observed cache reuse, and Z is compute tokens.  Every
+    X is compute tokens, Y is observed cache reuse, and Z is TTFT.  Every
     geometry remains a low-opacity dot; only a handful of representative
     fixed-cache/fixed-compute slices are drawn as guide lines.
     """
@@ -628,9 +628,9 @@ def render_clean(
     cache_max = max(row["cache"] for row in rows)
     compute_max = max(row["compute"] for row in rows)
     xscale, yscale, zscale = (
-        max(rt_max, 1.0),
-        max(cache_max, 1.0),
         max(compute_max, 1.0),
+        max(cache_max, 1.0),
+        max(rt_max, 1.0),
     )
 
     def project(nx: float, ny: float, nz: float) -> tuple[float, float]:
@@ -679,8 +679,8 @@ def render_clean(
 .axis{{font-size:18px;fill:#334155;font-weight:600}} .tick{{font-size:15px;fill:#475569}}
 .paneltitle{{font-size:23px;font-weight:700}} .body{{font-size:17px;fill:#334155}}
 .note{{font-size:15px;fill:#64748b}} .legend{{font-size:16px;fill:#334155}}</style>
-<text x="1100" y="52" text-anchor="middle" class="title">DeepSeek-V4-Pro：三轴等距投影</text>
-<text x="1100" y="85" text-anchor="middle" class="sub">X = TTFT / prefill RT (ms) · Y = observed cached tokens · Z = compute tokens · all {len(rows):,} geometries shown</text>"""
+<text x="1100" y="52" text-anchor="middle" class="title">DeepSeek-V4-Pro Prefill — readable 3D view</text>
+<text x="1100" y="85" text-anchor="middle" class="sub">X = compute tokens · Y = observed cached tokens · Z = TTFT / prefill RT (ms) · all {len(rows):,} geometries shown</text>"""
     ]
 
     # Ground plane and a sparse grid keep the perspective legible.
@@ -697,24 +697,13 @@ def render_clean(
 
     # Every point is kept, but dots are deliberately faint so the axes and
     # representative slices remain visible at report scale.
-    for index, row in enumerate(sorted(rows, key=lambda item: item["compute"])):
-        # Keep every point. A regular sample of drop-lines supplies depth cues
-        # without turning the full cloud into a grey barcode.
-        nx = row["rt"] / xscale
-        ny = row["cache"] / yscale
-        nz = row["compute"] / zscale
-        if index % 8 == 0:
-            out.append(
-                line(
-                    project(nx, ny, 0),
-                    project(nx, ny, nz),
-                    "#94a3b8",
-                    0.55,
-                    opacity=0.28,
+    for row in sorted(rows, key=lambda item: item["compute"]):
+        out.append(
+            circle(
+                project(
+                    row["compute"] / xscale, row["cache"] / yscale, row["rt"] / zscale
                 )
             )
-        out.append(
-            circle(project(nx, ny, nz))
         )
 
     # Solid warm lines are fixed-cache slices; dashed cool lines are
@@ -771,9 +760,9 @@ def render_clean(
             representative["rt"] = rt_value
             points.append(
                 project(
-                    representative["rt"] / xscale,
+                    representative["compute"] / xscale,
                     representative["cache"] / yscale,
-                    representative["compute"] / zscale,
+                    representative["rt"] / zscale,
                 )
             )
         return points
@@ -818,7 +807,7 @@ def render_clean(
         t = i / 4
         p = project(t, 0, 0)
         out.append(
-            f'<text x="{p[0]+4:.1f}" y="{p[1]+34:.1f}" text-anchor="middle" class="tick">{rt_max*t:.0f} ms</text>'
+            f'<text x="{p[0]+4:.1f}" y="{p[1]+34:.1f}" text-anchor="middle" class="tick">{fmt_tokens(compute_max*t)}</text>'
         )
         p = project(0, t, 0)
         out.append(
@@ -828,19 +817,19 @@ def render_clean(
         t = i / 5
         p = project(0, 0, t)
         out.append(
-            f'<text x="{p[0]-18:.1f}" y="{p[1]+5:.1f}" text-anchor="end" class="tick">{fmt_tokens(compute_max*t)}</text>'
+            f'<text x="{p[0]-18:.1f}" y="{p[1]+5:.1f}" text-anchor="end" class="tick">{rt_max*t:.0f} ms</text>'
         )
     out += [
-        f'<text x="{project(.55,0,0)[0]:.1f}" y="{project(.55,0,0)[1]+70:.1f}" text-anchor="middle" class="axis">TTFT / prefill RT (X, ms)</text>',
+        f'<text x="{project(.55,0,0)[0]:.1f}" y="{project(.55,0,0)[1]+70:.1f}" text-anchor="middle" class="axis">compute tokens (X)</text>',
         f'<text x="{project(0,.55,0)[0]-75:.1f}" y="{project(0,.55,0)[1]+70:.1f}" text-anchor="middle" class="axis">cached tokens (Y)</text>',
-        f'<text x="{project(0,0,.57)[0]-62:.1f}" y="{project(0,0,.57)[1]:.1f}" text-anchor="middle" transform="rotate(-90 {project(0,0,.57)[0]-62:.1f},{project(0,0,.57)[1]:.1f})" class="axis">compute tokens (Z)</text>',
+        f'<text x="{project(0,0,.57)[0]-62:.1f}" y="{project(0,0,.57)[1]:.1f}" text-anchor="middle" transform="rotate(-90 {project(0,0,.57)[0]-62:.1f},{project(0,0,.57)[1]:.1f})" class="axis">TTFT / prefill RT (Z, ms)</text>',
     ]
 
     one_m = next(
         (row for row in rows if row["input"] >= 1_048_575 and row["cache"] == 0), None
     )
     if one_m is not None:
-        px, py = project(one_m["rt"] / xscale, 0, one_m["compute"] / zscale)
+        px, py = project(one_m["compute"] / xscale, 0, one_m["rt"] / zscale)
         out.append(line((px, py), (px + 125, py - 70), "#b42318", 2, "5 4"))
         out.append(
             f'<rect x="{px+120:.1f}" y="{py-114:.1f}" width="315" height="76" rx="10" fill="#fff7ed" stroke="#b42318" stroke-width="2"/>'
@@ -862,9 +851,9 @@ def render_clean(
     text_lines = [
         f"source rows = {len(data_metrics(source)):,}; plotted = {len(rows):,}",
         "dots = every physical geometry (faint on purpose)",
-        "X right = higher TTFT / slower prefill",
+        "X right = more uncached compute tokens",
         "Y up = more observed KV-cache reuse",
-        "Z up = more uncached compute tokens",
+        "Z up = higher TTFT / slower prefill",
         "input length = cache + compute",
         "solid warm = fixed-cache median guides",
         "dashed cool = fixed-compute median guides",

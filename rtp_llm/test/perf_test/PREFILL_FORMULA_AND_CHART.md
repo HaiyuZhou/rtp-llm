@@ -59,7 +59,7 @@
 ## 图表
 
 - `deepseek_v4_prefill_cold_strict_489.svg`：489 个 cache=0 case 的服务端指标趋势。
-- `deepseek_v4_prefill_3d_strict_688.svg`：688 个严格有效 case，X=服务端指标，Y=cached tokens，Z=compute tokens。
+- `deepseek_v4_prefill_3d_strict_688.svg`：688 个严格有效 case，X=compute tokens，Y=cached tokens，Z=服务端指标。
 
 图中已经彻底排除 4,131 个 `invalid_reuse` case。由于服务端指标尚不能等同于端到端 TTFT，图标题和正文不得再写“真实 TTFT”。
 

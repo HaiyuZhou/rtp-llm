@@ -91,8 +91,17 @@ def _status_ok(item: dict[str, Any]) -> bool:
     }
 
 
+def _run_time_statistic(values: Sequence[float], estimator: str) -> float:
+    if estimator == "min":
+        return min(values)
+    if estimator == "trimmed":
+        ordered = sorted(values)
+        return statistics.median(ordered[:-1]) if len(ordered) > 1 else ordered[0]
+    return statistics.median(values)
+
+
 def _median_run_time(
-    item: dict[str, Any]
+    item: dict[str, Any], estimator: str = "median"
 ) -> tuple[float | None, int | None, str | None]:
     runs = item.get("runs")
     if not isinstance(runs, list) or not runs:
@@ -142,7 +151,7 @@ def _median_run_time(
         if latency is None or latency <= 0:
             return None, None, "invalid_latency"
         values.append(latency)
-    return statistics.median(values), cache_len, None
+    return _run_time_statistic(values, estimator), cache_len, None
 
 
 def _iter_json_metrics(path: pathlib.Path) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -158,7 +167,10 @@ def _iter_json_metrics(path: pathlib.Path) -> Iterable[tuple[int, dict[str, Any]
 
 
 def load_observations(
-    paths: Sequence[pathlib.Path], *, batch_size: int = 1
+    paths: Sequence[pathlib.Path],
+    *,
+    batch_size: int = 1,
+    estimator: str = "median",
 ) -> tuple[list[Observation], dict[str, Any]]:
     observations: list[Observation] = []
     rejected: dict[str, int] = {}
@@ -241,7 +253,7 @@ def load_observations(
             ):
                 rejected["invalid_geometry"] = rejected.get("invalid_geometry", 0) + 1
                 continue
-            target, observed_cache_len, reason = _median_run_time(item)
+            target, observed_cache_len, reason = _median_run_time(item, estimator)
             if target is None:
                 rejected[reason or "invalid_run"] = (
                     rejected.get(reason or "invalid_run", 0) + 1
@@ -283,6 +295,7 @@ def load_observations(
     unique = {(row.batch_size, row.input_len, row.cache_len) for row in observations}
     audit = {
         "input_files": input_files,
+        "estimator": estimator,
         "raw_metric_count": sum(int(item["rows"]) for item in input_files),
         "raw_valid_observation_count": raw_observation_count,
         "valid_observation_count": len(observations),
@@ -795,7 +808,9 @@ def write_fit_gap_svg(predictions: Sequence[dict[str, Any]], path: pathlib.Path)
 
 def run_fit(args: argparse.Namespace) -> int:
     paths = [pathlib.Path(value) for value in args.inputs]
-    rows, audit = load_observations(paths, batch_size=args.batch_size)
+    rows, audit = load_observations(
+        paths, batch_size=args.batch_size, estimator=args.estimator
+    )
     output = pathlib.Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     (output / "input_audit.json").write_text(
@@ -871,7 +886,7 @@ def run_fit(args: argparse.Namespace) -> int:
             ),
         }[args.objective],
         "target": (
-            "median of successful client TTFT runs; falls back to "
+            f"{args.estimator} of successful client TTFT runs; falls back to "
             "server prefill_time_ms only for legacy input"
         ),
         "formula": formula,
@@ -924,7 +939,9 @@ def run_fit(args: argparse.Namespace) -> int:
 
 def run_validate(args: argparse.Namespace) -> int:
     rows, audit = load_observations(
-        [pathlib.Path(value) for value in args.inputs], batch_size=args.batch_size
+        [pathlib.Path(value) for value in args.inputs],
+        batch_size=args.batch_size,
+        estimator=args.estimator,
     )
     report = {"model": "DeepSeek-V4-Pro", "audit": audit, "valid": bool(rows)}
     if args.report:
@@ -953,17 +970,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="fit objective; hybrid balances normalized absolute and relative error",
     )
     fit.add_argument(
-        "--split-mode",
-        choices=("random-50-50", "seq-hash-70-15-15"),
-        default="random-50-50",
-        help="default randomly assigns exactly half of valid geometries to training",
+        "--estimator",
+        choices=("median", "min", "trimmed"),
+        default="median",
+        help=(
+            "run-time statistic per case; 'min' rejects additive spikes from "
+            "external GPU contention, 'trimmed' drops the slowest run"
+        ),
     )
-    fit.add_argument("--split-seed", type=int, default=20260904)
     fit.add_argument("--allow-insufficient-data", action="store_true")
     fit.set_defaults(func=run_fit)
     validate = sub.add_parser("validate-inputs", help="audit valid/invalid DSV4 rows")
     validate.add_argument("--inputs", nargs="+", required=True)
     validate.add_argument("--batch-size", type=int, default=1)
+    validate.add_argument(
+        "--estimator",
+        choices=("median", "min", "trimmed"),
+        default="median",
+    )
     validate.add_argument("--report")
     validate.set_defaults(func=run_validate)
     return parser

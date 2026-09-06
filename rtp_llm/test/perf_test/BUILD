@@ -29,6 +29,28 @@ py_test(
     ],
 )
 
+py_binary(
+    name = "generate_cache_grid",
+    srcs = ["generate_cache_grid.py"],
+)
+
+py_test(
+    name = "generate_cache_grid_test",
+    srcs = ["generate_cache_grid_test.py"],
+    deps = [":generate_cache_grid"],
+)
+
+py_test(
+    name = "generate_prefill_3d_chart_test",
+    srcs = ["generate_prefill_3d_chart_test.py"],
+    deps = [":prefill_3d_chart_lib"],
+)
+
+py_library(
+    name = "prefill_3d_chart_lib",
+    srcs = ["generate_prefill_3d_chart.py"],
+)
+
 py_test(
     name = "deepseek_v4_prefill_formula_fit_test",
     srcs = [

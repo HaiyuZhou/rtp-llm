@@ -22,6 +22,7 @@ class EngineServer:
         env: Dict[str, str] = {
             "USE_BATCH_DECODE_SCHEDULER": "1",
             "FAKE_BALANCE_EXPERT": "1",
+            "REUSE_CACHE": "1",
             "BATCH_DECODE_SCHEDULER_WARMUP_TYPE": (
                 "0" if self._args.partial in (0, 1) else "1"
             ),

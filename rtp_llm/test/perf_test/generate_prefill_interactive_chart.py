@@ -2,22 +2,32 @@
 """Generate an interactive, rotatable 3D prefill chart from a result JSON.
 
 The chart mirrors the static SVG's convention:
-  X = measured prefill RT / TTFT (ms)
+  X = uncached compute tokens = input_len - observed_cache_len
   Y = observed cached tokens
-  Z = uncached compute tokens = input_len - observed_cache_len
+  Z = measured prefill RT / TTFT (ms)
 
 Every valid geometry is shown as a dot.  Coloured lines are representative
 fixed-cache (warm, solid) and fixed-compute (cool, dashed) trend guides.
+Duplicate geometries are collapsed by median RT.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import math
-from collections import Counter
+import warnings
+from collections import Counter, defaultdict
 from pathlib import Path
 from statistics import median
 from typing import Any
+
+from rtp_llm.test.perf_test.perf_profile import extract_embedded_profile
+from rtp_llm.test.perf_test.perf_profile import fingerprint as profile_fingerprint
+from rtp_llm.test.perf_test.perf_profile import (
+    load_profile,
+    resolve_label,
+    resolve_title,
+)
 
 
 def number(value: Any) -> float | None:
@@ -86,7 +96,13 @@ def load_rows(input_path: Path, batch_size: int) -> list[dict[str, float]]:
         if int(number(item.get("batch_size", 1)) or 1) != batch_size:
             continue
         status = str(item.get("status", "")).lower()
-        if status and status not in {"ok", "success", "passed", "unknown"}:
+        if status and status not in {
+            "ok",
+            "success",
+            "passed",
+            "unknown",
+            "invalid_reuse",
+        }:
             continue
 
         input_len = number(item.get("input_len", item.get("seq_len")))
@@ -111,7 +127,16 @@ def load_rows(input_path: Path, batch_size: int) -> list[dict[str, float]]:
             }
         )
 
-    return sorted(rows, key=lambda row: (row["input_len"], row["cache_len"]))
+    grouped: defaultdict[tuple[float, float, float], list[dict[str, float]]] = (
+        defaultdict(list)
+    )
+    for row in rows:
+        grouped[(row["input_len"], row["cache_len"], row["compute_len"])].append(row)
+    deduped = [
+        {**values[0], "prefill_rt": median(item["prefill_rt"] for item in values)}
+        for _, values in sorted(grouped.items())
+    ]
+    return deduped
 
 
 def top_levels(rows: list[dict[str, float]], key: str, limit: int = 8) -> list[float]:
@@ -140,9 +165,9 @@ def line_trace(
         key=lambda row: row[varying_key],
     )
     return go.Scatter3d(
-        x=[row["prefill_rt"] for row in subset],
+        x=[row["compute_len"] for row in subset],
         y=[row["cache_len"] for row in subset],
-        z=[row["compute_len"] for row in subset],
+        z=[row["prefill_rt"] for row in subset],
         mode="lines",
         line={"color": color, "width": 5, "dash": dash},
         name=name,
@@ -175,17 +200,74 @@ def main() -> None:
     parser.add_argument(
         "--batch-size", type=int, default=1, help="Batch size to display"
     )
-    parser.add_argument("--title", help="Chart title")
+    parser.add_argument("--title", default=None, help="Chart title")
     parser.add_argument(
-        "--log-x", action="store_true", help="Use log scale for the Prefill RT (X) axis"
+        "--model-label", default=None, help="Model label used to build the title."
+    )
+    parser.add_argument(
+        "--profile", default=None, help="JSON profile for parameter defaults."
+    )
+    parser.add_argument(
+        "--log-rt",
+        action="store_true",
+        help="Use log scale for the Prefill RT (Z) axis",
+    )
+    parser.add_argument(
+        "--log-x",
+        action="store_true",
+        help="Deprecated alias for --log-rt",
+    )
+    parser.add_argument(
+        "--stretch-rt",
+        type=float,
+        default=None,
+        help="Visual stretch factor for the Prefill RT axis (e.g. 5 makes RT changes 5x taller)",
     )
     parser.add_argument(
         "--stretch-x",
         type=float,
-        default=1.0,
-        help="Visual stretch factor for the Prefill RT axis (e.g. 5 makes RT changes 5x taller)",
+        default=None,
+        help="Deprecated alias for --stretch-rt",
     )
     args = parser.parse_args()
+
+    if args.log_x and not args.log_rt:
+        warnings.warn(
+            "--log-x is deprecated; use --log-rt", DeprecationWarning, stacklevel=2
+        )
+        args.log_rt = True
+    if args.stretch_x is not None and args.stretch_rt is None:
+        warnings.warn(
+            "--stretch-x is deprecated; use --stretch-rt",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        args.stretch_rt = args.stretch_x
+    if args.stretch_rt is None:
+        args.stretch_rt = 1.0
+
+    profile = None
+    profile_sha256 = None
+    if args.profile:
+        profile = load_profile(args.profile)
+        profile_sha256 = profile_fingerprint(profile)
+    else:
+        try:
+            input_data = json.loads(args.input.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            input_data = None
+        if isinstance(input_data, dict):
+            embedded_sha = input_data.get("profile_sha256")
+            embedded = extract_embedded_profile(input_data)
+            if embedded is not None:
+                profile = embedded
+                profile_sha256 = (
+                    embedded_sha
+                    if isinstance(embedded_sha, str)
+                    else profile_fingerprint(profile)
+                )
+
+    model_label = resolve_label(profile, args.model_label, "DeepSeek-V4-Pro")
 
     rows = load_rows(args.input, args.batch_size)
     if not rows:
@@ -200,7 +282,11 @@ def main() -> None:
 
     output = args.output or args.input.with_name(f"{args.input.stem}.interactive.html")
     output.parent.mkdir(parents=True, exist_ok=True)
-    title = args.title or f"Prefill performance — batch size {args.batch_size}"
+
+    default_title = (
+        f"{model_label} Prefill — interactive 3D view (batch size {args.batch_size})"
+    )
+    title = resolve_title(profile, args.title, default_title)
 
     warm_palette = (
         "#b42318",
@@ -256,9 +342,9 @@ def main() -> None:
 
     traces.append(
         go.Scatter3d(
-            x=[row["prefill_rt"] for row in rows],
+            x=[row["compute_len"] for row in rows],
             y=[row["cache_len"] for row in rows],
-            z=[row["compute_len"] for row in rows],
+            z=[row["prefill_rt"] for row in rows],
             mode="markers",
             marker={
                 "size": 4,
@@ -271,10 +357,10 @@ def main() -> None:
                 [row["input_len"], row["cache_len"], row["compute_len"]] for row in rows
             ],
             hovertemplate=(
-                "Prefill RT: %{x:.2f} ms<br>"
-                "Input length: %{customdata[0]:,.0f}<br>"
-                "Cached tokens: %{customdata[1]:,.0f}<br>"
-                "Compute tokens: %{customdata[2]:,.0f}<extra></extra>"
+                "Compute tokens: %{x:,.0f}<br>"
+                "Cached tokens: %{y:,.0f}<br>"
+                "Prefill RT: %{z:.2f} ms<br>"
+                "Input length: %{customdata[0]:,.0f}<extra></extra>"
             ),
             name="measurements",
             showlegend=False,
@@ -285,12 +371,12 @@ def main() -> None:
     figure.update_layout(
         title=title,
         scene={
-            "xaxis_title": "Prefill RT (ms)",
-            "yaxis_title": "Observed cached tokens",
-            "zaxis_title": "Uncached compute tokens",
-            "xaxis_type": "log" if args.log_x else "linear",
+            "xaxis_title": "Compute tokens (X)",
+            "yaxis_title": "Observed cached tokens (Y)",
+            "zaxis_title": "Prefill RT (Z, ms)",
+            "zaxis_type": "log" if args.log_rt else "linear",
             "aspectmode": "manual",
-            "aspectratio": {"x": args.stretch_x, "y": 1, "z": 1},
+            "aspectratio": {"x": 1, "y": 1, "z": args.stretch_rt},
         },
         legend={
             "title": {"text": "Trend guides"},
@@ -303,7 +389,17 @@ def main() -> None:
     )
     figure.write_html(output, include_plotlyjs=True, full_html=True)
     print(
-        json.dumps({"input": str(args.input), "rows": len(rows), "output": str(output)})
+        json.dumps(
+            {
+                "input": str(args.input),
+                "rows": len(rows),
+                "output": str(output),
+                "title": title,
+                "profile": profile,
+                "profile_sha256": profile_sha256,
+            },
+            ensure_ascii=False,
+        )
     )
 
 

@@ -449,3 +449,59 @@ block 的命中请求并校验 `reuse_len` 等于 block size。粒度不一致�
 `cache_grid_results.json`。采样坐标使用 requested cache；拟合和三维图必须
 继续使用引擎报告的 observed cache。三维图坐标为 X=compute tokens、
 Y=observed cached tokens、Z=TTFT。
+
+## 7. Profile 参数化
+
+所有工具（grid 生成、runner、拟合、图表）都支持 `--profile` 参数，指向一个
+版本化的 JSON 文件。DSV4-Pro 的标准 profile 在
+`rtp_llm/test/perf_test/profiles/dsv4_pro_prefill.json`。
+
+### 优先级链
+
+每个参数按以下顺序解析：
+
+1. **CLI 显式值**（包括 `0`）
+2. **Profile 字段**（`--profile` 指定的 JSON 文件）
+3. **输入中嵌入的 profile**（结果 JSON 的 `profile` 键，不传 `--profile` 时自动继承）
+4. **Legacy 默认值**（之前的硬编码值）
+
+不传 `--profile` 时，所有输出文件与 profile 化之前的版本字节一致——不会多出
+额外的键，也不会改变文件名。
+
+### 使用示例
+
+```bash
+PROFILE=rtp_llm/test/perf_test/profiles/dsv4_pro_prefill.json
+
+# 生成 grid（profile 提供 cache_alignment 等参数）
+python3 generate_cache_grid.py --profile $PROFILE \
+  --min-input-len 256 --max-input-len 1048575 --input-points 489
+
+# 运行测试（profile 注入引擎参数 + cache grid 参数）
+bazelisk test //rtp_llm/test/perf_test:cache_grid_perf_test \
+  --test_arg=--profile=$PROFILE \
+  --test_arg=--cache_grid_json=grid.json \
+  --test_arg=--partial=2
+
+# 拟合公式（profile 提供 token_unit、model_label 等）
+python3 deepseek_v4_prefill_formula_fit.py fit \
+  --inputs cache_grid_results.json --output-dir formula/ \
+  --profile $PROFILE --estimator min
+
+# 异常分析
+python3 deepseek_v4_prefill_formula_fit.py analyze-anomalies \
+  --inputs cache_grid_results.json --output-dir anomalies/ \
+  --profile $PROFILE --estimator min
+```
+
+### Resume 守卫
+
+Runner 在恢复时会校验 `grid_sha256`、`profile_sha256`、`measure_runs` 和
+`expected_block_size`。如果缓存的 `cache_grid_results.json` 与当前 profile
+不匹配，运行会中止。传 `--allow_resume_mismatch` 可以跳过校验（仅 warning）。
+
+### 限制
+
+环境变量（如 `WORLD_SIZE`、`DSV4_USE_MEGA_MOE`）**不会**被 profile 捕获。
+它们必须通过 BUILD target 的 env 块或命令行显式设置。Profile 只记录
+CLI 可见的引擎参数。

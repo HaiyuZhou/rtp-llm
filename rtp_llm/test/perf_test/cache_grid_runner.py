@@ -392,6 +392,7 @@ class MaterializedCaseStore:
         self.run_count = -1
         self.grid_metadata: Dict[str, Any] = {}
         self.grid_sha256 = ""
+        self.profile_sha256 = ""
 
     def materialize(
         self,
@@ -401,6 +402,7 @@ class MaterializedCaseStore:
         *,
         grid_metadata: Optional[Dict[str, Any]] = None,
         grid_sha256: str = "",
+        profile_sha256: str = "",
     ) -> Dict[str, Any]:
         if run_count <= 0:
             raise ValueError("run_count must be positive")
@@ -475,6 +477,7 @@ class MaterializedCaseStore:
                     "case_count": stats["cases"],
                     "grid_metadata": grid_metadata or {},
                     "grid_sha256": grid_sha256,
+                    "profile_sha256": profile_sha256,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -489,6 +492,7 @@ class MaterializedCaseStore:
         self.run_count = run_count
         self.grid_metadata = grid_metadata or {}
         self.grid_sha256 = grid_sha256
+        self.profile_sha256 = profile_sha256
         self._marker_ids_len = len(marker_ids)
         self._base_text = base_text
         return stats
@@ -561,6 +565,7 @@ class MaterializedCaseStore:
             self.run_count = int(info.get("run_count", -1))
             self.grid_metadata = info.get("grid_metadata", {})
             self.grid_sha256 = info.get("grid_sha256", "")
+            self.profile_sha256 = info.get("profile_sha256", "")
         with self.manifest_path.open(encoding="utf-8") as manifest:
             for line in manifest:
                 line = line.strip()
@@ -650,6 +655,9 @@ class CacheGridRunner:
         grid_sha256: str | None = None,
         expected_block_size: int = 0,
         case_store: "MaterializedCaseStore | None" = None,
+        profile: Dict[str, Any] | None = None,
+        profile_sha256: str | None = None,
+        allow_resume_mismatch: bool = False,
     ):
         self.port = port
         self.factory = PrefixPromptFactory(tokenizer)
@@ -679,6 +687,8 @@ class CacheGridRunner:
         self.grid_metadata = grid_metadata or {}
         self.grid_sha256 = grid_sha256
         self.expected_block_size = expected_block_size
+        self.profile = profile
+        self.profile_sha256 = profile_sha256
         self.result_path = self.result_dir / "cache_grid_results.json"
         self._results: Dict[str, Dict[str, Any]] = {}
         self._http_session = _make_http_session()
@@ -689,7 +699,53 @@ class CacheGridRunner:
         if self.result_path.exists():
             with self.result_path.open(encoding="utf-8") as f:
                 payload = json.load(f)
+            self._check_resume_guard(payload, allow_resume_mismatch)
             self._results = {str(x["case_key"]): x for x in payload.get("metrics", [])}
+
+    def _check_resume_guard(
+        self, payload: Dict[str, Any], allow_resume_mismatch: bool
+    ) -> None:
+        """Validate that the existing results are compatible with the current run."""
+        mismatches = []
+        old_grid_sha = payload.get("grid_sha256")
+        if old_grid_sha and self.grid_sha256 and old_grid_sha != self.grid_sha256:
+            mismatches.append(f"grid_sha256: {old_grid_sha} vs {self.grid_sha256}")
+        old_profile_sha = payload.get("profile_sha256")
+        if (
+            old_profile_sha
+            and self.profile_sha256
+            and old_profile_sha != self.profile_sha256
+        ):
+            mismatches.append(
+                f"profile_sha256: {old_profile_sha} vs {self.profile_sha256}"
+            )
+        old_measure_runs = payload.get("measure_runs")
+        if old_measure_runs is not None and int(old_measure_runs) != self.measure_runs:
+            mismatches.append(
+                f"measure_runs: {old_measure_runs} vs {self.measure_runs}"
+            )
+        old_block_size = payload.get("expected_block_size")
+        if (
+            old_block_size is not None
+            and self.expected_block_size > 0
+            and int(old_block_size) != self.expected_block_size
+        ):
+            mismatches.append(
+                f"expected_block_size: {old_block_size} vs {self.expected_block_size}"
+            )
+        if mismatches:
+            detail = "; ".join(mismatches)
+            if allow_resume_mismatch:
+                logging.warning(
+                    "cache grid: resuming with mismatched parameters (--allow_resume_mismatch): %s",
+                    detail,
+                )
+            else:
+                raise ValueError(
+                    f"cache grid: existing results at {self.result_path} have "
+                    f"incompatible parameters: {detail}. Pass "
+                    f"--allow_resume_mismatch to override."
+                )
 
     @staticmethod
     def case_key(case: Dict[str, int]) -> str:
@@ -712,6 +768,10 @@ class CacheGridRunner:
             ),
             "grid_metadata": self.grid_metadata,
             "grid_sha256": self.grid_sha256,
+            "measure_runs": self.measure_runs,
+            "expected_block_size": self.expected_block_size,
+            "profile": self.profile,
+            "profile_sha256": self.profile_sha256,
             "metrics": list(self._results.values()),
         }
         if asynchronous:

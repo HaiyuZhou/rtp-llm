@@ -16,6 +16,10 @@ import random
 from pathlib import Path
 from typing import Any, Iterable
 
+from rtp_llm.test.perf_test.perf_profile import cache_grid_section, engine_section
+from rtp_llm.test.perf_test.perf_profile import fingerprint as profile_fingerprint
+from rtp_llm.test.perf_test.perf_profile import load_profile
+
 DEFAULT_SEED = 104729  # A fixed prime, recorded in every generated plan.
 DEFAULT_BOUNDARIES = (
     256,
@@ -212,9 +216,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cache-alignment",
         type=int,
-        default=0,
+        default=None,
         help=(
-            "Alignment in tokens for cache lengths; 0 keeps --alignment. "
+            "Alignment in tokens for cache lengths; defaults to --alignment. "
             "Set to the engine's physical reuse granularity "
             "(--seq_size_per_block, multiplied by CP size when "
             "PREFILL_CP_KV_CACHE_SHARDED=1) so every cache point is exactly "
@@ -232,12 +236,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--max-cases", type=int, default=20000)
     parser.add_argument("--allow-large-grid", action="store_true")
+    parser.add_argument(
+        "--profile",
+        type=Path,
+        default=None,
+        help=(
+            "JSON profile for parameter defaults and downstream embedding. "
+            "cache_grid.cache_alignment overrides --cache-alignment; "
+            "engine.max_seq_len is informational only."
+        ),
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    profile = None
+    profile_sha256 = None
+    if args.profile is not None:
+        profile = load_profile(args.profile)
+        profile_sha256 = profile_fingerprint(profile)
+        cache_grid = cache_grid_section(profile)
+        profile_cache_alignment = cache_grid.get("cache_alignment")
+        if args.cache_alignment is None and profile_cache_alignment is not None:
+            args.cache_alignment = int(profile_cache_alignment)
+    if args.cache_alignment is None:
+        args.cache_alignment = 0
     payload = build_grid(args)
+    if profile is not None:
+        payload["profile"] = profile
+        payload["profile_sha256"] = profile_sha256
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"

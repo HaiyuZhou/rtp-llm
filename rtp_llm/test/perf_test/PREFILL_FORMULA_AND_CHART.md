@@ -74,3 +74,70 @@
 - 逐点预测：`formula_strict_valid_688_final/predictions.csv`
 
 下一轮采集必须补上逐请求客户端 wall time，并记录完整 cache reuse 分项。只有重跑后通过 1M 冷点合理性检查，才能生成正式 TTFT 报告和生产公式。
+
+## Profiles
+
+All four tools (grid generator, runner, formula fitter, charts) accept a
+`--profile` flag pointing to a versioned JSON file.  The canonical DSV4-Pro
+profile lives at `rtp_llm/test/perf_test/profiles/dsv4_pro_prefill.json`.
+
+### Priority chain
+
+Every parameter is resolved in this order:
+
+1. **CLI explicit** (including `0`)
+2. **Profile field** (the JSON passed via `--profile`)
+3. **Embedded profile** (the `profile` key inside an input result JSON,
+   inherited automatically when `--profile` is not given)
+4. **Legacy default** (the previous hardcoded value)
+
+When `--profile` is omitted, every output file is byte-identical to the
+pre-profile version — no extra keys, no changed filenames.
+
+### Profile schema
+
+```json
+{
+  "schema_version": 1,
+  "label": "...",
+  "chart": {
+    "model_label": "...",
+    "token_unit": 1024,
+    "formula_filename": "deepseek_v4_prefill_formula.txt",
+    "formula_key": "PREFILL_TIME_FORMULA",
+    "annotate_cold_threshold": 1048575
+  },
+  "engine": {
+    "tp_size": 8, "dp_size": 1, "ep_size": 8,
+    "max_seq_len": 1048576, "seq_size_per_block": 512
+  },
+  "engine_args": { ... },
+  "cache_grid": {
+    "cache_alignment": 512,
+    "expected_block_size": 512,
+    "measure_runs": 3
+  }
+}
+```
+
+### Result files
+
+Every output JSON gains two additive top-level keys: `profile` (the full
+profile object, or `null`) and `profile_sha256` (the canonical SHA-256 of the
+profile).  The runner also validates these on resume: if a cached
+`cache_grid_results.json` was produced with a different profile, the run
+aborts unless `--allow_resume_mismatch` is passed.
+
+### Anomaly analysis
+
+`deepseek_v4_prefill_formula_fit.py analyze-anomalies` detects measurement
+anomalies in a result set: cache monotonicity violations (longer cache but
+slower RT), residual outliers vs the fitted formula, and cross-input compute
+monotonicity breaks.  Floors (`--min-rt-ms`, `--min-compute-tokens`) and
+thresholds (`--max-anomaly-ape-pct`) are configurable.
+
+### Limitations
+
+Environment variables (e.g. `WORLD_SIZE`, `DSV4_USE_MEGA_MOE`) are **not**
+captured by the profile.  They must be set explicitly or via the BUILD target
+env block.  The profile records only CLI-visible engine parameters.

@@ -9,6 +9,7 @@ py_library(
         "distribution_runner.py",
         "grid_runner.py",
         "hub_download.py",
+        "perf_profile.py",
         "sampling.py",
         "server.py",
         "test_util.py",
@@ -29,15 +30,27 @@ py_test(
     ],
 )
 
+py_test(
+    name = "perf_profile_test",
+    srcs = ["perf_profile_test.py"],
+    deps = [
+        ":perf_test_lib",
+    ],
+)
+
 py_binary(
     name = "generate_cache_grid",
     srcs = ["generate_cache_grid.py"],
+    deps = [":perf_test_lib"],
 )
 
 py_test(
     name = "generate_cache_grid_test",
     srcs = ["generate_cache_grid_test.py"],
-    deps = [":generate_cache_grid"],
+    deps = [
+        ":generate_cache_grid",
+        ":perf_test_lib",
+    ],
 )
 
 py_test(
@@ -49,6 +62,49 @@ py_test(
 py_library(
     name = "prefill_3d_chart_lib",
     srcs = ["generate_prefill_3d_chart.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_library(
+    name = "prefill_formula_fit_lib",
+    srcs = ["deepseek_v4_prefill_formula_fit.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_binary(
+    name = "deepseek_v4_prefill_formula_fit",
+    srcs = ["deepseek_v4_prefill_formula_fit.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
+    name = "deepseek_v4_prefill_formula_fit_test",
+    srcs = ["deepseek_v4_prefill_formula_fit_test.py"],
+    deps = [
+        ":prefill_formula_fit_lib",
+        ":perf_test_lib",
+    ],
+)
+
+py_library(
+    name = "prefill_interactive_chart_lib",
+    srcs = ["generate_prefill_interactive_chart.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_binary(
+    name = "generate_prefill_interactive_chart",
+    srcs = ["generate_prefill_interactive_chart.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
+    name = "generate_prefill_interactive_chart_test",
+    srcs = ["generate_prefill_interactive_chart_test.py"],
+    deps = [
+        ":prefill_interactive_chart_lib",
+        ":perf_test_lib",
+    ],
 )
 
 py_test(

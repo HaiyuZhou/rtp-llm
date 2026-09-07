@@ -21,6 +21,17 @@ from rtp_llm.test.perf_test.hub_download import (
     needs_perf_hub_resolve,
     resolve_checkpoint_or_tokenizer_for_perf,
 )
+from rtp_llm.test.perf_test.perf_profile import (
+    cache_grid_section,
+    engine_section,
+    extract_embedded_profile,
+)
+from rtp_llm.test.perf_test.perf_profile import fingerprint as profile_fingerprint
+from rtp_llm.test.perf_test.perf_profile import (
+    load_profile,
+    merge_engine_args,
+    resolve_int,
+)
 from rtp_llm.test.perf_test.sampling import prepare_distribution_config
 from rtp_llm.test.perf_test.server import EngineServer
 from rtp_llm.test.perf_test.test_util import create_query
@@ -198,6 +209,23 @@ def parse_args(argv: Optional[List[str]] = None):
             "the tokenizer at run time.  Requires the same --cache_grid_json."
         ),
     )
+    perf.add_argument(
+        "--profile",
+        type=str,
+        default="",
+        help=(
+            "JSON profile for parameter defaults and engine arg injection. "
+            "Priority: CLI explicit > profile > legacy default."
+        ),
+    )
+    perf.add_argument(
+        "--allow_resume_mismatch",
+        action="store_true",
+        help=(
+            "When resuming from existing results, warn instead of aborting "
+            "on grid/profile sha, measure_runs, or block_size mismatches."
+        ),
+    )
 
     engine = parser.add_argument_group(
         "engine args consumed by perf test (also forwarded to server)"
@@ -207,6 +235,60 @@ def parse_args(argv: Optional[List[str]] = None):
     engine.add_argument("--concurrency_limit", type=int, default=64)
 
     args, remaining = parser.parse_known_args(argv)
+
+    profile = None
+    profile_sha256 = None
+    if args.profile:
+        profile = load_profile(args.profile)
+        profile_sha256 = profile_fingerprint(profile)
+        cache_grid = cache_grid_section(profile)
+        engine = engine_section(profile)
+        args.cache_measure_runs = resolve_int(
+            profile,
+            "cache_grid",
+            "measure_runs",
+            args.cache_measure_runs if args.cache_measure_runs != 3 else None,
+            3,
+        )
+        args.expected_cache_block_size = resolve_int(
+            profile,
+            "cache_grid",
+            "expected_block_size",
+            (
+                args.expected_cache_block_size
+                if args.expected_cache_block_size != 0
+                else None
+            ),
+            0,
+        )
+        if "dp_size" in engine:
+            args.dp_size = resolve_int(
+                profile,
+                "engine",
+                "dp_size",
+                args.dp_size if args.dp_size != 1 else None,
+                1,
+            )
+        if "max_seq_len" in engine:
+            args.max_seq_len = resolve_int(
+                profile,
+                "engine",
+                "max_seq_len",
+                args.max_seq_len if args.max_seq_len != 8192 else None,
+                8192,
+            )
+        if "concurrency_limit" in engine:
+            args.concurrency_limit = resolve_int(
+                profile,
+                "engine",
+                "concurrency_limit",
+                args.concurrency_limit if args.concurrency_limit != 64 else None,
+                64,
+            )
+        remaining = merge_engine_args(profile, remaining)
+
+    args._profile = profile
+    args._profile_sha256 = profile_sha256
     return args, remaining
 
 
@@ -573,6 +655,8 @@ def _write_test_info(
     tokenizer_path = extract_arg(remaining_args, "tokenizer_path") or os.environ.get(
         "TOKENIZER_PATH"
     )
+    profile = getattr(args, "_profile", None)
+    profile_sha256 = getattr(args, "_profile_sha256", None)
     info = {
         "schema_version": 2,
         "status": status,
@@ -584,6 +668,7 @@ def _write_test_info(
         "max_seq_len": args.max_seq_len,
         "concurrency_limit": args.concurrency_limit,
         "decode_test_length": args.decode_test_length,
+        "seq_size_per_block": extract_arg(remaining_args, "seq_size_per_block", None),
         "cache_grid_json": args.cache_grid_json or None,
         "cache_measure_runs": (
             args.cache_measure_runs if args.cache_grid_json else None
@@ -607,6 +692,8 @@ def _write_test_info(
         "engine_args": _redact_argv(remaining_args),
         "engine_env_names": sorted(engine_env_names or []),
         "argv": _redact_argv(sys.argv),
+        "profile": profile,
+        "profile_sha256": profile_sha256,
     }
     path = os.path.join(args.result_dir, "test_info.json")
     with open(path, "w") as f:
@@ -746,6 +833,7 @@ def main() -> str:
                 args.cache_measure_runs,
                 grid_metadata=grid_metadata,
                 grid_sha256=grid_sha256,
+                profile_sha256=getattr(args, "_profile_sha256", "") or "",
             )
             logging.info(
                 "materialized %d cache-grid cases (%d cached) to %s: %s",
@@ -789,6 +877,9 @@ def main() -> str:
                 grid_sha256=grid_sha256,
                 expected_block_size=expected_block_size,
                 case_store=case_store,
+                profile=getattr(args, "_profile", None),
+                profile_sha256=getattr(args, "_profile_sha256", None),
+                allow_resume_mismatch=args.allow_resume_mismatch,
             ).run()
             _collect_timeline_files(args.result_dir)
         finally:

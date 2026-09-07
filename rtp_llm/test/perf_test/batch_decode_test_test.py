@@ -549,5 +549,151 @@ class CacheGridRunnerStoreTest(unittest.TestCase):
                 )
 
 
+class CacheGridRunnerResumeGuardTest(unittest.TestCase):
+    def _write_existing_results(self, result_dir, payload):
+        import json
+
+        path = Path(result_dir) / "cache_grid_results.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_resume_with_matching_results_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_existing_results(
+                tmp,
+                {
+                    "metrics": [],
+                    "grid_sha256": "abc",
+                    "profile_sha256": "def",
+                    "measure_runs": 3,
+                    "expected_block_size": 512,
+                },
+            )
+            runner = CacheGridRunner(
+                0,
+                _WordTokenizer(),
+                [{"case_id": 0, "batch_size": 1, "input_len": 1024, "cache_len": 512}],
+                tmp,
+                grid_sha256="abc",
+                profile_sha256="def",
+                expected_block_size=512,
+            )
+            self.assertEqual(runner._results, {})
+
+    def test_resume_with_profile_sha_mismatch_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_existing_results(
+                tmp,
+                {
+                    "metrics": [],
+                    "grid_sha256": "abc",
+                    "profile_sha256": "old_sha",
+                    "measure_runs": 3,
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "profile_sha256"):
+                CacheGridRunner(
+                    0,
+                    _WordTokenizer(),
+                    [
+                        {
+                            "case_id": 0,
+                            "batch_size": 1,
+                            "input_len": 1024,
+                            "cache_len": 512,
+                        }
+                    ],
+                    tmp,
+                    grid_sha256="abc",
+                    profile_sha256="new_sha",
+                )
+
+    def test_resume_mismatch_allowed_with_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_existing_results(
+                tmp,
+                {
+                    "metrics": [
+                        {
+                            "case_key": "bs1_seq1024_cache512",
+                            "status": "ok",
+                        }
+                    ],
+                    "grid_sha256": "abc",
+                    "profile_sha256": "old",
+                    "measure_runs": 3,
+                },
+            )
+            runner = CacheGridRunner(
+                0,
+                _WordTokenizer(),
+                [{"case_id": 0, "batch_size": 1, "input_len": 1024, "cache_len": 512}],
+                tmp,
+                grid_sha256="abc",
+                profile_sha256="new",
+                allow_resume_mismatch=True,
+            )
+            self.assertEqual(len(runner._results), 1)
+
+    def test_save_includes_profile_and_measure_runs(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = {"schema_version": 1, "label": "test"}
+            runner = CacheGridRunner(
+                0,
+                _WordTokenizer(),
+                [{"case_id": 0, "batch_size": 1, "input_len": 1024, "cache_len": 0}],
+                tmp,
+                measure_runs=5,
+                expected_block_size=256,
+                profile=profile,
+                profile_sha256="fp123",
+            )
+            runner._save(complete=True)
+            path = Path(tmp) / "cache_grid_results.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["measure_runs"], 5)
+            self.assertEqual(payload["expected_block_size"], 256)
+            self.assertEqual(payload["profile"], profile)
+            self.assertEqual(payload["profile_sha256"], "fp123")
+
+
+class MaterializedCaseStoreProfileTest(unittest.TestCase):
+    def test_materialize_persists_profile_sha256(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MaterializedCaseStore(tmp)
+            factory = PrefixPromptFactory(_WordTokenizer())
+            cases = [
+                {"case_id": 0, "batch_size": 1, "input_len": 1024, "cache_len": 512}
+            ]
+            store.materialize(
+                cases, factory, run_count=3, profile_sha256="sha_profile_42"
+            )
+            info = json.loads(
+                (Path(tmp) / "store_info.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(info["profile_sha256"], "sha_profile_42")
+            self.assertEqual(store.profile_sha256, "sha_profile_42")
+
+    def test_load_reads_profile_sha256(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store1 = MaterializedCaseStore(tmp)
+            factory = PrefixPromptFactory(_WordTokenizer())
+            cases = [
+                {"case_id": 0, "batch_size": 1, "input_len": 1024, "cache_len": 512}
+            ]
+            store1.materialize(
+                cases, factory, run_count=3, profile_sha256="persisted_sha"
+            )
+            store2 = MaterializedCaseStore(tmp)
+            store2.load_cases()
+            self.assertEqual(store2.profile_sha256, "persisted_sha")
+
+
 if __name__ == "__main__":
     unittest.main()

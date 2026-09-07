@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "label": "DeepSeek-V4-Pro Prefill Handoff",
+  "model_label": "DSV4-Pro",
+  "model_type": "deepseek_v4",
+  "checkpoint_path": "/data5/nanjun.cp/DeepSeek-V4-Pro",
+  "tokenizer_path": "/data5/nanjun.cp/DeepSeek-V4-Pro",
+  "engine": {
+    "tp_size": 8,
+    "dp_size": 1,
+    "ep_size": 8,
+    "world_size": 8,
+    "max_seq_len": 1048576,
+    "seq_size_per_block": 512,
+    "kernel_seq_size_per_block": 128,
+    "max_batch_tokens_size": 1048576,
+    "max_context_batch_size": 1,
+    "concurrency_limit": 1
+  },
+  "engine_args": {
+    "--cp_rotate_method": "ALL_GATHER",
+    "--fp8_kv_cache": "1",
+    "--reuse_cache": "1",
+    "--enable_device_cache": "1",
+    "--use_deepep_moe": "1",
+    "--use_deepep_low_latency": "0",
+    "--act_type": "BF16",
+    "--load_method": "fastsafetensors",
+    "--enable_cuda_graph": "0",
+    "--reserver_runtime_mem_mb": "81920"
+  },
+  "cache_grid": {
+    "cache_alignment": 512,
+    "expected_block_size": 512,
+    "measure_runs": 3
+  },
+  "chart": {
+    "title": "DeepSeek-V4-Pro Prefill RT — dense 3D measurement view",
+    "model_label": "DeepSeek-V4-Pro",
+    "annotate_cold_threshold": 1048575,
+    "formula_filename": "deepseek_v4_prefill_formula.txt",
+    "formula_key": "PREFILL_TIME_FORMULA",
+    "token_unit": 1024
+  }
+}

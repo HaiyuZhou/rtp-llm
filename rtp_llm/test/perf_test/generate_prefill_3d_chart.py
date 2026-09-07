@@ -23,6 +23,15 @@ from collections import defaultdict
 from statistics import median
 from typing import Any
 
+from rtp_llm.test.perf_test.perf_profile import extract_embedded_profile
+from rtp_llm.test.perf_test.perf_profile import fingerprint as profile_fingerprint
+from rtp_llm.test.perf_test.perf_profile import (
+    load_profile,
+    resolve_int,
+    resolve_label,
+    resolve_title,
+)
+
 
 def _number(value: Any) -> float | None:
     try:
@@ -167,7 +176,13 @@ def fmt_tokens(value: float) -> str:
     return f"{value:.0f}"
 
 
-def render(rows: list[dict[str, float]], source: pathlib.Path, batch_size: int) -> str:
+def render(
+    rows: list[dict[str, float]],
+    source: pathlib.Path,
+    batch_size: int,
+    *,
+    annotate_cold_threshold: int = 1_048_575,
+) -> str:
     if not rows:
         raise SystemExit("no usable rows for the requested batch size")
     width, height = 2200, 1350
@@ -365,7 +380,12 @@ def render(rows: list[dict[str, float]], source: pathlib.Path, batch_size: int) 
     ]
 
     one_m = next(
-        (row for row in rows if row["input"] >= 1_048_575 and row["cache"] == 0), None
+        (
+            row
+            for row in rows
+            if row["input"] >= annotate_cold_threshold and row["cache"] == 0
+        ),
+        None,
     )
     if one_m is not None:
         x, y = project(one_m["rt"] / xscale, 0, one_m["compute"] / zscale)
@@ -609,7 +629,12 @@ def render_cold_miss_2d(
 
 
 def render_clean(
-    rows: list[dict[str, float]], source: pathlib.Path, batch_size: int
+    rows: list[dict[str, float]],
+    source: pathlib.Path,
+    batch_size: int,
+    *,
+    title: str = "DeepSeek-V4-Pro Prefill — readable 3D view",
+    annotate_cold_threshold: int = 1_048_575,
 ) -> str:
     """Render a legible 3-D view without the old dense drop-line clutter.
 
@@ -679,7 +704,7 @@ def render_clean(
 .axis{{font-size:18px;fill:#334155;font-weight:600}} .tick{{font-size:15px;fill:#475569}}
 .paneltitle{{font-size:23px;font-weight:700}} .body{{font-size:17px;fill:#334155}}
 .note{{font-size:15px;fill:#64748b}} .legend{{font-size:16px;fill:#334155}}</style>
-<text x="1100" y="52" text-anchor="middle" class="title">DeepSeek-V4-Pro Prefill — readable 3D view</text>
+<text x="1100" y="52" text-anchor="middle" class="title">{esc(title)}</text>
 <text x="1100" y="85" text-anchor="middle" class="sub">X = compute tokens · Y = observed cached tokens · Z = TTFT / prefill RT (ms) · all {len(rows):,} geometries shown</text>"""
     ]
 
@@ -826,7 +851,12 @@ def render_clean(
     ]
 
     one_m = next(
-        (row for row in rows if row["input"] >= 1_048_575 and row["cache"] == 0), None
+        (
+            row
+            for row in rows
+            if row["input"] >= annotate_cold_threshold and row["cache"] == 0
+        ),
+        None,
     )
     if one_m is not None:
         px, py = project(one_m["compute"] / xscale, 0, one_m["rt"] / zscale)
@@ -901,11 +931,64 @@ def main() -> None:
         help="Optional cache-miss 2-D SVG. Defaults to <output stem>_cold_miss.svg.",
     )
     parser.add_argument("--batch-size", default=1, type=int)
+    parser.add_argument("--title", default=None, help="Override the chart title.")
+    parser.add_argument(
+        "--model-label", default=None, help="Model label used to build the title."
+    )
+    parser.add_argument(
+        "--annotate-cold-threshold",
+        type=int,
+        default=None,
+        help="Minimum input_len for the cold-point annotation (default: 1048575).",
+    )
+    parser.add_argument(
+        "--profile", default=None, help="JSON profile for parameter defaults."
+    )
     args = parser.parse_args()
+
+    profile = None
+    profile_sha256 = None
+    if args.profile:
+        profile = load_profile(args.profile)
+        profile_sha256 = profile_fingerprint(profile)
+    else:
+        try:
+            input_data = json.loads(args.input.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            input_data = None
+        if isinstance(input_data, dict):
+            embedded_sha = input_data.get("profile_sha256")
+            embedded = extract_embedded_profile(input_data)
+            if embedded is not None:
+                profile = embedded
+                profile_sha256 = (
+                    embedded_sha
+                    if isinstance(embedded_sha, str)
+                    else profile_fingerprint(profile)
+                )
+
+    model_label = resolve_label(profile, args.model_label, "DeepSeek-V4-Pro")
+    default_title = f"{model_label} Prefill — readable 3D view"
+    title = resolve_title(profile, args.title, default_title)
+    cold_threshold = args.annotate_cold_threshold
+    if cold_threshold is None and profile is not None:
+        cold_threshold = resolve_int(
+            profile, "chart", "annotate_cold_threshold", None, 1_048_575
+        )
+    if cold_threshold is None:
+        cold_threshold = 1_048_575
+
     rows = load_rows(args.input, args.batch_size)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
-        render_clean(rows, args.input, args.batch_size), encoding="utf-8"
+        render_clean(
+            rows,
+            args.input,
+            args.batch_size,
+            title=title,
+            annotate_cold_threshold=cold_threshold,
+        ),
+        encoding="utf-8",
     )
     cold_output = args.cold_output or args.output.with_name(
         f"{args.output.stem}_cold_miss{args.output.suffix}"
@@ -922,6 +1005,9 @@ def main() -> None:
                 "output": str(args.output),
                 "cold_output": str(cold_output),
                 "cold_rows": sum(row["cache"] == 0 for row in rows),
+                "title": title,
+                "profile": profile,
+                "profile_sha256": profile_sha256,
             },
             ensure_ascii=False,
         )

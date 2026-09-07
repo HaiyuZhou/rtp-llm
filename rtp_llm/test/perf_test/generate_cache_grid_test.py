@@ -1,5 +1,10 @@
 import argparse
+import json
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 from rtp_llm.test.perf_test.generate_cache_grid import (
     DEFAULT_SEED,
@@ -7,6 +12,7 @@ from rtp_llm.test.perf_test.generate_cache_grid import (
     generate_cache_lengths,
     generate_input_lengths,
 )
+from rtp_llm.test.perf_test.perf_profile import fingerprint as profile_fingerprint
 
 
 class GenerateCacheGridTest(unittest.TestCase):
@@ -96,6 +102,101 @@ class GenerateCacheGridTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "exceeding --max-cases"):
             build_grid(args)
+
+
+class GenerateCacheGridProfileTest(unittest.TestCase):
+    COMMON_ARGS = [
+        "--min-input-len",
+        "2048",
+        "--max-input-len",
+        "65536",
+        "--alignment",
+        "128",
+        "--input-points",
+        "8",
+        "--cache-points-per-input",
+        "6",
+        "--cache-ratio-points",
+        "2",
+    ]
+
+    def _run_grid(self, extra_args, tmp):
+        output = Path(tmp) / "grid.json"
+        cmd = (
+            [
+                sys.executable,
+                "-m",
+                "rtp_llm.test.perf_test.generate_cache_grid",
+                "--output",
+                str(output),
+            ]
+            + self.COMMON_ARGS
+            + extra_args
+        )
+        subprocess.run(cmd, check=True, capture_output=True)
+        return json.loads(output.read_text(encoding="utf-8"))
+
+    def test_without_profile_no_profile_keys_in_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self._run_grid([], tmp)
+        self.assertNotIn("profile", payload)
+        self.assertNotIn("profile_sha256", payload)
+
+    def test_with_profile_embeds_profile_and_sha256(self):
+        profile = {
+            "schema_version": 1,
+            "label": "test",
+            "cache_grid": {"cache_alignment": 512},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_path = Path(tmp) / "profile.json"
+            profile_path.write_text(json.dumps(profile), encoding="utf-8")
+            payload = self._run_grid(["--profile", str(profile_path)], tmp)
+        self.assertIn("profile", payload)
+        self.assertIn("profile_sha256", payload)
+        self.assertEqual(payload["profile"], profile)
+        self.assertEqual(payload["profile_sha256"], profile_fingerprint(profile))
+        for case in payload["cases"]:
+            self.assertEqual(case["cache_len"] % 512, 0)
+
+    def test_cli_cache_alignment_wins_over_profile(self):
+        profile = {
+            "schema_version": 1,
+            "cache_grid": {"cache_alignment": 512},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_path = Path(tmp) / "profile.json"
+            profile_path.write_text(json.dumps(profile), encoding="utf-8")
+            payload = self._run_grid(
+                ["--profile", str(profile_path), "--cache-alignment", "256"], tmp
+            )
+        for case in payload["cases"]:
+            self.assertEqual(case["cache_len"] % 256, 0)
+        self.assertEqual(payload["generator"]["cache_sampling"]["alignment"], 256)
+
+    def test_byte_identity_without_profile(self):
+        """Output without --profile must be identical to pre-profile code."""
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self._run_grid(["--cache-alignment", "0"], tmp)
+        args = argparse.Namespace(
+            min_input_len=2048,
+            max_input_len=65536,
+            alignment=128,
+            cache_alignment=0,
+            input_points=8,
+            input_mode="stratified",
+            seed=DEFAULT_SEED,
+            cache_points_per_input=6,
+            cache_ratio_points=2,
+            batch_size=1,
+            max_cases=20000,
+            allow_large_grid=False,
+            measure_runs=3,
+        )
+        expected = build_grid(args)
+        self.assertEqual(payload["cases"], expected["cases"])
+        self.assertEqual(payload["generator"], expected["generator"])
+        self.assertEqual(payload["summary"], expected["summary"])
 
 
 if __name__ == "__main__":

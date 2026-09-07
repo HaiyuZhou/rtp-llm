@@ -2,10 +2,10 @@
   "schema_version": 1,
   "label": "DeepSeek-V4-Pro Prefill Handoff",
   "model_label": "DSV4-Pro",
-  "model_type": "deepseek_v4",
-  "checkpoint_path": "/data5/nanjun.cp/DeepSeek-V4-Pro",
-  "tokenizer_path": "/data5/nanjun.cp/DeepSeek-V4-Pro",
   "engine": {
+    "model_type": "deepseek_v4",
+    "checkpoint_path": "/data5/nanjun.cp/DeepSeek-V4-Pro",
+    "tokenizer_path": "/data5/nanjun.cp/DeepSeek-V4-Pro",
     "tp_size": 8,
     "dp_size": 1,
     "ep_size": 8,

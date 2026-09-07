@@ -124,8 +124,7 @@ class BatchDecodeTest(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                case["cache_len"] == 0
-                or case["cache_len"] + 4096 <= case["input_len"]
+                case["cache_len"] == 0 or case["cache_len"] + 4096 <= case["input_len"]
                 for case in cases
             )
         )
@@ -264,6 +263,23 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertEqual(args.engine_env, ["FP8_KV_CACHE=1"])
         self.assertEqual(args.measure_runs, 3)
         self.assertIn("--model_type=example_model", remaining)
+
+    def test_dsv4_profile_injects_model_identity_and_paths(self):
+        profile = Path(__file__).parent / "profiles" / "dsv4_pro_prefill.json"
+        _, remaining = parse_args(["--profile", str(profile)])
+
+        self.assertIn("--model_type", remaining)
+        self.assertEqual(remaining[remaining.index("--model_type") + 1], "deepseek_v4")
+        self.assertIn("--checkpoint_path", remaining)
+        self.assertEqual(
+            remaining[remaining.index("--checkpoint_path") + 1],
+            "/data5/nanjun.cp/DeepSeek-V4-Pro",
+        )
+        self.assertIn("--tokenizer_path", remaining)
+        self.assertEqual(
+            remaining[remaining.index("--tokenizer_path") + 1],
+            "/data5/nanjun.cp/DeepSeek-V4-Pro",
+        )
 
     def test_redact_argv_hides_embedded_engine_secret(self):
         self.assertEqual(

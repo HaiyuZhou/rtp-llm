@@ -28,6 +28,7 @@ py_test(
     deps = [
         ":perf_test_lib",
     ],
+    data = ["profiles/dsv4_pro_prefill.json"],
 )
 
 py_test(
@@ -105,15 +106,6 @@ py_test(
         ":prefill_interactive_chart_lib",
         ":perf_test_lib",
     ],
-)
-
-py_test(
-    name = "deepseek_v4_prefill_formula_fit_test",
-    srcs = [
-        "deepseek_v4_prefill_formula_fit.py",
-        "deepseek_v4_prefill_formula_fit_test.py",
-    ],
-    main = "deepseek_v4_prefill_formula_fit_test.py",
 )
 
 py_test(

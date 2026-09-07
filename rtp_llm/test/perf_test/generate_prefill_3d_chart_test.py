@@ -62,6 +62,24 @@ class GeneratePrefill3dChartTest(unittest.TestCase):
         self.assertIn("Custom Model Chart", svg)
         self.assertNotIn("DeepSeek-V4-Pro", svg)
 
+    def test_dot_colour_depth_represents_local_query_density(self):
+        rows = [
+            {"compute": 10.0, "cache": 10.0, "rt": 1.0, "input": 20.0},
+            {"compute": 11.0, "cache": 11.0, "rt": 2.0, "input": 22.0},
+            {"compute": 12.0, "cache": 12.0, "rt": 3.0, "input": 24.0},
+            {"compute": 1000.0, "cache": 1000.0, "rt": 4.0, "input": 2000.0},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "results.json"
+            source.write_text(json.dumps({"metrics": rows}), encoding="utf-8")
+            svg = render_clean(rows, source, 1)
+        self.assertEqual(svg.count('data-query-density="3"'), 3)
+        self.assertEqual(svg.count('data-query-density="1"'), 1)
+        self.assertIn('fill="#1e3a8a"', svg)
+        self.assertIn('fill="#dbeafe"', svg)
+        self.assertIn("Query distribution density", svg)
+        self.assertIn("sparse · local 16×16 compute/cache bins · dense (max 3)", svg)
+
     def test_annotate_cold_threshold(self):
         payload = {
             "metrics": [

@@ -9,8 +9,9 @@ Examples::
 
 The plot has exactly three data coordinates: X=compute tokens, Y=cached
 tokens, Z=measured prefill RT (TTFT) in milliseconds. Every usable row for the
-selected batch is emitted; there is no point decimation and colour is uniform
-so it cannot be mistaken for a fourth data dimension.
+selected batch is emitted with no point decimation. Dot colour depth shows
+local query density on the compute/cache plane; TTFT remains encoded solely by
+the Z coordinate.
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ import argparse
 import csv
 import html
 import json
+import math
 import pathlib
 from collections import defaultdict
 from statistics import median
@@ -31,6 +33,39 @@ from rtp_llm.test.perf_test.perf_profile import (
     resolve_label,
     resolve_title,
 )
+
+QUERY_DENSITY_PALETTE = ("#dbeafe", "#93c5fd", "#60a5fa", "#2563eb", "#1e3a8a")
+
+
+def _query_density(
+    rows: list[dict[str, float]], compute_max: float, cache_max: float, bins: int = 16
+) -> tuple[list[int], int]:
+    """Count query geometries in local compute/cache bins.
+
+    Density deliberately ignores TTFT: colour describes where query shapes are
+    concentrated, while the Z coordinate remains the sole encoding of latency.
+    """
+    counts: defaultdict[tuple[int, int], int] = defaultdict(int)
+    locations: list[tuple[int, int]] = []
+    compute_scale = max(compute_max, 1.0)
+    cache_scale = max(cache_max, 1.0)
+    for row in rows:
+        compute_bin = min(bins - 1, int(row["compute"] / compute_scale * bins))
+        cache_bin = min(bins - 1, int(row["cache"] / cache_scale * bins))
+        location = (compute_bin, cache_bin)
+        locations.append(location)
+        counts[location] += 1
+    densities = [counts[location] for location in locations]
+    return densities, max(densities, default=0)
+
+
+def _query_density_color(density: int, maximum: int) -> str:
+    """Map density to a log-scaled light-to-dark blue ramp."""
+    if maximum <= 1:
+        return QUERY_DENSITY_PALETTE[0]
+    ratio = math.log(density) / math.log(maximum)
+    index = round(ratio * (len(QUERY_DENSITY_PALETTE) - 1))
+    return QUERY_DENSITY_PALETTE[index]
 
 
 def _number(value: Any) -> float | None:
@@ -466,7 +501,9 @@ def render_cold_miss_2d(
     a linear token axis so the 1M boundary is honest; an inset expands the
     short-sequence region that would otherwise be compressed near the origin.
     """
-    cold = sorted((row for row in rows if row["cache"] == 0), key=lambda row: row["input"])
+    cold = sorted(
+        (row for row in rows if row["cache"] == 0), key=lambda row: row["input"]
+    )
     if not cold:
         raise SystemExit("no cache-miss rows for the requested batch size")
     width, height = 1800, 1050
@@ -507,7 +544,7 @@ def render_cold_miss_2d(
 
     points = [(sx(row["input"]), sy(row["rt"])) for row in cold]
     out = [
-        f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+        f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
 <rect width="100%" height="100%" fill="#ffffff"/>
 <style>text{{font-family:Arial,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#172033}}
 .title{{font-size:34px;font-weight:700}} .sub{{font-size:18px;fill:#475569}}
@@ -515,11 +552,20 @@ def render_cold_miss_2d(
 .paneltitle{{font-size:23px;font-weight:700}} .body{{font-size:17px;fill:#334155}}
 .note{{font-size:15px;fill:#64748b}}</style>
 <text x="70" y="55" class="title">DeepSeek-V4-Pro：Cache miss 的 seq_len–RT 趋势</text>
-<text x="70" y="88" class="sub">BS={batch_size} · observed cache_len=0 · 每个 seq_len 使用三次成功测量的中位 prefill RT / TTFT</text>'''
+<text x="70" y="88" class="sub">BS={batch_size} · observed cache_len=0 · 每个 seq_len 使用三次成功测量的中位 prefill RT / TTFT</text>"""
     ]
     out.append(line(x0, y1, x1, y1, "#0f172a", 2))
     out.append(line(x0, y0, x0, y1, "#0f172a", 2))
-    for tick in (0, 64 * 1024, 128 * 1024, 256 * 1024, 384 * 1024, 512 * 1024, 768 * 1024, 1024 * 1024):
+    for tick in (
+        0,
+        64 * 1024,
+        128 * 1024,
+        256 * 1024,
+        384 * 1024,
+        512 * 1024,
+        768 * 1024,
+        1024 * 1024,
+    ):
         x = sx(min(tick, xmax))
         out.append(line(x, y1, x, y1 + 9, "#0f172a", 1.3))
         out.append(
@@ -562,7 +608,9 @@ def render_cold_miss_2d(
         return inset_left + value / max(inset_xmax, 1.0) * (inset_right - inset_left)
 
     def iy(value: float) -> float:
-        return inset_bottom - (value - inset_ymin) / max(inset_ymax - inset_ymin, 1.0) * (inset_bottom - inset_top)
+        return inset_bottom - (value - inset_ymin) / max(
+            inset_ymax - inset_ymin, 1.0
+        ) * (inset_bottom - inset_top)
 
     out.append(
         f'<rect x="{inset_x:.1f}" y="{inset_y:.1f}" width="{inset_w:.1f}" height="{inset_h:.1f}" rx="10" fill="#f8fafc" stroke="#64748b" stroke-width="1.5"/>'
@@ -570,7 +618,9 @@ def render_cold_miss_2d(
     out.append(
         f'<text x="{inset_x + 15:.1f}" y="{inset_y + 28:.1f}" class="body" font-weight="700">放大：0–{fmt_tokens(inset_xmax)} tokens</text>'
     )
-    out.append(line(inset_left, inset_bottom, inset_right, inset_bottom, "#334155", 1.2))
+    out.append(
+        line(inset_left, inset_bottom, inset_right, inset_bottom, "#334155", 1.2)
+    )
     out.append(line(inset_left, inset_top, inset_left, inset_bottom, "#334155", 1.2))
     inset_points = [(ix(row["input"]), iy(row["rt"])) for row in inset_rows]
     out.append(
@@ -601,7 +651,9 @@ def render_cold_miss_2d(
     out.append(
         f'<rect x="{panel_x:.1f}" y="{panel_y:.1f}" width="{panel_w:.1f}" height="{panel_h:.1f}" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>'
     )
-    out.append(f'<text x="{panel_x + 20:.1f}" y="{panel_y + 42:.1f}" class="paneltitle">怎么读</text>')
+    out.append(
+        f'<text x="{panel_x + 20:.1f}" y="{panel_y + 42:.1f}" class="paneltitle">怎么读</text>'
+    )
     median_rt = median(row["rt"] for row in cold)
     sorted_rt = sorted(row["rt"] for row in cold)
     p95_rt = sorted_rt[min(len(sorted_rt) - 1, int(len(sorted_rt) * 0.95))]
@@ -639,8 +691,8 @@ def render_clean(
     """Render a legible 3-D view without the old dense drop-line clutter.
 
     X is compute tokens, Y is observed cache reuse, and Z is TTFT.  Every
-    geometry remains a low-opacity dot; only a handful of representative
-    fixed-cache/fixed-compute slices are drawn as guide lines.
+    geometry remains a dot coloured by local query density; only a handful of
+    representative fixed-cache/fixed-compute slices are drawn as guide lines.
     """
     if not rows:
         raise SystemExit("no usable rows for the requested batch size")
@@ -679,11 +731,13 @@ def render_clean(
         )
 
     def circle(
-        point: tuple[float, float], radius=3.2, fill="#2563eb", opacity=0.50
+        point: tuple[float, float], density: int, maximum_density: int, radius=3.2
     ) -> str:
+        fill = _query_density_color(density, maximum_density)
         return (
             f'<circle cx="{point[0]:.1f}" cy="{point[1]:.1f}" r="{radius}" '
-            f'fill="{fill}" fill-opacity="{opacity}" stroke="#ffffff" stroke-width=".55"/>'
+            f'fill="{fill}" fill-opacity=".82" stroke="#ffffff" stroke-width=".55" '
+            f'data-query-density="{density}"><title>local query density: {density}</title></circle>'
         )
 
     def polyline(points: list[tuple[float, float]], stroke: str, dash: str = "") -> str:
@@ -720,14 +774,18 @@ def render_clean(
         out.append(line(project(0, 0, t), project(1, 0, t), "#dbe4ee", 1, "5 6", 0.75))
         out.append(line(project(0, 0, t), project(0, 1, t), "#dbe4ee", 1, "5 6", 0.75))
 
-    # Every point is kept, but dots are deliberately faint so the axes and
-    # representative slices remain visible at report scale.
-    for row in sorted(rows, key=lambda item: item["compute"]):
+    # Every point is kept. Colour depth represents local query-geometry
+    # density on the compute/cache plane; TTFT remains encoded only by Z.
+    sorted_rows = sorted(rows, key=lambda item: item["compute"])
+    densities, maximum_density = _query_density(sorted_rows, compute_max, cache_max)
+    for row, density in zip(sorted_rows, densities):
         out.append(
             circle(
                 project(
                     row["compute"] / xscale, row["cache"] / yscale, row["rt"] / zscale
-                )
+                ),
+                density,
+                maximum_density,
             )
         )
 
@@ -880,7 +938,7 @@ def render_clean(
     )
     text_lines = [
         f"source rows = {len(data_metrics(source)):,}; plotted = {len(rows):,}",
-        "dots = every physical geometry (faint on purpose)",
+        "dots = every physical geometry; darker means denser queries",
         "X right = more uncached compute tokens",
         "Y up = more observed KV-cache reuse",
         "Z up = higher TTFT / slower prefill",
@@ -917,6 +975,18 @@ def render_clean(
         out.append(
             f'<text x="{px+405}" y="{yy}" class="legend">compute ≈ {fmt_tokens(level)}</text>'
         )
+    density_y = py + 650
+    out.append(
+        f'<text x="{px+30}" y="{density_y}" class="paneltitle">Query distribution density</text>'
+    )
+    swatch_width = 82
+    for index, colour in enumerate(QUERY_DENSITY_PALETTE):
+        out.append(
+            f'<rect x="{px+30+index*swatch_width}" y="{density_y+22}" width="{swatch_width}" height="24" fill="{colour}"/>'
+        )
+    out.append(
+        f'<text x="{px+30}" y="{density_y+70}" class="note">sparse · local 16×16 compute/cache bins · dense (max {maximum_density})</text>'
+    )
     out.append("</svg>")
     return "".join(out)
 

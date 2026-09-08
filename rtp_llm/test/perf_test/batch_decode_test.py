@@ -13,6 +13,8 @@ from rtp_llm.test.perf_test.cache_grid_runner import (
     CacheGridRunner,
     MaterializedCaseStore,
     PrefixPromptFactory,
+    resume_config_fingerprint,
+    validate_cache_grid_resume,
 )
 from rtp_llm.test.perf_test.dataset import KNOWN_DATASETS, extract_arg
 from rtp_llm.test.perf_test.distribution_runner import DistributionRunner
@@ -155,23 +157,35 @@ def parse_args(argv: Optional[List[str]] = None):
         ),
     )
     perf.add_argument(
-        "--warmup_runs", type=int, default=None,
+        "--warmup_runs",
+        type=int,
+        default=None,
         help="Override PERF_FORMAL_WARMUP_RUNS for every case.",
     )
     perf.add_argument(
-        "--measure_runs", type=int, default=None,
+        "--measure_runs",
+        type=int,
+        default=None,
         help="Override PERF_MEASURE_RUNS for every case.",
     )
     perf.add_argument(
-        "--profile_runs", type=int, default=None,
+        "--profile_runs",
+        type=int,
+        default=None,
         help="Override PERF_PROFILE_RUNS for every case.",
     )
     perf.add_argument(
-        "--engine_arg", action="append", default=[], metavar="NAME=VALUE",
+        "--engine_arg",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
         help="Repeatable engine argument shorthand, e.g. tp_size=8.",
     )
     perf.add_argument(
-        "--engine_env", action="append", default=[], metavar="NAME=VALUE",
+        "--engine_env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
         help="Repeatable engine environment default; --test_env wins.",
     )
     perf.add_argument(
@@ -200,6 +214,21 @@ def parse_args(argv: Optional[List[str]] = None):
         ),
     )
     perf.add_argument(
+        "--cache_request_transport",
+        choices=("http_prompt", "dashsc_input_ids"),
+        default="http_prompt",
+        help=(
+            "Cache-grid request transport. dashsc_input_ids sends the already "
+            "verified token IDs as binary INT32 and skips server tokenization."
+        ),
+    )
+    perf.add_argument(
+        "--cache_grpc_port",
+        type=int,
+        default=0,
+        help="Dash-SC gRPC port for input_ids mode; 0 uses HTTP port + 8.",
+    )
+    perf.add_argument(
         "--cache_case_files",
         type=str,
         default="",
@@ -219,11 +248,29 @@ def parse_args(argv: Optional[List[str]] = None):
         ),
     )
     perf.add_argument(
+        "--cache_checkpoint_every",
+        type=int,
+        default=100,
+        help=(
+            "Compact the append-only per-case journal into the full result "
+            "JSON after this many cases (default: 100)."
+        ),
+    )
+    perf.add_argument(
+        "--require_cache_resume",
+        action="store_true",
+        help=(
+            "Require cache_grid_results.json in --result_dir. Use this on a "
+            "restart to prevent an accidental fresh run from a mistyped path."
+        ),
+    )
+    perf.add_argument(
         "--allow_resume_mismatch",
         action="store_true",
         help=(
             "When resuming from existing results, warn instead of aborting "
-            "on grid/profile sha, measure_runs, or block_size mismatches."
+            "on grid/profile, model/engine config, measure runs, transport, "
+            "commit-tail, or block-size mismatches."
         ),
     )
 
@@ -338,6 +385,15 @@ def _apply_run_overrides(args: argparse.Namespace) -> None:
         os.environ[env_name] = str(value)
 
 
+def _is_sensitive_name(name: str) -> bool:
+    normalized = name.strip().lstrip("-").lower()
+    return (
+        any(token in normalized for token in ("password", "secret", "access_key"))
+        or normalized == "token"
+        or normalized.endswith("_token")
+    )
+
+
 def _redact_argv(argv: List[str]) -> List[str]:
     """Redact likely credentials before persisting invocation metadata."""
     redacted: List[str] = []
@@ -351,9 +407,8 @@ def _redact_argv(argv: List[str]) -> List[str]:
         embedded_key = ""
         if key in ("engine_arg", "engine_env") and "=" in item:
             embedded_key = item.split("=", 1)[1].split("=", 1)[0].lower()
-        sensitive = any(
-            token in key or token in embedded_key
-            for token in ("password", "secret", "access_key", "token")
+        sensitive = _is_sensitive_name(key) or (
+            bool(embedded_key) and _is_sensitive_name(embedded_key)
         )
         if sensitive:
             if "=" in item:
@@ -364,6 +419,78 @@ def _redact_argv(argv: List[str]) -> List[str]:
         else:
             redacted.append(item)
     return redacted
+
+
+_REPRODUCTION_ENV_NAMES = {
+    "CUDA_VISIBLE_DEVICES",
+    "LOCAL_WORLD_SIZE",
+    "START_PORT",
+    "TOKENIZERS_PARALLELISM",
+    "WORLD_SIZE",
+}
+_REPRODUCTION_ENV_PREFIXES = (
+    "CACHE_",
+    "DG_JIT_",
+    "DSV4_",
+    "PERF_",
+    "PREFILL_",
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "TILELANG_",
+    "TRITON_",
+)
+
+
+def _capture_reproduction_env(
+    engine_env_names: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    """Capture performance-relevant environment values with credential redaction."""
+    requested = set(engine_env_names or [])
+    requested.update(
+        name
+        for name in os.environ
+        if name in _REPRODUCTION_ENV_NAMES
+        or name.startswith(_REPRODUCTION_ENV_PREFIXES)
+    )
+    captured = {}
+    for name in sorted(requested):
+        if name not in os.environ:
+            continue
+        lowered = name.lower()
+        sensitive = _is_sensitive_name(lowered)
+        captured[name] = "***" if sensitive else os.environ[name]
+    return captured
+
+
+def _build_cache_resume_config(
+    args: argparse.Namespace,
+    remaining_args: List[str],
+    engine_env_names: Optional[List[str]],
+    expected_cache_block_size: int,
+) -> Dict[str, Any]:
+    """Build the stable model/workload config guarded across resumed attempts."""
+    return {
+        "schema_version": 1,
+        "model": {
+            "model_type": extract_arg(remaining_args, "model_type"),
+            "checkpoint_path": extract_arg(remaining_args, "checkpoint_path"),
+            "tokenizer_path": extract_arg(remaining_args, "tokenizer_path"),
+        },
+        "engine": {
+            "args": _redact_argv(remaining_args),
+            "environment": _capture_reproduction_env(engine_env_names),
+            "dp_size": args.dp_size,
+            "max_seq_len": args.max_seq_len,
+            "concurrency_limit": args.concurrency_limit,
+        },
+        "workload": {
+            "partial": args.partial,
+            "decode_test_length": args.decode_test_length,
+            "cache_measure_runs": args.cache_measure_runs,
+            "cache_commit_tail_tokens": args.cache_commit_tail_tokens,
+            "expected_cache_block_size": expected_cache_block_size,
+            "cache_request_transport": args.cache_request_transport,
+        },
+    }
 
 
 def _replace_cli_value(argv: List[str], key: str, new_value: str) -> None:
@@ -644,6 +771,7 @@ def _write_test_info(
     engine_env_names: Optional[List[str]] = None,
     status: str = "completed",
     expected_cache_block_size: int = 0,
+    resume_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Persist a reproducible, credential-safe test configuration."""
     model_type = extract_arg(remaining_args, "model_type") or os.environ.get(
@@ -657,9 +785,27 @@ def _write_test_info(
     )
     profile = getattr(args, "_profile", None)
     profile_sha256 = getattr(args, "_profile_sha256", None)
+    path = os.path.join(args.result_dir, "test_info.json")
+    previous: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as stream:
+                previous = json.load(stream)
+        except (OSError, ValueError):
+            logging.warning("Ignoring unreadable previous test info at %s", path)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    attempt_count = int(previous.get("attempt_count", 0))
+    if status == "running":
+        attempt_count += 1
     info = {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": status,
+        "started_at": previous.get("started_at", now),
+        "updated_at": now,
+        "last_attempt_started_at": (
+            now if status == "running" else previous.get("last_attempt_started_at", now)
+        ),
+        "attempt_count": attempt_count,
         "model_type": model_type,
         "checkpoint_path": checkpoint_path,
         "tokenizer_path": tokenizer_path,
@@ -687,18 +833,28 @@ def _write_test_info(
             expected_cache_block_size if args.cache_grid_json else None
         ),
         "cache_case_store": args.cache_case_files or None,
+        "cache_request_transport": (
+            args.cache_request_transport if args.cache_grid_json else None
+        ),
+        "cache_grpc_port": (
+            args.cache_grpc_port or None if args.cache_grid_json else None
+        ),
         "dataset_name": args.dataset_name or None,
         "dataset_path": args.dataset_path or args.dataset or None,
         "engine_args": _redact_argv(remaining_args),
         "engine_env_names": sorted(engine_env_names or []),
+        "engine_environment": _capture_reproduction_env(engine_env_names),
         "argv": _redact_argv(sys.argv),
+        "resume_config": resume_config,
+        "resume_config_sha256": resume_config_fingerprint(resume_config),
         "profile": profile,
         "profile_sha256": profile_sha256,
     }
-    path = os.path.join(args.result_dir, "test_info.json")
-    with open(path, "w") as f:
-        json.dump(info, f, indent=2)
-    logging.info(f"Wrote test info to {path}")
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as stream:
+        json.dump(info, stream, indent=2)
+    os.replace(tmp_path, path)
+    logging.info("Wrote test info to %s", path)
 
 
 def _effective_grid_max_seq_len(
@@ -741,8 +897,10 @@ def main() -> str:
     remaining = resolve_perf_engine_paths(remaining)
     generate_config = json.loads(args.generate_config)
     os.makedirs(args.result_dir, exist_ok=True)
-    # Leave a reproduction manifest even if server startup or a request fails.
-    _write_test_info(args, remaining, engine_env_names, status="running")
+    # Cache-grid mode writes its manifest after resolving the grid and resume
+    # fingerprint, but still before tokenizer/model initialization.
+    if not args.cache_grid_json:
+        _write_test_info(args, remaining, engine_env_names, status="running")
     EngineServer.propagate_engine_env(remaining)
 
     logging.info(f"Result directory: {args.result_dir}")
@@ -757,6 +915,8 @@ def main() -> str:
             raise ValueError("--cache_request_timeout must be positive")
         if args.cache_commit_tail_tokens <= 0:
             raise ValueError("--cache_commit_tail_tokens must be positive")
+        if args.cache_checkpoint_every <= 0:
+            raise ValueError("--cache_checkpoint_every must be positive")
         if args.materialize_cache_cases and args.cache_case_files:
             raise ValueError(
                 "--materialize_cache_cases and --cache_case_files are mutually "
@@ -794,6 +954,59 @@ def main() -> str:
             expected_block_size,
             grid_metadata,
         )
+        resume_config = _build_cache_resume_config(
+            args, remaining, engine_env_names, expected_block_size
+        )
+        checkpoint = validate_cache_grid_resume(
+            args.result_dir,
+            grid_sha256=grid_sha256,
+            profile_sha256=getattr(args, "_profile_sha256", None),
+            measure_runs=args.cache_measure_runs,
+            cache_commit_tail_tokens=args.cache_commit_tail_tokens,
+            expected_block_size=expected_block_size,
+            request_transport=args.cache_request_transport,
+            run_config=resume_config,
+            allow_resume_mismatch=args.allow_resume_mismatch,
+            require_resume=args.require_cache_resume,
+        )
+        if checkpoint is not None:
+            logging.info(
+                "cache grid: preflight resume accepted progress=%s",
+                checkpoint.get("progress"),
+            )
+        _write_test_info(
+            args,
+            remaining,
+            engine_env_names,
+            status="running",
+            expected_cache_block_size=expected_block_size,
+            resume_config=resume_config,
+        )
+        checkpoint_ok_keys = (
+            {
+                str(row.get("case_key"))
+                for row in checkpoint.get("metrics", [])
+                if isinstance(row, dict) and row.get("status") == "ok"
+            }
+            if checkpoint is not None
+            else set()
+        )
+        planned_case_keys = {CacheGridRunner.case_key(case) for case in cases}
+        if checkpoint is not None and checkpoint_ok_keys == planned_case_keys:
+            logging.info(
+                "cache grid: checkpoint already contains all %d successful cases; "
+                "skipping tokenizer and model startup",
+                len(cases),
+            )
+            _write_test_info(
+                args,
+                remaining,
+                engine_env_names,
+                status="completed",
+                expected_cache_block_size=expected_block_size,
+                resume_config=resume_config,
+            )
+            return args.result_dir
         for case in cases:
             cache_len = int(case["cache_len"])
             input_len = int(case["input_len"])
@@ -872,6 +1085,7 @@ def main() -> str:
                 args.result_dir,
                 request_timeout=args.cache_request_timeout,
                 measure_runs=args.cache_measure_runs,
+                checkpoint_every=args.cache_checkpoint_every,
                 cache_commit_tail_tokens=args.cache_commit_tail_tokens,
                 grid_metadata=grid_metadata,
                 grid_sha256=grid_sha256,
@@ -880,6 +1094,10 @@ def main() -> str:
                 profile=getattr(args, "_profile", None),
                 profile_sha256=getattr(args, "_profile_sha256", None),
                 allow_resume_mismatch=args.allow_resume_mismatch,
+                require_resume=args.require_cache_resume,
+                request_transport=args.cache_request_transport,
+                grpc_port=args.cache_grpc_port or None,
+                run_config=resume_config,
             ).run()
             _collect_timeline_files(args.result_dir)
         finally:
@@ -890,6 +1108,7 @@ def main() -> str:
             engine_env_names,
             status="completed",
             expected_cache_block_size=expected_block_size,
+            resume_config=resume_config,
         )
         return args.result_dir
 

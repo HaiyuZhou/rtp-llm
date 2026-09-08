@@ -565,6 +565,7 @@ def _apply_request_overrides(
     environment. DashScope-serving still sends per-request thinking, timeout,
     and priority controls; those explicit controls must win before enqueue.
     """
+    generate_config.force_sp_accept = bool(other.force_sp_accept)
     request_max_think = sampling.max_new_think_tokens
     if request_max_think is None:
         request_max_think = other.max_new_think_tokens
@@ -647,7 +648,7 @@ async def iter_real_model_stream_infer(
     the HTTP path). ``request.id`` (string) is preserved as the trace id.
 
     ``echo_prefix_ids`` is the auto-derived "thinking prefill" token id sequence. When
-    non-empty and ``input_ids.values`` ends with it, the first non-empty ``generated_ids``
+    non-empty and ``input_ids.sequence`` ends with it, the first non-empty ``generated_ids``
     chunk gets ``echo_prefix_ids`` prepended so downstream consumers that rely on the
     prefill-echo contract (dashllm-style) see the expected first token.
 
@@ -668,7 +669,7 @@ async def iter_real_model_stream_infer(
     + tuple hashing entirely. The slow branch only fires when a caller explicitly
     sets ``stop_words_list`` on the request.
     """
-    input_ids_list = input_ids.values
+    input_ids_list = input_ids.sequence
     trace_str = str(request.id)
     tag = stream_log_tag(request_id_numeric=rtp_llm_request_id, trace_id=trace_str)
     runtime = think_runtime if think_runtime is not None else _ThinkRuntime()
@@ -1418,7 +1419,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     )
                     yield resp
                     return
-                input_ids_list = input_ids.values
+                input_ids_list = input_ids.sequence
                 if first_request:
                     # Hand the record the payload we just parsed so it does not
                     # decode the same request proto again.

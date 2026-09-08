@@ -1,5 +1,6 @@
 import argparse
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ from unittest import mock
 from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.batch_decode_test import (
+    _capture_reproduction_env,
     _dedupe_cache_grid_cases,
     _effective_grid_max_seq_len,
     _engine_arg_argv,
@@ -15,6 +17,7 @@ from rtp_llm.test.perf_test.batch_decode_test import (
     _parse_name_value,
     _redact_argv,
     _resolve_cache_block_size,
+    _write_test_info,
     parse_args,
 )
 from rtp_llm.test.perf_test.cache_grid_runner import (
@@ -22,6 +25,9 @@ from rtp_llm.test.perf_test.cache_grid_runner import (
     MaterializedCaseStore,
     PrefixPromptFactory,
     _post_prefill,
+    _post_prefill_ids,
+    resume_config_fingerprint,
+    validate_cache_grid_resume,
 )
 
 
@@ -99,6 +105,10 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertEqual(args.expected_cache_block_size, 0)
         self.assertEqual(args.materialize_cache_cases, "")
         self.assertEqual(args.cache_case_files, "")
+        self.assertEqual(args.cache_request_transport, "http_prompt")
+        self.assertEqual(args.cache_grpc_port, 0)
+        self.assertEqual(args.cache_checkpoint_every, 100)
+        self.assertFalse(args.require_cache_resume)
         self.assertIsInstance(remaining, list)
 
     def test_generated_cache_grid_uses_independent_seq_and_cache_alignment(self):
@@ -168,6 +178,45 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertGreaterEqual(result["ttft_ms"], 0.0)
         self.assertEqual(result["ttft_ms"], result["client_wall_time_ms"])
         self.assertEqual(result["ttft_source"], "client_http_wall_max_new_tokens_1")
+
+    def test_post_prefill_ids_parses_grpc_metrics(self):
+        from rtp_llm.dash_sc.proto import predict_v2_pb2
+
+        response = predict_v2_pb2.ModelStreamInferResponse()
+        infer = response.infer_response
+        for name, value in (("prompt_token_num", 4), ("prompt_cached_token_num", 2)):
+            output = infer.outputs.add(name=name, datatype="INT32")
+            output.shape.append(1)
+            infer.raw_output_contents.append(struct.pack("<i", value))
+        output = infer.outputs.add(name="generated_ids", datatype="INT32")
+        output.shape.extend([1, 1])
+        infer.raw_output_contents.append(struct.pack("<i", 7))
+        infer.parameters["engine_cost_time_us"].int64_param = 12500
+        infer.parameters["engine_first_token_cost_time_us"].int64_param = 12000
+        infer.parameters["engine_wait_time_us"].int64_param = 500
+
+        class Stub:
+            def ModelStreamInfer(self, requests, timeout):
+                request = next(requests)
+                self.assert_timeout = timeout
+                self.request = request
+                return iter((response,))
+
+        stub = Stub()
+        result = _post_prefill_ids(stub, [1, 2, 3, 4], 10, "case:run0")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["input_len"], 4)
+        self.assertEqual(result["reuse_len"], 2)
+        self.assertEqual(result["output_len"], 1)
+        self.assertEqual(result["prefill_time_ms"], 12.0)
+        self.assertEqual(result["total_time_ms"], 12.5)
+        self.assertEqual(result["wait_time_ms"], 0.5)
+        self.assertEqual(stub.assert_timeout, 10)
+        self.assertTrue(stub.request.parameters["force_sp_accept"].bool_param)
+        self.assertEqual(
+            result["ttft_source"],
+            "client_dashsc_grpc_input_ids_wall_max_new_tokens_1",
+        )
 
     @patch("rtp_llm.test.perf_test.cache_grid_runner._post_prefill")
     def test_runner_accepts_only_exact_shape_reuse_and_ttft(self, post):
@@ -290,6 +339,75 @@ class BatchDecodeTest(unittest.TestCase):
                 ]
             ),
             ["--engine_env=***", "--engine_arg=tp_size=8"],
+        )
+
+    def test_redact_argv_preserves_noncredential_token_parameters(self):
+        argv = [
+            "--tokenizer_path",
+            "/weights/model",
+            "--cache_commit_tail_tokens",
+            "128",
+            "--max_batch_tokens_size",
+            "1048576",
+        ]
+        self.assertEqual(_redact_argv(argv), argv)
+
+    def test_capture_reproduction_env_records_values_and_redacts_secrets(self):
+        with patch.dict(
+            "os.environ",
+            {"DSV4_CHUNK_TOKENS": "8192", "PRIVATE_TOKEN": "secret-value"},
+            clear=False,
+        ):
+            captured = _capture_reproduction_env(["PRIVATE_TOKEN"])
+        self.assertEqual(captured["DSV4_CHUNK_TOKENS"], "8192")
+        self.assertEqual(captured["PRIVATE_TOKEN"], "***")
+
+    def test_test_info_records_resume_config_env_and_attempt_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _ = parse_args(
+                [
+                    "--result_dir",
+                    tmp,
+                    "--cache_grid_json",
+                    "grid.json",
+                    "--partial",
+                    "2",
+                ]
+            )
+            remaining = [
+                "--model_type",
+                "deepseek_v4",
+                "--checkpoint_path",
+                "/weights/model",
+                "--tokenizer_path",
+                "/weights/model",
+            ]
+            resume_config = {"model": {"checkpoint_path": "/weights/model"}}
+            with patch.dict("os.environ", {"DSV4_CHUNK_TOKENS": "8192"}):
+                _write_test_info(
+                    args,
+                    remaining,
+                    status="running",
+                    expected_cache_block_size=512,
+                    resume_config=resume_config,
+                )
+                _write_test_info(
+                    args,
+                    remaining,
+                    status="completed",
+                    expected_cache_block_size=512,
+                    resume_config=resume_config,
+                )
+            info = json.loads(
+                (Path(tmp) / "test_info.json").read_text(encoding="utf-8")
+            )
+        self.assertEqual(info["schema_version"], 3)
+        self.assertEqual(info["status"], "completed")
+        self.assertEqual(info["attempt_count"], 1)
+        self.assertEqual(info["engine_environment"]["DSV4_CHUNK_TOKENS"], "8192")
+        self.assertEqual(info["resume_config"], resume_config)
+        self.assertEqual(
+            info["resume_config_sha256"], resume_config_fingerprint(resume_config)
         )
 
     def test_resolve_cache_block_size_prefers_cli_value(self):
@@ -651,28 +769,211 @@ class CacheGridRunnerResumeGuardTest(unittest.TestCase):
             )
             self.assertEqual(len(runner._results), 1)
 
+    def test_require_resume_rejects_missing_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "require_cache_resume"):
+                validate_cache_grid_resume(
+                    tmp,
+                    grid_sha256="grid",
+                    profile_sha256="profile",
+                    measure_runs=3,
+                    cache_commit_tail_tokens=128,
+                    expected_block_size=512,
+                    request_transport="http_prompt",
+                    require_resume=True,
+                )
+
+    def test_resume_config_mismatch_is_rejected_before_model_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_config = {"model": {"checkpoint_path": "/weights/old"}}
+            self._write_existing_results(
+                tmp,
+                {
+                    "metrics": [],
+                    "run_config_sha256": resume_config_fingerprint(old_config),
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "run_config_sha256"):
+                validate_cache_grid_resume(
+                    tmp,
+                    grid_sha256=None,
+                    profile_sha256=None,
+                    measure_runs=3,
+                    cache_commit_tail_tokens=128,
+                    expected_block_size=0,
+                    request_transport="http_prompt",
+                    run_config={"model": {"checkpoint_path": "/weights/new"}},
+                )
+
+    @patch("rtp_llm.test.perf_test.cache_grid_runner._post_prefill")
+    def test_resume_skips_ok_case_and_starts_at_next_input_cache(self, post):
+        cases = [
+            {"case_id": 0, "batch_size": 1, "input_len": 8, "cache_len": 0},
+            {"case_id": 1, "batch_size": 1, "input_len": 16, "cache_len": 0},
+        ]
+        post.return_value = {
+            "success": True,
+            "input_len": 16,
+            "output_len": 1,
+            "reuse_len": 0,
+            "ttft_ms": 5.0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_existing_results(
+                tmp,
+                {
+                    "metrics": [
+                        {
+                            "case_key": "bs1_seq8_cache0",
+                            "case_id": 0,
+                            "status": "ok",
+                        }
+                    ],
+                    "measure_runs": 1,
+                    "request_transport": "http_prompt",
+                    "started_at": "2026-09-08T00:00:00+0800",
+                },
+            )
+            rows = CacheGridRunner(
+                12345,
+                _WordTokenizer(),
+                cases,
+                tmp,
+                measure_runs=1,
+                cache_commit_tail_tokens=4,
+            ).run()
+            result = json.loads(
+                (Path(tmp) / "cache_grid_results.json").read_text(encoding="utf-8")
+            )
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["resume_count"], 1)
+        self.assertEqual(result["progress"]["completed_cases"], 2)
+        self.assertIsNone(result["progress"]["next_pending_case"])
+
+    def test_resume_replays_case_journal_newer_than_full_checkpoint(self):
+        cases = [
+            {"case_id": 0, "batch_size": 1, "input_len": 8, "cache_len": 0},
+            {"case_id": 1, "batch_size": 1, "input_len": 16, "cache_len": 0},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            first = CacheGridRunner(
+                0,
+                _WordTokenizer(),
+                cases,
+                tmp,
+                measure_runs=1,
+                cache_commit_tail_tokens=4,
+            )
+            first._save(complete=False)
+            metric = {
+                "case_key": first.case_key(cases[0]),
+                "case_id": 0,
+                "status": "ok",
+            }
+            first._append_journal(metric)
+            first._close_resources()
+
+            resumed = CacheGridRunner(
+                0,
+                _WordTokenizer(),
+                cases,
+                tmp,
+                measure_runs=1,
+                cache_commit_tail_tokens=4,
+            )
+            try:
+                self.assertEqual(
+                    resumed._results[resumed.case_key(cases[0])]["status"], "ok"
+                )
+                progress = resumed._progress()
+                self.assertEqual(progress["completed_cases"], 1)
+                self.assertEqual(progress["next_pending_case"]["input_len"], 16)
+            finally:
+                resumed._close_resources()
+
+    @patch("rtp_llm.test.perf_test.cache_grid_runner._post_prefill")
+    def test_keyboard_interrupt_flushes_resumable_next_case(self, post):
+        post.side_effect = KeyboardInterrupt()
+        case = {
+            "case_id": 7,
+            "batch_size": 1,
+            "input_len": 16,
+            "cache_len": 0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = CacheGridRunner(
+                12345,
+                _WordTokenizer(),
+                [case],
+                tmp,
+                measure_runs=1,
+                cache_commit_tail_tokens=4,
+            )
+            with self.assertRaises(KeyboardInterrupt):
+                runner.run()
+            result = json.loads(
+                (Path(tmp) / "cache_grid_results.json").read_text(encoding="utf-8")
+            )
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["progress"]["completed_cases"], 0)
+        self.assertEqual(
+            result["progress"]["next_pending_case"],
+            {
+                "case_key": "bs1_seq16_cache0",
+                "case_id": 7,
+                "batch_size": 1,
+                "input_len": 16,
+                "cache_len": 0,
+            },
+        )
+
     def test_save_includes_profile_and_measure_runs(self):
         import json
 
         with tempfile.TemporaryDirectory() as tmp:
             profile = {"schema_version": 1, "label": "test"}
+            cases = [
+                {"case_id": 0, "batch_size": 1, "input_len": 1024, "cache_len": 0},
+                {"case_id": 1, "batch_size": 1, "input_len": 2048, "cache_len": 512},
+            ]
+            run_config = {"model": {"checkpoint_path": "/weights/model"}}
             runner = CacheGridRunner(
                 0,
                 _WordTokenizer(),
-                [{"case_id": 0, "batch_size": 1, "input_len": 1024, "cache_len": 0}],
+                cases,
                 tmp,
                 measure_runs=5,
                 expected_block_size=256,
                 profile=profile,
                 profile_sha256="fp123",
+                run_config=run_config,
             )
-            runner._save(complete=True)
+            runner._results[runner.case_key(cases[0])] = {
+                "case_key": runner.case_key(cases[0]),
+                "status": "ok",
+            }
+            runner._save(complete=False)
             path = Path(tmp) / "cache_grid_results.json"
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(payload["measure_runs"], 5)
             self.assertEqual(payload["expected_block_size"], 256)
             self.assertEqual(payload["profile"], profile)
             self.assertEqual(payload["profile_sha256"], "fp123")
+            self.assertEqual(payload["schema_version"], 2)
+            self.assertEqual(payload["run_config"], run_config)
+            self.assertEqual(
+                payload["run_config_sha256"], resume_config_fingerprint(run_config)
+            )
+            self.assertEqual(payload["progress"]["completed_cases"], 1)
+            self.assertEqual(
+                payload["progress"]["last_completed_case"]["input_len"], 1024
+            )
+            self.assertEqual(
+                payload["progress"]["next_pending_case"]["input_len"], 2048
+            )
+            self.assertEqual(payload["progress"]["next_pending_case"]["cache_len"], 512)
 
 
 class MaterializedCaseStoreProfileTest(unittest.TestCase):

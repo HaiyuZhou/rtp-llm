@@ -73,9 +73,7 @@ def _make_observations(count: int = 20) -> list[Observation]:
         input_len = 1024 * (i + 1)
         cache_len = 512 * i
         compute_len = input_len - cache_len
-        target_ms = 10.0 + 0.5 * (compute_len / 1024.0) - 0.1 * (
-            cache_len / 1024.0
-        )
+        target_ms = 10.0 + 0.5 * (compute_len / 1024.0) - 0.1 * (cache_len / 1024.0)
         rows.append(
             Observation(
                 batch_size=1,
@@ -128,6 +126,30 @@ def _write_cache_grid_result(
         "metrics": metrics,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+class MeasurementContractTest(unittest.TestCase):
+    def test_load_rejects_mixed_ttft_sources(self):
+        rows = _make_observations(2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for index, source in enumerate(
+                (
+                    "client_http_wall_max_new_tokens_1",
+                    "client_dashsc_grpc_input_ids_wall_max_new_tokens_1",
+                )
+            ):
+                path = Path(tmpdir) / f"result-{index}.json"
+                _write_cache_grid_result(path, rows)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                for metric in payload["metrics"]:
+                    for run in metric["runs"]:
+                        run["ttft_source"] = source
+                        run["ttft_ms"] = run["prefill_time_ms"]
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                paths.append(path)
+            with self.assertRaisesRegex(ValueError, "incompatible request transports"):
+                load_observations(paths)
 
 
 class BuildFeatureNamesTest(unittest.TestCase):

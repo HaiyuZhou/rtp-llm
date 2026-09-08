@@ -494,11 +494,36 @@ python3 deepseek_v4_prefill_formula_fit.py analyze-anomalies \
   --profile $PROFILE --estimator min
 ```
 
-### Resume 守卫
+### 断点续测与 Resume 守卫
 
-Runner 在恢复时会校验 `grid_sha256`、`profile_sha256`、`measure_runs` 和
-`expected_block_size`。如果缓存的 `cache_grid_results.json` 与当前 profile
-不匹配，运行会中止。传 `--allow_resume_mismatch` 可以跳过校验（仅 warning）。
+Cache-grid 每完成一个 case 都会同步追加
+`cache_grid_results.journal.jsonl`，并原子更新轻量的
+`cache_grid_progress.json`；每 100 个 case（可用
+`--cache_checkpoint_every` 调整）及正常退出时，将 journal 合并进完整的
+`cache_grid_results.json`。重新执行原命令并使用**同一个**
+`--result_dir` 时，会自动跳过所有 `status=ok` 的 case；中断时尚未完成或
+失败的 case 会从该点重新执行。推荐在续测命令额外加
+`--require_cache_resume`，这样结果目录写错时会直接报错，而不会意外开始一轮
+新测试：
+
+```bash
+# 其余模型、profile、grid 和引擎参数必须与首次运行保持一致
+python3 -m rtp_llm.test.perf_test.batch_decode_test \
+  ...首次运行的全部参数... \
+  --result_dir "$RESULT_DIR" \
+  --require_cache_resume
+```
+
+checkpoint 顶层的 `progress` 会记录 `completed_cases`、`pending_cases`、
+`progress_pct`，以及 `last_completed_case` / `next_pending_case` 的
+`input_len` 和 `cache_len`。`test_info.json` 会记录完整 argv、脱敏后的相关环境
+变量值、首次启动时间、最近更新时间和 `attempt_count`。
+
+恢复校验在 tokenizer 和模型加载**之前**执行，覆盖 `grid_sha256`、
+`profile_sha256`、模型/权重/引擎配置指纹、`measure_runs`、transport、
+`cache_commit_tail_tokens` 和 `expected_block_size`。配置不一致时默认中止。
+`--allow_resume_mismatch` 仅用于人工确认过的特殊场景，因为它会复用不同配置
+产生的成功结果。
 
 ### 限制
 

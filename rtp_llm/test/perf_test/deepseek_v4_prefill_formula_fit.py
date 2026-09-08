@@ -191,6 +191,7 @@ def load_observations(
     observations: list[Observation] = []
     rejected: dict[str, int] = {}
     input_files: list[dict[str, Any]] = []
+    measurement_contracts: set[str] = set()
     for path in paths:
         if path.suffix.lower() == ".csv":
             with path.open(newline="", encoding="utf-8") as stream:
@@ -215,9 +216,7 @@ def load_observations(
                                 "client_wall_time_ms",
                                 item.get(
                                     "avg_prefill_time_ms",
-                                    item.get(
-                                        "prefill_time_ms", item.get("target_ms")
-                                    ),
+                                    item.get("prefill_time_ms", item.get("target_ms")),
                                 ),
                             ),
                         ),
@@ -249,6 +248,33 @@ def load_observations(
             )
             continue
 
+        json_payload = json.loads(path.read_text(encoding="utf-8"))
+        file_sources = {
+            str(run.get("ttft_source"))
+            for item in (
+                json_payload.get("metrics", json_payload.get("results", []))
+                if isinstance(json_payload, dict)
+                else []
+            )
+            if isinstance(item, dict)
+            for run in item.get("runs", [])
+            if isinstance(run, dict) and run.get("ttft_source")
+        }
+        if len(file_sources) > 1:
+            raise ValueError(
+                f"{path}: mixed ttft_source values are not fit-compatible: "
+                f"{sorted(file_sources)}"
+            )
+        transport = (
+            json_payload.get("request_transport")
+            if isinstance(json_payload, dict)
+            else None
+        )
+        contract = next(iter(file_sources), None) or (
+            f"transport:{transport}" if transport else None
+        )
+        if contract:
+            measurement_contracts.add(contract)
         source_count = 0
         for index, item in _iter_json_metrics(path):
             source_count += 1
@@ -288,6 +314,12 @@ def load_observations(
             )
         input_files.append({"path": str(path), "rows": source_count, "format": "json"})
 
+    if len(measurement_contracts) > 1:
+        raise ValueError(
+            "input files mix incompatible request transports/TTFT sources: "
+            f"{sorted(measurement_contracts)}"
+        )
+
     observations.sort(
         key=lambda row: (row.batch_size, row.input_len, row.cache_len, row.source)
     )
@@ -319,6 +351,7 @@ def load_observations(
         "unique_geometry_count": len(unique),
         "rejected_counts": rejected,
         "selected_batch_size": batch_size,
+        "measurement_contracts": sorted(measurement_contracts),
         "seq_len_range": [
             min((x.input_len for x in observations), default=None),
             max((x.input_len for x in observations), default=None),
@@ -456,9 +489,7 @@ def fit_hybrid_coefficients(
         dtype=torch.float64,
         device="cpu",
     )
-    y = torch.tensor(
-        [row.target_ms for row in rows], dtype=torch.float64, device="cpu"
-    )
+    y = torch.tensor([row.target_ms for row in rows], dtype=torch.float64, device="cpu")
     scales = torch.amax(torch.abs(x), dim=0).clamp_min(1.0)
     scaled_x = x / scales
     # Start from the exact coordinate-descent MAE fit.  It is a materially
@@ -482,9 +513,10 @@ def fit_hybrid_coefficients(
         optimizer.zero_grad(set_to_none=True)
         with torch.enable_grad():
             absolute_error = torch.abs(scaled_x.mv(beta) - y)
-            loss = 0.5 * absolute_error.mean() / latency_scale + 0.5 * (
-                absolute_error / y.clamp_min(1e-9)
-            ).mean()
+            loss = (
+                0.5 * absolute_error.mean() / latency_scale
+                + 0.5 * (absolute_error / y.clamp_min(1e-9)).mean()
+            )
             loss.backward()
         optimizer.step()
         value = float(loss.detach())
@@ -649,7 +681,9 @@ def formula_text(
     return "".join(terms) if terms else "0"
 
 
-def write_fit_gap_svg(predictions: Sequence[dict[str, Any]], path: pathlib.Path) -> None:
+def write_fit_gap_svg(
+    predictions: Sequence[dict[str, Any]], path: pathlib.Path
+) -> None:
     """Write an all-point measured-vs-predicted and absolute-error chart."""
     if not predictions:
         return
@@ -658,9 +692,7 @@ def write_fit_gap_svg(predictions: Sequence[dict[str, Any]], path: pathlib.Path)
     left_x, right_x, top = 120.0, 1010.0, 150.0
     targets = [float(row["target_ms"]) for row in predictions]
     estimates = [float(row["predicted_ms"]) for row in predictions]
-    errors = [
-        abs(estimate - target) for estimate, target in zip(estimates, targets)
-    ]
+    errors = [abs(estimate - target) for estimate, target in zip(estimates, targets)]
     latency_max = max(max(targets), max(estimates), 1.0)
     error_max = max(max(errors), 1.0)
     p95_abs = _quantile(errors, 0.95)
@@ -688,19 +720,19 @@ def write_fit_gap_svg(predictions: Sequence[dict[str, Any]], path: pathlib.Path)
         '<rect width="100%" height="100%" fill="#fff"/>',
         (
             '<style>text{font-family:Arial,"Noto Sans CJK SC","Microsoft YaHei",'
-            'sans-serif;fill:#172033}.title{font-size:32px;font-weight:700}'
-            '.sub{font-size:17px;fill:#475569}.panel{font-size:22px;font-weight:700}'
-            '.axis{font-size:17px;fill:#334155}.tick{font-size:14px;fill:#64748b}'
-            '.legend{font-size:15px;fill:#334155}</style>'
+            "sans-serif;fill:#172033}.title{font-size:32px;font-weight:700}"
+            ".sub{font-size:17px;fill:#475569}.panel{font-size:22px;font-weight:700}"
+            ".axis{font-size:17px;fill:#334155}.tick{font-size:14px;fill:#64748b}"
+            ".legend{font-size:15px;fill:#334155}</style>"
         ),
         (
             '<text x="900" y="48" text-anchor="middle" class="title">'
-            'DeepSeek-V4-Pro：实测 TTFT 与拟合误差</text>'
+            "DeepSeek-V4-Pro：实测 TTFT 与拟合误差</text>"
         ),
         (
             f'<text x="900" y="82" text-anchor="middle" class="sub">'
-            f'{len(predictions):,} 个严格有效 geometry；'
-            '每个点取 3 次成功请求的 TTFT 中位数</text>'
+            f"{len(predictions):,} 个严格有效 geometry；"
+            "每个点取 3 次成功请求的 TTFT 中位数</text>"
         ),
         (
             f'<text x="{left_x + panel_width / 2:.1f}" y="120" '

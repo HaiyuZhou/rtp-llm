@@ -26,10 +26,12 @@ without a tokenizer (``MaterializedCaseStore``).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import statistics
+import struct
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -38,6 +40,91 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
+
+
+def resume_config_fingerprint(config: Dict[str, Any] | None) -> str | None:
+    """Return a stable fingerprint for the model/workload configuration."""
+    if config is None:
+        return None
+    canonical = json.dumps(
+        config, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_cache_grid_resume(
+    result_dir: str,
+    *,
+    grid_sha256: str | None,
+    profile_sha256: str | None,
+    measure_runs: int,
+    cache_commit_tail_tokens: int,
+    expected_block_size: int,
+    request_transport: str,
+    run_config: Dict[str, Any] | None = None,
+    allow_resume_mismatch: bool = False,
+    require_resume: bool = False,
+) -> Dict[str, Any] | None:
+    """Validate a checkpoint before expensive tokenizer/model initialization."""
+    result_path = Path(result_dir) / "cache_grid_results.json"
+    if not result_path.exists():
+        if require_resume:
+            raise ValueError(
+                f"cache grid: --require_cache_resume was set but checkpoint "
+                f"does not exist: {result_path}"
+            )
+        return None
+    with result_path.open(encoding="utf-8") as stream:
+        payload = json.load(stream)
+
+    mismatches = []
+    checks = (
+        ("grid_sha256", payload.get("grid_sha256"), grid_sha256),
+        ("profile_sha256", payload.get("profile_sha256"), profile_sha256),
+        ("measure_runs", payload.get("measure_runs"), measure_runs),
+        (
+            "cache_commit_tail_tokens",
+            payload.get("cache_commit_tail_tokens"),
+            cache_commit_tail_tokens,
+        ),
+        (
+            "request_transport",
+            payload.get("request_transport", "http_prompt"),
+            request_transport,
+        ),
+    )
+    for name, old, new in checks:
+        if old is not None and new is not None and str(old) != str(new):
+            mismatches.append(f"{name}: {old} vs {new}")
+    old_block_size = payload.get("expected_block_size")
+    if (
+        old_block_size is not None
+        and expected_block_size > 0
+        and int(old_block_size) != expected_block_size
+    ):
+        mismatches.append(
+            f"expected_block_size: {old_block_size} vs {expected_block_size}"
+        )
+    old_config_sha = payload.get("run_config_sha256")
+    new_config_sha = resume_config_fingerprint(run_config)
+    if old_config_sha and new_config_sha and old_config_sha != new_config_sha:
+        mismatches.append(f"run_config_sha256: {old_config_sha} vs {new_config_sha}")
+
+    if mismatches:
+        detail = "; ".join(mismatches)
+        if allow_resume_mismatch:
+            logging.warning(
+                "cache grid: resuming with mismatched parameters "
+                "(--allow_resume_mismatch): %s",
+                detail,
+            )
+        else:
+            raise ValueError(
+                f"cache grid: existing results at {result_path} have "
+                f"incompatible parameters: {detail}. Pass "
+                f"--allow_resume_mismatch to override."
+            )
+    return payload
 
 
 def _make_http_session() -> requests.Session:
@@ -196,8 +283,13 @@ class PrefixPromptFactory:
     def make_seed(
         self, case_id: int, prefix: str, cache_len: int, commit_tail_tokens: int
     ) -> str:
+        return self.make_seed_and_ids(case_id, prefix, cache_len, commit_tail_tokens)[0]
+
+    def make_seed_and_ids(
+        self, case_id: int, prefix: str, cache_len: int, commit_tail_tokens: int
+    ) -> Tuple[str, List[int]]:
         if cache_len <= 0:
-            return ""
+            return "", []
         seed_len = cache_len + commit_tail_tokens
         seed, seed_ids = self._exact_text_and_ids(
             seed_len, prefix + f" __seed_commit_{case_id}_"
@@ -210,7 +302,7 @@ class PrefixPromptFactory:
                 f"unable to build cache seed for case={case_id}: "
                 f"prefix={cache_len}, seed={len(seed_ids)}"
             )
-        return seed
+        return seed, seed_ids
 
     def _safe_marker_ids(self, marker: str) -> Optional[List[int]]:
         """Marker ids when ``marker + filler*k`` tokenizes structurally.
@@ -636,6 +728,75 @@ def _post_prefill(
     }
 
 
+def _post_prefill_ids(stub, input_ids, timeout: int, request_id: str) -> Dict[str, Any]:
+    """Send pre-tokenized INT32 ids over Dash-SC gRPC and record end-to-end TTFT."""
+    from rtp_llm.dash_sc.client import build_model_infer_request
+    from rtp_llm.dash_sc.codec import SamplingParams
+
+    started = time.perf_counter()
+    try:
+        request = build_model_infer_request(
+            request_id=request_id,
+            model_name="rtp_llm",
+            input_ids=input_ids,
+            sampling=SamplingParams(max_new_tokens=1, min_new_tokens=1, top_k=1),
+            enable_thinking=False,
+            force_sp_accept=True,
+        )
+        responses = stub.ModelStreamInfer(iter((request,)), timeout=timeout)
+        values: Dict[str, Any] = {}
+        output_len = 0
+        for response in responses:
+            if response.error_message:
+                raise RuntimeError(response.error_message)
+            if not response.HasField("infer_response"):
+                continue
+            infer = response.infer_response
+            for name in (
+                "engine_cost_time_us",
+                "engine_first_token_cost_time_us",
+                "engine_wait_time_us",
+            ):
+                if name in infer.parameters:
+                    values[name] = infer.parameters[name].int64_param / 1000.0
+            for index, output in enumerate(infer.outputs):
+                if index >= len(infer.raw_output_contents):
+                    continue
+                raw = infer.raw_output_contents[index]
+                if output.name == "generated_ids" and output.datatype == "INT32":
+                    shape = list(output.shape)
+                    output_len = max(
+                        output_len, int(shape[-1]) if shape else len(raw) // 4
+                    )
+                elif output.datatype == "INT32" and len(raw) >= 4:
+                    values[output.name] = struct.unpack_from("<i", raw)[0]
+                elif output.datatype == "FP64" and len(raw) >= 8:
+                    values[output.name] = struct.unpack_from("<d", raw)[0]
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        return {
+            "success": True,
+            "request_id": request_id,
+            "input_len": int(values.get("prompt_token_num", 0)),
+            "output_len": output_len,
+            "reuse_len": int(values.get("prompt_cached_token_num", 0)),
+            "prefill_time_ms": float(
+                values.get("engine_first_token_cost_time_us", 0.0)
+            ),
+            "total_time_ms": float(values.get("engine_cost_time_us", 0.0)),
+            "wait_time_ms": float(values.get("engine_wait_time_us", 0.0)),
+            "client_wall_time_ms": wall_ms,
+            "ttft_ms": wall_ms,
+            "ttft_source": "client_dashsc_grpc_input_ids_wall_max_new_tokens_1",
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": repr(exc),
+            "request_id": request_id,
+            "client_wall_time_ms": (time.perf_counter() - started) * 1000.0,
+        }
+
+
 class CacheGridRunner:
     """Run and checkpoint a total-seq × prefix-cache grid."""
 
@@ -648,7 +809,7 @@ class CacheGridRunner:
         *,
         request_timeout: int = 7200,
         measure_runs: int = 3,
-        checkpoint_every: int = 1,
+        checkpoint_every: int = 100,
         cache_commit_tail_tokens: int = 4096,
         fail_fast: bool = True,
         grid_metadata: Dict[str, Any] | None = None,
@@ -658,8 +819,33 @@ class CacheGridRunner:
         profile: Dict[str, Any] | None = None,
         profile_sha256: str | None = None,
         allow_resume_mismatch: bool = False,
+        require_resume: bool = False,
+        request_transport: str = "http_prompt",
+        grpc_port: int | None = None,
+        run_config: Dict[str, Any] | None = None,
     ):
         self.port = port
+        if request_transport not in {"http_prompt", "dashsc_input_ids"}:
+            raise ValueError(
+                f"unsupported cache request transport: {request_transport}"
+            )
+        self.request_transport = request_transport
+        self.grpc_port = int(grpc_port if grpc_port is not None else port + 8)
+        self._grpc_channel = None
+        self._grpc_stub = None
+        if self.request_transport == "dashsc_input_ids":
+            import grpc
+
+            from rtp_llm.dash_sc.client import dash_sc_grpc_client_channel_options
+            from rtp_llm.dash_sc.proto import predict_v2_pb2_grpc
+
+            self._grpc_channel = grpc.insecure_channel(
+                f"127.0.0.1:{self.grpc_port}",
+                options=dash_sc_grpc_client_channel_options(),
+            )
+            self._grpc_stub = predict_v2_pb2_grpc.GRPCInferenceServiceStub(
+                self._grpc_channel
+            )
         self.factory = PrefixPromptFactory(tokenizer)
         self.cases = list(cases)
         self.case_store = case_store
@@ -689,87 +875,189 @@ class CacheGridRunner:
         self.expected_block_size = expected_block_size
         self.profile = profile
         self.profile_sha256 = profile_sha256
+        self.run_config = run_config
+        self.run_config_sha256 = resume_config_fingerprint(run_config)
         self.result_path = self.result_dir / "cache_grid_results.json"
+        self.progress_path = self.result_dir / "cache_grid_progress.json"
+        self.journal_path = self.result_dir / "cache_grid_results.journal.jsonl"
         self._results: Dict[str, Dict[str, Any]] = {}
+        self._resume_count = 0
+        self._started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        payload = validate_cache_grid_resume(
+            str(self.result_dir),
+            grid_sha256=self.grid_sha256,
+            profile_sha256=self.profile_sha256,
+            measure_runs=self.measure_runs,
+            cache_commit_tail_tokens=self.cache_commit_tail_tokens,
+            expected_block_size=self.expected_block_size,
+            request_transport=self.request_transport,
+            run_config=self.run_config,
+            allow_resume_mismatch=allow_resume_mismatch,
+            require_resume=require_resume,
+        )
+        if payload is None and self.journal_path.exists():
+            raise ValueError(
+                f"cache grid: found {self.journal_path} without the base "
+                f"{self.result_path}; restore the base checkpoint or use a new "
+                f"result directory"
+            )
+        if payload is not None:
+            planned_keys = {self.case_key(case) for case in self.cases}
+            self._results = {
+                str(row["case_key"]): row
+                for row in payload.get("metrics", [])
+                if isinstance(row, dict) and row.get("case_key") in planned_keys
+            }
+            self._load_journal(planned_keys)
+            self._resume_count = int(payload.get("resume_count", 0)) + 1
+            self._started_at = payload.get("started_at", self._started_at)
+            progress = payload.get("progress") or {}
+            logging.info(
+                "cache grid: checkpoint loaded resume_count=%d completed=%s/%s "
+                "next=%s",
+                self._resume_count,
+                progress.get("completed_cases", len(self._results)),
+                progress.get("total_cases", len(self.cases)),
+                progress.get("next_pending_case"),
+            )
         self._http_session = _make_http_session()
         self._checkpoint_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="checkpoint-writer"
         )
         self._checkpoint_future: Optional[Future] = None
-        if self.result_path.exists():
-            with self.result_path.open(encoding="utf-8") as f:
-                payload = json.load(f)
-            self._check_resume_guard(payload, allow_resume_mismatch)
-            self._results = {str(x["case_key"]): x for x in payload.get("metrics", [])}
-
-    def _check_resume_guard(
-        self, payload: Dict[str, Any], allow_resume_mismatch: bool
-    ) -> None:
-        """Validate that the existing results are compatible with the current run."""
-        mismatches = []
-        old_grid_sha = payload.get("grid_sha256")
-        if old_grid_sha and self.grid_sha256 and old_grid_sha != self.grid_sha256:
-            mismatches.append(f"grid_sha256: {old_grid_sha} vs {self.grid_sha256}")
-        old_profile_sha = payload.get("profile_sha256")
-        if (
-            old_profile_sha
-            and self.profile_sha256
-            and old_profile_sha != self.profile_sha256
-        ):
-            mismatches.append(
-                f"profile_sha256: {old_profile_sha} vs {self.profile_sha256}"
-            )
-        old_measure_runs = payload.get("measure_runs")
-        if old_measure_runs is not None and int(old_measure_runs) != self.measure_runs:
-            mismatches.append(
-                f"measure_runs: {old_measure_runs} vs {self.measure_runs}"
-            )
-        old_block_size = payload.get("expected_block_size")
-        if (
-            old_block_size is not None
-            and self.expected_block_size > 0
-            and int(old_block_size) != self.expected_block_size
-        ):
-            mismatches.append(
-                f"expected_block_size: {old_block_size} vs {self.expected_block_size}"
-            )
-        if mismatches:
-            detail = "; ".join(mismatches)
-            if allow_resume_mismatch:
-                logging.warning(
-                    "cache grid: resuming with mismatched parameters (--allow_resume_mismatch): %s",
-                    detail,
-                )
-            else:
-                raise ValueError(
-                    f"cache grid: existing results at {self.result_path} have "
-                    f"incompatible parameters: {detail}. Pass "
-                    f"--allow_resume_mismatch to override."
-                )
 
     @staticmethod
     def case_key(case: Dict[str, int]) -> str:
         return f"bs{case['batch_size']}_seq{case['input_len']}_cache{case['cache_len']}"
 
+    def _load_journal(self, planned_keys: set[str]) -> None:
+        if not self.journal_path.exists():
+            return
+        loaded = 0
+        with self.journal_path.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    logging.warning(
+                        "cache grid: ignoring malformed journal record at %s:%d",
+                        self.journal_path,
+                        line_number,
+                    )
+                    continue
+                if isinstance(row, dict) and row.get("case_key") in planned_keys:
+                    self._results[str(row["case_key"])] = row
+                    loaded += 1
+        if loaded:
+            logging.info(
+                "cache grid: replayed %d durable case records from %s",
+                loaded,
+                self.journal_path,
+            )
+
+    def _append_journal(self, metric: Dict[str, Any]) -> None:
+        encoded = (
+            json.dumps(metric, separators=(",", ":"), ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        with self.journal_path.open("a+b") as stream:
+            size = stream.tell()
+            if size:
+                stream.seek(-1, os.SEEK_END)
+                if stream.read(1) != b"\n":
+                    stream.write(b"\n")
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def _write_json_atomic(self, path: Path, payload: Dict[str, Any]) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2)
+        os.replace(tmp, path)
+
     def _write_checkpoint(self, payload: Dict[str, Any]) -> None:
-        tmp = self.result_path.with_suffix(".json.tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        os.replace(tmp, self.result_path)
+        self._write_json_atomic(self.result_path, payload)
+
+    def _write_progress_checkpoint(self) -> None:
+        self._write_json_atomic(
+            self.progress_path,
+            {
+                "schema_version": 1,
+                "mode": "prefix_cache_grid_progress",
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "resume_count": self._resume_count,
+                "run_config_sha256": self.run_config_sha256,
+                "progress": self._progress(),
+            },
+        )
+
+    @staticmethod
+    def _case_descriptor(case: Dict[str, int]) -> Dict[str, Any]:
+        return {
+            "case_key": CacheGridRunner.case_key(case),
+            "case_id": int(case["case_id"]),
+            "batch_size": int(case.get("batch_size", 1)),
+            "input_len": int(case["input_len"]),
+            "cache_len": int(case["cache_len"]),
+        }
+
+    def _progress(self) -> Dict[str, Any]:
+        completed = []
+        failed = []
+        next_pending = None
+        for case in self.cases:
+            row = self._results.get(self.case_key(case))
+            if row is not None and row.get("status") == "ok":
+                completed.append(case)
+            else:
+                if next_pending is None:
+                    next_pending = case
+                if row is not None:
+                    failed.append(case)
+        completed_count = len(completed)
+        return {
+            "total_cases": len(self.cases),
+            "attempted_cases": completed_count + len(failed),
+            "completed_cases": completed_count,
+            "failed_or_invalid_cases": len(failed),
+            "pending_cases": len(self.cases) - completed_count,
+            "progress_pct": (
+                round(100.0 * completed_count / len(self.cases), 6)
+                if self.cases
+                else 100.0
+            ),
+            "last_completed_case": (
+                self._case_descriptor(completed[-1]) if completed else None
+            ),
+            "next_pending_case": (
+                self._case_descriptor(next_pending) if next_pending else None
+            ),
+        }
 
     def _save(self, *, complete: bool = False, asynchronous: bool = False) -> None:
+        progress = self._progress()
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "mode": "prefix_cache_grid",
             "complete": complete,
-            "total_cases": len(self.cases),
-            "completed_cases": sum(
-                row.get("status") == "ok" for row in self._results.values()
-            ),
+            "status": "completed" if complete else "in_progress",
+            "started_at": self._started_at,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "resume_count": self._resume_count,
+            "total_cases": progress["total_cases"],
+            "completed_cases": progress["completed_cases"],
+            "progress": progress,
             "grid_metadata": self.grid_metadata,
             "grid_sha256": self.grid_sha256,
             "measure_runs": self.measure_runs,
+            "cache_commit_tail_tokens": self.cache_commit_tail_tokens,
+            "checkpoint_every": self.checkpoint_every,
             "expected_block_size": self.expected_block_size,
+            "request_transport": self.request_transport,
+            "run_config": self.run_config,
+            "run_config_sha256": self.run_config_sha256,
             "profile": self.profile,
             "profile_sha256": self.profile_sha256,
             "metrics": list(self._results.values()),
@@ -785,6 +1073,7 @@ class CacheGridRunner:
             self._checkpoint_future.result()
             self._checkpoint_future = None
         self._write_checkpoint(payload)
+        self._write_progress_checkpoint()
 
     def _close_resources(self) -> None:
         if self._checkpoint_future is not None:
@@ -792,6 +1081,19 @@ class CacheGridRunner:
             self._checkpoint_future = None
         self._checkpoint_executor.shutdown(wait=True)
         self._http_session.close()
+        if self._grpc_channel is not None:
+            self._grpc_channel.close()
+
+    def _post_request(self, prompt: str, input_ids, request_id: str) -> Dict[str, Any]:
+        if self.request_transport == "dashsc_input_ids":
+            if self._grpc_stub is None:
+                raise RuntimeError("Dash-SC gRPC transport is not initialized")
+            return _post_prefill_ids(
+                self._grpc_stub, input_ids, self.request_timeout, request_id
+            )
+        return _post_prefill(
+            self.port, prompt, self.request_timeout, request_id, self._http_session
+        )
 
     def _probe_reuse_granularity(self) -> None:
         """Fail fast when the assumed physical reuse granularity is wrong."""
@@ -801,7 +1103,7 @@ class CacheGridRunner:
         prefix_text, prefix_ids = self.factory._exact_text_and_ids(
             block, PrefixPromptFactory.SHARED_PREFIX_MARKER
         )
-        seed_text = self.factory.make_seed(
+        seed_text, seed_ids = self.factory.make_seed_and_ids(
             -1, prefix_text, block, self.cache_commit_tail_tokens
         )
         hit_text, hit_ids = self.factory._exact_text_and_ids(
@@ -813,22 +1115,10 @@ class CacheGridRunner:
             raise RuntimeError(
                 "block-size probe could not build a prompt preserving its own prefix"
             )
-        seed = _post_prefill(
-            self.port,
-            seed_text,
-            self.request_timeout,
-            "block_size_probe:seed",
-            self._http_session,
-        )
+        seed = self._post_request(seed_text, seed_ids, "block_size_probe:seed")
         if not seed.get("success"):
             raise RuntimeError(f"block-size probe seed failed: {seed.get('error')}")
-        hit = _post_prefill(
-            self.port,
-            hit_text,
-            self.request_timeout,
-            "block_size_probe:hit",
-            self._http_session,
-        )
+        hit = self._post_request(hit_text, hit_ids, "block_size_probe:hit")
         if not hit.get("success"):
             raise RuntimeError(f"block-size probe request failed: {hit.get('error')}")
         observed = int(hit.get("reuse_len", -1))
@@ -879,16 +1169,20 @@ class CacheGridRunner:
         prompts = self._build_prompts(case, total_len, cache_len)
         prefix = prompts.seed_text
         built_len = prompts.built_len
-        seed = (
-            self.factory.make_seed(
+        if self.request_transport == "dashsc_input_ids" and not prompts.run_ids:
+            prompts.run_ids = [
+                _encode(self.factory.tokenizer, text) for text in prompts.run_texts
+            ]
+        run_ids = prompts.run_ids or [None] * len(prompts.run_texts)
+        if cache_len:
+            seed, seed_ids = self.factory.make_seed_and_ids(
                 int(case["case_id"]),
                 prefix,
                 cache_len,
                 self.cache_commit_tail_tokens,
             )
-            if cache_len
-            else ""
-        )
+        else:
+            seed, seed_ids = "", []
         return {
             "key": key,
             "total_len": total_len,
@@ -896,10 +1190,16 @@ class CacheGridRunner:
             "batch_size": batch_size,
             "built_len": built_len,
             "seed": seed,
+            "seed_ids": seed_ids,
             "run_targets": prompts.run_texts,
+            "run_ids": run_ids,
         }
 
     def run(self) -> List[Dict[str, Any]]:
+        # Establish a small, configuration-guarded base checkpoint before the
+        # first model request. Per-case journal records then provide durable
+        # one-case resume granularity without rewriting the growing full JSON.
+        self._save(complete=False)
         self._probe_reuse_granularity()
         pending = [
             case
@@ -917,6 +1217,8 @@ class CacheGridRunner:
             self._close_resources()
             return list(self._results.values())
 
+        completed_before = len(self.cases) - len(pending)
+        completed_this_attempt = 0
         try:
             with ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="query-prefetch"
@@ -939,12 +1241,8 @@ class CacheGridRunner:
                         built_len = payload["built_len"]
                         seed_result: Dict[str, Any] = {}
                         if cache_len:
-                            seed_result = _post_prefill(
-                                self.port,
-                                payload["seed"],
-                                self.request_timeout,
-                                f"{key}:seed",
-                                self._http_session,
+                            seed_result = self._post_request(
+                                payload["seed"], payload["seed_ids"], f"{key}:seed"
                             )
                             if not seed_result.get("success"):
                                 raise RuntimeError(
@@ -952,21 +1250,17 @@ class CacheGridRunner:
                                 )
 
                         runs = [
-                            _post_prefill(
-                                self.port,
+                            self._post_request(
                                 run_target,
-                                self.request_timeout,
+                                payload["run_ids"][run_idx],
                                 f"{key}:run{run_idx}",
-                                self._http_session,
                             )
                             for run_idx, run_target in enumerate(payload["run_targets"])
                         ]
 
                         successful = [r for r in runs if r.get("success")]
                         expected_reuse = cache_len
-                        reuse_values = [
-                            int(r.get("reuse_len", -1)) for r in successful
-                        ]
+                        reuse_values = [int(r.get("reuse_len", -1)) for r in successful]
                         reuse_exact = bool(
                             len(successful) == self.measure_runs
                             and all(x == expected_reuse for x in reuse_values)
@@ -1009,28 +1303,30 @@ class CacheGridRunner:
                             "timing_valid": timing_valid,
                             "ttft_ms": ttft_values,
                             "median_ttft_ms": (
-                                statistics.median(ttft_values)
-                                if timing_valid
-                                else None
+                                statistics.median(ttft_values) if timing_valid else None
                             ),
                             "avg_ttft_ms": (
-                                statistics.fmean(ttft_values)
-                                if timing_valid
-                                else None
+                                statistics.fmean(ttft_values) if timing_valid else None
                             ),
                             "elapsed_s": time.time() - started,
                             "status": (
                                 "ok"
                                 if reuse_exact and shape_exact and timing_valid
-                                else "invalid_shape"
-                                if len(successful) == self.measure_runs
-                                and not shape_exact
-                                else "invalid_timing"
-                                if len(successful) == self.measure_runs
-                                and not timing_valid
-                                else "invalid_reuse"
-                                if len(successful) == self.measure_runs
-                                else "failed"
+                                else (
+                                    "invalid_shape"
+                                    if len(successful) == self.measure_runs
+                                    and not shape_exact
+                                    else (
+                                        "invalid_timing"
+                                        if len(successful) == self.measure_runs
+                                        and not timing_valid
+                                        else (
+                                            "invalid_reuse"
+                                            if len(successful) == self.measure_runs
+                                            else "failed"
+                                        )
+                                    )
+                                )
                             ),
                         }
                     except Exception as exc:
@@ -1045,11 +1341,17 @@ class CacheGridRunner:
                             "elapsed_s": time.time() - started,
                         }
                     self._results[key] = metric
+                    self._append_journal(metric)
+                    self._write_progress_checkpoint()
                     if idx % self.checkpoint_every == 0:
                         self._save(asynchronous=True)
+                    if metric.get("status") == "ok":
+                        completed_this_attempt += 1
                     logging.info(
-                        "[CACHE_GRID] %d/%d %s status=%s reuse=%s "
-                        "query_prefetch=next",
+                        "[CACHE_GRID] completed=%d/%d resume_attempt=%d/%d "
+                        "%s status=%s reuse=%s query_prefetch=next",
+                        completed_before + completed_this_attempt,
+                        len(self.cases),
                         idx,
                         len(pending),
                         key,
@@ -1068,5 +1370,11 @@ class CacheGridRunner:
             )
             self._save(complete=complete)
             return list(self._results.values())
+        except BaseException:
+            try:
+                self._save(complete=False)
+            except Exception:
+                logging.exception("cache grid: failed to flush interruption checkpoint")
+            raise
         finally:
             self._close_resources()

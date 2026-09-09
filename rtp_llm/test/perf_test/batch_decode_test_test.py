@@ -461,6 +461,268 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertEqual(len(deduped), 3)
 
 
+class CacheGridProfileTest(unittest.TestCase):
+    cases = [
+        {"case_id": 1, "batch_size": 1, "input_len": 16, "cache_len": 8},
+        {"case_id": 2, "batch_size": 1, "input_len": 16, "cache_len": 0},
+    ]
+
+    def runner(self, tmp, **kwargs):
+        return CacheGridRunner(
+            12345,
+            _WhitespaceTokenizer(),
+            self.cases,
+            tmp,
+            cache_commit_tail_tokens=8,
+            profile_trace_timeout=0.01,
+            **kwargs,
+        )
+
+    def wire(self, runner, *, bad_reuse=False, write_traces=True):
+        events = []
+        active = []
+
+        def arm(url, json, timeout):
+            self.assertTrue(url.endswith("/start_profile"))
+            self.assertEqual(json["num_steps"], 1)
+            self.assertTrue(json["enable_all_rank"])
+            events.append("arm")
+            active.append(json["trace_name"])
+            response = Mock()
+            response.json.return_value = {"status": "ok"}
+            return response
+
+        def post(text, ids, request_id):
+            is_profile = request_id.endswith(":profile")
+            events.append(
+                "profile"
+                if is_profile
+                else "seed" if request_id.endswith(":seed") else "measure"
+            )
+            if is_profile and write_traces:
+                for rank in range(runner.profile_tp_size):
+                    (runner.result_dir / f"{active[-1]}_wr{rank}_1.json").write_text(
+                        json.dumps({"traceEvents": [{"name": "kernel", "dur": 1}]})
+                    )
+            cached = "seq16_cache8" in request_id
+            return {
+                "success": True,
+                "request_id": request_id,
+                "input_len": len(text.split()),
+                "output_len": 1,
+                "reuse_len": 0 if bad_reuse and is_profile else 8 if cached else 0,
+                "ttft_ms": 1000.0 if is_profile else 10.0,
+            }
+
+        runner._http_session.post = Mock(side_effect=arm)
+        runner._post_request = Mock(side_effect=post)
+        return events
+
+    def test_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(tmp)
+            events = self.wire(runner)
+            rows = runner.run()
+            self.assertNotIn("arm", events)
+            self.assertEqual([r["median_ttft_ms"] for r in rows], [10.0, 10.0])
+            self.assertFalse((Path(tmp) / "cache_profiles").exists())
+
+    def test_selected_profiles_follow_measurements_and_preserve_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(
+                tmp, profile_runs=2, profile_case_ids=[1], profile_tp_size=2
+            )
+            events = self.wire(runner)
+            rows = runner.run()
+            self.assertEqual(events[-6:], ["seed", "arm", "profile"] * 2)
+            self.assertEqual(events.count("measure"), 6)
+            self.assertEqual([r["median_ttft_ms"] for r in rows], [10.0, 10.0])
+            self.assertEqual([len(r["runs"]) for r in rows], [3, 3])
+            manifest = json.loads(
+                next((Path(tmp) / "cache_profiles").glob("*/manifest.json")).read_text()
+            )
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual([r["case_id"] for r in manifest["records"]], [1, 1])
+            self.assertNotEqual(
+                manifest["records"][0]["prompt_case_id"],
+                manifest["records"][1]["prompt_case_id"],
+            )
+            for record in manifest["records"]:
+                self.assertEqual(len(record["trace_files"]), 2)
+                for path in record["trace_files"]:
+                    self.assertTrue((Path(tmp) / path).is_file())
+
+    def test_profile_only_cold_replays_are_unique_and_do_not_write_measurements(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(
+                tmp, profile_runs=2, profile_case_ids=[2], profile_only=True
+            )
+            events = self.wire(runner)
+            records = runner.run()
+            self.assertEqual(events, ["arm", "profile"] * 2)
+            texts = [c.args[0] for c in runner._post_request.call_args_list]
+            self.assertNotEqual(texts[0], texts[1])
+            self.assertEqual([r["result"]["reuse_len"] for r in records], [0, 0])
+            self.assertFalse((Path(tmp) / "cache_grid_results.json").exists())
+
+    def test_completed_baseline_can_be_profiled_without_remeasurement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self.runner(tmp)
+            self.wire(first)
+            first.run()
+            baseline = (Path(tmp) / "cache_grid_results.json").read_bytes()
+            runner = self.runner(
+                tmp, profile_runs=1, profile_case_ids=[1], profile_only=True
+            )
+            events = self.wire(runner)
+            runner.run()
+            self.assertEqual(events, ["seed", "arm", "profile"])
+            self.assertEqual(
+                (Path(tmp) / "cache_grid_results.json").read_bytes(), baseline
+            )
+
+    def test_profile_failure_does_not_invalidate_completed_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(tmp, profile_runs=1, profile_case_ids=[1])
+            self.wire(runner, bad_reuse=True)
+            with self.assertRaisesRegex(RuntimeError, "shape/reuse mismatch"):
+                runner.run()
+            baseline = json.loads((Path(tmp) / "cache_grid_results.json").read_text())
+            self.assertTrue(baseline["complete"])
+            self.assertEqual(
+                [r["median_ttft_ms"] for r in baseline["metrics"]], [10.0, 10.0]
+            )
+            manifest = json.loads(
+                next((Path(tmp) / "cache_profiles").glob("*/manifest.json")).read_text()
+            )
+            self.assertEqual(manifest["status"], "failed")
+            self.assertTrue(manifest["records"][0]["trace_files"])
+
+    def test_profile_api_error_prevents_target_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(
+                tmp, profile_runs=1, profile_case_ids=[1], profile_only=True
+            )
+            events = self.wire(runner)
+            runner._http_session.post.side_effect = None
+            runner._http_session.post.return_value.json.return_value = {
+                "error": "broadcast failed"
+            }
+            with self.assertRaisesRegex(RuntimeError, "start_profile failed"):
+                runner.run()
+            self.assertEqual(events, ["seed"])
+
+    def test_missing_trace_is_reported_as_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(
+                tmp, profile_runs=1, profile_case_ids=[2], profile_only=True
+            )
+            self.wire(runner, write_traces=False)
+            with self.assertRaisesRegex(RuntimeError, "missing TP ranks"):
+                runner.run()
+
+    def test_incomplete_json_is_not_accepted_as_trace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(
+                tmp, profile_runs=1, profile_case_ids=[2], profile_only=True
+            )
+            (Path(tmp) / "example_wr0_1.json").write_text('{"traceEvents": [')
+            try:
+                with self.assertRaisesRegex(RuntimeError, "trace timeout"):
+                    runner._wait_profile_traces("example")
+            finally:
+                runner._close_resources()
+
+    def test_cli_profile_only_preserves_existing_report_directory(self):
+        from rtp_llm.test.perf_test import batch_decode_test as entry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            grid = root / "grid.json"
+            grid.write_text(json.dumps({"cases": self.cases}))
+            original_info = root / "test_info.json"
+            original_info.write_text('{"original": true}')
+            argv = [
+                "--result_dir",
+                tmp,
+                "--cache_grid_json",
+                str(grid),
+                "--partial",
+                "2",
+                "--cache_commit_tail_tokens",
+                "8",
+                "--tokenizer_path",
+                "/mock/tokenizer",
+                "--tp_size",
+                "2",
+                "--cache_profile_only",
+                "--cache_profile_runs",
+                "1",
+                "--cache_profile_case_ids",
+                "1",
+            ]
+            parsed = parse_args(argv)
+            with patch.object(entry, "parse_args", return_value=parsed), patch.object(
+                entry, "_ensure_xgrammar_lib_path"
+            ), patch.object(
+                entry, "resolve_perf_engine_paths", side_effect=lambda x: x
+            ), patch.object(
+                entry, "EngineServer"
+            ) as server, patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                return_value=_WhitespaceTokenizer(),
+            ), patch.object(
+                entry, "_collect_timeline_files"
+            ), patch.object(
+                CacheGridRunner, "run", autospec=True, return_value=[]
+            ) as run, patch.dict(
+                "os.environ", {}, clear=False
+            ):
+                server.return_value.port = 12345
+                result_dir = Path(entry.main())
+                runner = run.call_args.args[0]
+                self.assertTrue(runner.profile_only)
+                self.assertEqual(runner.profile_tp_size, 2)
+                self.assertEqual(runner.profile_case_ids, {1})
+                runner._close_resources()
+                self.assertEqual(result_dir.parent, root / "cache_profile_replays")
+                self.assertEqual(original_info.read_text(), '{"original": true}')
+                self.assertTrue((result_dir / "test_info.json").is_file())
+                server.return_value.stop.assert_called_once()
+
+    def test_profile_cli_defaults_and_validation(self):
+        args, _ = parse_args([])
+        self.assertEqual(args.cache_profile_runs, 0)
+        self.assertFalse(args.cache_profile_only)
+        args, remaining = parse_args(
+            [
+                "--cache_grid_json",
+                "grid.json",
+                "--partial",
+                "2",
+                "--cache_profile_runs",
+                "2",
+                "--cache_profile_case_ids",
+                "1",
+                "2",
+                "--cache_profile_only",
+            ]
+        )
+        self.assertEqual(args.cache_profile_case_ids, [1, 2])
+        self.assertFalse(remaining)
+        for options in [
+            ["--cache_profile_only"],
+            ["--cache_profile_runs", "1"],
+            ["--cache_profile_case_ids", "1"],
+            ["--cache_profile_runs", "-1"],
+            ["--cache_profile_trace_timeout", "0"],
+        ]:
+            with self.subTest(options=options), patch("sys.stderr"), self.assertRaises(
+                SystemExit
+            ):
+                parse_args(options)
+
+
 class CacheGridRunnerBlockProbeTest(unittest.TestCase):
     def _make_runner(self, tmp, block_size):
         cases = [{"case_id": 0, "batch_size": 1, "input_len": 1024, "cache_len": 512}]

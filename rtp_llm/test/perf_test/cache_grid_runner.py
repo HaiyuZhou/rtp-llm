@@ -33,6 +33,7 @@ import os
 import statistics
 import struct
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -823,6 +824,11 @@ class CacheGridRunner:
         request_transport: str = "http_prompt",
         grpc_port: int | None = None,
         run_config: Dict[str, Any] | None = None,
+        profile_runs: int = 0,
+        profile_case_ids: Iterable[int] = (),
+        profile_only: bool = False,
+        profile_tp_size: int = 1,
+        profile_trace_timeout: float = 120.0,
     ):
         self.port = port
         if request_transport not in {"http_prompt", "dashsc_input_ids"}:
@@ -848,6 +854,22 @@ class CacheGridRunner:
             )
         self.factory = PrefixPromptFactory(tokenizer)
         self.cases = list(cases)
+        self.profile_runs = profile_runs
+        self.profile_case_ids = set(profile_case_ids)
+        self.profile_only = profile_only
+        self.profile_tp_size = profile_tp_size
+        self.profile_trace_timeout = profile_trace_timeout
+        if profile_runs < 0 or profile_trace_timeout <= 0 or profile_tp_size <= 0:
+            raise ValueError("invalid cache profile runs, timeout or TP size")
+        if bool(profile_runs) != bool(self.profile_case_ids) or (
+            profile_only and not profile_runs
+        ):
+            raise ValueError(
+                "cache profiling requires positive runs and explicit case IDs"
+            )
+        unknown = self.profile_case_ids - {int(c["case_id"]) for c in self.cases}
+        if unknown:
+            raise ValueError(f"unknown cache profile case IDs: {sorted(unknown)}")
         self.case_store = case_store
         if case_store is not None and case_store.run_count not in (-1, measure_runs):
             raise ValueError(
@@ -1195,7 +1217,169 @@ class CacheGridRunner:
             "run_ids": run_ids,
         }
 
+    def _wait_profile_traces(self, trace_name: str) -> List[str]:
+        """Wait for valid JSON from every TP rank; files are saved asynchronously."""
+        deadline = time.monotonic() + self.profile_trace_timeout
+        complete: Dict[int, Path] = {}
+        while True:
+            for rank in range(self.profile_tp_size):
+                if rank in complete:
+                    continue
+                for path in self.result_dir.glob(f"{trace_name}_wr{rank}_*.json"):
+                    try:
+                        with path.open() as stream:
+                            trace = json.load(stream)
+                        if isinstance(trace, dict) and trace.get("traceEvents"):
+                            complete[rank] = path
+                            break
+                    except (OSError, ValueError):
+                        pass  # The background saver may still be writing.
+            if len(complete) == self.profile_tp_size:
+                target = self.result_dir / "timelines"
+                target.mkdir(exist_ok=True)
+                paths = []
+                for rank in sorted(complete):
+                    path = complete[rank]
+                    destination = target / path.name
+                    path.rename(destination)
+                    paths.append(str(destination.relative_to(self.result_dir)))
+                return paths
+            if time.monotonic() >= deadline:
+                missing = sorted(set(range(self.profile_tp_size)) - complete.keys())
+                raise RuntimeError(
+                    f"profile trace timeout for {trace_name}; missing TP ranks {missing}"
+                )
+            time.sleep(0.5)
+
+    def _run_profiles(self) -> List[Dict[str, Any]]:
+        """Replay selected geometries after measurements, never adding to runs[]."""
+        if not self.profile_runs:
+            return []
+        session_id = uuid.uuid4().hex
+        directory = self.result_dir / "cache_profiles" / session_id
+        directory.mkdir(parents=True)
+        manifest_path = directory / "manifest.json"
+        records: List[Dict[str, Any]] = []
+        manifest = {
+            "schema_version": 1,
+            "session_id": session_id,
+            "diagnostic_only": True,
+            "profile_runs": self.profile_runs,
+            "profile_case_ids": sorted(self.profile_case_ids),
+            "profile_tp_size": self.profile_tp_size,
+            "request_transport": self.request_transport,
+            "grid_sha256": self.grid_sha256,
+            "run_config": self.run_config,
+            "status": "running",
+            "records": records,
+        }
+
+        def save():
+            temporary = manifest_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            temporary.replace(manifest_path)
+
+        save()
+        try:
+            for case in self.cases:
+                if int(case["case_id"]) not in self.profile_case_ids:
+                    continue
+                key = self.case_key(case)
+                total_len, cache_len = int(case["input_len"]), int(case["cache_len"])
+                for index in range(self.profile_runs):
+                    # New identity for EACH replay, including cold requests. Replaying
+                    # formal prompts would accidentally hit their previously cached tails.
+                    prompt_case_id = uuid.uuid4().int >> 64
+                    prompts = self.factory.build_case_prompts(
+                        prompt_case_id, total_len, cache_len, 1
+                    )
+                    trace_name = f"cache_profile_{session_id}_{key}_run{index}"
+                    record = {
+                        "case_id": int(case["case_id"]),
+                        "case_key": key,
+                        "profile_run": index,
+                        "prompt_case_id": prompt_case_id,
+                        "input_len": total_len,
+                        "cache_len_requested": cache_len,
+                        "trace_name": trace_name,
+                        "status": "running",
+                    }
+                    records.append(record)
+                    save()
+                    if cache_len:
+                        seed, seed_ids = self.factory.make_seed_and_ids(
+                            prompt_case_id,
+                            prompts.seed_text,
+                            cache_len,
+                            self.cache_commit_tail_tokens,
+                        )
+                        record["seed"] = self._post_request(
+                            seed, seed_ids, f"{trace_name}:seed"
+                        )
+                        if not record["seed"].get("success"):
+                            raise RuntimeError(f"profile seed failed: {record['seed']}")
+                    # Await the all-TP acknowledgement before submitting the target.
+                    # One real forward consumes the window; idle TP sync does not.
+                    response = self._http_session.post(
+                        f"http://127.0.0.1:{self.port}/start_profile",
+                        json={
+                            "gen_timeline": True,
+                            "trace_name": trace_name,
+                            "start_step": 0,
+                            "num_steps": 1,
+                            "enable_all_rank": True,
+                        },
+                        timeout=60,
+                    )
+                    response.raise_for_status()
+                    acknowledgement = response.json()
+                    if acknowledgement.get("status") != "ok" or acknowledgement.get(
+                        "error"
+                    ):
+                        raise RuntimeError(f"start_profile failed: {acknowledgement}")
+                    record["profile_request"] = acknowledgement
+                    result = self._post_request(
+                        prompts.run_texts[0],
+                        prompts.run_ids[0],
+                        f"{trace_name}:profile",
+                    )
+                    record["result"] = result
+                    if not result.get("success"):
+                        raise RuntimeError(f"profile request failed: {result}")
+                    record["trace_files"] = self._wait_profile_traces(trace_name)
+                    if (
+                        result.get("input_len") != total_len
+                        or result.get("reuse_len") != cache_len
+                        or result.get("output_len") != 1
+                    ):
+                        raise RuntimeError(f"profile shape/reuse mismatch: {result}")
+                    record["status"] = "ok"
+                    save()
+                    logging.info(
+                        "[CACHE_PROFILE] %s run=%d traces=%s",
+                        key,
+                        index,
+                        record["trace_files"],
+                    )
+            manifest["status"] = "completed"
+            save()
+            return records
+        except BaseException as exc:
+            manifest["status"] = "failed"
+            manifest["error"] = repr(exc)
+            if records and records[-1]["status"] == "running":
+                records[-1]["status"] = "failed"
+                records[-1]["error"] = repr(exc)
+            save()
+            # Abort rather than let a partially armed profiler affect later requests.
+            raise
+
     def run(self) -> List[Dict[str, Any]]:
+        if self.profile_only:
+            try:
+                return self._run_profiles()
+            finally:
+                self._close_resources()
         # Establish a small, configuration-guarded base checkpoint before the
         # first model request. Per-case journal records then provide durable
         # one-case resume granularity without rewriting the growing full JSON.
@@ -1214,8 +1398,11 @@ class CacheGridRunner:
         )
         if not pending:
             self._save(complete=True)
-            self._close_resources()
-            return list(self._results.values())
+            try:
+                self._run_profiles()
+                return list(self._results.values())
+            finally:
+                self._close_resources()
 
         completed_before = len(self.cases) - len(pending)
         completed_this_attempt = 0
@@ -1369,12 +1556,14 @@ class CacheGridRunner:
                 for case in self.cases
             )
             self._save(complete=complete)
-            return list(self._results.values())
         except BaseException:
             try:
                 self._save(complete=False)
             except Exception:
                 logging.exception("cache grid: failed to flush interruption checkpoint")
             raise
+        else:
+            self._run_profiles()
+            return list(self._results.values())
         finally:
             self._close_resources()

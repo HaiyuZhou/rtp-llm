@@ -9,6 +9,8 @@ from rtp_llm.test.perf_test.generate_prefill_interactive_chart import (
     number,
     observed_cache_len,
     prefill_rt,
+    representative_levels,
+    representative_slice,
 )
 
 
@@ -103,6 +105,35 @@ class LoadRowsTest(unittest.TestCase):
         self.assertEqual(rows[0]["cache_len"], 512)
         self.assertEqual(rows[0]["compute_len"], 1536)
         self.assertAlmostEqual(rows[0]["prefill_rt"], 10.0)
+
+
+class TrendGuideTest(unittest.TestCase):
+    def setUp(self):
+        self.rows = [
+            {
+                "input_len": float(value * 2),
+                "cache_len": float(value),
+                "compute_len": float(value),
+                "prefill_rt": float(value),
+            }
+            for value in range(0, 101, 10)
+        ]
+
+    def test_representative_levels_span_axis(self):
+        self.assertEqual(
+            representative_levels(self.rows, "cache_len"),
+            [0.0, 30.0, 70.0, 100.0],
+        )
+
+    def test_representative_slice_stays_on_selected_plane(self):
+        points = representative_slice(self.rows, "cache_len", 70.0, "compute_len")
+        self.assertGreaterEqual(len(points), 2)
+        self.assertLessEqual(len(points), 12)
+        self.assertTrue(all(point["cache_len"] == 70.0 for point in points))
+        self.assertEqual(
+            [point["compute_len"] for point in points],
+            sorted(point["compute_len"] for point in points),
+        )
 
 
 class NumberTest(unittest.TestCase):

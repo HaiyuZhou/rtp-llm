@@ -16,7 +16,7 @@ import argparse
 import json
 import math
 import warnings
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -139,14 +139,49 @@ def load_rows(input_path: Path, batch_size: int) -> list[dict[str, float]]:
     return deduped
 
 
-def top_levels(rows: list[dict[str, float]], key: str, limit: int = 8) -> list[float]:
-    counts = Counter(row[key] for row in rows)
-    return sorted(
-        level
-        for level, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[
-            :limit
-        ]
+def representative_levels(rows: list[dict[str, float]], key: str) -> list[float]:
+    """Choose guide planes near 0%, 33%, 67%, and 100% of an axis."""
+    values = sorted({row[key] for row in rows})
+    maximum = values[-1]
+    chosen: list[float] = []
+    for target in (0.0, 0.33 * maximum, 0.67 * maximum, maximum):
+        level = min(values, key=lambda value: abs(value - target))
+        if level not in chosen:
+            chosen.append(level)
+    return chosen
+
+
+def representative_slice(
+    rows: list[dict[str, float]],
+    fixed_key: str,
+    fixed_value: float,
+    varying_key: str,
+) -> list[dict[str, float]]:
+    """Build the same nearby, median-binned guide used by the static SVG."""
+    axis_maximum = max(
+        max(row["cache_len"] for row in rows),
+        max(row["compute_len"] for row in rows),
     )
+    tolerance = max(4_096.0, axis_maximum * 0.025)
+    subset = [row for row in rows if abs(row[fixed_key] - fixed_value) <= tolerance]
+    if len(subset) < 8:
+        subset = sorted(rows, key=lambda row: abs(row[fixed_key] - fixed_value))[
+            : max(8, min(24, len(rows)))
+        ]
+
+    ordered = sorted(subset, key=lambda row: row[varying_key])
+    bins = min(12, len(ordered))
+    points: list[dict[str, float]] = []
+    for index in range(bins):
+        lo = (index * len(ordered)) // bins
+        hi = ((index + 1) * len(ordered)) // bins
+        group = ordered[lo : max(hi, lo + 1)]
+        point = dict(group[len(group) // 2])
+        point[fixed_key] = fixed_value
+        point[varying_key] = median(row[varying_key] for row in group)
+        point["prefill_rt"] = median(row["prefill_rt"] for row in group)
+        points.append(point)
+    return points
 
 
 def line_trace(
@@ -160,10 +195,7 @@ def line_trace(
 ) -> Any:
     import plotly.graph_objects as go
 
-    subset = sorted(
-        (row for row in rows if row[fixed_key] == fixed_value),
-        key=lambda row: row[varying_key],
-    )
+    subset = representative_slice(rows, fixed_key, fixed_value, varying_key)
     return go.Scatter3d(
         x=[row["compute_len"] for row in subset],
         y=[row["cache_len"] for row in subset],
@@ -229,7 +261,16 @@ def main() -> None:
         default=None,
         help="Deprecated alias for --stretch-rt",
     )
+    parser.add_argument(
+        "--marker-size",
+        type=float,
+        default=2.0,
+        help="Measurement marker size in pixels (default: 2)",
+    )
     args = parser.parse_args()
+
+    if args.marker_size <= 0:
+        parser.error("--marker-size must be greater than 0")
 
     if args.log_x and not args.log_rt:
         warnings.warn(
@@ -309,8 +350,8 @@ def main() -> None:
         "#475569",
     )
 
-    cache_levels = top_levels(rows, "cache_len")
-    compute_levels = top_levels(rows, "compute_len")
+    cache_levels = representative_levels(rows, "cache_len")
+    compute_levels = representative_levels(rows, "compute_len")
 
     traces: list[Any] = []
 
@@ -347,7 +388,7 @@ def main() -> None:
             z=[row["prefill_rt"] for row in rows],
             mode="markers",
             marker={
-                "size": 4,
+                "size": args.marker_size,
                 "color": [row["prefill_rt"] for row in rows],
                 "colorscale": "Viridis",
                 "colorbar": {"title": "Prefill RT (ms)"},

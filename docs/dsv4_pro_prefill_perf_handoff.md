@@ -296,6 +296,61 @@ $RESULT_DIR/cache_grid_results.json
 
 需要特别说明：这两个 `/tmp` 文件不是当前 Git 分支里的受版本控制文件，机器重启或清理临时目录后可能消失。因此它们只能解释历史结果，不能作为正式交接依赖。正式交接前应把 runner 和入口纳入目标分支，并为其补一个 Bazel target；在此之前，接手人不能只按本手册第 6 节的标准 target 完成 cache-hit 测试。
 
+### cache-grid 异常点的可选 profiler 补采
+
+版本控制内的 `rtp_llm/test/perf_test/cache_grid_runner.py` 支持指定 case 的
+Torch/Kineto CPU + CUDA trace。默认 `--cache_profile_runs=0`，不调用 profiler，
+也不增加诊断请求。该参数独立于普通 grid 的 `--profile_runs` / `PERF_PROFILE_RUNS`。
+
+在原测试命令上追加以下参数，可针对报告中的 case ID 补采：
+
+```bash
+# 保留原命令中的模型、并行、cache 对齐、transport 和 engine_env 配置。
+# --cache_grid_json 仍传完整原始 grid，不需要手工裁剪或重新编号。
+<原 cache-grid 测试命令> \
+  --cache_profile_only \
+  --cache_profile_case_ids 14579 14595 \
+  --cache_profile_runs 3 \
+  --cache_profile_trace_timeout 180
+```
+
+- `--cache_profile_case_ids`：显式选择原 grid / 报告的 case ID，必须与正数
+  `--cache_profile_runs` 一起使用；未知或已被对齐去重移除的 ID 会在启动模型前报错。
+- `--cache_profile_only`：仅补采，跳过正式测量。实际输出到
+  `$RESULT_DIR/cache_profile_replays/<唯一 session>/`，保留原报告、test_info 和 checkpoint。
+  可以对已经完成全量测试的目录使用。不要同时传 `--require_cache_resume`。
+- 不传 `--cache_profile_only`：先完成正常测量/恢复，再补采所选 case；profile
+  结果不进入正式 `runs[]`、`median_ttft_ms` 或吞吐计算。
+- 当前支持 DP=1，并通过 `/start_profile` 的 `enable_all_rank=true` 采集全部 TP rank。
+  每个诊断请求使用 `start_step=0, num_steps=1`，捕获一个实际 forward。
+
+每次诊断使用新的 prompt case 标识，按相同 input/cache geometry 重新生成输入，
+先执行未开启 profiler 的 seed，再开启 profiler 并发送 continuation；冷请求不发 seed。
+这会更换前缀内容，避免复用正式请求或上次诊断已经写入的后缀缓存，属于同形状补采，
+不是原 token 序列的逐字重放。诊断仍检查引擎反馈的 `input_len`、`reuse_len`、`output_len`。
+当前补采不增加单独的形状预热，若要分析稳定态，应先按原流程预热并比较多次 trace。
+
+补采产物（相对于实际输出目录）：
+
+```text
+cache_profiles/<session>/manifest.json  # case / request ID、输入生成标识、seed、诊断响应、trace 路径
+timelines/cache_profile_*_wr0_*.json   # rank 0 的 Kineto trace
+timelines/cache_profile_*_wr1_*.json   # 其他 TP rank，以此类推
+```
+
+`manifest.json` 中的 `trace_files` 相对于实际输出目录。runner 等待每个 TP rank
+写出可解析且含事件的 JSON 后才记录成功；接口失败、命中不符或 trace 超时都会保存失败
+记录并终止补采，不会把已经完成的正式测试标为失败。trace 超时可用
+`--cache_profile_trace_timeout` 调整，已有文件也会保留。
+
+trace 可以在 Perfetto 等支持 Chrome trace JSON 的工具中查看 CPU/CUDA 时间线。
+优先核对 `executor.model_forward(ctx_batch=...,gen_batch=...,tokens=...,max_seq=...)`
+确认实际执行模式，再比较每层、kernel、内存拷贝和跨卡等待。补采沿用原调度器配置，
+不会自动切换 prefill/decode。现有采样窗口从模型输入 TP 同步之后开始，不能据此宣称
+完整覆盖调度、cache 加载和输入构造。DSV4 prefill fast path 会省略部分细分逻辑标记，
+保留层级范围；GPU kernel 时间线仍由 profiler 采集。诊断时延包含 profiler 开销，
+不能替代关闭 profiler 的正式性能基线。
+
 ## 8. 运行时监控和停机
 
 启动后至少每 30 秒看一次：

@@ -1,1 +1,0 @@
-/data7/zhouhaiyu.zhy/bazel_output/a14a089edd258815559523f0f82e8fb6/execroot/rtp_llm/bazel-out/k8-opt/bin/rtp_llm/cpp/model_rpc/proto/flexlb_schedule_service_pb2.py

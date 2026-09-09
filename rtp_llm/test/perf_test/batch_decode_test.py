@@ -7,6 +7,8 @@ import os
 import shutil
 import sys
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from rtp_llm.test.perf_test.cache_grid_runner import (
@@ -175,6 +177,36 @@ def parse_args(argv: Optional[List[str]] = None):
         help="Override PERF_PROFILE_RUNS for every case.",
     )
     perf.add_argument(
+        "--cache_profile_runs",
+        type=int,
+        default=0,
+        help=(
+            "Diagnostic replays per selected cache-grid case (default: disabled). "
+            "Independent of --profile_runs."
+        ),
+    )
+    perf.add_argument(
+        "--cache_profile_case_ids",
+        type=int,
+        nargs="+",
+        default=[],
+        help="Explicit case IDs from the cache grid/report to profile.",
+    )
+    perf.add_argument(
+        "--cache_profile_only",
+        action="store_true",
+        help=(
+            "Skip formal measurements; write a new isolated replay directory "
+            "below result_dir."
+        ),
+    )
+    perf.add_argument(
+        "--cache_profile_trace_timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for complete trace JSON from every TP rank.",
+    )
+    perf.add_argument(
         "--engine_arg",
         action="append",
         default=[],
@@ -282,6 +314,23 @@ def parse_args(argv: Optional[List[str]] = None):
     engine.add_argument("--concurrency_limit", type=int, default=64)
 
     args, remaining = parser.parse_known_args(argv)
+    if args.cache_profile_runs < 0 or args.cache_profile_trace_timeout <= 0:
+        parser.error(
+            "cache profile runs must be non-negative and trace timeout positive"
+        )
+    if bool(args.cache_profile_runs) != bool(args.cache_profile_case_ids):
+        parser.error(
+            "--cache_profile_runs and --cache_profile_case_ids must be supplied together"
+        )
+    if args.cache_profile_only and args.require_cache_resume:
+        parser.error(
+            "--cache_profile_only creates a fresh replay directory; "
+            "omit --require_cache_resume"
+        )
+    if args.cache_profile_only and not args.cache_profile_runs:
+        parser.error("--cache_profile_only requires --cache_profile_runs and case IDs")
+    if args.cache_profile_runs and (not args.cache_grid_json or args.partial != 2):
+        parser.error("cache profiling requires --cache_grid_json and --partial=2")
 
     profile = None
     profile_sha256 = None
@@ -833,6 +882,10 @@ def _write_test_info(
             expected_cache_block_size if args.cache_grid_json else None
         ),
         "cache_case_store": args.cache_case_files or None,
+        "cache_profile_runs": args.cache_profile_runs,
+        "cache_profile_case_ids": args.cache_profile_case_ids,
+        "cache_profile_only": args.cache_profile_only,
+        "cache_profile_trace_timeout": args.cache_profile_trace_timeout,
         "cache_request_transport": (
             args.cache_request_transport if args.cache_grid_json else None
         ),
@@ -896,6 +949,15 @@ def main() -> str:
     remaining.extend(_engine_arg_argv(args.engine_arg))
     remaining = resolve_perf_engine_paths(remaining)
     generate_config = json.loads(args.generate_config)
+    if args.cache_profile_runs and args.dp_size != 1:
+        raise ValueError(
+            "cache-grid profiling currently requires DP=1; all TP ranks are captured"
+        )
+    if args.cache_profile_only:
+        # Preserve the original report, manifest and resume checkpoint byte-for-byte.
+        args.result_dir = str(
+            Path(args.result_dir) / "cache_profile_replays" / uuid.uuid4().hex
+        )
     os.makedirs(args.result_dir, exist_ok=True)
     # Cache-grid mode writes its manifest after resolving the grid and resume
     # fingerprint, but still before tokenizer/model initialization.
@@ -954,6 +1016,17 @@ def main() -> str:
             expected_block_size,
             grid_metadata,
         )
+        unknown_profile_ids = set(args.cache_profile_case_ids) - {
+            int(c["case_id"]) for c in cases
+        }
+        if unknown_profile_ids:
+            raise ValueError(
+                f"unknown/deduplicated cache profile case IDs: {sorted(unknown_profile_ids)}"
+            )
+        if args.cache_profile_runs and args.materialize_cache_cases:
+            raise ValueError(
+                "cache profiling cannot be combined with --materialize_cache_cases"
+            )
         resume_config = _build_cache_resume_config(
             args, remaining, engine_env_names, expected_block_size
         )
@@ -992,7 +1065,11 @@ def main() -> str:
             else set()
         )
         planned_case_keys = {CacheGridRunner.case_key(case) for case in cases}
-        if checkpoint is not None and checkpoint_ok_keys == planned_case_keys:
+        if (
+            checkpoint is not None
+            and checkpoint_ok_keys == planned_case_keys
+            and not args.cache_profile_runs
+        ):
             logging.info(
                 "cache grid: checkpoint already contains all %d successful cases; "
                 "skipping tokenizer and model startup",
@@ -1098,6 +1175,13 @@ def main() -> str:
                 request_transport=args.cache_request_transport,
                 grpc_port=args.cache_grpc_port or None,
                 run_config=resume_config,
+                profile_runs=args.cache_profile_runs,
+                profile_case_ids=args.cache_profile_case_ids,
+                profile_only=args.cache_profile_only,
+                profile_tp_size=int(
+                    extract_arg(remaining, "tp_size") or os.environ.get("TP_SIZE", "1")
+                ),
+                profile_trace_timeout=args.cache_profile_trace_timeout,
             ).run()
             _collect_timeline_files(args.result_dir)
         finally:

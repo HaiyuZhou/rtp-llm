@@ -12,9 +12,9 @@
   },
   "summary": {
     "input_count": 1024,
-    "case_count": 15175,
-    "estimated_measure_requests": 45525,
-    "estimated_seed_requests": 14151
+    "case_count": 44505,
+    "estimated_measure_requests": 133515,
+    "estimated_seed_requests": 43481
   },
   "seq_generation": {
     "kind": "linear_with_dense_prefix",
@@ -23,21 +23,5 @@
   },
   "seq_block_size": 256,
   "cache_block_size": 4096,
-  "cache_ratios": [
-    0.0,
-    0.0625,
-    0.125,
-    0.1875,
-    0.25,
-    0.3125,
-    0.375,
-    0.4375,
-    0.5,
-    0.5625,
-    0.625,
-    0.6875,
-    0.75,
-    0.8125,
-    0.875
-  ]
+  "cache_ratio_interval": 0.02
 }

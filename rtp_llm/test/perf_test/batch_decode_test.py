@@ -3,11 +3,13 @@ import glob
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import sys
 import time
 import uuid
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -576,6 +578,49 @@ def resolve_perf_engine_paths(remaining: List[str]) -> List[str]:
     return out
 
 
+def _resolve_cache_ratios(config: Dict[str, Any]) -> List[float]:
+    has_ratios = "cache_ratios" in config
+    has_interval = "cache_ratio_interval" in config
+    if has_ratios and has_interval:
+        raise ValueError("cache_ratios and cache_ratio_interval are mutually exclusive")
+
+    if has_interval:
+        try:
+            interval = Decimal(str(config["cache_ratio_interval"]))
+        except (InvalidOperation, ValueError) as error:
+            raise ValueError(
+                "cache_ratio_interval must be a finite number in (0, 1)"
+            ) from error
+        if not interval.is_finite() or interval <= 0 or interval >= 1:
+            raise ValueError("cache_ratio_interval must be a finite number in (0, 1)")
+        ratio_count = int(
+            (Decimal(1) / interval).to_integral_value(rounding=ROUND_CEILING)
+        )
+        if ratio_count > 10_000:
+            raise ValueError(
+                "cache_ratio_interval generates more than 10000 cache ratios"
+            )
+        return [
+            float(ratio)
+            for index in range(ratio_count)
+            if (ratio := index * interval) < 1.0
+        ]
+
+    try:
+        ratios = [
+            float(value)
+            for value in config.get(
+                "cache_ratios",
+                [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 0.95],
+            )
+        ]
+    except (TypeError, ValueError) as error:
+        raise ValueError("cache_ratios must contain numbers in [0, 1)") from error
+    if any(not math.isfinite(ratio) or ratio < 0.0 or ratio >= 1.0 for ratio in ratios):
+        raise ValueError("cache_ratios must contain finite numbers in [0, 1)")
+    return ratios
+
+
 def _load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
     """Load and validate an explicit total-sequence × cache-length grid.
 
@@ -625,18 +670,10 @@ def _load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
             seq_lens = sorted(values)[:target_nonmax] + [max_seq_len]
             if len(seq_lens) != count or len(set(seq_lens)) != count:
                 raise ValueError("generated sequence lengths are not unique")
-        ratios = [
-            float(x)
-            for x in config.get(
-                "cache_ratios",
-                [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 0.95],
-            )
-        ]
+        ratios = _resolve_cache_ratios(config)
         block = int(config.get("cache_block_size", 4096))
-        if block <= 0 or any(ratio < 0.0 or ratio >= 1.0 for ratio in ratios):
-            raise ValueError(
-                "cache_ratios must be in [0, 1) and block must be positive"
-            )
+        if block <= 0:
+            raise ValueError("cache_block_size must be positive")
         raw_cases = []
         case_id = 0
         for seq_len in seq_lens:

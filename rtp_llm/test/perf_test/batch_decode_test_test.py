@@ -19,6 +19,7 @@ from rtp_llm.test.perf_test.batch_decode_test import (
     _parse_name_value,
     _redact_argv,
     _resolve_cache_block_size,
+    _resolve_cache_ratios,
     _write_test_info,
     parse_args,
 )
@@ -448,6 +449,39 @@ class BatchDecodeTest(unittest.TestCase):
                 for case in cases
             )
         )
+
+    def test_cache_ratio_interval_generates_uniform_ratios_below_one(self):
+        self.assertEqual(
+            _resolve_cache_ratios({"cache_ratio_interval": 0.1}),
+            [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+        )
+
+    def test_cache_ratio_interval_expands_to_aligned_cases(self):
+        payload = {
+            "seq_lens": [65536],
+            "cache_block_size": 4096,
+            "cache_ratio_interval": 0.25,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cache_grid.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            cases = _load_cache_grid_cases(str(path))
+        self.assertEqual(
+            [case["cache_len"] for case in cases],
+            [0, 12288, 28672, 45056, 61440],
+        )
+
+    def test_cache_ratio_interval_is_mutually_exclusive_with_explicit_ratios(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            _resolve_cache_ratios(
+                {"cache_ratios": [0.0, 0.5], "cache_ratio_interval": 0.25}
+            )
+
+    def test_cache_ratio_interval_rejects_invalid_values(self):
+        for interval in (0, -0.1, 1, "nan", "bad", 0.00001):
+            with self.subTest(interval=interval):
+                with self.assertRaisesRegex(ValueError, "cache_ratio_interval"):
+                    _resolve_cache_ratios({"cache_ratio_interval": interval})
 
     def test_cache_seed_commits_one_tail_and_preserves_exact_prefix(self):
         tokenizer = _WhitespaceTokenizer()

@@ -105,7 +105,7 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertEqual(args.expected_cache_block_size, 0)
         self.assertEqual(args.materialize_cache_cases, "")
         self.assertEqual(args.cache_case_files, "")
-        self.assertEqual(args.cache_request_transport, "http_prompt")
+        self.assertEqual(args.cache_request_transport, "dashsc_input_ids")
         self.assertEqual(args.cache_grpc_port, 0)
         self.assertEqual(args.cache_checkpoint_every, 100)
         self.assertFalse(args.require_cache_resume)

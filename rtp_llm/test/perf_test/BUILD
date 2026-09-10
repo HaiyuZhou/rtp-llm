@@ -99,6 +99,28 @@ py_binary(
     deps = [":perf_test_lib"],
 )
 
+py_library(
+    name = "cache_grid_pipeline_lib",
+    srcs = ["run_cache_grid_pipeline.py"],
+)
+
+py_binary(
+    name = "run_cache_grid_pipeline",
+    srcs = ["run_cache_grid_pipeline.py"],
+    deps = [
+        ":perf_test_lib",
+        ":prefill_3d_chart_lib",
+        ":prefill_formula_fit_lib",
+        ":prefill_interactive_chart_lib",
+    ],
+)
+
+py_test(
+    name = "run_cache_grid_pipeline_test",
+    srcs = ["run_cache_grid_pipeline_test.py"],
+    deps = [":cache_grid_pipeline_lib"],
+)
+
 py_test(
     name = "generate_prefill_interactive_chart_test",
     srcs = ["generate_prefill_interactive_chart_test.py"],

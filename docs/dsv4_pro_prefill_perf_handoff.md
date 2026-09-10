@@ -505,6 +505,45 @@ block 的命中请求并校验 `reuse_len` 等于 block size。粒度不一致�
 继续使用引擎报告的 observed cache。三维图坐标为 X=compute tokens、
 Y=observed cached tokens、Z=TTFT。
 
+### 一条命令完成测试、拟合和绘图
+
+`run_cache_grid_pipeline` 会先运行 cache-grid 测试，并且只在
+`cache_grid_results.json` 标记为完整后依次生成拟合公式、静态 SVG 和可旋转的
+HTML 三维图。cache 请求默认使用 `dashsc_input_ids`，直接通过 Dash-SC gRPC
+发送已经校验的 INT32 token IDs；需要兼容旧链路时可显式传
+`--cache_request_transport=http_prompt`。`--` 后的参数原样转发给 cache runner：
+
+```bash
+bazelisk run //rtp_llm/test/perf_test:run_cache_grid_pipeline \
+  --config=cuda13 --config=sm10x -- \
+  --cache-grid-json=/path/to/cache_grid_128.json \
+  --result-dir=/path/to/results \
+  --profile=rtp_llm/test/perf_test/profiles/dsv4_pro_prefill.json \
+  --estimator=median \
+  -- \
+  --cache_measure_runs=3 \
+  --cache_commit_tail_tokens=4096 \
+  --expected_cache_block_size=512
+```
+
+默认产物为：
+
+```text
+results/cache_grid_results.json
+results/formula/deepseek_v4_prefill_formula.txt
+results/formula/fit_report.json
+results/formula/fit_gap.svg
+results/prefill_3d.svg
+results/prefill_cold_miss.svg
+results/prefill_3d.interactive.html
+results/pipeline_summary.json
+```
+
+模型和并行参数可以由 `--profile` 提供，也可以放在第二个 `--` 后传给 runner。
+已有完整测试结果需要重新拟合或绘图时，加 `--skip-test`。拟合质量门禁不通过时，
+脚本仍会生成 SVG 和 HTML，但最终返回拟合脚本的非零状态，并在
+`pipeline_summary.json` 中记录 `fit_rejected`。
+
 ## 7. Profile 参数化
 
 所有工具（grid 生成、runner、拟合、图表）都支持 `--profile` 参数，指向一个

@@ -248,10 +248,11 @@ def parse_args(argv: Optional[List[str]] = None):
     perf.add_argument(
         "--cache_request_transport",
         choices=("http_prompt", "dashsc_input_ids"),
-        default="http_prompt",
+        default="dashsc_input_ids",
         help=(
             "Cache-grid request transport. dashsc_input_ids sends the already "
-            "verified token IDs as binary INT32 and skips server tokenization."
+            "verified token IDs as binary INT32 and skips server tokenization "
+            "(default: dashsc_input_ids)."
         ),
     )
     perf.add_argument(

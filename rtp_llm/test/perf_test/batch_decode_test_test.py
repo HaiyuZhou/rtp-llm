@@ -2,6 +2,7 @@ import argparse
 import json
 import struct
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.batch_decode_test import (
     _capture_reproduction_env,
+    _configure_cache_batch_limits,
     _dedupe_cache_grid_cases,
     _effective_grid_max_seq_len,
     _engine_arg_argv,
@@ -26,10 +28,317 @@ from rtp_llm.test.perf_test.cache_grid_runner import (
     PrefixPromptFactory,
     _post_prefill,
     _post_prefill_ids,
+    build_grouped_prompts,
+    normalize_cache_case,
     resume_config_fingerprint,
     validate_cache_grid_resume,
 )
 from rtp_llm.test.perf_test.server import EngineServer
+
+
+class CacheGridBatchTest(unittest.TestCase):
+    def setUp(self):
+        scheduler = patch.object(
+            CacheGridRunner, "_set_prefill_batch_size", return_value={"status": "ok"}
+        )
+        self.scheduler = scheduler.start()
+        self.addCleanup(scheduler.stop)
+
+    def case(self, policy="independent"):
+        return {
+            "case_id": 10,
+            "batch_size": 4,
+            "prefix_policy": policy,
+            "request_groups": [
+                {"count": 2, "input_len": 24, "cache_len": 8},
+                {"count": 1, "input_len": 32, "cache_len": 16},
+                {"count": 1, "input_len": 24, "cache_len": 0},
+            ],
+        }
+
+    def test_fixed_batch_service_limits_and_dp_guard(self):
+        args = argparse.Namespace(dp_size=1, concurrency_limit=1)
+        remaining = ["--max_context_batch_size=1", "--max_batch_tokens_size", "32"]
+        cases = [normalize_cache_case(self.case())]
+        _configure_cache_batch_limits(args, remaining, cases)
+        self.assertEqual(args.concurrency_limit, 4)
+        self.assertEqual(
+            remaining,
+            ["--max_context_batch_size", "4", "--max_batch_tokens_size", "104"],
+        )
+        args.dp_size = 2
+        with self.assertRaisesRegex(ValueError, "dp_size=1"):
+            _configure_cache_batch_limits(args, remaining, cases)
+
+    def test_cold_batch_skips_seed_and_restores_scheduler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = CacheGridRunner(
+                12345,
+                _WordTokenizer(),
+                [{"case_id": 1, "batch_size": 2, "input_len": 24, "cache_len": 0}],
+                tmp,
+                measure_runs=1,
+            )
+            with patch(
+                "rtp_llm.test.perf_test.cache_grid_runner._post_prefill",
+                return_value={
+                    "success": True,
+                    "input_len": 24,
+                    "reuse_len": 0,
+                    "output_len": 1,
+                    "ttft_ms": 1,
+                },
+            ) as post:
+                row = runner.run()[0]
+            self.assertEqual(row["status"], "ok")
+            self.assertEqual(row["seed_batch_size"], 0)
+            self.assertEqual(post.call_count, 2)
+            self.assertEqual([c.args[0] for c in self.scheduler.call_args_list], [2, 1])
+
+    def test_scheduler_rejection_aborts_before_seeding(self):
+        self.scheduler.side_effect = [
+            RuntimeError("scheduler unavailable"),
+            {"status": "ok"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = CacheGridRunner(
+                12345,
+                _WordTokenizer(),
+                [self.case()],
+                tmp,
+                cache_commit_tail_tokens=8,
+                fail_fast=False,
+            )
+            with patch(
+                "rtp_llm.test.perf_test.cache_grid_runner._post_prefill"
+            ) as post:
+                with self.assertRaisesRegex(RuntimeError, "stopped"):
+                    runner.run()
+            post.assert_not_called()
+
+    def test_config_validation_and_homogeneous_compatibility(self):
+        case = normalize_cache_case({"batch_size": 3, "input_len": 24, "cache_len": 8})
+        self.assertEqual(
+            case["request_groups"], [{"count": 3, "input_len": 24, "cache_len": 8}]
+        )
+        for change in (
+            {"batch_size": 5},
+            {"prefix_policy": "random"},
+            {"request_groups": []},
+            {"request_groups": [{"count": 4, "input_len": 8, "cache_len": 8}]},
+        ):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                normalize_cache_case({**self.case(), **change})
+
+    def test_prefix_sharing_and_distinct_round_suffixes(self):
+        for policy in ("independent", "shared_by_group"):
+            members = build_grouped_prompts(
+                PrefixPromptFactory(_WordTokenizer()), self.case(policy), 3
+            )
+            first, second = members[:2]
+            self.assertEqual(
+                first["prompts"].prefix_ids == second["prompts"].prefix_ids,
+                policy == "shared_by_group",
+            )
+            texts = [text for member in members for text in member["prompts"].run_texts]
+            self.assertEqual(len(texts), len(set(texts)))
+            for member in members:
+                for ids in member["prompts"].run_ids:
+                    self.assertEqual(len(ids), member["input_len"])
+                    self.assertEqual(
+                        ids[: member["cache_len"]], member["prompts"].prefix_ids
+                    )
+
+    def test_loader_dedupe_and_distribution_identity(self):
+        first = self.case()
+        second = {**self.case("shared_by_group"), "case_id": 11}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "grid.json"
+            path.write_text(json.dumps({"cases": [first, second]}))
+            cases = _load_cache_grid_cases(str(path))
+        self.assertEqual(len(_dedupe_cache_grid_cases(cases, 8)), 2)
+        self.assertNotEqual(
+            CacheGridRunner.case_key(first), CacheGridRunner.case_key(second)
+        )
+        self.assertEqual(cases[0]["input_len"], 32)
+
+    def test_materialized_roundtrip_and_distribution_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MaterializedCaseStore(tmp)
+            case = normalize_cache_case(self.case("shared_by_group"))
+            store.materialize([case], PrefixPromptFactory(_WordTokenizer()), 2)
+            loaded = MaterializedCaseStore(tmp)
+            self.assertEqual(loaded.load_cases(), [case])
+            expected = build_grouped_prompts(
+                PrefixPromptFactory(_WordTokenizer()), case, 2
+            )
+            self.assertEqual(loaded.load_grouped_case(case), expected)
+            with self.assertRaisesRegex(ValueError, "distribution"):
+                loaded.load_grouped_case(self.case())
+
+    def run_mock_batch(
+        self, policy, bad_slot=None, transport="http_prompt", store=False
+    ):
+        gate = threading.Barrier(4)
+        seed_gate = threading.Barrier(2 if policy == "shared_by_group" else 3)
+        seeds, sessions, calls = [], {}, []
+        lock = threading.Lock()
+
+        def post(port, prompt, timeout, request_id, session=None):
+            if ":seed:" in request_id:
+                seeds.append(prompt.split())
+                seed_gate.wait(timeout=3)
+                return {"success": True}
+            ids = prompt.split()
+            slot = int(request_id.rsplit("request", 1)[1])
+            with lock:
+                sessions[slot] = session
+                calls.append(request_id)
+            # A serial implementation cannot pass this gate.
+            gate.wait(timeout=3)
+            reuse = 0
+            for seed in seeds:
+                common = 0
+                for a, b in zip(seed, ids):
+                    if a != b:
+                        break
+                    common += 1
+                reuse = max(reuse, common // 8 * 8)
+            if slot == bad_slot:
+                reuse += 8
+            return {
+                "success": True,
+                "input_len": len(ids),
+                "reuse_len": reuse,
+                "output_len": 1,
+                "ttft_ms": 2.0,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self.case(policy)
+            case_store = None
+            if store:
+                case_store = MaterializedCaseStore(str(Path(tmp) / "prompts"))
+                case_store.materialize([case], PrefixPromptFactory(_WordTokenizer()), 2)
+            runner = CacheGridRunner(
+                12345,
+                _WordTokenizer(),
+                [case],
+                str(Path(tmp) / "results"),
+                measure_runs=2,
+                cache_commit_tail_tokens=8,
+                fail_fast=False,
+                case_store=case_store,
+            )
+            if transport == "dashsc_input_ids":
+                runner.request_transport = transport
+                runner._grpc_stub = Mock()
+            with patch(
+                "rtp_llm.test.perf_test.cache_grid_runner._post_prefill",
+                side_effect=post,
+            ), patch(
+                "rtp_llm.test.perf_test.cache_grid_runner._post_prefill_ids",
+                side_effect=lambda stub, ids, timeout, request_id: post(
+                    0, " ".join(ids), timeout, request_id
+                ),
+            ):
+                rows = runner.run()
+            persisted = json.loads(runner.result_path.read_text())["metrics"][0]
+            self.assertEqual(persisted["status"], rows[0]["status"])
+        self.assertEqual(len(calls), 8)
+        self.assertEqual(
+            [c.args[0] for c in self.scheduler.call_args_list[-3:]],
+            [2 if policy == "shared_by_group" else 3, 4, 1],
+        )
+        self.assertEqual(len(seeds), 2 if policy == "shared_by_group" else 3)
+        if transport == "http_prompt":
+            self.assertEqual(len({id(s) for s in sessions.values()}), 4)
+        return rows[0]
+
+    def test_concurrent_requests_and_per_member_cache_hits(self):
+        for policy in ("independent", "shared_by_group"):
+            with self.subTest(policy=policy):
+                row = self.run_mock_batch(policy)
+                self.assertEqual(row["status"], "ok")
+                self.assertEqual(row["execution_mode"], "scheduler_fixed_batch")
+                self.assertGreater(row["median_batch_wall_time_ms"], 0)
+                self.assertNotIn("median_ttft_ms", row)
+                for run in row["runs"]:
+                    self.assertEqual(run["total_input_tokens"], 104)
+                    self.assertEqual(run["new_prefill_tokens"], 72)
+                    self.assertEqual(
+                        [r["reuse_len"] for r in run["requests"]], [8, 8, 16, 0]
+                    )
+
+    def test_wrong_member_reuse_invalidates_batch(self):
+        row = self.run_mock_batch("independent", bad_slot=1)
+        self.assertEqual(row["status"], "invalid_reuse")
+        self.assertIsNone(row["median_batch_wall_time_ms"])
+        self.assertFalse(row["runs"][0]["requests"][1]["reuse_exact"])
+
+    def test_materialized_grpc_batch(self):
+        self.assertEqual(
+            self.run_mock_batch(
+                "shared_by_group", transport="dashsc_input_ids", store=True
+            )["status"],
+            "ok",
+        )
+
+    def test_failed_request_is_preserved_and_other_members_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = CacheGridRunner(
+                12345,
+                _WordTokenizer(),
+                [self.case()],
+                tmp,
+                measure_runs=1,
+                cache_commit_tail_tokens=8,
+                fail_fast=False,
+            )
+
+            def post(port, prompt, timeout, request_id, session=None):
+                if ":seed:" in request_id:
+                    return {"success": True}
+                slot = int(request_id.rsplit("request", 1)[1])
+                if slot == 1:
+                    raise TimeoutError("simulated request timeout")
+                return {
+                    "success": True,
+                    "input_len": len(prompt.split()),
+                    "reuse_len": [8, 8, 16, 0][slot],
+                    "output_len": 1,
+                    "ttft_ms": 1,
+                }
+
+            with patch(
+                "rtp_llm.test.perf_test.cache_grid_runner._post_prefill",
+                side_effect=post,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stopped"):
+                    runner.run()
+                row = next(iter(runner._results.values()))
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["runs"][0]["completed_requests"], 3)
+        self.assertIn("timeout", row["runs"][0]["requests"][1]["error"])
+
+    def test_resume_does_not_reuse_a_different_distribution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self.case()
+            runner = CacheGridRunner(12345, _WordTokenizer(), [case], tmp)
+            runner._results[runner.case_key(case)] = {
+                "case_key": runner.case_key(case),
+                "status": "ok",
+            }
+            runner._save(complete=True)
+            runner._close_resources()
+            same = CacheGridRunner(12345, _WordTokenizer(), [case], tmp)
+            self.assertEqual(len(same._results), 1)
+            same._close_resources()
+            changed = CacheGridRunner(
+                12345, _WordTokenizer(), [self.case("shared_by_group")], tmp
+            )
+            self.assertEqual(changed._results, {})
+            changed._close_resources()
 
 
 class _WhitespaceTokenizer:

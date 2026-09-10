@@ -22,6 +22,11 @@ re-encoding the first built case; tokenizers that do not tokenize the filler
 pattern structurally fall back to the legacy text-layer construction.
 Precomputed prompts can also be materialized to disk once and reloaded
 without a tokenizer (``MaterializedCaseStore``).
+
+Grouped cases support explicit request counts and independent or group-shared
+prefixes. Seed and measurement phases configure the dedicated DP=1 test scheduler
+to their respective batch sizes before concurrent submission. Each member's
+geometry is validated; see ``cache_grid_batches.md``.
 """
 
 from __future__ import annotations
@@ -32,15 +37,114 @@ import logging
 import os
 import statistics
 import struct
+import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
+
+
+def normalize_cache_case(raw: Dict[str, Any], index: int = 0) -> Dict[str, Any]:
+    """Validate groups while retaining legacy single-request geometries."""
+
+    def integer(value):
+        if isinstance(value, (float, bool)):
+            raise ValueError(f"cache grid fields must be integers, got {value!r}")
+        return int(value)
+
+    case = dict(raw)
+    case["case_id"] = integer(raw.get("case_id", index))
+    batch = integer(raw.get("batch_size", 1))
+    policy = raw.get("prefix_policy", "independent")
+    if batch <= 0 or policy not in {"independent", "shared_by_group"}:
+        raise ValueError("invalid batch_size or prefix_policy")
+    groups = raw.get("request_groups")
+    if groups is None:
+        groups = [
+            {
+                "count": batch,
+                "input_len": raw["input_len"],
+                "cache_len": raw.get("cache_len", 0),
+            }
+        ]
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("request_groups must be a nonempty list")
+    normalized = []
+    for group in groups:
+        if not isinstance(group, dict):
+            raise ValueError("each request group must be an object")
+        item = {
+            k: integer(group.get(k, 0)) for k in ("count", "input_len", "cache_len")
+        }
+        if item["count"] <= 0 or not 0 <= item["cache_len"] < item["input_len"]:
+            raise ValueError(f"invalid request group: {group}")
+        normalized.append(item)
+    if sum(g["count"] for g in normalized) != batch:
+        raise ValueError("request group counts must sum to batch_size")
+    case["batch_size"] = batch
+    case["input_len"] = max(g["input_len"] for g in normalized)
+    case["cache_len"] = max(g["cache_len"] for g in normalized)
+    if batch > 1 or "request_groups" in raw or "prefix_policy" in raw:
+        case["request_groups"] = normalized
+        case["prefix_policy"] = policy
+    return case
+
+
+def is_grouped_case(case: Dict[str, Any]) -> bool:
+    return (
+        int(case.get("batch_size", 1)) > 1
+        or "request_groups" in case
+        or "prefix_policy" in case
+    )
+
+
+def build_grouped_prompts(factory, case, run_count):
+    """Build per-request prompts with distinct suffixes across all rounds."""
+    case = normalize_cache_case(case)
+    members = []
+    for group_index, group in enumerate(case["request_groups"]):
+        shared = case["prefix_policy"] == "shared_by_group"
+        shared_prompts = None
+        for member in range(group["count"]):
+            identity = f"{case['case_id']}_g{group_index}_r{0 if shared else member}"
+            if shared_prompts is None:
+                prompts = factory.build_case_prompts(
+                    identity,
+                    group["input_len"],
+                    group["cache_len"],
+                    run_count * group["count"] if shared else run_count,
+                )
+                if shared:
+                    shared_prompts = prompts
+            else:
+                prompts = shared_prompts
+            indices = (
+                [r * group["count"] + member for r in range(run_count)]
+                if shared
+                else list(range(run_count))
+            )
+            members.append(
+                {
+                    "group_index": group_index,
+                    "request_index": len(members),
+                    "prefix_id": identity,
+                    "input_len": group["input_len"],
+                    "cache_len": group["cache_len"],
+                    "prompts": CasePrompts(
+                        prompts.seed_text,
+                        prompts.prefix_ids,
+                        [prompts.run_texts[r] for r in indices],
+                        [prompts.run_ids[r] for r in indices],
+                        prompts.built_len,
+                    ),
+                }
+            )
+    return members
 
 
 def resume_config_fingerprint(config: Dict[str, Any] | None) -> str | None:
@@ -256,7 +360,7 @@ class PrefixPromptFactory:
         return text
 
     def make_case(
-        self, case_id: int, total_len: int, cache_len: int
+        self, case_id: int | str, total_len: int, cache_len: int
     ) -> Tuple[str, str, int]:
         if cache_len < 0 or cache_len >= total_len:
             raise ValueError(
@@ -282,12 +386,12 @@ class PrefixPromptFactory:
         return target, prefix, len(target_ids)
 
     def make_seed(
-        self, case_id: int, prefix: str, cache_len: int, commit_tail_tokens: int
+        self, case_id: int | str, prefix: str, cache_len: int, commit_tail_tokens: int
     ) -> str:
         return self.make_seed_and_ids(case_id, prefix, cache_len, commit_tail_tokens)[0]
 
     def make_seed_and_ids(
-        self, case_id: int, prefix: str, cache_len: int, commit_tail_tokens: int
+        self, case_id: int | str, prefix: str, cache_len: int, commit_tail_tokens: int
     ) -> Tuple[str, List[int]]:
         if cache_len <= 0:
             return "", []
@@ -337,7 +441,7 @@ class PrefixPromptFactory:
         return result
 
     def build_case_prompts(
-        self, case_id: int, total_len: int, cache_len: int, run_count: int
+        self, case_id: int | str, total_len: int, cache_len: int, run_count: int
     ) -> CasePrompts:
         """Build the seed prefix and the measured run prompts for one case.
 
@@ -368,7 +472,7 @@ class PrefixPromptFactory:
         return self._legacy_case_prompts(case_id, total_len, cache_len, run_count)
 
     def _fast_case_prompts(
-        self, case_id: int, total_len: int, cache_len: int, run_count: int
+        self, case_id: int | str, total_len: int, cache_len: int, run_count: int
     ) -> CasePrompts:
         if cache_len == 0:
             run_texts: List[str] = []
@@ -436,7 +540,7 @@ class PrefixPromptFactory:
         )
 
     def _legacy_case_prompts(
-        self, case_id: int, total_len: int, cache_len: int, run_count: int
+        self, case_id: int | str, total_len: int, cache_len: int, run_count: int
     ) -> CasePrompts:
         _, prefix, built_len = self.make_case(case_id, total_len, cache_len)
         prefix_ids = _encode(self.tokenizer, prefix) if cache_len else []
@@ -470,7 +574,7 @@ class MaterializedCaseStore:
     verbatim text records.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, root: str):
         self.root = Path(root)
@@ -489,7 +593,7 @@ class MaterializedCaseStore:
 
     def materialize(
         self,
-        cases: Iterable[Dict[str, int]],
+        cases: Iterable[Dict[str, Any]],
         factory: PrefixPromptFactory,
         run_count: int,
         *,
@@ -510,9 +614,23 @@ class MaterializedCaseStore:
         }
         base_text = ""
         base_cache_len = -1
-        case_list = list(cases)
+        case_list = [normalize_cache_case(case) for case in cases]
+        self._records = {}
         marker_ids = _encode(factory.tokenizer, factory.SHARED_PREFIX_MARKER)
         for case in case_list:
+            if is_grouped_case(case):
+                members = build_grouped_prompts(factory, case, run_count)
+                self._records[case["case_id"]] = {
+                    **case,
+                    "schema_version": self.SCHEMA_VERSION,
+                    "members": [
+                        {**member, "prompts": asdict(member["prompts"])}
+                        for member in members
+                    ],
+                }
+                stats["cases"] += 1
+                stats["cached_cases"] += int(any(m["cache_len"] for m in members))
+                continue
             prompts = factory.build_case_prompts(
                 int(case["case_id"]),
                 int(case["input_len"]),
@@ -590,7 +708,7 @@ class MaterializedCaseStore:
         self._base_text = base_text
         return stats
 
-    def load_cases(self) -> List[Dict[str, int]]:
+    def load_cases(self) -> List[Dict[str, Any]]:
         self._ensure_loaded()
         return [
             {
@@ -598,11 +716,19 @@ class MaterializedCaseStore:
                 "batch_size": record["batch_size"],
                 "input_len": record["input_len"],
                 "cache_len": record["cache_len"],
+                **(
+                    {
+                        "request_groups": record["request_groups"],
+                        "prefix_policy": record["prefix_policy"],
+                    }
+                    if "members" in record
+                    else {}
+                ),
             }
             for record in self._records.values()
         ]
 
-    def load_case(self, case: Dict[str, int]) -> CasePrompts:
+    def load_case(self, case: Dict[str, Any]) -> CasePrompts:
         self._ensure_loaded()
         record = self._records[int(case["case_id"])]
         cache_len = int(record["cache_len"])
@@ -627,6 +753,16 @@ class MaterializedCaseStore:
             else:
                 run_texts.append(spec["marker"] + self._word * int(spec["fillers"]))
         return CasePrompts(seed_text, [], run_texts, [], int(record["input_len"]))
+
+    def load_grouped_case(self, case):
+        self._ensure_loaded()
+        record = self._records[int(case["case_id"])]
+        if CacheGridRunner.case_key(record) != CacheGridRunner.case_key(case):
+            raise ValueError("materialized batch distribution does not match case")
+        return [
+            {**member, "prompts": CasePrompts(**member["prompts"])}
+            for member in record["members"]
+        ]
 
     def _base_prefix_text(self, cache_len: int) -> str:
         if self._base_text is None:
@@ -805,7 +941,7 @@ class CacheGridRunner:
         self,
         port: int,
         tokenizer: Any,
-        cases: Iterable[Dict[str, int]],
+        cases: Iterable[Dict[str, Any]],
         result_dir: str,
         *,
         request_timeout: int = 7200,
@@ -853,9 +989,18 @@ class CacheGridRunner:
                 self._grpc_channel
             )
         self.factory = PrefixPromptFactory(tokenizer)
-        self.cases = list(cases)
+        self.cases = [normalize_cache_case(case) for case in cases]
+        if len({c["case_id"] for c in self.cases}) != len(self.cases):
+            raise ValueError("cache grid case_id values must be unique")
         self.profile_runs = profile_runs
         self.profile_case_ids = set(profile_case_ids)
+        if any(
+            is_grouped_case(c) and c["case_id"] in self.profile_case_ids
+            for c in self.cases
+        ):
+            raise ValueError(
+                "cache profiling currently supports only ungrouped batch_size=1 cases"
+            )
         self.profile_only = profile_only
         self.profile_tp_size = profile_tp_size
         self.profile_trace_timeout = profile_trace_timeout
@@ -949,7 +1094,17 @@ class CacheGridRunner:
         self._checkpoint_future: Optional[Future] = None
 
     @staticmethod
-    def case_key(case: Dict[str, int]) -> str:
+    def case_key(case: Dict[str, Any]) -> str:
+        if is_grouped_case(case):
+            case = normalize_cache_case(case)
+            digest = resume_config_fingerprint(
+                {
+                    "request_groups": case["request_groups"],
+                    "prefix_policy": case["prefix_policy"],
+                    "execution_mode": "scheduler_fixed_batch_v1",
+                }
+            )
+            return f"bs{case['batch_size']}_dist{digest[:16]}"
         return f"bs{case['batch_size']}_seq{case['input_len']}_cache{case['cache_len']}"
 
     def _load_journal(self, planned_keys: set[str]) -> None:
@@ -1016,8 +1171,9 @@ class CacheGridRunner:
         )
 
     @staticmethod
-    def _case_descriptor(case: Dict[str, int]) -> Dict[str, Any]:
+    def _case_descriptor(case: Dict[str, Any]) -> Dict[str, Any]:
         return {
+            **case,
             "case_key": CacheGridRunner.case_key(case),
             "case_id": int(case["case_id"]),
             "batch_size": int(case.get("batch_size", 1)),
@@ -1155,7 +1311,7 @@ class CacheGridRunner:
         logging.info("[CACHE_GRID] block-size probe passed: reuse_len=%d", block)
 
     def _build_prompts(
-        self, case: Dict[str, int], total_len: int, cache_len: int
+        self, case: Dict[str, Any], total_len: int, cache_len: int
     ) -> CasePrompts:
         if self.case_store is not None:
             prompts = self.case_store.load_case(case)
@@ -1170,8 +1326,10 @@ class CacheGridRunner:
             )
         return prompts
 
-    def _prepare_case_payload(self, case: Dict[str, int]) -> Dict[str, Any]:
+    def _prepare_case_payload(self, case: Dict[str, Any]) -> Dict[str, Any]:
         """Build prompts for one case without issuing a model request."""
+        if is_grouped_case(case):
+            return self._prepare_grouped_payload(case)
         key = self.case_key(case)
         total_len = int(case["input_len"])
         cache_len = int(case["cache_len"])
@@ -1215,6 +1373,247 @@ class CacheGridRunner:
             "seed_ids": seed_ids,
             "run_targets": prompts.run_texts,
             "run_ids": run_ids,
+        }
+
+    def _prepare_grouped_payload(self, case):
+        case = normalize_cache_case(case)
+        for group in case["request_groups"]:
+            cache_len = group["cache_len"]
+            if cache_len and (
+                cache_len % self.cache_commit_tail_tokens
+                or cache_len + self.cache_commit_tail_tokens > group["input_len"]
+                or (self.expected_block_size and cache_len % self.expected_block_size)
+            ):
+                raise ValueError(
+                    f"invalid cache alignment or seed commit space: {group}"
+                )
+        members = (
+            self.case_store.load_grouped_case(case)
+            if self.case_store is not None
+            else build_grouped_prompts(self.factory, case, self.measure_runs)
+        )
+        seeds = {}
+        for member in members:
+            prompts = member["prompts"]
+            if len(prompts.run_texts) != self.measure_runs:
+                raise ValueError("materialized batch measure_runs mismatch")
+            if member["cache_len"] and member["prefix_id"] not in seeds:
+                seeds[member["prefix_id"]] = self.factory.make_seed_and_ids(
+                    member["prefix_id"],
+                    prompts.seed_text,
+                    member["cache_len"],
+                    self.cache_commit_tail_tokens,
+                )
+        return {"case": case, "members": members, "seeds": seeds}
+
+    def _set_prefill_batch_size(self, batch_size):
+        """Wait for scheduler acknowledgement before submitting a complete batch."""
+        response = self._http_session.post(
+            f"http://127.0.0.1:{self.port}/update_scheduler_info",
+            json={"batch_size": batch_size, "mode": "prefill"},
+            timeout=min(self.request_timeout, 60),
+        )
+        response.raise_for_status()
+        acknowledgement = response.json()
+        if acknowledgement.get("status") != "ok" or acknowledgement.get("error"):
+            raise RuntimeError(
+                f"scheduler rejected batch_size={batch_size}: {acknowledgement}"
+            )
+        logging.info(
+            "[CACHE_BATCH] scheduler batch_size=%d mode=prefill acknowledged",
+            batch_size,
+        )
+        return acknowledgement
+
+    def _seed_grouped_payload(self, payload):
+        seeds = list(payload["seeds"].items())
+        if not seeds:
+            return []
+        self._set_prefill_batch_size(len(seeds))
+        barrier = threading.Barrier(len(seeds))
+        key = self.case_key(payload["case"])
+
+        def send(seed):
+            identity, (text, ids) = seed
+            request_id = f"{key}:seed:{identity}"
+            with _make_http_session() as session:
+                barrier.wait(timeout=self.request_timeout)
+                if self.request_transport == "dashsc_input_ids":
+                    return _post_prefill_ids(
+                        self._grpc_stub, ids, self.request_timeout, request_id
+                    )
+                return _post_prefill(
+                    self.port, text, self.request_timeout, request_id, session
+                )
+
+        with ThreadPoolExecutor(
+            max_workers=len(seeds), thread_name_prefix="cache-seed"
+        ) as pool:
+            futures = [pool.submit(send, seed) for seed in seeds]
+            results = [future.result() for future in futures]
+        if not all(result.get("success") for result in results):
+            raise RuntimeError(f"batch seed failed: {results}")
+        return results
+
+    def _measure_grouped_payload(self, payload, started):
+        try:
+            return self._measure_fixed_batch(payload, started)
+        finally:
+            # The following case/probe/profile can contain a single request.
+            self._set_prefill_batch_size(1)
+
+    def _measure_fixed_batch(self, payload, started):
+        case, members = payload["case"], payload["members"]
+        key = self.case_key(case)
+        seeds = self._seed_grouped_payload(payload)
+        self._set_prefill_batch_size(len(members))
+
+        # Sessions are owned by logical request slots, never shared concurrently.
+        sessions = [_make_http_session() for _ in members]
+        rounds = []
+        try:
+            with ThreadPoolExecutor(
+                max_workers=len(members), thread_name_prefix="cache-batch"
+            ) as pool:
+                for run_index in range(self.measure_runs):
+                    released = []
+                    barrier = threading.Barrier(
+                        len(members),
+                        action=lambda: released.append(time.perf_counter()),
+                    )
+
+                    def send(member):
+                        slot = member["request_index"]
+                        prompts = member["prompts"]
+                        request_id = f"{key}:run{run_index}:request{slot}"
+                        try:
+                            barrier.wait(timeout=self.request_timeout)
+                            if self.request_transport == "dashsc_input_ids":
+                                result = _post_prefill_ids(
+                                    self._grpc_stub,
+                                    prompts.run_ids[run_index],
+                                    self.request_timeout,
+                                    request_id,
+                                )
+                            else:
+                                result = _post_prefill(
+                                    self.port,
+                                    prompts.run_texts[run_index],
+                                    self.request_timeout,
+                                    request_id,
+                                    sessions[slot],
+                                )
+                        except Exception as exc:
+                            result = {
+                                "success": False,
+                                "error": repr(exc),
+                                "request_id": request_id,
+                            }
+                        completed = time.perf_counter()
+                        result = dict(result)
+                        result.update(
+                            {
+                                k: member[k]
+                                for k in ("request_index", "group_index", "prefix_id")
+                            }
+                        )
+                        result["expected_input_len"] = member["input_len"]
+                        result["expected_reuse_len"] = member["cache_len"]
+                        result["shape_exact"] = bool(
+                            result.get("success")
+                            and result.get("input_len") == member["input_len"]
+                            and result.get("output_len") == 1
+                        )
+                        result["reuse_exact"] = bool(
+                            result.get("success")
+                            and result.get("reuse_len") == member["cache_len"]
+                        )
+                        result["timing_valid"] = bool(
+                            result.get("success")
+                            and 0 < float(result.get("ttft_ms", 0)) < float("inf")
+                        )
+                        return result, completed
+
+                    futures = [pool.submit(send, member) for member in members]
+                    completed = [future.result() for future in futures]
+                    results = [result for result, _ in completed]
+                    wall_ms = (
+                        (max(t for _, t in completed) - released[0]) * 1000
+                        if released
+                        else None
+                    )
+                    valid = all(
+                        r["shape_exact"] and r["reuse_exact"] and r["timing_valid"]
+                        for r in results
+                    )
+                    rounds.append(
+                        {
+                            "run_index": run_index,
+                            "requests": results,
+                            "batch_wall_time_ms": wall_ms,
+                            "valid": valid,
+                            "completed_requests": sum(
+                                bool(r.get("success")) for r in results
+                            ),
+                            "total_input_tokens": sum(
+                                r.get("input_len", 0)
+                                for r in results
+                                if r.get("success")
+                            ),
+                            "new_prefill_tokens": sum(
+                                r.get("input_len", 0) - r.get("reuse_len", 0)
+                                for r in results
+                                if r.get("success")
+                            ),
+                        }
+                    )
+                    if not all(r.get("success") for r in results):
+                        # A missing request can leave a fixed-size scheduler waiting.
+                        # Never mix the remaining requests with a subsequent round.
+                        break
+        finally:
+            for session in sessions:
+                session.close()
+        results = [r for run in rounds for r in run["requests"]]
+        shape = all(r["shape_exact"] for r in results)
+        reuse = all(r["reuse_exact"] for r in results)
+        timing = all(r["timing_valid"] for r in results)
+        success = all(r.get("success") for r in results)
+        status = (
+            "failed"
+            if not success
+            else (
+                "invalid_shape"
+                if not shape
+                else (
+                    "invalid_reuse"
+                    if not reuse
+                    else "invalid_timing" if not timing else "ok"
+                )
+            )
+        )
+        return {
+            **case,
+            "case_key": key,
+            "execution_mode": "scheduler_fixed_batch",
+            "seed_batch_size": len(seeds),
+            "scheduler_batch_size": len(members),
+            "requested_batch_size": len(members),
+            "measure_runs": self.measure_runs,
+            "seed": seeds,
+            "runs": rounds,
+            "status": status,
+            "success_runs": sum(r["valid"] for r in rounds),
+            "shape_exact": shape,
+            "reuse_exact": reuse,
+            "timing_valid": timing,
+            "cache_len_observed": [r.get("reuse_len") for r in results],
+            "median_batch_wall_time_ms": (
+                statistics.median(r["batch_wall_time_ms"] for r in rounds)
+                if status == "ok"
+                else None
+            ),
+            "elapsed_s": time.time() - started,
         }
 
     def _wait_profile_traces(self, trace_name: str) -> List[str]:
@@ -1422,102 +1821,115 @@ class CacheGridRunner:
                                 prepared = prep.submit(
                                     self._prepare_case_payload, pending[idx]
                                 )
-                        total_len = payload["total_len"]
-                        cache_len = payload["cache_len"]
-                        batch_size = payload["batch_size"]
-                        built_len = payload["built_len"]
-                        seed_result: Dict[str, Any] = {}
-                        if cache_len:
-                            seed_result = self._post_request(
-                                payload["seed"], payload["seed_ids"], f"{key}:seed"
-                            )
-                            if not seed_result.get("success"):
-                                raise RuntimeError(
-                                    seed_result.get("error", "seed request failed")
+                        if "members" in payload:
+                            metric = self._measure_grouped_payload(payload, started)
+                        else:
+                            total_len = payload["total_len"]
+                            cache_len = payload["cache_len"]
+                            batch_size = payload["batch_size"]
+                            built_len = payload["built_len"]
+                            seed_result: Dict[str, Any] = {}
+                            if cache_len:
+                                seed_result = self._post_request(
+                                    payload["seed"], payload["seed_ids"], f"{key}:seed"
                                 )
+                                if not seed_result.get("success"):
+                                    raise RuntimeError(
+                                        seed_result.get("error", "seed request failed")
+                                    )
 
-                        runs = [
-                            self._post_request(
-                                run_target,
-                                payload["run_ids"][run_idx],
-                                f"{key}:run{run_idx}",
+                            runs = [
+                                self._post_request(
+                                    run_target,
+                                    payload["run_ids"][run_idx],
+                                    f"{key}:run{run_idx}",
+                                )
+                                for run_idx, run_target in enumerate(
+                                    payload["run_targets"]
+                                )
+                            ]
+
+                            successful = [r for r in runs if r.get("success")]
+                            expected_reuse = cache_len
+                            reuse_values = [
+                                int(r.get("reuse_len", -1)) for r in successful
+                            ]
+                            reuse_exact = bool(
+                                len(successful) == self.measure_runs
+                                and all(x == expected_reuse for x in reuse_values)
                             )
-                            for run_idx, run_target in enumerate(payload["run_targets"])
-                        ]
-
-                        successful = [r for r in runs if r.get("success")]
-                        expected_reuse = cache_len
-                        reuse_values = [int(r.get("reuse_len", -1)) for r in successful]
-                        reuse_exact = bool(
-                            len(successful) == self.measure_runs
-                            and all(x == expected_reuse for x in reuse_values)
-                        )
-                        shape_exact = bool(
-                            len(successful) == self.measure_runs
-                            and all(
-                                int(r.get("input_len", -1)) == total_len
+                            shape_exact = bool(
+                                len(successful) == self.measure_runs
+                                and all(
+                                    int(r.get("input_len", -1)) == total_len
+                                    for r in successful
+                                )
+                                and all(
+                                    int(r.get("output_len", -1)) == 1
+                                    for r in successful
+                                )
+                            )
+                            ttft_values = [
+                                float(r["ttft_ms"])
                                 for r in successful
-                            )
-                            and all(
-                                int(r.get("output_len", -1)) == 1 for r in successful
-                            )
-                        )
-                        ttft_values = [
-                            float(r["ttft_ms"])
-                            for r in successful
-                            if float(r.get("ttft_ms", 0.0)) > 0.0
-                        ]
-                        timing_valid = len(ttft_values) == self.measure_runs
-                        metric = {
-                            "case_key": key,
-                            "case_id": int(case["case_id"]),
-                            "batch_size": batch_size,
-                            "input_len": total_len,
-                            "input_len_built": built_len,
-                            "cache_len_requested": cache_len,
-                            "cache_len_observed": reuse_values,
-                            "input_len_observed": [
-                                int(r.get("input_len", 0)) for r in successful
-                            ],
-                            "expected_reuse_len": expected_reuse,
-                            "success_runs": len(successful),
-                            "measure_runs": self.measure_runs,
-                            "cache_commit_tail_tokens": self.cache_commit_tail_tokens,
-                            "seed": seed_result,
-                            "runs": runs,
-                            "reuse_exact": reuse_exact,
-                            "shape_exact": shape_exact,
-                            "timing_valid": timing_valid,
-                            "ttft_ms": ttft_values,
-                            "median_ttft_ms": (
-                                statistics.median(ttft_values) if timing_valid else None
-                            ),
-                            "avg_ttft_ms": (
-                                statistics.fmean(ttft_values) if timing_valid else None
-                            ),
-                            "elapsed_s": time.time() - started,
-                            "status": (
-                                "ok"
-                                if reuse_exact and shape_exact and timing_valid
-                                else (
-                                    "invalid_shape"
-                                    if len(successful) == self.measure_runs
-                                    and not shape_exact
+                                if float(r.get("ttft_ms", 0.0)) > 0.0
+                            ]
+                            timing_valid = len(ttft_values) == self.measure_runs
+                            metric = {
+                                "case_key": key,
+                                "case_id": int(case["case_id"]),
+                                "batch_size": batch_size,
+                                "input_len": total_len,
+                                "input_len_built": built_len,
+                                "cache_len_requested": cache_len,
+                                "cache_len_observed": reuse_values,
+                                "input_len_observed": [
+                                    int(r.get("input_len", 0)) for r in successful
+                                ],
+                                "expected_reuse_len": expected_reuse,
+                                "success_runs": len(successful),
+                                "measure_runs": self.measure_runs,
+                                "cache_commit_tail_tokens": self.cache_commit_tail_tokens,
+                                "seed": seed_result,
+                                "runs": runs,
+                                "reuse_exact": reuse_exact,
+                                "shape_exact": shape_exact,
+                                "timing_valid": timing_valid,
+                                "ttft_ms": ttft_values,
+                                "median_ttft_ms": (
+                                    statistics.median(ttft_values)
+                                    if timing_valid
+                                    else None
+                                ),
+                                "avg_ttft_ms": (
+                                    statistics.fmean(ttft_values)
+                                    if timing_valid
+                                    else None
+                                ),
+                                "elapsed_s": time.time() - started,
+                                "status": (
+                                    "ok"
+                                    if reuse_exact and shape_exact and timing_valid
                                     else (
-                                        "invalid_timing"
+                                        "invalid_shape"
                                         if len(successful) == self.measure_runs
-                                        and not timing_valid
+                                        and not shape_exact
                                         else (
-                                            "invalid_reuse"
+                                            "invalid_timing"
                                             if len(successful) == self.measure_runs
-                                            else "failed"
+                                            and not timing_valid
+                                            else (
+                                                "invalid_reuse"
+                                                if len(successful) == self.measure_runs
+                                                else "failed"
+                                            )
                                         )
                                     )
-                                )
-                            ),
-                        }
+                                ),
+                            }
                     except Exception as exc:
                         metric = {
+                            **case,
                             "case_key": key,
                             "case_id": int(case["case_id"]),
                             "batch_size": int(case.get("batch_size", 1)),
@@ -1525,6 +1937,7 @@ class CacheGridRunner:
                             "cache_len_requested": int(case["cache_len"]),
                             "status": "error",
                             "error": repr(exc),
+                            "batch_execution_failed": is_grouped_case(case),
                             "elapsed_s": time.time() - started,
                         }
                     self._results[key] = metric
@@ -1545,7 +1958,10 @@ class CacheGridRunner:
                         metric.get("status"),
                         metric.get("cache_len_observed", []),
                     )
-                    if self.fail_fast and metric.get("status") != "ok":
+                    if (self.fail_fast and metric.get("status") != "ok") or (
+                        is_grouped_case(case)
+                        and metric.get("status") in {"failed", "error"}
+                    ):
                         self._save()
                         raise RuntimeError(
                             f"cache grid stopped at {key}: "

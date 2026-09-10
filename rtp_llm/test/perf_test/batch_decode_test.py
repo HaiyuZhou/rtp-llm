@@ -15,6 +15,8 @@ from rtp_llm.test.perf_test.cache_grid_runner import (
     CacheGridRunner,
     MaterializedCaseStore,
     PrefixPromptFactory,
+    is_grouped_case,
+    normalize_cache_case,
     resume_config_fingerprint,
     validate_cache_grid_resume,
 )
@@ -666,29 +668,67 @@ def _load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
         raise ValueError("cache grid cases must be a list")
     cases: List[Dict[str, int]] = []
     seen = set()
+    seen_ids = set()
     for index, raw in enumerate(raw_cases):
         if not isinstance(raw, dict):
             raise ValueError(f"cache grid case {index} must be an object")
-        case = {
-            "case_id": int(raw.get("case_id", index)),
-            "batch_size": int(raw.get("batch_size", 1)),
-            "input_len": int(raw["input_len"]),
-            "cache_len": int(raw.get("cache_len", 0)),
-        }
-        if case["batch_size"] != 1:
-            raise ValueError("cache grid currently requires batch_size=1")
-        if case["input_len"] <= 0 or not 0 <= case["cache_len"] < case["input_len"]:
-            raise ValueError(f"invalid cache grid case: {case}")
-        key = (case["batch_size"], case["input_len"], case["cache_len"])
+        case = normalize_cache_case(raw, index)
+        key = CacheGridRunner.case_key(case)
         if key in seen:
             if not explicit_cases:
                 continue
             raise ValueError(f"duplicate cache grid case: {case}")
         seen.add(key)
+        if case["case_id"] in seen_ids:
+            raise ValueError(f"duplicate cache grid case_id: {case['case_id']}")
+        seen_ids.add(case["case_id"])
         cases.append(case)
     if not cases:
         raise ValueError(f"cache grid {path} contains no cases")
     return cases
+
+
+def _configure_cache_batch_limits(args, remaining, cases):
+    """Ensure admission and context limits can accommodate every fixed batch."""
+    batch_size = max(c["batch_size"] for c in cases)
+    if batch_size <= 1:
+        return
+    if args.dp_size != 1:
+        raise ValueError("fixed cache batches currently require dp_size=1")
+    args.concurrency_limit = max(args.concurrency_limit, batch_size)
+    total_tokens = max(
+        sum(
+            g["count"] * g["input_len"]
+            for g in c.get(
+                "request_groups",
+                [{"count": c["batch_size"], "input_len": c["input_len"]}],
+            )
+        )
+        for c in cases
+    )
+    for name, required in (
+        ("max_context_batch_size", batch_size),
+        ("max_batch_tokens_size", total_tokens),
+    ):
+        current = int(extract_arg(remaining, name) or 0)
+        if current >= required:
+            continue
+        flag = "--" + name
+        cleaned = []
+        index = 0
+        while index < len(remaining):
+            value = remaining[index]
+            if value == flag:
+                index += 2
+            elif value.startswith(flag + "="):
+                index += 1
+            else:
+                cleaned.append(value)
+                index += 1
+        remaining[:] = cleaned + [flag, str(required)]
+        logging.info(
+            "cache fixed batch: raised %s from %d to %d", name, current, required
+        )
 
 
 def _resolve_cache_block_size(grid_payload: Any, cli_value: int) -> int:
@@ -738,6 +778,12 @@ def _dedupe_cache_grid_cases(
     buckets: Dict[tuple, Dict[str, int]] = {}
     order: List[tuple] = []
     for case in cases:
+        if is_grouped_case(case):
+            key = (CacheGridRunner.case_key(case),)
+            if key not in buckets:
+                buckets[key] = case
+                order.append(key)
+            continue
         key = (case["batch_size"], case["input_len"], case["cache_len"] // block_size)
         kept = buckets.get(key)
         if kept is None:
@@ -778,6 +824,7 @@ def _load_materialized_case_store(
     def geometry(case: Dict[str, int]) -> tuple:
         return (
             case["case_id"],
+            CacheGridRunner.case_key(case),
             case["batch_size"],
             case["input_len"],
             case["cache_len"],
@@ -987,6 +1034,7 @@ def main() -> str:
             )
 
         cases = _load_cache_grid_cases(args.cache_grid_json)
+        _configure_cache_batch_limits(args, remaining, cases)
         with open(args.cache_grid_json, "rb") as stream:
             grid_bytes = stream.read()
         grid_payload = json.loads(grid_bytes)
@@ -1023,6 +1071,13 @@ def main() -> str:
         if unknown_profile_ids:
             raise ValueError(
                 f"unknown/deduplicated cache profile case IDs: {sorted(unknown_profile_ids)}"
+            )
+        if any(
+            is_grouped_case(c) and c["case_id"] in args.cache_profile_case_ids
+            for c in cases
+        ):
+            raise ValueError(
+                "cache profiling currently supports only ungrouped batch_size=1 cases"
             )
         if args.cache_profile_runs and args.materialize_cache_cases:
             raise ValueError(
@@ -1085,9 +1140,17 @@ def main() -> str:
                 resume_config=resume_config,
             )
             return args.result_dir
-        for case in cases:
+        for case in [group for c in cases for group in c.get("request_groups", [c])]:
             cache_len = int(case["cache_len"])
             input_len = int(case["input_len"])
+            if (
+                "count" in case
+                and expected_block_size
+                and cache_len % expected_block_size
+            ):
+                raise ValueError(
+                    f"cache-grid cache_len must align to block size {expected_block_size}: {case}"
+                )
             if cache_len and cache_len % args.cache_commit_tail_tokens:
                 raise ValueError(
                     "cache-grid cache_len must align to "
@@ -1150,9 +1213,7 @@ def main() -> str:
         server = EngineServer(args, remaining)
         server.start(
             max_seq_len=max(max_input_len + args.decode_test_length, args.max_seq_len),
-            # CacheGridRunner keeps model forwards serial. Preserve the
-            # requested service admission limit instead of rewriting it to
-            # the workload's fixed batch size of one.
+            # Admission must allow the complete fixed batch to reach the scheduler.
             max_concurrency=args.concurrency_limit,
         )
         try:

@@ -1156,6 +1156,10 @@ def main() -> str:
             max_concurrency=args.concurrency_limit,
         )
         try:
+            # CacheGridRunner bypasses GridRunner/BatchPerfImpl, whose run() normally
+            # switches BatchDecodeScheduler to prefill. Configure it explicitly before
+            # the block-size probe, cache seeds, or measurement requests are issued.
+            server.set_scheduler_mode(batch_size=1, mode="prefill")
             CacheGridRunner(
                 server.port,
                 tokenizer,

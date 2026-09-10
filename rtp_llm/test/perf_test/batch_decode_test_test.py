@@ -29,6 +29,7 @@ from rtp_llm.test.perf_test.cache_grid_runner import (
     resume_config_fingerprint,
     validate_cache_grid_resume,
 )
+from rtp_llm.test.perf_test.server import EngineServer
 
 
 class _WhitespaceTokenizer:
@@ -461,6 +462,46 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertEqual(len(deduped), 3)
 
 
+class EngineServerSchedulerModeTest(unittest.TestCase):
+    def _server(self):
+        args = argparse.Namespace(partial=2, result_dir="/tmp/result", dp_size=1)
+        server = EngineServer(args, [])
+        server._server = Mock(port=12345)
+        return server
+
+    @patch("rtp_llm.test.perf_test.server.requests.post")
+    def test_set_scheduler_mode_posts_prefill_configuration(self, post):
+        response = Mock(status_code=200)
+        response.json.return_value = {"status": "ok"}
+        post.return_value = response
+
+        result = self._server().set_scheduler_mode(batch_size=1, mode="prefill")
+
+        self.assertEqual(result, {"status": "ok"})
+        post.assert_called_once_with(
+            "http://127.0.0.1:12345/update_scheduler_info",
+            json={"batch_size": 1, "mode": "prefill"},
+            timeout=60,
+        )
+
+    @patch("rtp_llm.test.perf_test.server.time.sleep")
+    @patch("rtp_llm.test.perf_test.server.requests.post")
+    def test_set_scheduler_mode_fails_after_retries(self, post, sleep):
+        post.side_effect = ConnectionError("server unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "after retries"):
+            self._server().set_scheduler_mode(batch_size=1, mode="prefill")
+
+        self.assertEqual(post.call_count, 20)
+        self.assertEqual(sleep.call_count, 20)
+
+    @patch("rtp_llm.test.perf_test.server.requests.post")
+    def test_set_scheduler_mode_rejects_invalid_mode(self, post):
+        with self.assertRaisesRegex(ValueError, "unsupported scheduler mode"):
+            self._server().set_scheduler_mode(batch_size=1, mode="invalid")
+        post.assert_not_called()
+
+
 class CacheGridProfileTest(unittest.TestCase):
     cases = [
         {"case_id": 1, "batch_size": 1, "input_len": 16, "cache_len": 8},
@@ -679,6 +720,14 @@ class CacheGridProfileTest(unittest.TestCase):
                 "os.environ", {}, clear=False
             ):
                 server.return_value.port = 12345
+
+                def assert_prefill_mode_before_run(_runner):
+                    server.return_value.set_scheduler_mode.assert_called_once_with(
+                        batch_size=1, mode="prefill"
+                    )
+                    return []
+
+                run.side_effect = assert_prefill_mode_before_run
                 result_dir = Path(entry.main())
                 runner = run.call_args.args[0]
                 self.assertTrue(runner.profile_only)
@@ -688,6 +737,9 @@ class CacheGridProfileTest(unittest.TestCase):
                 self.assertEqual(result_dir.parent, root / "cache_profile_replays")
                 self.assertEqual(original_info.read_text(), '{"original": true}')
                 self.assertTrue((result_dir / "test_info.json").is_file())
+                server.return_value.set_scheduler_mode.assert_called_once_with(
+                    batch_size=1, mode="prefill"
+                )
                 server.return_value.stop.assert_called_once()
 
     def test_profile_cli_defaults_and_validation(self):

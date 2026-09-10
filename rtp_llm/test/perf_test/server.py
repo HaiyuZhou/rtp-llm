@@ -1,7 +1,10 @@
 import argparse
 import logging
 import os
+import time
 from typing import Dict, List, Optional
+
+import requests
 
 from rtp_llm.test.perf_test.dataset import extract_arg
 from rtp_llm.test.utils.maga_server_manager import MagaServerManager
@@ -45,6 +48,44 @@ class EngineServer:
     def stop(self) -> None:
         if self._server is not None:
             self._server.stop_server()
+
+    def set_scheduler_mode(self, *, batch_size: int, mode: str) -> Dict[str, object]:
+        """Configure BatchDecodeScheduler before issuing performance requests."""
+        if batch_size <= 0:
+            raise ValueError("scheduler batch_size must be positive")
+        if mode not in ("decode", "prefill"):
+            raise ValueError(f"unsupported scheduler mode: {mode}")
+
+        payload = {"batch_size": batch_size, "mode": mode}
+        last_error = None
+        for attempt in range(1, 21):
+            try:
+                response = requests.post(
+                    f"http://127.0.0.1:{self.port}/update_scheduler_info",
+                    json=payload,
+                    timeout=60,
+                )
+                if (
+                    response.status_code == 200
+                    and response.json().get("status", "ok") == "ok"
+                ):
+                    logging.info(
+                        "scheduler configured before perf requests: payload=%s "
+                        "response=%s",
+                        payload,
+                        response.json(),
+                    )
+                    return response.json()
+                last_error = f"{response.text}, {response.status_code}"
+            except Exception as error:
+                last_error = repr(error)
+            logging.warning(
+                "failed to configure scheduler, retrying (%d/20): %s",
+                attempt,
+                last_error,
+            )
+            time.sleep(3)
+        raise RuntimeError(f"failed to configure scheduler after retries: {last_error}")
 
     @property
     def port(self) -> int:

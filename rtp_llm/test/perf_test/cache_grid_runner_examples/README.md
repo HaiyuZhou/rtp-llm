@@ -502,3 +502,38 @@ bazelisk run //rtp_llm/test/perf_test:run_cache_grid_pipeline -- \
   --estimator=median \
   --skip-test
 ```
+# 随机混合 batch 的交互图
+
+使用 `../generate_batch_interactive_chart.py` 从已分析的
+`interactive_data.json` 生成离线 HTML（依赖 Python `plotly`，不需要 GPU）。
+在仓库根目录执行：
+
+```bash
+python rtp_llm/test/perf_test/generate_batch_interactive_chart.py \
+  --input /path/to/run/report/interactive_data.json \
+  --output /path/to/run/report/batch_cache_compute_ttft.html
+```
+
+输入是分析后的 JSON，不是 runner 原始 `cache_grid_results.json`：顶层包含
+`measurement_contract=batch_input_ids_wall_barrier_to_last_response_ms` 和 `rows`。
+每行包含 case_id、batch_size、band（cache/compute 的 low/low、low/high、high/low、high/high）、
+cached_tokens/compute_tokens 总量及 mean/min/max、median/min/max_batch_ttft_ms、
+p95_request_ttft_ms、formal_rounds_ms，以及 request_distribution
+（每请求 `[input_tokens, observed_cache_tokens, compute_tokens]`）。
+脚本只呈现输入统计，不重新选择预热轮次或计算测量中位数；不完整数据加 `--partial`。
+
+三种视图均在轴上及图外明确标注含义、单位：
+
+- 默认：X=batch 请求数，Y=每请求平均实际 cache，Z=每请求平均 compute，颜色=整批 TTFT。
+- 总量：Y/Z 改为整批 cache/compute token 总量。
+- 时延：X=平均 compute，Y=平均实际 cache，Z=整批 TTFT，颜色=batch。
+
+长度单位 Ki tokens=1024 tokens；TTFT 单位 ms，计时到整批最后一条响应，
+不是纯 GPU prefill 时间。支持旋转、筛选和点击请求明细，不插值未测量曲面。
+页面内嵌 Plotly，无 CDN 依赖。可执行交互逻辑回归检查（需要 Node.js，不代替浏览器渲染验收）：
+
+```bash
+node rtp_llm/test/perf_test/generate_batch_interactive_chart_test.js \
+  /path/to/run/report/batch_cache_compute_ttft.html \
+  /path/to/run/report/interactive_data.json
+```

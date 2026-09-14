@@ -68,6 +68,10 @@ const CachedEnvFlag kDeviceInputFlag   = cacheEnvFlag("RTP_LLM_DEVICE_INPUT", "n
 const CachedEnvFlag kDeviceInputCheckFlag =
     cacheEnvFlag("RTP_LLM_DEVICE_INPUT_CHECK", "normal-device-input", "enabled");
 
+bool recordDecodeEnabled() {
+    static const bool enabled = readEnvFlagOnce("RTP_LLM_RECORD_DECODE", "execution-recorder", "record_decode");
+    return enabled;
+}
 void holdSamplerInputHostBuffers(TensorHolder& holder, const SamplerInputs& inputs) {
     holder.hold_host(inputs.token_ids);
     holder.hold_host(inputs.input_lengths);
@@ -101,6 +105,63 @@ void checkRuntimeCudaDevice(const torch::Tensor& tensor, const char* tag, const 
                             name,
                             tensor.get_device(),
                             expected_device);
+}
+
+// Called before forward on its producing stream. copy_ queues D2H before any
+// later input reuse, and the closure retains source/destination/event ownership.
+void recordBatchInputs(const GptModelInputs& inputs, const StreamGroups& groups) {
+    auto& recorder = ExecutionRecorder::instance();
+    if (!recorder.enabled() || !inputs.record_execution_id)
+        return;
+    RTP_LLM_PROFILE_SCOPE("recorder.snapshot");
+    std::vector<torch::Tensor> sources{inputs.input_lengths, inputs.sequence_lengths, inputs.prefix_lengths};
+    std::vector<torch::Tensor> hosts;
+    for (const auto& source : sources) {
+        auto host = torch::empty(source.sizes(), torch::TensorOptions(torch::kInt32).pinned_memory(true));
+        host.copy_(source, true);
+        hosts.push_back(std::move(host));
+    }
+    auto done = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    done->record(cuda_graph::graphGetCurrentStream());
+    std::vector<std::string> rows;
+    auto                     append = [&](const auto& streams, const char* phase) {
+        for (const auto& stream : streams) {
+            const auto request = stream->recordedRequest();
+            for (int i = 0; i < stream->currentBatchSize(); ++i) {
+                rows.push_back("{\"batch_slot\":" + std::to_string(rows.size()) + ",\"request_id\":"
+                               + (request ? ExecutionRecorder::quote("r" + std::to_string(request->id())) : "null")
+                               + ",\"sequence_id\":" + std::to_string(i)
+                               + ",\"phase\":" + ExecutionRecorder::quote(phase)
+                               + ",\"prompt_tokens\":" + std::to_string(stream->inputLength())
+                               + ",\"prefix_cache_hit_tokens\":" + std::to_string(stream->initialReuseLength())
+                               + ",\"is_fake\":" + (stream->isFakeStream() ? "true" : "false"));
+            }
+        }
+    };
+    append(groups.decodeStreams(), "decode");
+    append(groups.contextStreams(), "prefill");
+    if (rows.size() != static_cast<size_t>(inputs.input_lengths.numel())
+        || groups.totalDecodeBatchSize() != static_cast<size_t>(inputs.sequence_lengths.numel())
+        || groups.totalContextBatchSize() != static_cast<size_t>(inputs.prefix_lengths.numel()))
+        throw std::runtime_error("batch snapshot slot/length count mismatch");
+    const auto prefix = "{" + recorder.identity() + ",\"execution_id\":" + std::to_string(inputs.record_execution_id)
+                        + ",\"scheduler_step_id\":"
+                        + (inputs.record_scheduler_step_id ? std::to_string(inputs.record_scheduler_step_id) : "null")
+                        + ",\"model_role\":\"target\",\"requests\":[";
+    const auto decodes = groups.totalDecodeBatchSize();
+    recorder.submit("batches.jsonl", [sources, hosts, done, rows, prefix, decodes] {
+        done->synchronize();
+        std::string line = prefix;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (i)
+                line += ',';
+            const auto q  = i < decodes ? 1 : hosts[0].data_ptr<int32_t>()[i];
+            const auto kv = i < decodes ? hosts[1].data_ptr<int32_t>()[i] : hosts[2].data_ptr<int32_t>()[i - decodes];
+            line += rows[i] + ",\"q_tokens\":" + std::to_string(q) + ",\"kv_tokens_before\":" + std::to_string(kv)
+                    + ",\"length_source\":\"device_snapshot\"}";
+        }
+        return line + "]}";
+    });
 }
 
 }  // namespace
@@ -139,6 +200,24 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
     enable_detail_log_  = params.profiling_debug_logging_config.enable_detail_log;
     tp_rank_            = params.parallelism_config.tp_rank;
     parallelism_config_ = params.parallelism_config;
+    if (!warm_up_)
+        ExecutionRecorder::instance().configure(parallelism_config_.world_rank, parallelism_config_.dp_rank);
+    if (!warm_up_ && ExecutionRecorder::instance().enabled()) {
+        ExecutionRecorder::instance().setMetadata(
+            "{\"tp_size\":" + std::to_string(parallelism_config_.tp_size)
+            + ",\"dp_size\":" + std::to_string(parallelism_config_.dp_size)
+            + ",\"world_size\":" + std::to_string(parallelism_config_.world_size)
+            + ",\"num_layers\":" + std::to_string(params.model_config_.num_layers)
+            + ",\"vocab_size\":" + std::to_string(params.model_config_.vocab_size)
+            + ",\"max_seq_len\":" + std::to_string(params.model_config_.max_seq_len)
+            + ",\"cache_block_tokens\":" + std::to_string(cache_manager_->cacheConfig().seq_size_per_block)
+            + ",\"cache_groups\":" + std::to_string(cache_manager_->cacheConfig().groupNums())
+            + ",\"model_config\":" + ExecutionRecorder::quote(params.model_config_.to_string())
+            + ",\"cache_config\":" + ExecutionRecorder::quote(cache_manager_->cacheConfig().debugString())
+            + ",\"record_decode\":" + (recordDecodeEnabled() ? "true" : "false")
+            + ",\"decode_filter_policy\":\"skip_entire_batch_containing_decode\""
+            + ",\"model_fingerprint\":null,\"scope\":\"normal_executor\"}");
+    }
     RTP_LLM_LOG_INFO("enable_detail_log_ = %d, tp_rank_ = %d", enable_detail_log_, tp_rank_);
 
     const bool enable_cross_node_cpu_tp_broadcast =
@@ -285,12 +364,27 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         prepareGrpcNormalDeviceState(stream_groups);
     }
 
+    auto&      execution_recorder = ExecutionRecorder::instance();
+    const bool record_owner       = execution_recorder.enabled() && !warm_up_ && !is_propose_ && tp_rank_ == 0;
+    // Filter before snapshot allocation/D2H/JSON work. Never emit a partial
+    // mixed batch that could be mistaken for a replayable model input.
+    const int64_t record_id = record_owner && (recordDecodeEnabled() || stream_groups.totalDecodeBatchSize() == 0) ?
+                                  execution_recorder.nextId() :
+                                  0;
+    if (record_owner) {
+        for (const auto& stream : streams) {
+            if (auto request = stream->recordedRequest())
+                request->scheduled(record_id, recording_step_);
+        }
+    }
     {
         RTP_LLM_PROFILE_SCOPE("executor.gather_model_input");
         int64_t start_time_us      = autil::TimeUtility::currentTimeInMicroSeconds();
         auto    model_input_status = batch_stream_processor_->gatherModelInput(stream_groups, buffer_holder_);
         RETURN_IF_STATUS_OR_ERROR(model_input_status);
         model_input                              = std::move(model_input_status.value());
+        model_input.record_execution_id          = record_id;
+        model_input.record_scheduler_step_id     = record_id ? recording_step_ : 0;
         executor_collector.gather_model_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
     {
@@ -316,6 +410,15 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
 
     if (profile_step_start_) {
         profile_step_start_();
+    }
+
+    if (tp_rank_ == 0 && model_input.record_execution_id) {
+        try {
+            recordBatchInputs(model_input, stream_groups);
+        } catch (const std::exception& e) {
+            execution_recorder.markError();
+            RTP_LLM_LOG_WARNING("batch snapshot failed: %s", e.what());
+        }
     }
 
     // make sure last model input is released before forward
@@ -345,9 +448,44 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
                                       stream_groups.totalDecodeBatchSize(),
                                       stream_groups.modelExecuteTokenSize(),
                                       stream_groups.maxSeqLen());
-        int64_t start_time_us               = autil::TimeUtility::currentTimeInMicroSeconds();
-        model_output                        = std::move(model_->forward(model_input));
+        int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("rtp.execution(id=%ld)", model_input.record_execution_id);
+        try {
+            model_output = std::move(model_->forward(model_input));
+        } catch (...) {
+            if (execution_recorder.enabled() && model_input.record_execution_id) {
+                execution_recorder.submit("executions.jsonl",
+                                          "{" + execution_recorder.identity()
+                                              + ",\"execution_id\":" + std::to_string(model_input.record_execution_id)
+                                              + ",\"status\":\"error\"}");
+            }
+            throw;
+        }
         executor_collector.model_forward_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+        if (execution_recorder.enabled() && model_input.record_execution_id) {
+            execution_recorder.submit(
+                "executions.jsonl",
+                "{" + execution_recorder.identity() + ",\"execution_id\":"
+                    + std::to_string(model_input.record_execution_id) + ",\"status\":\"success\",\"execution_mode\":"
+                    + ExecutionRecorder::quote(model_input.record_graph_kind > 1  ? "cuda_graph" :
+                                               model_input.record_graph_kind == 1 ? "eager" :
+                                                                                    "unknown")
+                    + ",\"graph_bucket\":"
+                    + (model_input.record_graph_bucket < 0 ? "null" : std::to_string(model_input.record_graph_bucket))
+                    + ",\"graph_bucket_unit\":"
+                    + ExecutionRecorder::quote(model_input.record_graph_kind == 3 ? "tokens" : "sequences")
+                    + ",\"physical_batch_size\":"
+                    + std::to_string(model_input.record_graph_kind == 2 ? model_input.record_graph_bucket :
+                                                                          model_input.input_lengths.numel())
+                    + ",\"physical_tokens\":"
+                    + (model_input.record_graph_kind == 0 ?
+                           "null" :
+                           std::to_string(model_input.record_graph_kind > 1 ? model_input.record_graph_bucket :
+                                                                              model_input.combo_tokens.numel()))
+                    + ",\"logical_batch_size\":" + std::to_string(model_input.input_lengths.numel())
+                    + ",\"real_tokens\":" + std::to_string(model_input.combo_tokens.numel())
+                    + ",\"cpu_submit_us\":" + std::to_string(executor_collector.model_forward_us) + "}");
+        }
     }
     if (expert_balancer_) {
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();

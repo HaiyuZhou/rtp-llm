@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include "rtp_llm/cpp/observability/ExecutionRecorder.h"
 
 namespace rtp_llm {
 
@@ -172,6 +173,10 @@ public:
 
     bool isFakeStream() const {
         return is_fake_stream_;
+    }
+
+    std::shared_ptr<RecordedRequest> recordedRequest() const {
+        return recorded_request_;
     }
 
     virtual ErrorResult<GenerateOutputs> nextOutput() = 0;
@@ -945,7 +950,8 @@ protected:
     // just for bool test
     bool perf_test_ = false;
     friend class StreamCacheResource;
-    bool is_fake_stream_ = false;
+    bool                             is_fake_stream_ = false;
+    std::shared_ptr<RecordedRequest> recorded_request_;
 
     // prefill TP size queried from prefill server (used for asymmetric TP)
     int prefill_tp_size_ = -1;

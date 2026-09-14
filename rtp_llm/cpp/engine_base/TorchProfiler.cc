@@ -2,6 +2,7 @@
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "autil/TimeUtility.h"
 #include <string>
+#include "rtp_llm/cpp/observability/ExecutionRecorder.h"
 
 namespace rtp_llm {
 namespace tap = torch::autograd::profiler;
@@ -36,10 +37,17 @@ TorchProfile::~TorchProfile() {
 }
 
 void TorchProfile::start() {
-    count_ += 1;
-    stopped_ = false;
+    capture_number_ = ++count_;
+    stopped_        = false;
     tap::prepareProfiler(config_, activities_);
     tap::enableProfiler(config_, activities_);
+    auto& recorder = ExecutionRecorder::instance();
+    if (recorder.enabled())
+        recorder.submit("captures.jsonl",
+                        "{" + recorder.identity()
+                            + ",\"capture_id\":" + ExecutionRecorder::quote(prefix_ + std::to_string(capture_number_))
+                            + ",\"event\":\"start\",\"timestamp_monotonic_ns\":"
+                            + std::to_string(ExecutionRecorder::monotonicNs()) + "}");
 }
 
 std::pair<std::unique_ptr<tap::ProfilerResult>, std::string> TorchProfile::stopAndCollect() {
@@ -54,7 +62,13 @@ std::pair<std::unique_ptr<tap::ProfilerResult>, std::string> TorchProfile::stopA
     if (!res) {
         return {nullptr, ""};
     }
-    std::string file_name = output_dir_ + "/" + prefix_ + std::to_string(count_) + ".json";
+    std::string file_name = output_dir_ + "/" + prefix_ + std::to_string(capture_number_) + ".json";
+    auto&       recorder  = ExecutionRecorder::instance();
+    if (recorder.enabled())
+        recorder.submit("captures.jsonl",
+                        "{" + recorder.identity()
+                            + ",\"capture_id\":" + ExecutionRecorder::quote(prefix_ + std::to_string(capture_number_))
+                            + ",\"event\":\"collected\",\"trace_file\":" + ExecutionRecorder::quote(file_name) + "}");
     return {std::move(res), std::move(file_name)};
 }
 

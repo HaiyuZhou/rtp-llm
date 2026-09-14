@@ -185,6 +185,11 @@ void GenerateStream::recordWaitLatency() {
 void GenerateStream::recordSchedulerEnqueueTime(int64_t time_us) {
     if (scheduler_enqueue_time_us_ == 0) {
         scheduler_enqueue_time_us_ = time_us;
+        auto& recorder             = ExecutionRecorder::instance();
+        if (!isFakeStream() && recorder.enabled()) {
+            recorded_request_ = std::make_shared<RecordedRequest>(recorder);
+            recorded_request_->enqueue(isStreaming());
+        }
     }
 }
 
@@ -852,7 +857,12 @@ void GenerateStream::setReserveStep(size_t reserve_step) {
 StreamState GenerateStream::moveToNext() {
     checkTimeout();
     std::lock_guard<std::mutex> lock(*mutex_);
-    StreamState                 state = generate_status_->moveToNext();
+    const auto                  old_state = generate_status_->getStatus();
+    StreamState                 state     = generate_status_->moveToNext();
+    if (old_state != StreamState::FINISHED && state == StreamState::FINISHED && recorded_request_) {
+        const auto code = generate_status_->error_info.code();
+        recorded_request_->terminal(static_cast<int>(code), code == ErrorCode::CANCELLED);
+    }
 
     // notify one thread waiting for stream completion
     if (getStatus() == StreamState::FINISHED) {
@@ -1601,8 +1611,8 @@ void GenerateStream::reportStreamMetrics() {
         collector.is_streaming_qps  = generate_input_->generate_config->is_streaming;
         collector.not_streaming_qps = !generate_input_->generate_config->is_streaming;
         if (getStatus() == StreamState::FINISHED || cancelled || timeout) {
-            collector.reuse_length           = initial_reuse_length_;
-            collector.input_token_length     = inputLength();
+            collector.reuse_length       = initial_reuse_length_;
+            collector.input_token_length = inputLength();
             collector.effective_context_length =
                 std::max<int64_t>(0, collector.input_token_length - initial_reuse_length_);
             collector.output_token_length    = outputTokenLen();

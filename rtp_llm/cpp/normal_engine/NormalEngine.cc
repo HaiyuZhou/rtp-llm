@@ -166,6 +166,7 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
     step_profiler_(params.profiling_debug_logging_config.torch_cuda_profiler_dir,
                    params.parallelism_config.dp_rank * params.parallelism_config.tp_size
                        + params.parallelism_config.tp_rank) {
+    ExecutionRecorder::instance().configure(params.parallelism_config.world_rank, params.parallelism_config.dp_rank);
     RTP_LLM_LOG_INFO(__PRETTY_FUNCTION__);
     if (propose_params_) {
         reserve_step_ = propose_params_->gen_num_per_circle + 1;
@@ -749,6 +750,18 @@ void NormalEngine::loop() {
     RTP_LLM_LOG_INFO("loop begin");
     blockTerminationSignalsInEngineThread();
     cudaPreRun(getDeviceId());
+    if (const auto* steps = std::getenv("RTP_LLM_RECORD_PROFILE_STEPS")) {
+        try {
+            const int   count     = std::stoi(steps);
+            const auto* start_env = std::getenv("RTP_LLM_RECORD_PROFILE_START");
+            const int   start     = start_env ? std::stoi(start_env) : 0;
+            if (count > 0 && ExecutionRecorder::instance().enabled()) {
+                step_profiler_.configure(true, "record_ts" + std::to_string(ExecutionRecorder::unixNs()), start, count);
+            }
+        } catch (const std::exception& e) {
+            RTP_LLM_LOG_WARNING("invalid record profile window: %s", e.what());
+        }
+    }
     while (running_) {
         absl::Status status;
         try {
@@ -914,6 +927,8 @@ absl::Status NormalEngine::step() {
     }
     {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.execute(stream_size=%zu)", streams.size());
+        if (ExecutionRecorder::instance().enabled())
+            executor_->setRecordingStep(++recording_step_);
         status = executor_->process(streams, tps_schedule_time_us);
         if (propose_params_) {
             ++completed_steps_;

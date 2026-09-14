@@ -936,6 +936,10 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             !graph_required || graph_can_run,
             "CUDA graph is required for fixed-role MTP indexer sharing; eager fallback is disabled");
         if (graph_can_run) {
+            inputs.record_graph_kind   = py_model_inputs.attention_inputs.is_prefill ? 3 : 2;
+            inputs.record_graph_bucket = py_model_inputs.attention_inputs.is_prefill ?
+                                             graph_state_.current_real_graph_seq_len :
+                                             graph_state_.current_real_graph_bs;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(cuda_graph)");
             DevicePerfWrapper wrapper(enable_device_perf_, "cuda graph python forward");
             RTP_LLM_LOG_DEBUG(
@@ -950,6 +954,8 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         } else {
             py::gil_scoped_acquire gil;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
+            inputs.record_graph_kind   = 1;
+            inputs.record_graph_bucket = -1;
             DevicePerfWrapper wrapper(enable_device_perf_, "normal forward");
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] using normal forward, is_target_verify=%d, is_prefill=%d",
                               py_model_inputs.attention_inputs.is_target_verify,

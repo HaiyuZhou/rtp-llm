@@ -31,6 +31,11 @@ enum class ParallelMode {
 // context batch is request for initial word, decoder batch is request for incremental word.
 // ids and lengths are int32_t
 struct GptModelInputs {
+    int64_t record_execution_id      = 0;
+    int64_t record_scheduler_step_id = 0;
+    // Observability-only results written by the actual model execution path.
+    mutable int record_graph_bucket = -1;
+    mutable int record_graph_kind   = 0;  // 0 unknown, 1 eager, 2 decode graph, 3 prefill graph
     // input_lengths holds original input length for requests,
     // shape [decoder_batch_size + context_batch_size], int32
     // sequence_lengths holds current sequence length for incremental decoding requests,

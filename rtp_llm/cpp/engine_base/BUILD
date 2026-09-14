@@ -42,6 +42,7 @@ cc_library(
         "TorchProfiler.cc",
     ],
     deps = [
+        "//rtp_llm/cpp/observability:execution_recorder",
         "//rtp_llm/cpp/utils:core_utils",
         "//:rtp_compute_ops",
     ],

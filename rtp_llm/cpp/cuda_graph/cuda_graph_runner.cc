@@ -1170,6 +1170,7 @@ void CudaGraphRunner::initCapture() {
 }
 
 void CudaGraphRunner::replayGraph(int key) {
+    RTP_LLM_PROFILE_SCOPE_DYNAMIC("rtp.graph_replay(bucket=%d,prefill=%d)", key, int(is_prefill_cuda_graph_mode_));
     c10::DeviceGuard graph_device_guard(cuda_graph::graphDevice(device_index_));
     graph_instances_[key].graph_.replay();
 }

@@ -246,7 +246,20 @@ void NormalGenerateStream::enqueueGenerateOutput(GenerateOutputs&& generate_resu
            the stream will be set to stop directly to prevent the push to queue from getting stuck. */
         reportEventWithoutLock(StreamEvents::Error, ErrorCode::OUTPUT_QUEUE_FULL, "output queue is full");
     } else {
+        int64_t    published_tokens = 0;
+        int        first_sequence   = -1;
+        const auto request          = recordedRequest();
+        for (size_t i = 0; request && i < generate_results.generate_outputs.size(); ++i) {
+            const auto& ids = generate_results.generate_outputs[i].output_ids;
+            if (ids.defined() && ids.numel() > 0) {
+                published_tokens += ids.numel();
+                if (first_sequence < 0)
+                    first_sequence = static_cast<int>(i);
+            }
+        }
         generate_outputs_queue_.push(std::move(generate_results));
+        if (request)
+            request->published(published_tokens, first_sequence);
     }
 }
 

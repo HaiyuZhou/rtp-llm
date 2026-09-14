@@ -1,6 +1,8 @@
 import unittest
 
+from rtp_llm.test.perf_test.batch_replay import make_plan
 from rtp_llm.test.perf_test.batch_trace_analyze import (
+    compare_kernels,
     correlate_trace,
     execution_timings,
     request_latencies,
@@ -107,7 +109,19 @@ class RecordingTest(unittest.TestCase):
         self.assertEqual(result["kernel_union_ns"], 20)
         self.assertEqual(result["gpu_span_ns"], 25)
 
-    def test_large_batch(self):
+    def test_compare_does_not_align_by_call_index(self):
+        original = [
+            dict(execution_id=42, world_rank=0, kernel_name="k", duration_ns=10)
+        ]
+        replay = [
+            dict(execution_id=42, world_rank=0, kernel_name="k", duration_ns=15),
+            dict(execution_id=42, world_rank=0, kernel_name="extra", duration_ns=1),
+        ]
+        result = {r["kernel_name"]: r for r in compare_kernels(original, replay)}
+        self.assertEqual(result["k"]["change_percent"], 50)
+        self.assertIsNone(result["extra"]["change_percent"])
+
+    def test_large_batch_and_replay(self):
         batch = dict(
             schema_version=1,
             execution_id=42,
@@ -123,9 +137,10 @@ class RecordingTest(unittest.TestCase):
             ],
         )
         self.assertEqual(len(validate_batch(batch)), 100)
+        self.assertEqual(len(make_plan([batch]).splitlines()), 102)
         batch["requests"][0]["q_tokens"] = 2
         with self.assertRaises(ValueError):
-            validate_batch(batch)
+            make_plan([batch])
 
 
 if __name__ == "__main__":

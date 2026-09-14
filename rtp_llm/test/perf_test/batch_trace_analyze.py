@@ -6,6 +6,7 @@ are assigned by CPU thread containment, then joined to GPU events by correlation
 
 import argparse
 import collections
+import hashlib
 import html
 import json
 import re
@@ -268,6 +269,41 @@ def execution_timings(kernels):
     return result
 
 
+def compare_kernels(original, replay):
+    def grouped(rows):
+        groups = collections.defaultdict(list)
+        for row in rows:
+            if row["execution_id"] is not None:
+                groups[
+                    (row["execution_id"], row.get("world_rank"), row["kernel_name"])
+                ].append(row["duration_ns"])
+        return groups
+
+    left, right = grouped(original), grouped(replay)
+    result = []
+    for key in sorted(left.keys() | right.keys()):
+        a, b = left.get(key, []), right.get(key, [])
+        mean_a = sum(a) / len(a) if a else None
+        mean_b = sum(b) / len(b) if b else None
+        result.append(
+            dict(
+                execution_id=key[0],
+                world_rank=key[1],
+                kernel_name=key[2],
+                original_count=len(a),
+                replay_count=len(b),
+                original_mean_ns=mean_a,
+                replay_mean_ns=mean_b,
+                change_percent=(
+                    100 * (mean_b / mean_a - 1)
+                    if mean_a and mean_b is not None
+                    else None
+                ),
+            )
+        )
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--record-dir", required=True, type=Path)
@@ -280,6 +316,7 @@ def main(argv=None):
         "--trace", type=Path, help="One Kineto trace from the specified owner/rank"
     )
     parser.add_argument("--world-rank", type=int)
+    parser.add_argument("--replay-dir", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     manifest = json.loads((args.record_dir / "manifest.json").read_text())
@@ -308,6 +345,43 @@ def main(argv=None):
         }
         identity["capture_id"] = args.trace.name
         kernels, modes = correlate_trace(json.loads(args.trace.read_text()), identity)
+    replay_kernels = []
+    replay_modes = {}
+    compatibility = {
+        "status": "not_checked",
+        "differences": [],
+        "weights_verified": False,
+    }
+    if args.replay_dir:
+        for path in args.replay_dir.glob(
+            f"*.rank{manifest['world_rank']}.result.jsonl"
+        ):
+            for row in read_jsonl(path):
+                if row.get("event") == "runtime_config":
+                    original_config = manifest.get("engine", {})
+                    fields = ("tp_size", "dp_size", "model_config", "cache_config")
+                    differences = [
+                        key
+                        for key in fields
+                        if key not in original_config
+                        or original_config[key] != row.get(key)
+                    ]
+                    compatibility = dict(
+                        status="config_mismatch" if differences else "config_match",
+                        differences=differences,
+                        weights_verified=False,
+                        original_config_sha256=hashlib.sha256(
+                            json.dumps(original_config, sort_keys=True).encode()
+                        ).hexdigest(),
+                    )
+        for path in sorted(args.replay_dir.glob("replay_*_wr*.json")):
+            rank_match = re.search(r"_wr(\d+)_", path.name)
+            if rank_match and int(rank_match[1]) == manifest["world_rank"]:
+                parsed, parsed_modes = correlate_trace(
+                    json.loads(path.read_text()), {"world_rank": int(rank_match[1])}
+                )
+                replay_kernels.extend(parsed)
+                replay_modes.update(parsed_modes)
     # A truncated recording cannot certify any request as complete.
     if not manifest.get("complete"):
         for request in requests:
@@ -329,6 +403,13 @@ def main(argv=None):
             - {b["execution_id"] for b in batches}
         ),
         execution_timings=execution_timings(kernels),
+        replay_comparison=compare_kernels(kernels, replay_kernels),
+        replay_compatibility=compatibility,
+        graph_mismatches=[
+            dict(execution_id=eid, original=mode, replay=replay_modes.get(eid))
+            for eid, mode in modes.items()
+            if replay_modes and mode != replay_modes.get(eid)
+        ],
         kernel_summary=summarize_kernels(kernels),
         execution_modes=modes,
         kernel_count=len(kernels),

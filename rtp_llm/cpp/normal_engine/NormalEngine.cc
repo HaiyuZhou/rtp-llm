@@ -750,6 +750,11 @@ void NormalEngine::loop() {
     RTP_LLM_LOG_INFO("loop begin");
     blockTerminationSignalsInEngineThread();
     cudaPreRun(getDeviceId());
+    if (const auto* plan = std::getenv("RTP_LLM_REPLAY_PLAN")) {
+        runReplay(plan);
+        running_ = false;
+        return;
+    }
     if (const auto* steps = std::getenv("RTP_LLM_RECORD_PROFILE_STEPS")) {
         try {
             const int   count     = std::stoi(steps);
@@ -850,6 +855,10 @@ std::shared_ptr<GenerateStream> NormalEngine::makeStream(const std::shared_ptr<G
 }
 
 void NormalEngine::enqueue(std::shared_ptr<GenerateStream>& stream) {
+    if (std::getenv("RTP_LLM_REPLAY_PLAN")) {
+        stream->reportError(ErrorCode::INVALID_PARAMS, "engine is in offline replay mode");
+        return;
+    }
     stream->setReserveStep(reserve_step_);
     (void)scheduler_->enqueue(stream);
 }
@@ -857,8 +866,7 @@ void NormalEngine::enqueue(std::shared_ptr<GenerateStream>& stream) {
 std::shared_ptr<GenerateStream> NormalEngine::enqueue(const std::shared_ptr<GenerateInput>& input) {
     std::shared_ptr<GenerateStream> stream = std::make_shared<NormalGenerateStream>(
         input, model_config_, runtime_config, resource_context_, metrics_reporter_);
-    stream->setReserveStep(reserve_step_);
-    (void)scheduler_->enqueue(stream);
+    enqueue(stream);
     return stream;
 }
 
@@ -871,6 +879,11 @@ NormalEngine::enqueueMultiple(const std::vector<std::shared_ptr<GenerateInput>>&
             inp, model_config_, runtime_config, resource_context_, metrics_reporter_);
         stream->setReserveStep(reserve_step_);
         streams.push_back(stream);
+    }
+    if (std::getenv("RTP_LLM_REPLAY_PLAN")) {
+        for (const auto& stream : streams)
+            stream->reportError(ErrorCode::INVALID_PARAMS, "engine is in offline replay mode");
+        return {std::vector<bool>(streams.size(), false), {}};
     }
     return scheduler_->enqueueGroup(streams);
 }

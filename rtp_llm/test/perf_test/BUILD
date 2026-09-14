@@ -1,6 +1,6 @@
 py_library(
     name = "batch_recording_lib",
-    srcs = ["batch_trace_analyze.py"],
+    srcs = ["batch_trace_analyze.py", "batch_replay.py"],
 )
 
 py_test(

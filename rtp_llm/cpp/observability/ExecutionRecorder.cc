@@ -1,11 +1,20 @@
 #include "rtp_llm/cpp/observability/ExecutionRecorder.h"
+#include "alog/Appender.h"
+#include "alog/Layout.h"
+#include "alog/Logger.h"
+#include "aios/alog/src/cpp/EventBase.h"
 
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <unistd.h>
+
+namespace alog {
+extern EventBase gEventBase;
+}
 
 namespace rtp_llm {
 namespace {
@@ -155,10 +164,12 @@ void ExecutionRecorder::manifest(bool closed) {
     std::ofstream out(directory_ + "/manifest.json.tmp");
     out.exceptions(std::ios::failbit | std::ios::badbit);
     out << '{' << identity() << ",\"closed\":" << (closed ? "true" : "false")
-        << ",\"complete\":" << (closed && dropped_ == 0 && errors_ == 0 ? "true" : "false")
-        << ",\"generated\":" << generated_ << ",\"written\":" << written_ << ",\"dropped\":" << dropped_
+        << ",\"complete\":false,\"storage_backend\":\"alog\",\"delivery_policy\":\"best_effort\""
+        << ",\"generated\":" << generated_ << ",\"written\":null,\"submitted_to_alog\":" << submitted_
+        << ",\"dropped\":" << dropped_ << ",\"sink_dropped\":null"
         << ",\"errors\":" << errors_ << ",\"scope\":\"engine\",\"request_sampling\":false,\"engine\":" << metadata_
-        << ",\"max_total_bytes\":" << max_total_bytes_ << ",\"bytes_written\":" << total_bytes_ << ",\"files\":[";
+        << ",\"max_total_bytes\":" << max_total_bytes_ << ",\"bytes_written\":null,\"bytes_submitted\":" << total_bytes_
+        << ",\"files\":[";
     bool first = true;
     for (const auto& entry : files_) {
         for (size_t part = 0; part <= entry.second.part; ++part) {
@@ -193,21 +204,41 @@ void ExecutionRecorder::run() {
                 continue;
             }
             auto& file = files_[task.file];
-            if (file.stream.is_open() && file.bytes && file.bytes + line.size() + 1 > max_file_bytes_) {
-                file.stream.close();
-                file.bytes = 0;
+            if (file.logger && file.bytes && file.bytes + line.size() + 1 > max_file_bytes_) {
+                file.logger->flush();
+                file.logger = nullptr;
+                file.bytes  = 0;
                 ++file.part;
             }
-            if (!file.stream.is_open()) {
-                file.stream.open(directory_ + "/" + task.file + (file.part ? "." + std::to_string(file.part) : ""));
-                file.stream.exceptions(std::ios::failbit | std::ios::badbit);
+            if (!file.logger) {
+                const auto path     = directory_ + "/" + task.file + (file.part ? "." + std::to_string(file.part) : "");
+                auto*      appender = static_cast<alog::FileAppender*>(alog::FileAppender::getAppender(path.c_str()));
+                auto*      layout   = new alog::PatternLayout();
+                layout->setLogPattern("%%m");
+                appender->setLayout(layout);
+                appender->setAutoFlush(false);
+                appender->setCompress(false);
+                // Retain recorder's exact byte-based part naming and budget.
+                appender->setMaxSize(0);
+                appender->setAsyncFlush(true);
+                appender->setFlushThreshold(64 * 1024);
+                appender->setFlushIntervalInMS(100);
+                // setAsyncFlush alone does not register the appender. Mirror
+                // Configurator without resetting process-wide logger settings.
+                alog::gEventBase.addFileAppender(appender);
+                const auto name = "execution_recorder." + owner_ + "." + task.file + "." + std::to_string(file.part);
+                file.logger     = alog::Logger::getLogger(name.c_str());
+                file.logger->setInheritFlag(false);
+                file.logger->setLevel(alog::LOG_LEVEL_INFO);
+                file.logger->setAppender(appender);
             }
-            file.stream << line << '\n';
-            file.stream.flush();
+            // Unlike printf-style log(), this does not truncate at alog.max_msg_len.
+            // A void return only means handed to alog, not durably written.
+            file.logger->logPureMessage(alog::LOG_LEVEL_INFO, line.c_str());
             file.bytes += line.size() + 1;
             total_bytes_ += line.size() + 1;
-            ++written_;
-            if (written_ % 64 == 0)
+            ++submitted_;
+            if (submitted_ % 64 == 0)
                 manifest(false);
         } catch (...) {
             ++errors_;
@@ -228,6 +259,10 @@ void ExecutionRecorder::close() {
     if (worker_.joinable()) {
         worker_.join();
         try {
+            // Flush only this recorder's appenders, never shut down global alog.
+            for (const auto& entry : files_)
+                if (entry.second.logger)
+                    entry.second.logger->flush();
             manifest(true);
         } catch (...) {
             ++errors_;

@@ -1,16 +1,77 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from rtp_llm.test.perf_test.batch_replay import make_plan
 from rtp_llm.test.perf_test.batch_trace_analyze import (
     compare_kernels,
     correlate_trace,
     execution_timings,
+)
+from rtp_llm.test.perf_test.batch_trace_analyze import main as analyze
+from rtp_llm.test.perf_test.batch_trace_analyze import (
+    read_jsonl,
     request_latencies,
     validate_batch,
 )
 
 
 class RecordingTest(unittest.TestCase):
+    def test_best_effort_missing_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = self.events(
+                ["enqueue", "first_scheduled", "first_token", "finish"]
+            )
+            missing = [dict(e, request_id="r2") for e in events if e["event_seq"] != 2]
+            (root / "request_events.jsonl").write_text(
+                "".join(json.dumps(e) + "\n" for e in events + missing)
+                + '{"truncated":'
+            )
+            manifest = dict(
+                session_id="s",
+                replica_id="d0",
+                dp_rank=0,
+                world_rank=0,
+                complete=False,
+                delivery_policy="best_effort",
+                storage_backend="alog",
+            )
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertWarns(UserWarning):
+                analyze(["--record-dir", str(root), "--output", str(root / "report")])
+            report = json.loads((root / "report/report.json").read_text())
+            self.assertFalse(report["recording_complete"])
+            self.assertEqual(report["requests"][0]["engine_first_token_latency_ns"], 40)
+            self.assertEqual(report["requests"][1]["status"], "partial")
+            self.assertIsNone(report["requests"][1]["engine_first_token_latency_ns"])
+            with self.assertRaises(ValueError):
+                list(read_jsonl(root / "request_events.jsonl"))
+
+    def test_legacy_incomplete_stays_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = self.events(
+                ["enqueue", "first_scheduled", "first_token", "finish"]
+            )
+            (root / "request_events.jsonl").write_text(
+                "".join(json.dumps(e) + "\n" for e in events)
+            )
+            (root / "manifest.json").write_text('{"complete":false}')
+            analyze(["--record-dir", str(root), "--output", str(root / "report")])
+            report = json.loads((root / "report/report.json").read_text())
+            self.assertIsNone(report["requests"][0]["engine_first_token_latency_ns"])
+
+    def test_partial_utf8_is_missing_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "batches.jsonl"
+            path.write_bytes(b'{}\n{"broken":"\xe4\xb8')
+            with self.assertWarns(UserWarning):
+                self.assertEqual(list(read_jsonl(path, skip_invalid=True)), [{}])
+            with self.assertRaises(ValueError):
+                list(read_jsonl(path))
+
     def events(self, names):
         return [
             dict(

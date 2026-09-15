@@ -10,16 +10,22 @@ import hashlib
 import html
 import json
 import re
+import warnings
 from pathlib import Path
 
 
-def read_jsonl(path):
-    with Path(path).open() as stream:
+def read_jsonl(path, skip_invalid=False):
+    with Path(path).open("rb") as stream:
         for number, line in enumerate(stream, 1):
             if line.strip():
                 try:
                     yield json.loads(line)
-                except json.JSONDecodeError as error:
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    if skip_invalid:
+                        warnings.warn(
+                            f"{path}:{number}: skipping invalid JSONL (missing data)"
+                        )
+                        continue
                     raise ValueError(f"{path}:{number}: invalid JSONL") from error
 
 
@@ -320,12 +326,13 @@ def main(argv=None):
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     manifest = json.loads((args.record_dir / "manifest.json").read_text())
+    best_effort = manifest.get("delivery_policy") == "best_effort"
     rows = []
     for path in sorted(args.record_dir.glob("request_events.jsonl*")):
-        rows.extend(read_jsonl(path))
+        rows.extend(read_jsonl(path, skip_invalid=best_effort))
     batches = []
     for path in sorted((args.batch_dir or args.record_dir).glob("batches.jsonl*")):
-        batches.extend(read_jsonl(path))
+        batches.extend(read_jsonl(path, skip_invalid=best_effort))
     for batch in batches:
         if any(
             batch.get(key) != manifest.get(key)
@@ -382,8 +389,10 @@ def main(argv=None):
                 )
                 replay_kernels.extend(parsed)
                 replay_modes.update(parsed_modes)
-    # A truncated recording cannot certify any request as complete.
-    if not manifest.get("complete"):
+    # Legacy strict recordings invalidate all latencies when incomplete.
+    # Best-effort sinks validate each observed request independently instead:
+    # losing another request must not erase a complete request's measurements.
+    if not best_effort and not manifest.get("complete"):
         for request in requests:
             request["status"] = "partial"
             request["problems"].append("recording_incomplete")
@@ -396,6 +405,7 @@ def main(argv=None):
                 request[name] = None
     report = dict(
         recording_complete=manifest.get("complete", False),
+        delivery_policy=manifest.get("delivery_policy", "strict"),
         requests=requests,
         batches=batches,
         missing_batch_execution_ids=sorted(

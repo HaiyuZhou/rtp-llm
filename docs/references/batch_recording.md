@@ -1,6 +1,6 @@
 # Batch 与请求录制、Kernel 分析和形状回放
 
-本功能默认关闭。当前代码接入普通 `NormalExecutor`，逐请求生命周期由请求 owner 输出，batch 长度来自实际模型输入。完整设计见 [设计文档](../batch_execution_record_replay_design.md)。
+本功能默认关闭。当前代码接入普通 `NormalExecutor`，逐请求生命周期由请求 owner 输出，batch 长度来自实际模型输入。完整设计见 [设计文档](../batch_execution_record_replay_design.md)；按调用路径阅读实现见 [新增代码阅读指南](../batch_recording_code_walkthrough.md)。
 
 ## 开启录制
 
@@ -18,7 +18,13 @@ export RTP_LLM_RECORD_TOTAL_BYTES=1073741824
 
 `RTP_LLM_RECORD_DIR` 和 `RTP_LLM_RECORD_SESSION` 必须同时设置；启动后不支持动态修改。会话 ID 应在每次新实验时更换。数值参数要求为正整数，无效值回退默认值。队列单位为记录条数，字节预算按 owner 独立计算，仅覆盖录制 JSONL，不包含 profiler trace。
 
-文件轮转保留旧数据，不删除旧分片。达到总字节预算或 writer 出错时停止接收新记录；过载整条丢弃，不截断 batch。manifest 中记录生成、写入、丢弃、错误及字节计数。正常进程退出时 drain 队列并完成 manifest；强制终止时文件可能不完整。服务运行时 manifest 定期更新，`closed=false`，分析器保守地标为 partial。
+文件轮转保留旧数据，不删除旧分片。达到总提交字节预算或 snapshot worker 出错时停止接收新记录；过载整条丢弃，不截断 batch。
+
+JSONL 底层使用 alog：启用录制后动态创建独立 logger/FileAppender，路径仍为 owner 目录，纯消息布局 `%%m`，异步 flush（64 KiB 阈值、100 ms 间隔），不继承 engine/root logger。这里使用 alog API 配置，不读取 `alog.conf` 中的 engineAppender 参数；无需修改该配置，也不会在录制关闭时创建 JSONL。`logPureMessage` 避免 `alog.max_msg_len` 截断大 batch。manifest 仍用临时文件 + rename 更新，不走追加日志。
+
+交付语义为 **best effort**：缺日志就是缺失数据，不承诺无损。manifest 的 `submitted_to_alog` / `bytes_submitted` 表示提交量，不是实际落盘量；`written`、`bytes_written`、`sink_dropped` 为 null，`dropped` / `errors` 仅覆盖录制器能观察的丢弃/错误。`storage_backend=alog`、`delivery_policy=best_effort`，`complete` 始终 false（不能证明全量无损）。正常关闭 drain 上层队列并尝试 flush 本录制器的 alog 文件，`closed=true` 也不是无损保证。
+
+分析器对 best-effort 录制按每个已观察请求的事件完整性计算延迟；缺失事件的请求为 partial，不影响其他完整请求。损坏 JSONL 行警告后跳过，完全未记录的请求不可统计，不补造数据。旧版无 best_effort 标记的录制保留原严格行为。
 
 输出示例：
 
@@ -34,7 +40,7 @@ export RTP_LLM_RECORD_TOTAL_BYTES=1073741824
 
 请求事件为 enqueue、first_scheduled、first_token、finish/cancel/error。仅成功进入引擎队列的真实请求进入事件流。batch 文件每行包含完整 requests 数组，q_tokens 为本轮计算长度，kv_tokens_before 为本轮之前的逻辑 KV 长度。kernel 仅在 profiler 窗口采集。
 
-`RTP_LLM_RECORD_DECODE` 默认关闭，只有启动前设置为 `1` 才采集 decode。关闭时跳过所有包含 decode 的 batch（包括混合 prefill/decode batch）的快照和 execution 日志，在 D2H、event 分配和 JSON 构造之前过滤，不输出可能误导回放的残缺 batch。纯 prefill batch 和请求生命周期事件仍记录；first_scheduled 若落在被过滤的 batch 中，其 execution_id 为 null。manifest 的 engine.record_decode 和 decode_filter_policy 标明此采集范围；complete 仅表示范围内无丢失，不代表包含完整 decode 流量。
+`RTP_LLM_RECORD_DECODE` 默认关闭，只有启动前设置为 `1` 才采集 decode。关闭时跳过所有包含 decode 的 batch（包括混合 prefill/decode batch）的快照和 execution 日志，在 D2H、event 分配和 JSON 构造之前过滤，不输出可能误导回放的残缺 batch。纯 prefill batch 和请求生命周期事件仍记录；first_scheduled 若落在被过滤的 batch 中，其 execution_id 为 null。manifest 的 engine.record_decode 和 decode_filter_policy 标明此采集范围，不能把请求事件完整理解为记录了全部 decode。
 
 需要完整流量形状回放时设置 `export RTP_LLM_RECORD_DECODE=1`，各 TP rank 使用相同配置。此开关不关闭独立的 profiler 窗口，窗口内仍可能看到无 batch 关联的 decode kernel。
 

@@ -4,7 +4,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
-#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -12,9 +11,13 @@
 #include <string>
 #include <thread>
 
+namespace alog {
+class Logger;
+}
+
 namespace rtp_llm {
 
-// CPU-only writer. No CUDA or inference dependency; never serializes tensors.
+// CPU-only snapshot worker with a best-effort alog file sink.
 class ExecutionRecorder {
 public:
     static ExecutionRecorder& instance();
@@ -60,9 +63,9 @@ private:
         std::function<std::string()> make_line;
     };
     struct File {
-        std::ofstream stream;
-        size_t        bytes = 0;
-        size_t        part  = 0;
+        alog::Logger* logger = nullptr;  // Owned by alog, not the recorder.
+        size_t        bytes  = 0;
+        size_t        part   = 0;
     };
     std::string                 directory_, session_, owner_, replica_;
     std::string                 metadata_ = "{}";
@@ -70,7 +73,7 @@ private:
     size_t                      capacity_, max_file_bytes_, max_total_bytes_, total_bytes_ = 0;
     std::atomic<bool>           enabled_{false};
     std::atomic<int64_t>        next_id_{1};
-    std::atomic<uint64_t>       generated_{0}, written_{0}, dropped_{0}, errors_{0};
+    std::atomic<uint64_t>       generated_{0}, submitted_{0}, dropped_{0}, errors_{0};
     std::mutex                  mutex_;
     std::condition_variable     ready_;
     std::deque<Task>            queue_;

@@ -53,7 +53,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.world_size <= 0 or args.timeout <= 0:
         parser.error("world-size and timeout must be positive")
-    batches = list(read_jsonl(args.batches))
+    manifest_path = args.batches.parent / "manifest.json"
+    source_manifest = (
+        json.loads(manifest_path.read_text()) if manifest_path.exists() else None
+    )
+    best_effort = bool(
+        source_manifest and source_manifest.get("delivery_policy") == "best_effort"
+    )
+    batches = list(read_jsonl(args.batches, skip_invalid=best_effort))
     if args.execution_ids:
         wanted = {int(value) for value in args.execution_ids.split(",")}
         batches = [batch for batch in batches if batch["execution_id"] in wanted]
@@ -64,9 +71,7 @@ def main(argv=None):
     args.output.mkdir(parents=True, exist_ok=False)
     path = args.output.resolve() / "replay.plan"
     path.write_text(plan)
-    manifest_path = args.batches.parent / "manifest.json"
-    if manifest_path.exists():
-        source_manifest = json.loads(manifest_path.read_text())
+    if source_manifest is not None:
         (args.output / "source_manifest.json").write_text(
             json.dumps(source_manifest, indent=2) + "\n"
         )

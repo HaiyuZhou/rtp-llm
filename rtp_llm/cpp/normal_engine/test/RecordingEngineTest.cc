@@ -104,4 +104,23 @@ TEST_F(RecordingEngineTest, LifecycleAndSnapshot) {
         "");
 }
 
+TEST_F(RecordingEngineTest, NativeReplay) {
+    char directory[] = "/tmp/rtp-replay-engine-XXXXXX";
+    ASSERT_NE(mkdtemp(directory), nullptr);
+    const auto path = std::string(directory) + "/replay.plan";
+    {
+        std::ofstream plan(path);
+        // Mixed decode/prefill with prefix KV, then an independent prefill.
+        plan << "RTP_BATCH_REPLAY_V1 1 2 2\n11 2\n0 1 4 3\n1 2 3 5\n12 1\n1 3 0 3\n";
+    }
+    setenv("RTP_LLM_REPLAY_PLAN", path.c_str(), 1);
+    auto engine = createMockEngine(CustomConfig{});
+    // stop joins the dedicated loop; it does not interrupt fixed replay iterations.
+    ASSERT_TRUE(engine->stop().ok());
+    unsetenv("RTP_LLM_REPLAY_PLAN");
+    std::ifstream     file(path + ".rank0.result.jsonl");
+    const std::string result((std::istreambuf_iterator<char>(file)), {});
+    EXPECT_NE(result.find("\"status\":\"complete\""), std::string::npos) << result;
+    EXPECT_EQ(result.find("\"status\":\"error\""), std::string::npos) << result;
+}
 }  // namespace rtp_llm

@@ -159,6 +159,21 @@ std::shared_ptr<RecordedBatch> recordBatchInputs(const GptModelInputs& inputs, c
 
 NormalExecutor::ModelFactory NormalExecutor::test_model_factory = nullptr;
 
+void NormalExecutor::replayBatch(const std::list<GenerateStreamPtr>& streams, int64_t source_execution_id) {
+    StreamGroups groups(streams);
+    auto         gathered = batch_stream_processor_->gatherModelInput(groups, buffer_holder_);
+    if (!gathered.ok())
+        throw std::runtime_error(gathered.status().ToString());
+    auto inputs                = std::move(gathered.value());
+    inputs.record_execution_id = source_execution_id;
+    tpSyncModelInputs(inputs, parallelism_config_);
+    model_->forward(inputs);
+    // Replay is deliberately synchronous; production process() never takes this path.
+    cudaSyncAndCheck();
+    model_->releaseBuffers();
+    buffer_holder_.release();
+}
+
 NormalExecutor::~NormalExecutor() {
     cudaProfilerEnd();
 }

@@ -1,4 +1,15 @@
 py_library(
+    name = "batch_recording_lib",
+    srcs = ["batch_trace_analyze.py", "batch_replay.py"],
+)
+
+py_test(
+    name = "batch_offline_tools_test",
+    srcs = ["batch_offline_tools_test.py"],
+    deps = [":batch_recording_lib"],
+)
+
+py_library(
     name = "perf_test_lib",
     srcs = [
         "batch_decode_test.py",

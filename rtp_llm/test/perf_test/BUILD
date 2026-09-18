@@ -3,7 +3,6 @@ py_library(
     srcs = [
         "batch_decode_test.py",
         "batch_perf_impl.py",
-        "cache_grid_runner.py",
         "dataclass.py",
         "dataset.py",
         "distribution_runner.py",
@@ -12,7 +11,15 @@ py_library(
         "sampling.py",
         "server.py",
         "test_util.py",
-    ],
+    ] + glob(
+        ["cache_grid/**/*.py"],
+        exclude = ["cache_grid/tests/**"],
+    ),
+    data = glob([
+        "cache_grid/config/*.json",
+        "cache_grid/config/*.jsonc",
+        "cache_grid/examples/*",
+    ]),
     deps = [
         "//rtp_llm:testlib",
         "//rtp_llm/test/utils:maga_server_manager",
@@ -27,15 +34,190 @@ py_test(
     deps = [
         ":perf_test_lib",
     ],
+    data = ["cache_grid/config/dsv4_pro_prefill.json"],
+)
+
+py_test(
+    name = "perf_profile_test",
+    main = "cache_grid/tests/perf_profile_test.py",
+    srcs = ["cache_grid/tests/perf_profile_test.py"],
+    deps = [
+        ":perf_test_lib",
+    ],
+)
+
+py_binary(
+    name = "generate_cache_grid",
+    main = "cache_grid/runner/generate_cache_grid.py",
+    srcs = ["cache_grid/runner/generate_cache_grid.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
+    name = "generate_cache_grid_test",
+    main = "cache_grid/tests/generate_cache_grid_test.py",
+    srcs = ["cache_grid/tests/generate_cache_grid_test.py"],
+    deps = [
+        ":generate_cache_grid",
+        ":perf_test_lib",
+    ],
+)
+
+py_test(
+    name = "generate_prefill_3d_chart_test",
+    main = "cache_grid/tests/generate_prefill_3d_chart_test.py",
+    srcs = ["cache_grid/tests/generate_prefill_3d_chart_test.py"],
+    deps = [":prefill_3d_chart_lib"],
+)
+
+py_library(
+    name = "prefill_3d_chart_lib",
+    srcs = ["cache_grid/plot/generate_prefill_3d_chart.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_library(
+    name = "prefill_formula_fit_lib",
+    srcs = ["cache_grid/formula/deepseek_v4_prefill_formula_fit.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_binary(
+    name = "deepseek_v4_prefill_formula_fit",
+    main = "cache_grid/formula/deepseek_v4_prefill_formula_fit.py",
+    srcs = ["cache_grid/formula/deepseek_v4_prefill_formula_fit.py"],
+    deps = [":perf_test_lib"],
 )
 
 py_test(
     name = "deepseek_v4_prefill_formula_fit_test",
-    srcs = [
-        "deepseek_v4_prefill_formula_fit.py",
-        "deepseek_v4_prefill_formula_fit_test.py",
+    main = "cache_grid/tests/deepseek_v4_prefill_formula_fit_test.py",
+    srcs = ["cache_grid/tests/deepseek_v4_prefill_formula_fit_test.py"],
+    deps = [
+        ":prefill_formula_fit_lib",
+        ":perf_test_lib",
     ],
-    main = "deepseek_v4_prefill_formula_fit_test.py",
+)
+
+py_test(
+    name = "restricted_symbolic_fit_test",
+    main = "cache_grid/tests/restricted_symbolic_fit_test.py",
+    srcs = ["cache_grid/tests/restricted_symbolic_fit_test.py"],
+    deps = [
+        ":prefill_formula_fit_lib",
+        ":perf_test_lib",
+    ],
+)
+
+py_library(
+    name = "prefill_interactive_chart_lib",
+    srcs = ["cache_grid/plot/generate_prefill_interactive_chart.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_binary(
+    name = "generate_prefill_interactive_chart",
+    main = "cache_grid/plot/generate_prefill_interactive_chart.py",
+    srcs = ["cache_grid/plot/generate_prefill_interactive_chart.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_library(
+    name = "prefill_traffic_report_lib",
+    srcs = ["cache_grid/plot/generate_prefill_traffic_report.py"],
+    deps = [":prefill_interactive_chart_lib"],
+)
+
+py_binary(
+    name = "generate_prefill_traffic_report",
+    main = "cache_grid/plot/generate_prefill_traffic_report.py",
+    srcs = ["cache_grid/plot/generate_prefill_traffic_report.py"],
+    deps = [":prefill_traffic_report_lib"],
+)
+
+py_library(
+    name = "production_ttft_3d_lib",
+    srcs = ["cache_grid/plot/generate_production_ttft_3d.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_binary(
+    name = "generate_production_ttft_3d",
+    main = "cache_grid/plot/generate_production_ttft_3d.py",
+    srcs = ["cache_grid/plot/generate_production_ttft_3d.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_library(
+    name = "production_tpm_3d_lib",
+    srcs = ["cache_grid/plot/generate_production_tpm_3d.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_binary(
+    name = "generate_production_tpm_3d",
+    main = "cache_grid/plot/generate_production_tpm_3d.py",
+    srcs = ["cache_grid/plot/generate_production_tpm_3d.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_library(
+    name = "cache_grid_pipeline_lib",
+    srcs = ["cache_grid/runner/run_cache_grid_pipeline.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_binary(
+    name = "run_cache_grid_pipeline",
+    main = "cache_grid/runner/run_cache_grid_pipeline.py",
+    srcs = ["cache_grid/runner/run_cache_grid_pipeline.py"],
+    deps = [
+        ":perf_test_lib",
+        ":prefill_3d_chart_lib",
+        ":prefill_formula_fit_lib",
+        ":prefill_interactive_chart_lib",
+    ],
+)
+
+py_test(
+    name = "run_cache_grid_pipeline_test",
+    main = "cache_grid/tests/run_cache_grid_pipeline_test.py",
+    srcs = ["cache_grid/tests/run_cache_grid_pipeline_test.py"],
+    deps = [":cache_grid_pipeline_lib"],
+)
+
+py_test(
+    name = "generate_prefill_interactive_chart_test",
+    main = "cache_grid/tests/generate_prefill_interactive_chart_test.py",
+    srcs = ["cache_grid/tests/generate_prefill_interactive_chart_test.py"],
+    deps = [
+        ":prefill_interactive_chart_lib",
+        ":perf_test_lib",
+    ],
+)
+
+py_test(
+    name = "generate_prefill_traffic_report_test",
+    main = "cache_grid/tests/generate_prefill_traffic_report_test.py",
+    srcs = ["cache_grid/tests/generate_prefill_traffic_report_test.py"],
+    deps = [
+        ":prefill_traffic_report_lib",
+        ":perf_test_lib",
+    ],
+)
+
+py_test(
+    name = "generate_production_ttft_3d_test",
+    main = "cache_grid/tests/generate_production_ttft_3d_test.py",
+    srcs = ["cache_grid/tests/generate_production_ttft_3d_test.py"],
+    deps = [":production_ttft_3d_lib"],
+)
+
+py_test(
+    name = "generate_production_tpm_3d_test",
+    main = "cache_grid/tests/generate_production_tpm_3d_test.py",
+    srcs = ["cache_grid/tests/generate_production_tpm_3d_test.py"],
+    deps = [":production_tpm_3d_lib"],
 )
 
 py_test(
@@ -97,6 +279,27 @@ py_test(
         "1",
     ],
     tags = ["manual"],
+)
+
+py_test(
+    name = "cache_perf_test",
+    main = "cache_grid/tests/cache_perf_test.py",
+    srcs = ["cache_grid/tests/cache_perf_test.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
+    name = "cache_workspace_budget_test",
+    main = "cache_grid/tests/workspace_budget_test.py",
+    srcs = ["cache_grid/tests/workspace_budget_test.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
+    name = "generate_random_batch_grid_test",
+    main = "cache_grid/tests/generate_random_batch_grid_test.py",
+    srcs = ["cache_grid/tests/generate_random_batch_grid_test.py"],
+    deps = [":perf_test_lib"],
 )
 
 # Prefix-cache mode: measures an explicit total-sequence × cache-length grid.
@@ -745,6 +948,59 @@ py_test(
         "PERF_PROFILE_FLUSH_SLEEP": "120",
         "DSV4_USE_MEGA_MOE": "1",
         "DSV4_CHUNK_TOKENS": "8192",
+    },
+    tags = ["manual"],
+)
+
+# DeepSeek V4-Pro CP=8 + EP=8 prefill handoff baseline (1M, batch=1).
+py_test(
+    name = "dsv4_pro_prefill_handoff",
+    main = "batch_decode_test.py",
+    srcs = ["batch_decode_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/data5/nanjun.cp/DeepSeek-V4-Pro",
+        "--tokenizer_path", "/data5/nanjun.cp/DeepSeek-V4-Pro",
+        "--batch_size", "1",
+        "--input_len", "256,512,1024,2048,4096,8192,16384,32768,65536,131072,262144,524288,786432,1048575",
+        "--partial", "2",
+        "--decode_test_length", "1",
+        "--max_seq_len", "1048576",
+        "--max_batch_tokens_size", "1048576",
+        "--max_context_batch_size", "1",
+        "--concurrency_limit", "1",
+        "--tp_size", "8",
+        "--dp_size", "1",
+        "--ep_size", "8",
+        "--world_size", "8",
+        "--cp_rotate_method", "ALL_GATHER",
+        "--seq_size_per_block", "512",
+        "--kernel_seq_size_per_block", "128",
+        "--fp8_kv_cache", "1",
+        "--reuse_cache", "1",
+        "--enable_device_cache", "1",
+        "--use_deepep_moe", "1",
+        "--use_deepep_low_latency", "0",
+        "--act_type", "BF16",
+        "--load_method", "fastsafetensors",
+        "--enable_cuda_graph", "0",
+        "--reserver_runtime_mem_mb", "81920",
+    ],
+    env = {
+        "WORLD_SIZE": "8",
+        "DG_JIT_CPP_STANDARD": "20",
+        "DSV4_USE_MEGA_MOE": "1",
+        "DSV4_CHUNK_TOKENS": "8192",
+        "DG_JIT_CACHE_DIR": "/data7/zhouhaiyu.zhy/dsv4_perf_work/jit_cache",
+        "TRITON_CACHE_DIR": "/data7/zhouhaiyu.zhy/dsv4_perf_work/triton_cache",
+        "TILELANG_CACHE_DIR": "/data7/zhouhaiyu.zhy/dsv4_perf_work/tilelang_cache",
     },
     tags = ["manual"],
 )

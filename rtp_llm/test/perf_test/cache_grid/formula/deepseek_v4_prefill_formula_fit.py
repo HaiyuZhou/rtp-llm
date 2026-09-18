@@ -26,6 +26,7 @@ is used only as a backward-compatible fallback for legacy inputs.
 The report keeps the fit and the production gate separate: a formula can be
 useful for analysis while still failing a tail-error gate.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -37,16 +38,38 @@ import pathlib
 import random
 import statistics
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
-FEATURE_NAMES = (
-    "1",
-    "sum(computeTokens / 1024.0)",
-    "sum(hitCacheTokens / 1024.0)",
-    "sum((computeTokens / 1024.0) * (computeTokens / 1024.0))",
-    "sum((computeTokens / 1024.0) * (hitCacheTokens / 1024.0))",
-    "sum((hitCacheTokens / 1024.0) * (hitCacheTokens / 1024.0))",
+from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
+    fingerprint as profile_fingerprint,
 )
+from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
+    load_profile,
+    resolve_int,
+    resolve_label,
+    resolve_str,
+)
+from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
+    DEFAULT_HINGE_TOKENS,
+    fit_restricted_symbolic,
+)
+
+DEFAULT_TOKEN_UNIT = 1024
+
+
+def build_feature_names(token_unit: int = DEFAULT_TOKEN_UNIT) -> tuple[str, ...]:
+    u = str(token_unit)
+    return (
+        "1",
+        f"sum(computeTokens / {u}.0)",
+        f"sum(hitCacheTokens / {u}.0)",
+        f"sum((computeTokens / {u}.0) * (computeTokens / {u}.0))",
+        f"sum((computeTokens / {u}.0) * (hitCacheTokens / {u}.0))",
+        f"sum((hitCacheTokens / {u}.0) * (hitCacheTokens / {u}.0))",
+    )
+
+
+FEATURE_NAMES = build_feature_names()
 
 
 @dataclass(frozen=True)
@@ -91,8 +114,17 @@ def _status_ok(item: dict[str, Any]) -> bool:
     }
 
 
+def _run_time_statistic(values: Sequence[float], estimator: str) -> float:
+    if estimator == "min":
+        return min(values)
+    if estimator == "trimmed":
+        ordered = sorted(values)
+        return statistics.median(ordered[:-1]) if len(ordered) > 1 else ordered[0]
+    return statistics.median(values)
+
+
 def _median_run_time(
-    item: dict[str, Any]
+    item: dict[str, Any], estimator: str = "median"
 ) -> tuple[float | None, int | None, str | None]:
     runs = item.get("runs")
     if not isinstance(runs, list) or not runs:
@@ -104,7 +136,9 @@ def _median_run_time(
     values: list[float] = []
     input_len = _integer(item.get("input_len"))
     requested_cache_len = _integer(item.get("cache_len_requested")) or 0
-    if item.get("reuse_exact") is False:
+    if item.get("reuse_exact") is False and not item.get(
+        "reuse_validation_skipped", False
+    ):
         return None, None, "reuse_not_exact"
     observed = item.get("cache_len_observed")
     observed_values = (
@@ -142,7 +176,7 @@ def _median_run_time(
         if latency is None or latency <= 0:
             return None, None, "invalid_latency"
         values.append(latency)
-    return statistics.median(values), cache_len, None
+    return _run_time_statistic(values, estimator), cache_len, None
 
 
 def _iter_json_metrics(path: pathlib.Path) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -158,11 +192,15 @@ def _iter_json_metrics(path: pathlib.Path) -> Iterable[tuple[int, dict[str, Any]
 
 
 def load_observations(
-    paths: Sequence[pathlib.Path], *, batch_size: int = 1
+    paths: Sequence[pathlib.Path],
+    *,
+    batch_size: int = 1,
+    estimator: str = "median",
 ) -> tuple[list[Observation], dict[str, Any]]:
     observations: list[Observation] = []
     rejected: dict[str, int] = {}
     input_files: list[dict[str, Any]] = []
+    measurement_contracts: set[str] = set()
     for path in paths:
         if path.suffix.lower() == ".csv":
             with path.open(newline="", encoding="utf-8") as stream:
@@ -219,6 +257,33 @@ def load_observations(
             )
             continue
 
+        json_payload = json.loads(path.read_text(encoding="utf-8"))
+        file_sources = {
+            str(run.get("ttft_source"))
+            for item in (
+                json_payload.get("metrics", json_payload.get("results", []))
+                if isinstance(json_payload, dict)
+                else []
+            )
+            if isinstance(item, dict)
+            for run in item.get("runs", [])
+            if isinstance(run, dict) and run.get("ttft_source")
+        }
+        if len(file_sources) > 1:
+            raise ValueError(
+                f"{path}: mixed ttft_source values are not fit-compatible: "
+                f"{sorted(file_sources)}"
+            )
+        transport = (
+            json_payload.get("request_transport")
+            if isinstance(json_payload, dict)
+            else None
+        )
+        contract = next(iter(file_sources), None) or (
+            f"transport:{transport}" if transport else None
+        )
+        if contract:
+            measurement_contracts.add(contract)
         source_count = 0
         for index, item in _iter_json_metrics(path):
             source_count += 1
@@ -239,7 +304,7 @@ def load_observations(
             ):
                 rejected["invalid_geometry"] = rejected.get("invalid_geometry", 0) + 1
                 continue
-            target, observed_cache_len, reason = _median_run_time(item)
+            target, observed_cache_len, reason = _median_run_time(item, estimator)
             if target is None:
                 rejected[reason or "invalid_run"] = (
                     rejected.get(reason or "invalid_run", 0) + 1
@@ -257,6 +322,12 @@ def load_observations(
                 )
             )
         input_files.append({"path": str(path), "rows": source_count, "format": "json"})
+
+    if len(measurement_contracts) > 1:
+        raise ValueError(
+            "input files mix incompatible request transports/TTFT sources: "
+            f"{sorted(measurement_contracts)}"
+        )
 
     observations.sort(
         key=lambda row: (row.batch_size, row.input_len, row.cache_len, row.source)
@@ -281,6 +352,7 @@ def load_observations(
     unique = {(row.batch_size, row.input_len, row.cache_len) for row in observations}
     audit = {
         "input_files": input_files,
+        "estimator": estimator,
         "raw_metric_count": sum(int(item["rows"]) for item in input_files),
         "raw_valid_observation_count": raw_observation_count,
         "valid_observation_count": len(observations),
@@ -288,6 +360,7 @@ def load_observations(
         "unique_geometry_count": len(unique),
         "rejected_counts": rejected,
         "selected_batch_size": batch_size,
+        "measurement_contracts": sorted(measurement_contracts),
         "seq_len_range": [
             min((x.input_len for x in observations), default=None),
             max((x.input_len for x in observations), default=None),
@@ -300,17 +373,12 @@ def load_observations(
     return observations, audit
 
 
-def feature_values(row: Observation) -> list[float]:
-    compute = row.compute_len / 1024.0
-    hit = row.cache_len / 1024.0
-    return [
-        1.0,
-        compute,
-        hit,
-        compute * compute,
-        compute * hit,
-        hit * hit,
-    ]
+def feature_values(
+    row: Observation, token_unit: int = DEFAULT_TOKEN_UNIT
+) -> list[float]:
+    tokens = row.compute_len / float(token_unit)
+    hit = row.cache_len / float(token_unit)
+    return [1.0, tokens, hit, tokens * tokens, tokens * hit, hit * hit]
 
 
 def _solve_linear_system(matrix: list[list[float]], vector: list[float]) -> list[float]:
@@ -354,7 +422,11 @@ def _weighted_median(values: Sequence[tuple[float, float]]) -> float:
 
 
 def fit_lad_coefficients(
-    rows: Sequence[Observation], *, max_iter: int = 2000, tol: float = 1e-10
+    rows: Sequence[Observation],
+    *,
+    max_iter: int = 2000,
+    tol: float = 1e-10,
+    token_unit: int = DEFAULT_TOKEN_UNIT,
 ) -> list[float]:
     """Coordinate-descent least-absolute-deviation (L1/MAE) regression.
 
@@ -362,7 +434,7 @@ def fit_lad_coefficients(
     are scaled during optimization to avoid the large dynamic range of the
     quadratic token features, then converted back to formula coefficients.
     """
-    matrix = [feature_values(row) for row in rows]
+    matrix = [feature_values(row, token_unit) for row in rows]
     targets = [row.target_ms for row in rows]
     width = len(FEATURE_NAMES)
     scales = [1.0] * width
@@ -400,6 +472,7 @@ def fit_hybrid_coefficients(
     rows: Sequence[Observation],
     *,
     seed: int,
+    token_unit: int = DEFAULT_TOKEN_UNIT,
     steps: int = 8000,
     learning_rate: float = 0.03,
 ) -> list[float]:
@@ -421,7 +494,9 @@ def fit_hybrid_coefficients(
 
     torch.manual_seed(seed)
     x = torch.tensor(
-        [feature_values(row) for row in rows], dtype=torch.float64, device="cpu"
+        [feature_values(row, token_unit) for row in rows],
+        dtype=torch.float64,
+        device="cpu",
     )
     y = torch.tensor([row.target_ms for row in rows], dtype=torch.float64, device="cpu")
     scales = torch.amax(torch.abs(x), dim=0).clamp_min(1.0)
@@ -429,7 +504,7 @@ def fit_hybrid_coefficients(
     # Start from the exact coordinate-descent MAE fit.  It is a materially
     # better starting point than least squares for the long TTFT tail, and we
     # retain it unless autograd lowers the requested combined loss.
-    lad = fit_lad_coefficients(rows)
+    lad = fit_lad_coefficients(rows, token_unit=token_unit)
     beta = torch.nn.Parameter(
         torch.tensor(lad, dtype=torch.float64, device="cpu") * scales
     )
@@ -471,16 +546,19 @@ def fit_coefficients(
     objective: str = "mae",
     ridge: float = 1e-8,
     seed: int = 20260904,
+    token_unit: int = DEFAULT_TOKEN_UNIT,
 ) -> tuple[list[float], str]:
-    if len(rows) < len(FEATURE_NAMES):
-        raise ValueError(
-            f"need at least {len(FEATURE_NAMES)} valid rows, got {len(rows)}"
-        )
+    names = build_feature_names(token_unit)
+    if len(rows) < len(names):
+        raise ValueError(f"need at least {len(names)} valid rows, got {len(rows)}")
     if objective == "mae":
-        return fit_lad_coefficients(rows), "python_coordinate_descent_lad"
+        return (
+            fit_lad_coefficients(rows, token_unit=token_unit),
+            "python_coordinate_descent_lad",
+        )
     if objective == "hybrid":
         return (
-            fit_hybrid_coefficients(rows, seed=seed),
+            fit_hybrid_coefficients(rows, seed=seed, token_unit=token_unit),
             "torch_cpu_autograd_hybrid_absolute_relative",
         )
     if objective != "mse":
@@ -492,7 +570,9 @@ def fit_coefficients(
 
         torch.set_grad_enabled(False)
         x = torch.tensor(
-            [feature_values(row) for row in rows], dtype=torch.float64, device="cpu"
+            [feature_values(row, token_unit) for row in rows],
+            dtype=torch.float64,
+            device="cpu",
         )
         y = torch.tensor(
             [row.target_ms for row in rows], dtype=torch.float64, device="cpu"
@@ -502,11 +582,11 @@ def fit_coefficients(
     except (ImportError, RuntimeError, ValueError):
         pass
 
-    width = len(FEATURE_NAMES)
+    width = len(names)
     gram = [[0.0] * width for _ in range(width)]
     rhs = [0.0] * width
     for row in rows:
-        values = feature_values(row)
+        values = feature_values(row, token_unit)
         for i in range(width):
             rhs[i] += values[i] * row.target_ms
             for j in range(width):
@@ -516,10 +596,14 @@ def fit_coefficients(
     return _solve_linear_system(gram, rhs), "python_ridge_normal_equation"
 
 
-def predict(coefficients: Sequence[float], row: Observation) -> float:
+def predict(
+    coefficients: Sequence[float],
+    row: Observation,
+    token_unit: int = DEFAULT_TOKEN_UNIT,
+) -> float:
     return sum(
         coefficient * value
-        for coefficient, value in zip(coefficients, feature_values(row))
+        for coefficient, value in zip(coefficients, feature_values(row, token_unit))
     )
 
 
@@ -536,9 +620,19 @@ def _quantile(values: Sequence[float], q: float) -> float:
 
 
 def error_metrics(
-    rows: Sequence[Observation], coefficients: Sequence[float]
+    rows: Sequence[Observation],
+    coefficients: Sequence[float],
+    token_unit: int = DEFAULT_TOKEN_UNIT,
 ) -> dict[str, Any]:
-    errors = [abs(predict(coefficients, row) - row.target_ms) for row in rows]
+    return error_metrics_with_predictor(
+        rows, lambda row: predict(coefficients, row, token_unit)
+    )
+
+
+def error_metrics_with_predictor(
+    rows: Sequence[Observation], predictor: Callable[[Observation], float]
+) -> dict[str, Any]:
+    errors = [abs(predictor(row) - row.target_ms) for row in rows]
     apes = [100.0 * error / row.target_ms for error, row in zip(errors, rows)]
     return {
         "n": len(rows),
@@ -584,13 +678,16 @@ def split_rows(
     return result
 
 
-def formula_text(coefficients: Sequence[float]) -> str:
+def formula_text(
+    coefficients: Sequence[float], token_unit: int = DEFAULT_TOKEN_UNIT
+) -> str:
+    names = build_feature_names(token_unit)
     terms: list[str] = []
     for index, coefficient in enumerate(coefficients):
         if abs(coefficient) < 1e-14:
             continue
         magnitude = f"{abs(coefficient):.15g}"
-        expression = FEATURE_NAMES[index]
+        expression = names[index]
         term = magnitude if expression == "1" else f"{magnitude} * {expression}"
         if not terms:
             terms.append(("-" if coefficient < 0 else "") + term)
@@ -791,8 +888,42 @@ def write_fit_gap_svg(
 
 
 def run_fit(args: argparse.Namespace) -> int:
+    profile = None
+    profile_sha256 = None
+    if getattr(args, "profile", None):
+        profile = load_profile(args.profile)
+        profile_sha256 = profile_fingerprint(profile)
+
+    token_unit = resolve_int(
+        profile or {},
+        "chart",
+        "token_unit",
+        getattr(args, "token_unit", None),
+        DEFAULT_TOKEN_UNIT,
+    )
+    names = build_feature_names(token_unit)
+    model_label = resolve_label(
+        profile, getattr(args, "model_label", None), "DeepSeek-V4-Pro"
+    )
+    formula_filename = resolve_str(
+        profile or {},
+        "chart",
+        "formula_filename",
+        getattr(args, "formula_filename", None),
+        "deepseek_v4_prefill_formula.txt",
+    )
+    formula_key = resolve_str(
+        profile or {},
+        "chart",
+        "formula_key",
+        getattr(args, "formula_key", None),
+        "PREFILL_TIME_FORMULA",
+    )
+
     paths = [pathlib.Path(value) for value in args.inputs]
-    rows, audit = load_observations(paths, batch_size=args.batch_size)
+    rows, audit = load_observations(
+        paths, batch_size=args.batch_size, estimator=args.estimator
+    )
     output = pathlib.Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     (output / "input_audit.json").write_text(
@@ -805,6 +936,8 @@ def run_fit(args: argparse.Namespace) -> int:
             "required_min_valid_rows": args.min_valid_rows,
             "audit": audit,
             "formula": None,
+            "profile": profile,
+            "profile_sha256": profile_sha256,
         }
         (output / "fit_report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -812,16 +945,81 @@ def run_fit(args: argparse.Namespace) -> int:
         print(json.dumps(report, ensure_ascii=False))
         return 2
 
-    splits = split_rows(rows, mode=args.split_mode, seed=args.split_seed)
-    fit_rows = splits["train"] if len(splits["train"]) >= len(FEATURE_NAMES) else rows
-    coefficients, backend = fit_coefficients(
-        fit_rows, objective=args.objective, seed=args.split_seed
-    )
-    formula = formula_text(coefficients)
+    split_mode = getattr(args, "split_mode", "seq-hash-70-15-15")
+    split_seed = getattr(args, "split_seed", 20260904)
+    splits = split_rows(rows, mode=split_mode, seed=split_seed)
+    model_family = getattr(args, "model_family", "quadratic")
+    symbolic_report = None
+    if model_family == "restricted-symbolic":
+        if not splits["validation"]:
+            raise ValueError(
+                "restricted-symbolic requires a non-empty validation split; "
+                "use --split-mode=seq-hash-70-15-15"
+            )
+        hinge_tokens = (
+            tuple(
+                int(value)
+                for value in getattr(args, "symbolic_hinge_tokens", "").split(",")
+                if value.strip()
+            )
+            or DEFAULT_HINGE_TOKENS
+        )
+        symbolic_model = fit_restricted_symbolic(
+            splits["train"],
+            splits["validation"],
+            [*splits["train"], *splits["validation"]],
+            token_unit=token_unit,
+            hinge_tokens=hinge_tokens,
+            max_terms=getattr(args, "symbolic_max_terms", 15),
+            complexity_tolerance_pct=getattr(
+                args, "symbolic_complexity_tolerance_pct", 5.0
+            ),
+        )
+        coefficients = list(symbolic_model.coefficients)
+        backend = symbolic_model.backend
+        formula = symbolic_model.formula
+        predictor = symbolic_model.predict
+        coefficient_names = [term.expression for term in symbolic_model.terms]
+        symbolic_report = symbolic_model.search_report
+        formula_compatibility = {
+            "parser": "org.flexlb.balance.prediction.PrefillTimeFormula",
+            "variables": ["inputTokens", "computeTokens", "hitCacheTokens"],
+            "functions": ["sum", "sqrt", "log", "max", "pow"],
+            "operators": ["+", "-", "*", "/", "(", ")"],
+            "unsupported_constructs_used": [],
+        }
+        objective_name = "mean_squared_relative_error"
+    else:
+        fit_rows = splits["train"] if len(splits["train"]) >= len(names) else rows
+        coefficients, backend = fit_coefficients(
+            fit_rows,
+            objective=args.objective,
+            seed=split_seed,
+            token_unit=token_unit,
+        )
+        formula = formula_text(coefficients, token_unit)
+        predictor = lambda row: predict(coefficients, row, token_unit)
+        coefficient_names = list(names)
+        formula_compatibility = {
+            "parser": "org.flexlb.balance.prediction.PrefillTimeFormula",
+            "variables": ["computeTokens", "hitCacheTokens"],
+            "functions": ["sum"],
+            "operators": ["+", "-", "*", "/", "(", ")"],
+            "unsupported_constructs_used": [],
+        }
+        objective_name = {
+            "mae": "mean_absolute_error",
+            "mse": "mean_squared_error",
+            "hybrid": (
+                "0.5*MAE/median(train_target_ms) + "
+                "0.5*mean_absolute_percentage_error"
+            ),
+        }[args.objective]
     metrics = {
-        name: error_metrics(group, coefficients) for name, group in splits.items()
+        name: error_metrics_with_predictor(group, predictor)
+        for name, group in splits.items()
     }
-    metrics["all"] = error_metrics(rows, coefficients)
+    metrics["all"] = error_metrics_with_predictor(rows, predictor)
     split_by_geometry = {
         (row.batch_size, row.input_len, row.cache_len): name
         for name, group in splits.items()
@@ -829,7 +1027,7 @@ def run_fit(args: argparse.Namespace) -> int:
     }
     predictions = []
     for row in rows:
-        predicted = predict(coefficients, row)
+        predicted = predictor(row)
         predictions.append(
             {
                 "batch_size": row.batch_size,
@@ -857,38 +1055,28 @@ def run_fit(args: argparse.Namespace) -> int:
     write_fit_gap_svg(predictions, output / "fit_gap.svg")
     report = {
         "schema_version": 1,
-        "model": "DeepSeek-V4-Pro",
+        "model": model_label,
+        "model_family": model_family,
         "backend": backend,
-        "objective": {
-            "mae": "mean_absolute_error",
-            "mse": "mean_squared_error",
-            "hybrid": (
-                "0.5*MAE/median(train_target_ms) + "
-                "0.5*mean_absolute_percentage_error"
-            ),
-        }[args.objective],
+        "objective": objective_name,
         "target": (
-            "median of successful client TTFT runs; falls back to "
+            f"{args.estimator} of successful client TTFT runs; falls back to "
             "server prefill_time_ms only for legacy input"
         ),
         "formula": formula,
-        "formula_compatibility": {
-            "parser": "org.flexlb.balance.strategy.PrefillTimeFormula",
-            "variables": ["computeTokens", "hitCacheTokens"],
-            "functions": ["sum"],
-            "operators": ["+", "-", "*", "/", "(", ")"],
-            "unsupported_constructs_used": [],
-        },
+        "token_unit": token_unit,
+        "formula_compatibility": formula_compatibility,
         "coefficients": [
             {"expression": name, "coefficient": value}
-            for name, value in zip(FEATURE_NAMES, coefficients)
+            for name, value in zip(coefficient_names, coefficients)
         ],
+        "symbolic_search": symbolic_report,
         "audit": audit,
         "split": {
-            "mode": args.split_mode,
-            "seed": args.split_seed,
-            "train_fraction": 0.5 if args.split_mode == "random-50-50" else 0.70,
-            "test_fraction": 0.5 if args.split_mode == "random-50-50" else 0.15,
+            "mode": split_mode,
+            "seed": split_seed,
+            "train_fraction": 0.5 if split_mode == "random-50-50" else 0.70,
+            "test_fraction": 0.5 if split_mode == "random-50-50" else 0.15,
         },
         "split_counts": {name: len(group) for name, group in splits.items()},
         "metrics": metrics,
@@ -903,27 +1091,38 @@ def run_fit(args: argparse.Namespace) -> int:
             and metrics["test"]["max_ape_pct"] <= args.max_max_ape_pct
         ),
         "production_note": (
-            "Only rows whose requested and observed reuse match exactly are "
-            "included. Failed requests and invalid_reuse rows are excluded. "
+            "Rows require exact requested/observed reuse unless the runner "
+            "explicitly marked reuse validation as skipped; those rows use "
+            "observed reuse. Failed requests are excluded. "
             "Validate the latency measurement contract, tail error, and "
             "deployment range before production use."
         ),
+        "profile": profile,
+        "profile_sha256": profile_sha256,
     }
     (output / "fit_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
-    (output / "deepseek_v4_prefill_formula.txt").write_text(
-        "PREFILL_TIME_FORMULA=" + formula + "\n", encoding="utf-8"
+    (output / formula_filename).write_text(
+        formula_key + "=" + formula + "\n", encoding="utf-8"
     )
     print(json.dumps(report, ensure_ascii=False))
     return 0 if report["production_acceptance"] else 3
 
 
 def run_validate(args: argparse.Namespace) -> int:
-    rows, audit = load_observations(
-        [pathlib.Path(value) for value in args.inputs], batch_size=args.batch_size
+    profile = None
+    if getattr(args, "profile", None):
+        profile = load_profile(args.profile)
+    model_label = resolve_label(
+        profile, getattr(args, "model_label", None), "DeepSeek-V4-Pro"
     )
-    report = {"model": "DeepSeek-V4-Pro", "audit": audit, "valid": bool(rows)}
+    rows, audit = load_observations(
+        [pathlib.Path(value) for value in args.inputs],
+        batch_size=args.batch_size,
+        estimator=args.estimator,
+    )
+    report = {"model": model_label, "audit": audit, "valid": bool(rows)}
     if args.report:
         pathlib.Path(args.report).write_text(
             json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -932,10 +1131,184 @@ def run_validate(args: argparse.Namespace) -> int:
     return 0 if rows else 2
 
 
+def _add_common_profile_args(parser: argparse.ArgumentParser) -> None:
+    """Add --profile and --model-label shared by all subcommands."""
+    parser.add_argument(
+        "--profile", default=None, help="JSON profile for parameter defaults."
+    )
+    parser.add_argument(
+        "--model-label", default=None, help="Override the model label in output."
+    )
+
+
+def run_analyze_anomalies(args: argparse.Namespace) -> int:
+    """Detect anomalous measurements in a cache-grid result set.
+
+    Checks:
+    (a) Cache monotonicity: for same input_len, longer cache should be faster.
+    (b) Run spread: max/min RT ratio per case should be within threshold.
+    (c) Residual outliers: cases with high APE vs fitted formula.
+    (d) Cross-input compute monotonicity: more compute at same cache should cost more.
+    """
+    profile = None
+    if getattr(args, "profile", None):
+        profile = load_profile(args.profile)
+    model_label = resolve_label(
+        profile, getattr(args, "model_label", None), "DeepSeek-V4-Pro"
+    )
+
+    token_unit = resolve_int(
+        profile or {},
+        "chart",
+        "token_unit",
+        getattr(args, "token_unit", None),
+        DEFAULT_TOKEN_UNIT,
+    )
+
+    paths = [pathlib.Path(value) for value in args.inputs]
+    rows, audit = load_observations(
+        paths, batch_size=args.batch_size, estimator=args.estimator
+    )
+    output = pathlib.Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    anomalies: list[dict[str, Any]] = []
+    min_rt_ms = float(getattr(args, "min_rt_ms", 5.0))
+    min_compute_tokens = int(getattr(args, "min_compute_tokens", 16384))
+
+    # (a) Cache monotonicity: group by input_len, check that RT decreases with cache_len
+    by_input: dict[int, list[Observation]] = {}
+    for row in rows:
+        by_input.setdefault(row.input_len, []).append(row)
+    for input_len, group in sorted(by_input.items()):
+        sorted_by_cache = sorted(group, key=lambda r: r.cache_len)
+        for i in range(1, len(sorted_by_cache)):
+            prev = sorted_by_cache[i - 1]
+            curr = sorted_by_cache[i]
+            if curr.cache_len > prev.cache_len and curr.target_ms > prev.target_ms:
+                anomalies.append(
+                    {
+                        "check": "cache_monotonicity",
+                        "severity": "warning",
+                        "input_len": input_len,
+                        "detail": (
+                            f"cache={prev.cache_len} -> {curr.target_ms:.1f}ms but "
+                            f"cache={curr.cache_len} -> {curr.target_ms:.1f}ms "
+                            f"(longer cache is slower by {curr.target_ms - prev.target_ms:.1f}ms)"
+                        ),
+                        "cache_short": prev.cache_len,
+                        "cache_long": curr.cache_len,
+                        "rt_short_ms": prev.target_ms,
+                        "rt_long_ms": curr.target_ms,
+                    }
+                )
+
+    # (b) Run spread: skip if we don't have per-run data (observations are aggregated)
+    # This check applies to the raw result JSON items, not aggregated observations.
+
+    # (c) Residual outliers: fit formula and find high-APE cases
+    if len(rows) >= len(build_feature_names(token_unit)):
+        splits = split_rows(rows)
+        fit_rows = (
+            splits["train"]
+            if len(splits["train"]) >= len(build_feature_names(token_unit))
+            else rows
+        )
+        coefficients, _ = fit_coefficients(
+            fit_rows, objective="mae", token_unit=token_unit
+        )
+        max_ape_pct = float(getattr(args, "max_anomaly_ape_pct", 25.0))
+        for row in rows:
+            predicted = predict(coefficients, row, token_unit)
+            ape = 100.0 * abs(predicted - row.target_ms) / row.target_ms
+            if ape > max_ape_pct and row.target_ms > min_rt_ms:
+                anomalies.append(
+                    {
+                        "check": "residual_outlier",
+                        "severity": "warning",
+                        "input_len": row.input_len,
+                        "cache_len": row.cache_len,
+                        "compute_len": row.compute_len,
+                        "target_ms": row.target_ms,
+                        "predicted_ms": predicted,
+                        "ape_pct": round(ape, 2),
+                        "detail": f"APE={ape:.1f}% (target={row.target_ms:.1f}ms, predicted={predicted:.1f}ms)",
+                    }
+                )
+
+    # (d) Cross-input compute monotonicity: for same cache_len, more compute = more RT
+    by_cache: dict[int, list[Observation]] = {}
+    for row in rows:
+        by_cache.setdefault(row.cache_len, []).append(row)
+    for cache_len, group in sorted(by_cache.items()):
+        sorted_by_compute = sorted(group, key=lambda r: r.compute_len)
+        for i in range(1, len(sorted_by_compute)):
+            prev = sorted_by_compute[i - 1]
+            curr = sorted_by_compute[i]
+            if (
+                curr.compute_len > prev.compute_len
+                and curr.compute_len >= min_compute_tokens
+                and prev.compute_len >= min_compute_tokens
+                and curr.target_ms < prev.target_ms
+            ):
+                anomalies.append(
+                    {
+                        "check": "compute_monotonicity",
+                        "severity": "info",
+                        "cache_len": cache_len,
+                        "detail": (
+                            f"compute={prev.compute_len} -> {prev.target_ms:.1f}ms but "
+                            f"compute={curr.compute_len} -> {curr.target_ms:.1f}ms "
+                            f"(more compute is faster by {prev.target_ms - curr.target_ms:.1f}ms)"
+                        ),
+                    }
+                )
+
+    anomalies.sort(
+        key=lambda a: (
+            {"error": 0, "warning": 1, "info": 2}.get(a.get("severity", "info"), 2),
+            -abs(a.get("ape_pct", 0)),
+            a.get("check", ""),
+        )
+    )
+
+    summary = {
+        "total_anomalies": len(anomalies),
+        "by_check": {},
+        "by_severity": {},
+    }
+    for a in anomalies:
+        check = a["check"]
+        severity = a.get("severity", "info")
+        summary["by_check"][check] = summary["by_check"].get(check, 0) + 1
+        summary["by_severity"][severity] = summary["by_severity"].get(severity, 0) + 1
+
+    report = {
+        "schema_version": 1,
+        "model": model_label,
+        "summary": summary,
+        "anomalies": anomalies,
+        "audit": audit,
+        "valid_observations": len(rows),
+        "floors": {"min_rt_ms": min_rt_ms, "min_compute_tokens": min_compute_tokens},
+        "profile": profile,
+        "profile_sha256": profile_fingerprint(profile) if profile else None,
+    }
+    (output / "anomaly_report.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    print(
+        json.dumps(
+            {"total_anomalies": len(anomalies), "summary": summary}, ensure_ascii=False
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    fit = sub.add_parser("fit", help="fit from successful DSV4 measurements")
+    fit = sub.add_parser("fit", help="fit from successful measurements")
     fit.add_argument("--inputs", nargs="+", required=True)
     fit.add_argument("--output-dir", required=True)
     fit.add_argument("--batch-size", type=int, default=1)
@@ -944,25 +1317,98 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--max-p95-ape-pct", type=float, default=10.0)
     fit.add_argument("--max-max-ape-pct", type=float, default=40.0)
     fit.add_argument(
+        "--model-family",
+        choices=("quadratic", "restricted-symbolic"),
+        default="quadratic",
+        help="Formula family; restricted-symbolic performs train-only forward selection.",
+    )
+    fit.add_argument(
         "--objective",
         choices=("mae", "mse", "hybrid"),
         default="hybrid",
         help="fit objective; hybrid balances normalized absolute and relative error",
     )
     fit.add_argument(
+        "--estimator",
+        choices=("median", "min", "trimmed"),
+        default="median",
+        help=(
+            "run-time statistic per case; 'min' rejects additive spikes from "
+            "external GPU contention, 'trimmed' drops the slowest run"
+        ),
+    )
+    fit.add_argument(
         "--split-mode",
         choices=("random-50-50", "seq-hash-70-15-15"),
-        default="random-50-50",
-        help="default randomly assigns exactly half of valid geometries to training",
+        default="seq-hash-70-15-15",
     )
     fit.add_argument("--split-seed", type=int, default=20260904)
+    fit.add_argument("--symbolic-max-terms", type=int, default=15)
+    fit.add_argument("--symbolic-complexity-tolerance-pct", type=float, default=5.0)
+    fit.add_argument(
+        "--symbolic-hinge-tokens",
+        default=",".join(str(value) for value in DEFAULT_HINGE_TOKENS),
+        help="Comma-separated token thresholds for compute/input hinge candidates.",
+    )
     fit.add_argument("--allow-insufficient-data", action="store_true")
+    _add_common_profile_args(fit)
+    fit.add_argument(
+        "--token-unit",
+        type=int,
+        default=None,
+        help="Token unit for feature normalization (default: 1024).",
+    )
+    fit.add_argument(
+        "--formula-filename", default=None, help="Override the formula output filename."
+    )
+    fit.add_argument(
+        "--formula-key", default=None, help="Override the formula key in the .txt file."
+    )
     fit.set_defaults(func=run_fit)
-    validate = sub.add_parser("validate-inputs", help="audit valid/invalid DSV4 rows")
+
+    validate = sub.add_parser("validate-inputs", help="audit valid/invalid rows")
     validate.add_argument("--inputs", nargs="+", required=True)
     validate.add_argument("--batch-size", type=int, default=1)
+    validate.add_argument(
+        "--estimator",
+        choices=("median", "min", "trimmed"),
+        default="median",
+    )
     validate.add_argument("--report")
+    _add_common_profile_args(validate)
     validate.set_defaults(func=run_validate)
+
+    anom = sub.add_parser("analyze-anomalies", help="detect anomalous measurements")
+    anom.add_argument("--inputs", nargs="+", required=True)
+    anom.add_argument("--output-dir", required=True)
+    anom.add_argument("--batch-size", type=int, default=1)
+    anom.add_argument(
+        "--estimator",
+        choices=("median", "min", "trimmed"),
+        default="median",
+    )
+    anom.add_argument(
+        "--min-rt-ms",
+        type=float,
+        default=5.0,
+        help="Minimum RT floor for residual checks.",
+    )
+    anom.add_argument(
+        "--min-compute-tokens",
+        type=int,
+        default=16384,
+        help="Minimum compute floor for monotonicity.",
+    )
+    anom.add_argument(
+        "--max-anomaly-ape-pct",
+        type=float,
+        default=25.0,
+        help="APE threshold for residual outliers.",
+    )
+    _add_common_profile_args(anom)
+    anom.add_argument("--token-unit", type=int, default=None)
+    anom.set_defaults(func=run_analyze_anomalies)
+
     return parser
 
 

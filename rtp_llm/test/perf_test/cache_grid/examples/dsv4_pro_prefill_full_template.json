@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "kind": "dsv4_pro_prefill_full_template",
+  "description": "Compact full-range DSV4-Pro CP=8 prefill cache grid; expanded by batch_decode_test.py at load time",
+  "generator": {
+    "name": "linear_with_dense_prefix",
+    "version": 1,
+    "alignment": 256,
+    "cache_alignment": 4096,
+    "measure_runs_assumed_by_summary": 3,
+    "commit_tail_tokens_assumed": 4096
+  },
+  "summary": {
+    "input_count": 1024,
+    "case_count": 44505,
+    "estimated_measure_requests": 133515,
+    "estimated_seed_requests": 43481
+  },
+  "seq_generation": {
+    "kind": "linear_with_dense_prefix",
+    "count": 1024,
+    "max_seq_len": 1048575
+  },
+  "seq_block_size": 256,
+  "cache_block_size": 4096,
+  "cache_ratio_interval": 0.02
+}

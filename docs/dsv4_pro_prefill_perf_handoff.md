@@ -46,6 +46,24 @@ bazelisk test //rtp_llm/test/perf_test:batch_decode_test_test \
 
 标准 `GridRunner` 只扫描 batch 和 input length，本身没有 `--cache_len` 参数。因此，不能把普通 grid 的结果当成 cache-hit 结果；cache-hit 测试必须由能执行“seed → hit request → 校验 reuse_len”的专用 runner 完成，并把实际 `reuse_len` 写入结果。
 
+### 1.1 cache-grid prefill mode 修复（2026-09-10）
+
+旧版 cache-grid 分支绕过了标准 `GridRunner` 的 `_set_concurrency()`，服务启动后没有把
+scheduler 从默认 decode mode 切到 prefill mode。即使请求携带长输入、只输出 1 token，
+GPU 也可能实际执行 `ctx_batch=0, gen_batch=1, tokens=1` 的单 token decode；“输出 1 token”
+只定义请求输出长度，不能证明长输入已经走过 prefill。
+
+修复后的 `batch_decode_test.py` 会在 cache block 探测、seed 和正式测量之前调用
+`/update_scheduler_info`，固定发送 `batch_size=1, mode=prefill`；接口不可用或响应不符合
+预期时直接终止。因此不新增 scheduler CLI 参数，测试仍使用 `--partial=2` 和
+`--decode_test_length=1`。但必须按第 7 节先做 GPU trace 验证，不能只根据接口 ACK、请求成功、
+`reuse_len` 或时延趋势认定为 prefill。
+
+修复只影响之后新启动的服务，不会修正已经落盘的数据。目录
+`/data7/zhouhaiyu.zhy/tmp/dsv4_pro_center_dense_input_20260908` 的时延、吞吐、cache 收益、
+三维图和拟合结论不得继续使用；其中输入长度、请求 cache 长度、observed reuse 和请求成功状态
+可以作为元数据留档。
+
 ## 2. 代码版本
 
 当前代码分成两个仓库：
@@ -209,6 +227,27 @@ effective_max_seq_len = max(max_seq_len, max(input_len) + decode_test_length)
 
 本手册的基线是 batch=1，所以 `--concurrency_limit=1` 是为了保持“一个 geometry 一次 forward”的可比性。如果要测并发吞吐，另建 target，显式记录 `batch_size`、`max_context_batch_size` 和实际 server concurrency；不要把两类结果合并拟合。
 
+### 修复后需要确认的测试参数
+
+| 类别 | 参数 | 要求 |
+|---|---|---|
+| 保持 | `--partial=2` | cache-grid 仍是 prefill-only；代码据此进入修复后的分支 |
+| 保持 | `--decode_test_length=1` | 仍只生成首 token；它不等于 decode 性能测试 |
+| 保持 | `--batch_size=1`、`--max_context_batch_size=1`、`--concurrency_limit=1` | 与 scheduler 更新的 `batch_size=1` 一致 |
+| 保持 | `--cache_measure_runs=3` | 正式数据每个 geometry 三次，报告使用成功样本的 median TTFT |
+| 必改 | `--result_dir=<全新目录>` | 首次修复后运行不得续接旧的 decode-mode 结果 |
+| 必改 | `--cache-alignment=4096` | 生成 grid 时使用；当前 CP=8 分片配置下为 `512 × 8` |
+| 必改 | `--expected_cache_block_size=4096` | runner 的去重和启动探测使用同一 CP-visible 粒度 |
+| 保持 | `--cache_commit_tail_tokens=4096` | cache case 至少留下一个 4096-token 新计算尾部 |
+| 验证时临时开启 | `--cache_profile_runs=1`、`--cache_profile_case_ids ...` | 只用于小规模验真；正式全量运行恢复为 0 |
+| 正式关闭 | `--cache_profile_runs=0`、`PERF_PROFILE_RUNS=0` | profiler 时延不得进入正式基线 |
+
+这里必须区分三个概念：DSV4 单 rank 物理 block 是 512，kernel block 是 128；启用
+`PREFILL_CP_KV_CACHE_SHARDED=1` 且 CP=8 后，cache-grid 的 CP-visible reuse 粒度是 4096。
+当前受版本控制的 `dsv4_pro_prefill.json` 仍把 `cache_alignment` 和
+`expected_block_size` 写成 512；在该配置被同步修正前，生成 grid 和运行 runner 时必须用
+CLI 显式传入 4096，不能只依赖 profile 默认值。
+
 ## 6. 可复现的 Bazel 命令
 
 先做无 GPU 的 Python 检查：
@@ -276,7 +315,7 @@ cache 结果必须以 `cache_len_observed` 为准。请求的 cache 长度可能
 
 ### 专用 cache runner 的实际位置
 
-这一点不能靠默认入口推断：标准 `GridRunner` 没有 cache 维度。本轮带 cache 的临时 runner 实际放在：
+这一点不能靠默认入口推断：标准 `GridRunner` 没有 cache 维度。历史测试曾把临时 runner 放在：
 
 ```text
 /tmp/cache_grid_runner.remote.py
@@ -294,7 +333,101 @@ cache 结果必须以 `cache_len_observed` 为准。请求的 cache 长度可能
 $RESULT_DIR/cache_grid_results.json
 ```
 
-需要特别说明：这两个 `/tmp` 文件不是当前 Git 分支里的受版本控制文件，机器重启或清理临时目录后可能消失。因此它们只能解释历史结果，不能作为正式交接依赖。正式交接前应把 runner 和入口纳入目标分支，并为其补一个 Bazel target；在此之前，接手人不能只按本手册第 6 节的标准 target 完成 cache-hit 测试。
+需要特别说明：这两个 `/tmp` 文件不是当前 Git 分支里的受版本控制文件，机器重启或清理临时目录后可能消失，因此只能解释历史结果。后续必须使用仓库内受版本控制的
+`rtp_llm/test/perf_test/cache_grid/runner/cache_grid_runner.py` 和 `batch_decode_test.py`；不要再复制或运行历史
+`/tmp` 入口，否则不会得到本次 scheduler mode 修复。
+
+### cache-grid 异常点的可选 profiler 补采
+
+版本控制内的 `rtp_llm/test/perf_test/cache_grid/runner/cache_grid_runner.py` 支持指定 case 的
+Torch/Kineto CPU + CUDA trace。默认 `--cache_profile_runs=0`，不调用 profiler，
+也不增加诊断请求。该参数独立于普通 grid 的 `--profile_runs` / `PERF_PROFILE_RUNS`。
+
+在原测试命令上追加以下参数，可针对报告中的 case ID 补采：
+
+```bash
+# 保留原命令中的模型、并行、cache 对齐、transport 和 engine_env 配置。
+# --cache_grid_json 仍传完整原始 grid，不需要手工裁剪或重新编号。
+<原 cache-grid 测试命令> \
+  --cache_profile_only \
+  --cache_profile_case_ids 14579 14595 \
+  --cache_profile_runs 3 \
+  --cache_profile_trace_timeout 180
+```
+
+- `--cache_profile_case_ids`：显式选择原 grid / 报告的 case ID，必须与正数
+  `--cache_profile_runs` 一起使用；未知或已被对齐去重移除的 ID 会在启动模型前报错。
+- `--cache_profile_only`：仅补采，跳过正式测量。实际输出到
+  `$RESULT_DIR/cache_profile_replays/<唯一 session>/`，保留原报告、test_info 和 checkpoint。
+  可以对已经完成全量测试的目录使用。不要同时传 `--require_cache_resume`。
+- 不传 `--cache_profile_only`：先完成正常测量/恢复，再补采所选 case；profile
+  结果不进入正式 `runs[]`、`median_ttft_ms` 或吞吐计算。
+- 当前支持 DP=1，并通过 `/start_profile` 的 `enable_all_rank=true` 采集全部 TP rank。
+  每个诊断请求使用 `start_step=0, num_steps=1`，捕获一个实际 forward。
+
+每次诊断使用新的 prompt case 标识，按相同 input/cache geometry 重新生成输入，
+先执行未开启 profiler 的 seed，再开启 profiler 并发送 continuation；冷请求不发 seed。
+这会更换前缀内容，避免复用正式请求或上次诊断已经写入的后缀缓存，属于同形状补采，
+不是原 token 序列的逐字重放。诊断仍检查引擎反馈的 `input_len`、`reuse_len`、`output_len`。
+当前补采不增加单独的形状预热，若要分析稳定态，应先按原流程预热并比较多次 trace。
+
+补采产物（相对于实际输出目录）：
+
+```text
+cache_profiles/<session>/manifest.json  # case / request ID、输入生成标识、seed、诊断响应、trace 路径
+timelines/cache_profile_*_wr0_*.json   # rank 0 的 Kineto trace
+timelines/cache_profile_*_wr1_*.json   # 其他 TP rank，以此类推
+```
+
+`manifest.json` 中的 `trace_files` 相对于实际输出目录。runner 等待每个 TP rank
+写出可解析且含事件的 JSON 后才记录成功；接口失败、命中不符或 trace 超时都会保存失败
+记录并终止补采，不会把已经完成的正式测试标为失败。trace 超时可用
+`--cache_profile_trace_timeout` 调整，已有文件也会保留。
+
+trace 可以在 Perfetto 等支持 Chrome trace JSON 的工具中查看 CPU/CUDA 时间线。
+优先核对 `executor.model_forward(ctx_batch=...,gen_batch=...,tokens=...,max_seq=...)`
+确认实际执行模式，再比较每层、kernel、内存拷贝和跨卡等待。修复后的 cache-grid 入口会在
+block 探测、seed、正式测量和 profiler 补采之前统一切到 prefill mode；旧提交不会自动切换。
+现有采样窗口从模型输入 TP 同步之后开始，不能据此宣称
+完整覆盖调度、cache 加载和输入构造。DSV4 prefill fast path 会省略部分细分逻辑标记，
+保留层级范围；GPU kernel 时间线仍由 profiler 采集。诊断时延包含 profiler 开销，
+不能替代关闭 profiler 的正式性能基线。
+
+### 修复后的最小验真
+
+不要直接启动 1.5 万 case 全量网格。先用一个全新的结果目录和小 grid 验证以下三类 geometry：
+
+| case | `input_len` | requested/observed cache | 期望新计算 token |
+|---|---:|---:|---:|
+| 短 cold | 4,096 | 0 | 4,096 |
+| 长 cold | 65,536 | 0 | 65,536 |
+| 长 hit | 65,536 | 61,440 | 4,096 |
+
+小 grid 仍使用 `--partial=2 --decode_test_length=1 --cache_measure_runs=3`，并显式设置
+`--cache_commit_tail_tokens=4096 --expected_cache_block_size=4096`。选中这三个 case，临时追加：
+
+```bash
+--cache_profile_runs 1 \
+--cache_profile_case_ids <short-cold-id> <long-cold-id> <long-hit-id> \
+--cache_profile_trace_timeout 180
+```
+
+验收必须同时满足：
+
+1. runner 日志在任何 perf 请求前出现
+   `scheduler configured before perf requests: payload={'batch_size': 1, 'mode': 'prefill'}`，
+   引擎日志出现 scheduler mode 更新为 prefill；
+2. 输入所属 rank 的 GPU trace 为 `ctx_batch=1, gen_batch=0`，`tokens` 等于
+   `input_len - cache_len_observed`。CP=8 时局部 embedding token 数可分别表现为 512、8192、
+   512；其他 rank 在广播前出现零 token 标记不算失败；
+3. hit case 三次 `cache_len_observed` 都是 61,440，cold case 都是 0，且每次
+   `output_len=1`、请求成功；
+4. 在干净 cache 或独立服务上，对同一完整 input IDs 比较 cold 与 hit 的首个生成 token
+   （有 logits 时同时比较 logits），结果一致；只比较 `reuse_len` 不足以证明计算正确；
+5. profiler 关闭后再取正式 TTFT；不能用“输入越长越慢”或“命中越多越快”代替上述验真。
+
+任一项不满足时停止全量测试。验真通过后换另一个全新 `result_dir` 执行正式网格，并将
+`--cache_profile_runs` 和 `PERF_PROFILE_RUNS` 设为 0。
 
 ## 8. 运行时监控和停机
 
@@ -323,7 +456,7 @@ nvidia-smi
 
 ```bash
 cd /data0/luoli.hn/work/rtp_llm_4/dsv4-cache-affinity-1OIKUM
-FIT=rtp_llm/test/perf_test/deepseek_v4_prefill_formula_fit.py
+FIT=rtp_llm/test/perf_test/cache_grid/formula/deepseek_v4_prefill_formula_fit.py
 DATA=/path/to/cache_grid_results.json
 OUT=/path/to/formula_output
 
@@ -355,7 +488,7 @@ $OUT/predictions.csv
 ### 9.2 三维图
 
 ```bash
-CHART=rtp_llm/test/perf_test/generate_prefill_3d_chart.py
+CHART=rtp_llm/test/perf_test/cache_grid/plot/generate_prefill_3d_chart.py
 python3 "$CHART" \
   --input "$DATA" \
   --output "$OUT/deepseek_v4_prefill_3d.svg" \
@@ -365,9 +498,9 @@ python3 "$CHART" \
 当前图的坐标约定固定为：
 
 ```text
-X = measured TTFT / prefill RT (ms)
+X = uncached compute tokens = input_len - observed_cache_len
 Y = observed cached tokens
-Z = uncached compute tokens = input_len - observed_cache_len
+Z = measured TTFT / prefill RT (ms)
 ```
 
 浅灰点是全部可用 geometry；实线是近固定 cache 的中位数趋势，虚线是近固定 compute 的中位数趋势。颜色只区分趋势线，不表示 RT 数值。
@@ -384,3 +517,198 @@ Z = uncached compute tokens = input_len - observed_cache_len
 | 公式在 FlexLB 解析失败 | 是否混入 `sum`、`max`、`batchSize`、`computeTokens` 或 Python 语法 |
 
 交接时至少提供：代码 commit、模型目录、完整 argv/env、GPU 型号、结果 JSON、`process.log`、拟合报告和 SHA256。不要只交一张截图或一行平均 RT。
+
+## 11. 生成 128-token 对齐的密集 cache grid
+
+不要把 1M 范围内所有 `input_len × cache_len` 的 128-token 组合全部展开；
+完整三角网格约有 3355 万个 geometry。仓库提供分层采样生成器，使候选点按
+128 token 对齐，同时限制实际 case 数：
+
+```bash
+bazelisk run //rtp_llm/test/perf_test:generate_cache_grid -- \
+  --min-input-len 256 \
+  --max-input-len 1048575 \
+  --alignment 128 \
+  --cache-alignment 4096 \
+  --input-points 1024 \
+  --cache-points-per-input 16 \
+  --cache-ratio-points 7 \
+  --seed 104729 \
+  --max-cases 20000 \
+  --output /path/to/cache_grid_128.json
+```
+
+默认使用固定质数 `104729` 作为随机种子。同一组参数会生成相同的计划；每个
+input 同时包含 cold、near-full、按 cache ratio 分层以及按 compute tokens
+分层的点。普通点均按 128 对齐，严格 1M 的 `input_len=1048575` 是唯一保留的
+非对齐边界例外。
+
+`--cache-alignment` 是 cache 维度的对齐，应等于 cache-grid 可观察的复用粒度：
+`seq_size_per_block`（DSV4 未显式传入时默认 256），开启
+`PREFILL_CP_KV_CACHE_SHARDED=1` 时再乘以 CP size。它与 `--alignment`
+（input 维度）解耦：handoff 基线 `--seq_size_per_block 512` 对应
+`--cache-alignment 4096`。cache 长度按 CP-visible block 对齐后，每个点的 requested
+与 observed reuse 一致；若 cache 对齐小于物理 block（例如 128 对齐 × 512
+block），同桶点测的是同一几何，白付 seed 和测量轮次。`--cache-alignment 0`
+（默认）保持旧行为，即跟随 `--alignment`。
+
+如果需要枚举范围内每个 128-token input 候选点，可增加
+`--input-mode=stride`。这通常会突破默认 20000 case 保护，生成器会拒绝输出；
+只有确认预计请求量后才使用 `--allow-large-grid`。
+
+运行密集计划：
+
+```bash
+bazelisk test //rtp_llm/test/perf_test:cache_grid_perf_test \
+  --config=cuda13 --config=sm10x \
+  --test_timeout=345600 --test_output=streamed --nocache_test_results \
+  --test_arg=--cache_grid_json=/path/to/cache_grid_128.json \
+  --test_arg=--partial=2 \
+  --test_arg=--decode_test_length=1 \
+  --test_arg=--cache_measure_runs=3 \
+  --test_arg=--cache_commit_tail_tokens=4096 \
+  --test_arg=--expected_cache_block_size=4096 \
+  --test_arg=--result_dir=/path/to/new_prefill_results
+```
+
+`--expected_cache_block_size`（缺省 0 时自动读取计划里的
+`generator.cache_alignment`）有两个作用：加载时把落到同一物理 block 桶的
+case 去重；服务启动后先做一次探测——写入恰好一个 block 的前缀、发送两
+block 的命中请求并校验 `reuse_len` 等于 block size。粒度不一致（比如
+`seq_size_per_block` 算错或 CP 分片开关与预期不符）会立即终止测试，避免
+整轮 cache-hit 数据全部作废。引擎实际生效的粒度也可以从启动日志确认：
+`cache config: ... seq_size_per_block=N`（通用）或
+`DSV4 physical block=N, kernel block=M`（DSV4）。
+
+生成计划中的 `generator`、`summary` 和输入文件 SHA256 会写入
+`cache_grid_results.json`。采样坐标使用 requested cache；拟合和三维图必须
+继续使用引擎报告的 observed cache。三维图坐标为 X=compute tokens、
+Y=observed cached tokens、Z=TTFT。
+
+### 一条命令完成测试、拟合和绘图
+
+`run_cache_grid_pipeline` 会先运行 cache-grid 测试，并且只在
+`cache_grid_results.json` 标记为完整后依次生成拟合公式、静态 SVG 和可旋转的
+HTML 三维图。cache 请求默认使用 `dashsc_input_ids`，直接通过 Dash-SC gRPC
+发送已经校验的 INT32 token IDs；需要兼容旧链路时可显式传
+`--cache_request_transport=http_prompt`。`--` 后的参数原样转发给 cache runner：
+
+```bash
+bazelisk run //rtp_llm/test/perf_test:run_cache_grid_pipeline \
+  --config=cuda13 --config=sm10x -- \
+  --cache-grid-json=/path/to/cache_grid_128.json \
+  --result-dir=/path/to/results \
+  --profile=rtp_llm/test/perf_test/cache_grid/config/dsv4_pro_prefill.json \
+  --estimator=median \
+  -- \
+  --cache_measure_runs=3 \
+  --cache_commit_tail_tokens=4096 \
+  --expected_cache_block_size=4096
+```
+
+默认产物为：
+
+```text
+results/cache_grid_results.json
+results/formula/deepseek_v4_prefill_formula.txt
+results/formula/fit_report.json
+results/formula/fit_gap.svg
+results/prefill_3d.svg
+results/prefill_cold_miss.svg
+results/prefill_3d.interactive.html
+results/pipeline_summary.json
+```
+
+模型和并行参数可以由 `--profile` 提供，也可以放在第二个 `--` 后传给 runner。
+已有完整测试结果需要重新拟合或绘图时，加 `--skip-test`。拟合质量门禁不通过时，
+脚本仍会生成 SVG 和 HTML，但最终返回拟合脚本的非零状态，并在
+`pipeline_summary.json` 中记录 `fit_rejected`。
+
+## 7. Profile 参数化
+
+所有工具（grid 生成、runner、拟合、图表）都支持 `--profile` 参数，指向一个
+版本化的 JSON 文件。DSV4-Pro 的标准 profile 在
+`rtp_llm/test/perf_test/cache_grid/config/dsv4_pro_prefill.json`。
+
+### 优先级链
+
+每个参数按以下顺序解析：
+
+1. **CLI 显式值**（包括 `0`）
+2. **Profile 字段**（`--profile` 指定的 JSON 文件）
+3. **输入中嵌入的 profile**（结果 JSON 的 `profile` 键，不传 `--profile` 时自动继承）
+4. **Legacy 默认值**（之前的硬编码值）
+
+不传 `--profile` 时，所有输出文件与 profile 化之前的版本字节一致——不会多出
+额外的键，也不会改变文件名。
+
+### 使用示例
+
+```bash
+PROFILE=rtp_llm/test/perf_test/cache_grid/config/dsv4_pro_prefill.json
+
+# 当前 profile 的 cache_alignment 仍是 512，本基线必须用 CLI 覆盖为 4096
+python3 generate_cache_grid.py --profile $PROFILE \
+  --min-input-len 256 --max-input-len 1048575 --input-points 489 \
+  --cache-alignment 4096
+
+# 运行测试（profile 注入引擎参数 + cache grid 参数）
+bazelisk test //rtp_llm/test/perf_test:cache_grid_perf_test \
+  --test_arg=--profile=$PROFILE \
+  --test_arg=--cache_grid_json=grid.json \
+  --test_arg=--partial=2 \
+  --test_arg=--decode_test_length=1 \
+  --test_arg=--expected_cache_block_size=4096
+
+# 拟合公式（profile 提供 token_unit、model_label 等）
+python3 deepseek_v4_prefill_formula_fit.py fit \
+  --inputs cache_grid_results.json --output-dir formula/ \
+  --profile $PROFILE --estimator min
+
+# 异常分析
+python3 deepseek_v4_prefill_formula_fit.py analyze-anomalies \
+  --inputs cache_grid_results.json --output-dir anomalies/ \
+  --profile $PROFILE --estimator min
+```
+
+### 断点续测与 Resume 守卫
+
+scheduler mode 修复后的第一次测试必须使用全新的 `--result_dir`，且不要传
+`--require_cache_resume`。不得把旧 decode-mode 目录中的
+`cache_grid_results.json`、journal 或 checkpoint 复制到新目录。只有已经通过本节验真的
+修复后新任务，才可以在代码 commit、grid、profile、模型、引擎参数和运行指纹都一致时续测。
+
+Cache-grid 每完成一个 case 都会同步追加
+`cache_grid_results.journal.jsonl`，并原子更新轻量的
+`cache_grid_progress.json`；每 100 个 case（可用
+`--cache_checkpoint_every` 调整）及正常退出时，将 journal 合并进完整的
+`cache_grid_results.json`。重新执行原命令并使用**同一个**
+`--result_dir` 时，会自动跳过所有 `status=ok` 的 case；中断时尚未完成或
+失败的 case 会从该点重新执行。推荐在续测命令额外加
+`--require_cache_resume`，这样结果目录写错时会直接报错，而不会意外开始一轮
+新测试：
+
+```bash
+# 其余模型、profile、grid 和引擎参数必须与首次运行保持一致
+python3 -m rtp_llm.test.perf_test.batch_decode_test \
+  ...首次运行的全部参数... \
+  --result_dir "$RESULT_DIR" \
+  --require_cache_resume
+```
+
+checkpoint 顶层的 `progress` 会记录 `completed_cases`、`pending_cases`、
+`progress_pct`，以及 `last_completed_case` / `next_pending_case` 的
+`input_len` 和 `cache_len`。`test_info.json` 会记录完整 argv、脱敏后的相关环境
+变量值、首次启动时间、最近更新时间和 `attempt_count`。
+
+恢复校验在 tokenizer 和模型加载**之前**执行，覆盖 `grid_sha256`、
+`profile_sha256`、模型/权重/引擎配置指纹、`measure_runs`、transport、
+`cache_commit_tail_tokens` 和 `expected_block_size`。配置不一致时默认中止。
+`--allow_resume_mismatch` 仅用于人工确认过的特殊场景，因为它会复用不同配置
+产生的成功结果。
+
+### 限制
+
+环境变量（如 `WORLD_SIZE`、`DSV4_USE_MEGA_MOE`）**不会**被 profile 捕获。
+它们必须通过 BUILD target 的 env 块或命令行显式设置。Profile 只记录
+CLI 可见的引擎参数。

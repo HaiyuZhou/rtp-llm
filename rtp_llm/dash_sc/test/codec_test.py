@@ -395,6 +395,7 @@ class DashScGrpcRequestTest(TestCase):
                 json_format=True,
             ),
             enable_thinking=False,
+            force_sp_accept=True,
         )
 
         sp = parse_sampling_params(req)
@@ -403,6 +404,7 @@ class DashScGrpcRequestTest(TestCase):
         self.assertEqual(json.loads(sp.response_format), {"type": "json_object"})
         self.assertTrue(sp.json_format)
         self.assertIs(op.enable_thinking, False)
+        self.assertTrue(op.force_sp_accept)
 
     def test_parse_sampling_tool_call_structural_tag_parameter(self) -> None:
         tag = _tool_call_structural_tag()
@@ -864,6 +866,8 @@ class DashScGrpcRequestTest(TestCase):
         assert parsed is not None
         self.assertEqual(parsed.tensor.dtype, torch.int32)
         self.assertEqual(parsed.tensor.tolist(), [7, 8, 9])
+        self.assertIsNone(parsed._values)
+        self.assertEqual(list(parsed.sequence), [7, 8, 9])
         parsed.tensor[0] = 99
         self.assertEqual(parsed.values, [7, 8, 9])
         self.assertEqual(parse_input_ids_from_request(req), [7, 8, 9])
@@ -942,7 +946,13 @@ class StreamResponseBuilderTest(TestCase):
         out = GenerateOutput(
             output_ids=torch.tensor([7, 8, 9], dtype=torch.int32),
             finished=True,
-            aux_info=AuxInfo(input_len=10, reuse_len=4),
+            aux_info=AuxInfo(
+                input_len=10,
+                reuse_len=4,
+                cost_time=12.5,
+                first_token_cost_time=3.5,
+                wait_time=1.25,
+            ),
         )
         go = GenerateOutputs(generate_outputs=[out])
         resp = StreamResponseBuilder(
@@ -978,6 +988,11 @@ class StreamResponseBuilderTest(TestCase):
             4,
         )
         self.assertEqual(infer.parameters["prompt_token_num"].int64_param, 10)
+        self.assertEqual(infer.parameters["engine_cost_time_us"].int64_param, 12500)
+        self.assertEqual(
+            infer.parameters["engine_first_token_cost_time_us"].int64_param, 3500
+        )
+        self.assertEqual(infer.parameters["engine_wait_time_us"].int64_param, 1250)
 
     def test_dash_error_response_uses_inner_error_fields(self) -> None:
         resp = build_dash_error_response(

@@ -133,6 +133,14 @@ def init_distributed_environment(
     """
     global _group_map, _parallelism_config, _initialized, _cpu_tp_broadcaster_base_path
 
+    logging.debug(
+        "init_distributed_environment called, world_size=%s, tp_size=%s, _initialized=%s, torch.distributed.is_initialized=%s",
+        parallelism_config.world_size,
+        parallelism_config.tp_size,
+        _initialized,
+        torch.distributed.is_initialized(),
+    )
+
     # Check if already initialized (and not destroyed)
     if _initialized and torch.distributed.is_initialized():
         logging.warning(
@@ -293,6 +301,10 @@ def _create_process_groups(
 
 def _register_process_groups_to_cpp():
     """Register Python comm op callbacks for C++ to call back into."""
+    logging.debug(
+        "_register_process_groups_to_cpp called, _group_map=%s",
+        list(_group_map.keys()),
+    )
     try:
         import librtp_compute_ops
 
@@ -301,9 +313,10 @@ def _register_process_groups_to_cpp():
                 "register_comm_ops not available, skip C++ comm ops registration"
             )
             return
-    except ImportError:
+    except ImportError as e:
         logging.debug(
-            "librtp_compute_ops not available, skip C++ comm ops registration"
+            "librtp_compute_ops not available, skip C++ comm ops registration: %s",
+            e,
         )
         return
 
@@ -312,6 +325,7 @@ def _register_process_groups_to_cpp():
     registered_modes: set = set()
 
     for group_key, pg in _group_map.items():
+        logging.debug("processing group_key=%s type=%s", group_key, type(group_key))
         if group_key == Group.DP_AND_TP:
             if _CPP_PARALLEL_MODE_DP_AND_TP not in registered_modes:
                 mode_to_group[_CPP_PARALLEL_MODE_DP_AND_TP] = pg
@@ -687,7 +701,9 @@ def broadcast(tensor: torch.Tensor, src: int, group: Group) -> None:
     torch.distributed.broadcast(tensor, src, group=process_group)
 
 
-def all_reduce(tensor: torch.Tensor, group: Group, *, inplace: bool = False) -> torch.Tensor:
+def all_reduce(
+    tensor: torch.Tensor, group: Group, *, inplace: bool = False
+) -> torch.Tensor:
     """All-reduce a tensor across all ranks in the group.
 
     Args:

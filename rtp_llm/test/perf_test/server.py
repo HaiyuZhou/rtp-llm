@@ -3,6 +3,9 @@ import logging
 import os
 from typing import Dict, List, Optional
 
+import requests
+
+from rtp_llm.test.perf_test.cache_grid.runner.scheduler import configure_scheduler
 from rtp_llm.test.perf_test.dataset import extract_arg
 from rtp_llm.test.utils.maga_server_manager import MagaServerManager
 
@@ -22,12 +25,16 @@ class EngineServer:
         env: Dict[str, str] = {
             "USE_BATCH_DECODE_SCHEDULER": "1",
             "FAKE_BALANCE_EXPERT": "1",
+            "REUSE_CACHE": "1",
             "BATCH_DECODE_SCHEDULER_WARMUP_TYPE": (
                 "0" if self._args.partial in (0, 1) else "1"
             ),
             "TORCH_CUDA_PROFILER_DIR": self._args.result_dir,
         }
 
+        if getattr(self._args, "cache_profile_backend", "kineto") == "nsys":
+            env["GEN_TIMELINE_SYNC"] = "0"
+            engine_cli += " --gen_timeline_sync=False"
         logging.info(f"Starting server with engine CLI: {engine_cli}")
         logging.info(f"remaining_args (raw list): {self._remaining_args}")
         self._server = MagaServerManager(
@@ -44,6 +51,12 @@ class EngineServer:
     def stop(self) -> None:
         if self._server is not None:
             self._server.stop_server()
+
+    def set_scheduler_mode(self, *, batch_size: int, mode: str) -> Dict[str, object]:
+        """Configure BatchDecodeScheduler before issuing performance requests."""
+        return configure_scheduler(
+            self.port, batch_size=batch_size, mode=mode, post=requests.post, attempts=20
+        )
 
     @property
     def port(self) -> int:

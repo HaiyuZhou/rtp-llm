@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import struct
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, NamedTuple
@@ -683,6 +683,7 @@ class OtherParams:
     """Non-sampling knobs carried alongside ``input_ids`` (filled by ``parse_other_params``)."""
 
     return_input_ids: bool = False
+    force_sp_accept: bool = False
     enable_thinking: bool | None = None
     max_new_think_tokens: int | None = None
     timeout_ms: int | None = None
@@ -774,8 +775,36 @@ class SamplingParams:
 
 @dataclass(frozen=True)
 class ParsedInputIds:
-    values: list[int]
+    _values: list[int] | None
     tensor: torch.Tensor
+    _view: memoryview | None = None
+
+    def __init__(
+        self,
+        values: list[int] | None = None,
+        tensor: torch.Tensor | None = None,
+        *,
+        view: memoryview | None = None,
+    ) -> None:
+        if tensor is None:
+            tensor = torch.tensor(values or [], dtype=torch.int32)
+        object.__setattr__(self, "_values", values)
+        object.__setattr__(self, "tensor", tensor)
+        object.__setattr__(self, "_view", view)
+
+    @property
+    def sequence(self) -> Sequence[int]:
+        """A zero-copy integer sequence for inference hot paths."""
+        return self._view if self._view is not None else (self._values or [])
+
+    @property
+    def values(self) -> list[int]:
+        """Materialize a list only for compatibility callers that require one."""
+        values = self._values
+        if values is None:
+            values = list(self.sequence)
+            object.__setattr__(self, "_values", values)
+        return values
 
 
 def parse_input_ids_from_request(request) -> list[int] | None:
@@ -793,21 +822,26 @@ def _parse_input_ids_for_inference(request) -> ParsedInputIds | None:
     inp, raw = _find_input_raw(request, "input_ids")
     if inp is None or raw is None:
         return None
-    values = _parse_int_tensor_flat(inp, raw)
-    if values is None:
-        return None
     if inp.datatype == "INT32":
-        tensor = torch.frombuffer(bytearray(raw), dtype=torch.int32)
+        if not raw or len(raw) & 3:
+            return None
+        owned = bytearray(raw)
+        tensor = torch.frombuffer(owned, dtype=torch.int32)
+        view = memoryview(raw).cast("i")
     elif inp.datatype == "INT64":
+        values = _parse_int_tensor_flat(inp, raw)
+        if values is None:
+            return None
         tensor = torch.frombuffer(bytearray(raw), dtype=torch.int64)
         if tensor.numel():
             min_value, max_value = torch.aminmax(tensor)
             if min_value.item() < _INT32_MIN or max_value.item() > _INT32_MAX:
                 raise DashScInputIdsError("input_ids value is outside the INT32 range")
         tensor = tensor.to(torch.int32)
+        return ParsedInputIds(values=values, tensor=tensor)
     else:
         return None
-    return ParsedInputIds(values=values, tensor=tensor)
+    return ParsedInputIds(tensor=tensor, view=view)
 
 
 def parse_sampling_params(
@@ -943,6 +977,9 @@ def parse_other_params(request, ds_attrs: dict[str, Any] | None = None) -> Other
                 if vf is not None:
                     return_input_ids = vf != 0.0
 
+    force_sp_accept = bool(
+        _parse_optional_parameter_bool(request, "force_sp_accept") or False
+    )
     ds_attrs = ds_attrs if ds_attrs is not None else parse_ds_header_attributes(request)
     enable_thinking = _parse_optional_bool(
         _lookup_ds_request_control(ds_attrs, "x-ds-llm-thinking")
@@ -999,6 +1036,7 @@ def parse_other_params(request, ds_attrs: dict[str, Any] | None = None) -> Other
 
     return OtherParams(
         return_input_ids=return_input_ids,
+        force_sp_accept=force_sp_accept,
         enable_thinking=enable_thinking,
         max_new_think_tokens=max_new_think_tokens,
         timeout_ms=timeout_ms,
@@ -1216,7 +1254,27 @@ def _append_aux_info_metrics_outputs(
     reuse_len = int(ax.reuse_len) if ax is not None else 0
     _append_int32_scalar_output(infer, "prompt_token_num", input_len)
     _append_int32_scalar_output(infer, "prompt_cached_token_num", reuse_len)
+    _set_aux_info_timing_parameters(infer, ax)
     _append_prompt_cache_usage_parameters(infer, input_len, reuse_len)
+
+
+def _set_aux_info_timing_parameters(
+    infer: predict_v2_pb2.ModelInferResponse,
+    aux_info: Any,
+) -> None:
+    """Expose engine timings as integer microseconds without adding output tensors."""
+    infer.parameters["engine_cost_time_us"].int64_param = int(
+        round((float(aux_info.cost_time) if aux_info is not None else 0.0) * 1000.0)
+    )
+    infer.parameters["engine_first_token_cost_time_us"].int64_param = int(
+        round(
+            (float(aux_info.first_token_cost_time) if aux_info is not None else 0.0)
+            * 1000.0
+        )
+    )
+    infer.parameters["engine_wait_time_us"].int64_param = int(
+        round((float(aux_info.wait_time) if aux_info is not None else 0.0) * 1000.0)
+    )
 
 
 class StreamResponseBuilder:
@@ -1373,6 +1431,7 @@ class StreamResponseBuilder:
         response = predict_v2_pb2.ModelStreamInferResponse()
         response.CopyFrom(self._template)
         infer = response.infer_response
+        _set_aux_info_timing_parameters(infer, aux_info)
 
         generated_raw = (
             struct.pack("<%di" % len(generated_ids), *generated_ids)

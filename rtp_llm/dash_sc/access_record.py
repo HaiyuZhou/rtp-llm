@@ -608,8 +608,15 @@ class GrpcAccessRecord:
                     input_ids = None
             if input_ids is not None:
                 self.input_len = len(input_ids)
-                self.input_ids = input_ids
                 self._repetition_monitor.set_input_ids(input_ids)
+                # Avoid retaining and serializing multi-megabyte token lists in
+                # access logs. Length and repetition monitoring still consume
+                # the zero-copy sequence; ordinary requests preserve full IDs.
+                self.input_ids = (
+                    input_ids
+                    if isinstance(input_ids, list)
+                    else list(input_ids) if len(input_ids) <= 4096 else None
+                )
         if self.generate_config is None:
             try:
                 if sampling is None:

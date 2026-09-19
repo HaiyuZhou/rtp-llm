@@ -50,6 +50,12 @@ HTTP 每个请求槽使用独立 session，Dash-SC gRPC 也支持并发。
 任一请求失败或长度/缓存命中不符，整批不能记为有效；所有轮次有效时才输出
 `median_batch_wall_time_ms`。逐请求 TTFT 不能当作整批耗时。
 
+随机 batch 中若只要求保留实测命中数据，可传 `--cache_skip_reuse_validation`。
+此时 `reuse_len`、`expected_reuse_len` 和 `reuse_exact` 仍按请求记录，case 额外保留
+`validation_status=invalid_reuse`，但仅 reuse 不一致不会让 case 失败或中止后续 case；
+请求失败、input/output shape 和 timing 校验仍保持严格。启动前的 cache block 粒度探针
+也不会被跳过，因为探针失败表示配置的 block 大小与服务不一致。
+
 此模式要求独占的 `BatchDecodeScheduler` 测试服务及 DP=1；调度器等齐指定数量后
 统一调度，不能用于混入其他流量的共享服务。CLI 会确保 `concurrency_limit` 不小于 B。
 对于新随机 grid 的 `fixed_cp8_1m_v1` 策略（或底层显式 `--cache_fixed_workspace`），

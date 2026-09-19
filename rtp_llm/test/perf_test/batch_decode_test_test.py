@@ -179,7 +179,12 @@ class CacheGridBatchTest(unittest.TestCase):
                 loaded.load_grouped_case(self.case())
 
     def run_mock_batch(
-        self, policy, bad_slot=None, transport="http_prompt", store=False
+        self,
+        policy,
+        bad_slot=None,
+        transport="http_prompt",
+        store=False,
+        skip_reuse_validation=False,
     ):
         gate = threading.Barrier(4)
         seed_gate = threading.Barrier(2 if policy == "shared_by_group" else 3)
@@ -230,6 +235,7 @@ class CacheGridBatchTest(unittest.TestCase):
                 measure_runs=2,
                 cache_commit_tail_tokens=8,
                 fail_fast=False,
+                skip_reuse_validation=skip_reuse_validation,
                 case_store=case_store,
             )
             if transport == "dashsc_input_ids":
@@ -277,6 +283,16 @@ class CacheGridBatchTest(unittest.TestCase):
         self.assertEqual(row["status"], "invalid_reuse")
         self.assertIsNone(row["median_batch_wall_time_ms"])
         self.assertFalse(row["runs"][0]["requests"][1]["reuse_exact"])
+
+    def test_reuse_validation_can_be_skipped_without_losing_observed_values(self):
+        row = self.run_mock_batch("independent", bad_slot=1, skip_reuse_validation=True)
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["validation_status"], "invalid_reuse")
+        self.assertTrue(row["reuse_validation_skipped"])
+        self.assertFalse(row["reuse_exact"])
+        self.assertEqual(row["success_runs"], 2)
+        self.assertEqual(row["cache_len_observed"], [8, 16, 16, 0] * 2)
+        self.assertGreater(row["median_batch_wall_time_ms"], 0)
 
     def test_materialized_grpc_batch(self):
         self.assertEqual(
@@ -633,6 +649,39 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertFalse(result["complete"])
         self.assertEqual(result["completed_cases"], 0)
         self.assertEqual(result["metrics"][0]["status"], "invalid_reuse")
+
+    @patch("rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner._post_prefill")
+    def test_scalar_runner_can_accept_and_record_reuse_mismatch(self, post):
+        post.side_effect = [
+            {"success": True},
+            *[
+                {
+                    "success": True,
+                    "input_len": 16,
+                    "output_len": 1,
+                    "reuse_len": 0,
+                    "ttft_ms": 10.0,
+                }
+                for _ in range(3)
+            ],
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = CacheGridRunner(
+                12345,
+                _WhitespaceTokenizer(),
+                [{"case_id": 1, "batch_size": 1, "input_len": 16, "cache_len": 8}],
+                tmp,
+                cache_commit_tail_tokens=8,
+                skip_reuse_validation=True,
+            ).run()
+            result = json.loads((Path(tmp) / "cache_grid_results.json").read_text())
+        self.assertTrue(result["complete"])
+        self.assertTrue(result["skip_reuse_validation"])
+        self.assertEqual(rows[0]["status"], "ok")
+        self.assertEqual(rows[0]["validation_status"], "invalid_reuse")
+        self.assertFalse(rows[0]["reuse_exact"])
+        self.assertEqual(rows[0]["cache_len_observed"], [0, 0, 0])
+        self.assertEqual(rows[0]["input_len_observed"], [16, 16, 16])
 
     def test_engine_arg_shorthand_is_forwarded(self):
         self.assertEqual(

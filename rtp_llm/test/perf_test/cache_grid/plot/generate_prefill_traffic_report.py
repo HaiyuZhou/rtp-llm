@@ -275,7 +275,9 @@ def _benchmark_metric(
         return None, "missing_geometry"
     if input_len < 0 or requested_cache < 0 or requested_cache > input_len:
         return None, "invalid_geometry"
-    if item.get("reuse_exact") is False:
+    if item.get("reuse_exact") is False and not item.get(
+        "reuse_validation_skipped", False
+    ):
         return None, "reuse_not_exact"
     if not isinstance(runs, list) or len(runs) != expected_runs:
         return None, "incomplete_runs"

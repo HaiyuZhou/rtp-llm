@@ -161,6 +161,15 @@ def parse_args(argv: Optional[List[str]] = None):
         help="Measured requests per cache-grid case (default: 3)",
     )
     perf.add_argument(
+        "--cache_skip_reuse_validation",
+        action="store_true",
+        help=(
+            "Record observed cache reuse but do not fail a case when reuse_len "
+            "differs from the requested cache_len. Shape, timing, and request "
+            "failures remain strict."
+        ),
+    )
+    perf.add_argument(
         "--cache_request_timeout",
         type=int,
         default=int(os.environ.get("PERF_REQUEST_TIMEOUT", "7200")),
@@ -576,6 +585,7 @@ def _build_cache_resume_config(
             "partial": args.partial,
             "decode_test_length": args.decode_test_length,
             "cache_measure_runs": args.cache_measure_runs,
+            "cache_skip_reuse_validation": args.cache_skip_reuse_validation,
             "cache_commit_tail_tokens": args.cache_commit_tail_tokens,
             "expected_cache_block_size": expected_cache_block_size,
             "cache_request_transport": args.cache_request_transport,
@@ -1034,6 +1044,9 @@ def _write_test_info(
         "cache_measure_runs": (
             args.cache_measure_runs if args.cache_grid_json else None
         ),
+        "cache_skip_reuse_validation": (
+            args.cache_skip_reuse_validation if args.cache_grid_json else None
+        ),
         "cache_request_timeout": (
             args.cache_request_timeout if args.cache_grid_json else None
         ),
@@ -1404,6 +1417,7 @@ def main() -> str:
                 measure_runs=args.cache_measure_runs,
                 checkpoint_every=args.cache_checkpoint_every,
                 cache_commit_tail_tokens=args.cache_commit_tail_tokens,
+                skip_reuse_validation=args.cache_skip_reuse_validation,
                 grid_metadata=grid_metadata,
                 grid_sha256=grid_sha256,
                 expected_block_size=expected_block_size,

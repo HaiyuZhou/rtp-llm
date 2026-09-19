@@ -93,6 +93,9 @@ Pro 模型改用对应 model-dir 和 `--mega-moe-se 1`（默认值）。
   命令、运行状态与退出码。已有结果不会被覆盖。
 
 默认遇到失败停止，后续文件保持 pending；`--continue-on-error` 可继续其余文件。
+若 batch 场景允许实测 cache reuse 与 JSON 期望不同，可加
+`--skip-reuse-validation`。启动器会传递底层 `--cache_skip_reuse_validation`，保留每个
+请求的实际 `input_len`、`reuse_len` 及 `reuse_exact`，并继续运行后续 case。
 复测选定文件时使用 `--grid-json` 和新的 result-root。
 若需额外 Bazel 环境选项，可放在末尾 `--` 后，例如：
 `-- --test_env=FLASHINFER_DISABLE_VERSION_CHECK=1`。
@@ -112,6 +115,17 @@ Pro 的 CP gather workspace 在该配置下约为每卡 20 GiB，而不是乘以
   --grid /path/generated_batch_grid.json --result-dir /path/new_result
 ./tools/cache_perf resume --result-dir /path/new_result
 ```
+
+允许实测 reuse 与 grid 期望不一致时，在首次运行增加
+`--skip-reuse-validation`：
+
+```bash
+./tools/cache_perf run --profile /path/local.jsonc \
+  --grid /path/generated_batch_grid.json --result-dir /path/new_result \
+  --skip-reuse-validation
+```
+
+该选项会写入启动快照，后续 `resume` 自动沿用，无需再次传入。
 
 策略标记会覆盖 profile 中的上述容量参数并冻结有效启动配置；模型路径、编译器和环境仍来自 profile。
 `resume` 使用冻结配置，`retest` 继承固定容量策略；`profile` 仍只支持未分组 batch=1。

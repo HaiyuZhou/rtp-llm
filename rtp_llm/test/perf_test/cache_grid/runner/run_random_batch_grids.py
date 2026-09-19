@@ -125,6 +125,8 @@ def build_command(args, plan):
     }
     command += [f"--test_arg=--{name}={value}" for name, value in engine.items()]
     command.append("--test_arg=--cache_fixed_workspace")
+    if args.skip_reuse_validation:
+        command.append("--test_arg=--cache_skip_reuse_validation")
     cc = shutil.which("gcc") or "gcc"
     cxx = shutil.which("g++") or "g++"
     env = {
@@ -184,6 +186,11 @@ def parse_args(argv=None):
     parser.add_argument("--bazelisk", default="bazelisk")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument(
+        "--skip-reuse-validation",
+        action="store_true",
+        help="Keep cases with observed reuse mismatches and record the actual values",
+    )
     parser.add_argument("bazel_args", nargs=argparse.REMAINDER)
     return parser.parse_args(argv)
 

@@ -131,7 +131,9 @@ def _median_run_time(
     values: list[float] = []
     input_len = _integer(item.get("input_len"))
     requested_cache_len = _integer(item.get("cache_len_requested")) or 0
-    if item.get("reuse_exact") is False:
+    if item.get("reuse_exact") is False and not item.get(
+        "reuse_validation_skipped", False
+    ):
         return None, None, "reuse_not_exact"
     observed = item.get("cache_len_observed")
     observed_values = (
@@ -1030,8 +1032,9 @@ def run_fit(args: argparse.Namespace) -> int:
             and metrics["test"]["max_ape_pct"] <= args.max_max_ape_pct
         ),
         "production_note": (
-            "Only rows whose requested and observed reuse match exactly are "
-            "included. Failed requests and invalid_reuse rows are excluded. "
+            "Rows require exact requested/observed reuse unless the runner "
+            "explicitly marked reuse validation as skipped; those rows use "
+            "observed reuse. Failed requests are excluded. "
             "Validate the latency measurement contract, tail error, and "
             "deployment range before production use."
         ),

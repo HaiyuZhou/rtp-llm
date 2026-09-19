@@ -174,6 +174,42 @@ class RandomBatchGridTest(unittest.TestCase):
                 self.assertIn("--test_env=DSV4_USE_MEGA_MOE_SE=1", command)
                 self.assertIn("--test_env=DSV4_USE_MEGA_MOE=1", command)
 
+    def test_runner_can_forward_skip_reuse_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            main(
+                [
+                    "--output-dir",
+                    str(root / "grids"),
+                    "--num-cases",
+                    "1",
+                    "--batch-sizes",
+                    "2",
+                ]
+            )
+            with patch(
+                "rtp_llm.test.perf_test.cache_grid.runner.run_random_batch_grids.subprocess.run"
+            ) as run:
+                run.return_value.returncode = 0
+                self.assertEqual(
+                    run_main(
+                        [
+                            "--grid-dir",
+                            str(root / "grids"),
+                            "--model-dir",
+                            "/weights/Pro",
+                            "--result-root",
+                            str(root / "results"),
+                            "--skip-reuse-validation",
+                        ]
+                    ),
+                    0,
+                )
+                self.assertIn(
+                    "--test_arg=--cache_skip_reuse_validation",
+                    run.call_args.args[0],
+                )
+
     def test_directory_writer_and_serial_runner(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

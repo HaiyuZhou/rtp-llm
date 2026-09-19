@@ -954,6 +954,7 @@ class CacheGridRunner:
         checkpoint_every: int = 100,
         cache_commit_tail_tokens: int = 4096,
         fail_fast: bool = True,
+        skip_reuse_validation: bool = False,
         grid_metadata: Dict[str, Any] | None = None,
         grid_sha256: str | None = None,
         expected_block_size: int = 0,
@@ -1068,6 +1069,7 @@ class CacheGridRunner:
         self.checkpoint_every = max(1, checkpoint_every)
         self.cache_commit_tail_tokens = cache_commit_tail_tokens
         self.fail_fast = fail_fast
+        self.skip_reuse_validation = skip_reuse_validation
         self.grid_metadata = grid_metadata or {}
         self.grid_sha256 = grid_sha256
         self.expected_block_size = expected_block_size
@@ -1267,6 +1269,7 @@ class CacheGridRunner:
             "measure_runs": self.measure_runs,
             "cache_commit_tail_tokens": self.cache_commit_tail_tokens,
             "checkpoint_every": self.checkpoint_every,
+            "skip_reuse_validation": self.skip_reuse_validation,
             "expected_block_size": self.expected_block_size,
             "request_transport": self.request_transport,
             "run_config": self.run_config,
@@ -1717,7 +1720,9 @@ class CacheGridRunner:
                         else None
                     )
                     valid = all(
-                        r["shape_exact"] and r["reuse_exact"] and r["timing_valid"]
+                        r["shape_exact"]
+                        and (r["reuse_exact"] or self.skip_reuse_validation)
+                        and r["timing_valid"]
                         for r in results
                     )
                     rounds.append(
@@ -1753,7 +1758,7 @@ class CacheGridRunner:
         reuse = all(r["reuse_exact"] for r in results)
         timing = all(r["timing_valid"] for r in results)
         success = all(r.get("success") for r in results)
-        status = (
+        validation_status = (
             "failed"
             if not success
             else (
@@ -1763,6 +1768,23 @@ class CacheGridRunner:
                     "invalid_reuse"
                     if not reuse
                     else "invalid_timing" if not timing else "ok"
+                )
+            )
+        )
+        status = (
+            "failed"
+            if not success
+            else (
+                "invalid_shape"
+                if not shape
+                else (
+                    "invalid_timing"
+                    if not timing
+                    else (
+                        "invalid_reuse"
+                        if not reuse and not self.skip_reuse_validation
+                        else "ok"
+                    )
                 )
             )
         )
@@ -1777,6 +1799,8 @@ class CacheGridRunner:
             "seed": seeds,
             "runs": rounds,
             "status": status,
+            "validation_status": validation_status,
+            "reuse_validation_skipped": self.skip_reuse_validation,
             "success_runs": sum(r["valid"] for r in rounds),
             "shape_exact": shape,
             "reuse_exact": reuse,
@@ -2072,6 +2096,43 @@ class CacheGridRunner:
                                 if float(r.get("ttft_ms", 0.0)) > 0.0
                             ]
                             timing_valid = len(ttft_values) == self.measure_runs
+                            validation_status = (
+                                "ok"
+                                if reuse_exact and shape_exact and timing_valid
+                                else (
+                                    "invalid_shape"
+                                    if len(successful) == self.measure_runs
+                                    and not shape_exact
+                                    else (
+                                        "invalid_timing"
+                                        if len(successful) == self.measure_runs
+                                        and not timing_valid
+                                        else (
+                                            "invalid_reuse"
+                                            if len(successful) == self.measure_runs
+                                            else "failed"
+                                        )
+                                    )
+                                )
+                            )
+                            status = (
+                                "failed"
+                                if len(successful) != self.measure_runs
+                                else (
+                                    "invalid_shape"
+                                    if not shape_exact
+                                    else (
+                                        "invalid_timing"
+                                        if not timing_valid
+                                        else (
+                                            "invalid_reuse"
+                                            if not reuse_exact
+                                            and not self.skip_reuse_validation
+                                            else "ok"
+                                        )
+                                    )
+                                )
+                            )
                             metric = {
                                 "case_key": key,
                                 "case_id": int(case["case_id"]),
@@ -2090,6 +2151,8 @@ class CacheGridRunner:
                                 "seed": seed_result,
                                 "runs": runs,
                                 "reuse_exact": reuse_exact,
+                                "reuse_validation_skipped": self.skip_reuse_validation,
+                                "validation_status": validation_status,
                                 "shape_exact": shape_exact,
                                 "timing_valid": timing_valid,
                                 "ttft_ms": ttft_values,
@@ -2104,25 +2167,7 @@ class CacheGridRunner:
                                     else None
                                 ),
                                 "elapsed_s": time.time() - started,
-                                "status": (
-                                    "ok"
-                                    if reuse_exact and shape_exact and timing_valid
-                                    else (
-                                        "invalid_shape"
-                                        if len(successful) == self.measure_runs
-                                        and not shape_exact
-                                        else (
-                                            "invalid_timing"
-                                            if len(successful) == self.measure_runs
-                                            and not timing_valid
-                                            else (
-                                                "invalid_reuse"
-                                                if len(successful) == self.measure_runs
-                                                else "failed"
-                                            )
-                                        )
-                                    )
-                                ),
+                                "status": status,
                             }
                     except Exception as exc:
                         metric = {

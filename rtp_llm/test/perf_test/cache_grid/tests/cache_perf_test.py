@@ -143,6 +143,29 @@ class CachePerfTest(unittest.TestCase):
         run.assert_not_called()
         self.assertFalse(self.result.exists())
 
+    def test_run_forwards_and_resume_freezes_skip_reuse_validation(self):
+        first = cli.build_plan(
+            self.args(extra=["--skip-reuse-validation"]),
+            {"PATH": "/usr/bin"},
+        )
+        self.assertIn("--test_arg=--cache_skip_reuse_validation", first["command"])
+        self.assertTrue(first["summary"]["skip_reuse_validation"])
+        self.result.mkdir()
+        for name, data in first["artifacts"].items():
+            (self.result / name).write_bytes(data)
+        (self.result / "cache_grid_results.json").write_text("{}")
+        resumed = cli.build_plan(self.args("resume", explicit=False), {})
+        self.assertIn("--test_arg=--cache_skip_reuse_validation", resumed["command"])
+        with self.assertRaisesRegex(ValueError, "overrides"):
+            cli.build_plan(
+                self.args(
+                    "resume",
+                    extra=["--skip-reuse-validation"],
+                    explicit=False,
+                ),
+                {},
+            )
+
     def test_run_refuses_existing_results(self):
         self.save_run()
         with self.assertRaisesRegex(ValueError, "empty/new"):

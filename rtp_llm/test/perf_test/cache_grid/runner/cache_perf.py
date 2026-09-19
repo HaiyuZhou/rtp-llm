@@ -161,7 +161,11 @@ def build_plan(args, inherited=None):
     if args.mode == "resume" and not (source / "cache_grid_results.json").is_file():
         raise ValueError("resume requires an existing cache_grid_results.json")
     if args.mode == "resume" and (
-        args.profile or args.grid or args.runs is not None or args.env
+        args.profile
+        or args.grid
+        or args.runs is not None
+        or args.env
+        or args.skip_reuse_validation
     ):
         raise ValueError(
             "resume uses frozen configuration; profile/grid/runs/env overrides are forbidden"
@@ -293,6 +297,8 @@ def build_plan(args, inherited=None):
                 "allow_resume_mismatch",
             ),
         )
+        if args.skip_reuse_validation and "--cache_skip_reuse_validation" not in runner:
+            runner.append("--cache_skip_reuse_validation")
         if fixed_workspace:
             if "--cache_fixed_workspace" not in runner:
                 runner.append("--cache_fixed_workspace")
@@ -366,6 +372,7 @@ def build_plan(args, inherited=None):
             planned_cases=len(cases),
             selected_case_ids=ids,
             profiler=args.mode == "profile",
+            skip_reuse_validation="--cache_skip_reuse_validation" in runner,
             reads_checkpoint=args.mode == "resume",
             output=str(dest),
             environment=env,
@@ -391,6 +398,14 @@ def parser():
     p.add_argument("--output-base")
     p.add_argument("--bazel")
     p.add_argument("--trace-timeout", type=int, default=180)
+    p.add_argument(
+        "--skip-reuse-validation",
+        action="store_true",
+        help=(
+            "Keep cases whose observed reuse differs from the grid expectation; "
+            "the actual values remain recorded"
+        ),
+    )
     p.add_argument(
         "--dry-run", action="store_true", help="print only; no writes/Bazel/GPU work"
     )

@@ -131,7 +131,9 @@ def load_rows(path: pathlib.Path, batch_size: int) -> list[dict[str, float]]:
             "passed",
         }:
             continue
-        if item.get("reuse_exact") is False:
+        if item.get("reuse_exact") is False and not item.get(
+            "reuse_validation_skipped", False
+        ):
             continue
         if item.get("success_runs") is not None:
             try:

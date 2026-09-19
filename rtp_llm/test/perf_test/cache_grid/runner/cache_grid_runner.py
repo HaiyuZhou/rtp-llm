@@ -968,6 +968,7 @@ class CacheGridRunner:
         profile_runs: int = 0,
         profile_case_ids: Iterable[int] = (),
         profile_only: bool = False,
+        profile_flat_output: bool = False,
         profile_tp_size: int = 1,
         profile_trace_timeout: float = 120.0,
     ):
@@ -1029,6 +1030,9 @@ class CacheGridRunner:
                 "cache profiling currently supports only ungrouped batch_size=1 cases"
             )
         self.profile_only = profile_only
+        self.profile_flat_output = profile_flat_output
+        if profile_flat_output and not profile_only:
+            raise ValueError("flat profile output requires profile-only mode")
         self.profile_tp_size = profile_tp_size
         self.profile_trace_timeout = profile_trace_timeout
         if profile_runs < 0 or profile_trace_timeout <= 0 or profile_tp_size <= 0:
@@ -1825,8 +1829,12 @@ class CacheGridRunner:
         if not self.profile_runs:
             return []
         session_id = uuid.uuid4().hex
-        directory = self.result_dir / "cache_profiles" / session_id
-        directory.mkdir(parents=True)
+        directory = (
+            self.result_dir
+            if self.profile_flat_output
+            else self.result_dir / "cache_profiles" / session_id
+        )
+        directory.mkdir(parents=True, exist_ok=self.profile_flat_output)
         manifest_path = directory / "manifest.json"
         records: List[Dict[str, Any]] = []
         manifest = {
@@ -1848,7 +1856,9 @@ class CacheGridRunner:
             temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             temporary.replace(manifest_path)
 
-        save()
+        # Reserve the manifest before arming the profiler; never replace an old session.
+        with manifest_path.open("x", encoding="utf-8") as stream:
+            json.dump(manifest, stream, indent=2)
         try:
             for case in self.cases:
                 if int(case["case_id"]) not in self.profile_case_ids:

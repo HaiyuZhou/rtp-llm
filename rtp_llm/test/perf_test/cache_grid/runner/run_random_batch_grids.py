@@ -9,7 +9,18 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+# Keep the canonical script usable both as a module and by file path.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
+
+from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
+    WORKSPACE_TOKENS,
+    grid_token_budget,
+    validate_fixed_workspace,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 TARGET = "//rtp_llm/test/perf_test:cache_grid_perf_test"
@@ -22,7 +33,6 @@ def inspect_grid(path):
     if not isinstance(cases, list) or not cases:
         raise ValueError(f"{path}: requires a nonempty explicit cases list")
     batch_sizes = set()
-    max_input = max_total = 0
     metadata = grid.get("generator", {})
     block = int(metadata.get("cache_alignment", 4096))
     tail = int(metadata.get("parameters", {}).get("commit_tail_tokens", 4096))
@@ -42,7 +52,6 @@ def inspect_grid(path):
         ]
         if batch <= 0 or sum(int(g["count"]) for g in groups) != batch:
             raise ValueError(f"{path}: group counts must sum to positive batch size")
-        total = 0
         for group in groups:
             count = int(group["count"])
             length = int(group["input_len"])
@@ -51,18 +60,20 @@ def inspect_grid(path):
                 raise ValueError(f"{path}: invalid group or input above256K")
             if cached and (cached % block or cached % tail or cached + tail > length):
                 raise ValueError(f"{path}: invalid cache alignment or commit space")
-            max_input = max(max_input, length)
-            total += count * length
-        max_total = max(max_total, total)
         batch_sizes.add(batch)
     if len(batch_sizes) != 1:
         raise ValueError(f"{path}: split mixed batch sizes into separate files")
+    budget = grid_token_budget(grid)
+    capacity = validate_fixed_workspace(
+        cases, commit_tail=tail, block=block, token_budget=budget
+    )
     return {
         "grid_json": str(path.resolve()),
         "batch_size": batch_sizes.pop(),
-        # Include one output token and the block-size probe's8192-token input.
-        "max_seq_len": max(max_input, 2 * block, block + tail) + 1,
-        "max_batch_tokens": max(max_total, 2 * block, block + tail),
+        "max_seq_len": WORKSPACE_TOKENS,
+        "max_context_batch_size": 1,
+        "max_batch_tokens": budget,
+        "workspace_capacity": capacity,
         "commit_tail_tokens": tail,
     }
 
@@ -85,7 +96,7 @@ def build_command(args, plan):
         "partial": 2,
         "decode_test_length": 1,
         "concurrency_limit": batch,
-        "max_context_batch_size": batch,
+        "max_context_batch_size": 1,
         "model_type": "deepseek_v4",
         "checkpoint_path": args.model_dir,
         "tokenizer_path": args.model_dir,
@@ -110,8 +121,10 @@ def build_command(args, plan):
         "expected_cache_block_size": 4096,
         "cache_commit_tail_tokens": plan["commit_tail_tokens"],
         "cache_profile_runs": 0,
+        "cache_request_transport": "dashsc_input_ids",
     }
     command += [f"--test_arg=--{name}={value}" for name, value in engine.items()]
+    command.append("--test_arg=--cache_fixed_workspace")
     cc = shutil.which("gcc") or "gcc"
     cxx = shutil.which("g++") or "g++"
     env = {

@@ -17,6 +17,7 @@ from rtp_llm.test.perf_test.batch_decode_test import (
     _load_cache_grid_cases,
     _load_materialized_case_store,
     _parse_name_value,
+    _prepare_cache_profile_result_dir,
     _redact_argv,
     _resolve_cache_block_size,
     _resolve_cache_ratios,
@@ -848,6 +849,106 @@ class EngineServerSchedulerModeTest(unittest.TestCase):
 
 
 class CacheGridProfileTest(unittest.TestCase):
+    def test_flat_output_directory_is_claimed_without_nesting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in (
+                "cache_perf_launch.json",
+                "grid.snapshot.json",
+                "profile.snapshot.json",
+            ):
+                (Path(tmp) / name).write_text("{}")
+            args = argparse.Namespace(
+                result_dir=tmp, cache_profile_only=True, cache_profile_flat_output=True
+            )
+            _prepare_cache_profile_result_dir(args)
+            self.assertEqual(args.result_dir, tmp)
+            self.assertFalse((Path(tmp) / "cache_profile_replays").exists())
+            with self.assertRaisesRegex(ValueError, "fresh isolated"):
+                _prepare_cache_profile_result_dir(args)
+
+    def test_flat_output_rejects_existing_result_files(self):
+        for filename in ("test_info.json", "cache_grid_results.json", "manifest.json"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / filename
+                path.write_text("original")
+                args = argparse.Namespace(
+                    result_dir=tmp,
+                    cache_profile_only=True,
+                    cache_profile_flat_output=True,
+                )
+                with self.assertRaisesRegex(ValueError, "fresh isolated"):
+                    _prepare_cache_profile_result_dir(args)
+                self.assertEqual(path.read_text(), "original")
+
+    def test_legacy_profile_only_still_creates_isolated_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                result_dir=tmp, cache_profile_only=True, cache_profile_flat_output=False
+            )
+            _prepare_cache_profile_result_dir(args)
+            self.assertEqual(
+                Path(args.result_dir).parent, Path(tmp) / "cache_profile_replays"
+            )
+
+    def test_flat_flag_requires_profile_only(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--cache_profile_flat_output"])
+
+    def test_flat_manifest_and_timelines_share_output_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(
+                tmp,
+                profile_runs=2,
+                profile_case_ids=[1],
+                profile_tp_size=2,
+                profile_only=True,
+                profile_flat_output=True,
+            )
+            events = self.wire(runner)
+            runner.run()
+            self.assertEqual(events, ["seed", "arm", "profile"] * 2)
+            manifest = json.loads((Path(tmp) / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "completed")
+            self.assertTrue(manifest["session_id"])
+            self.assertEqual(len(manifest["records"]), 2)
+            for record in manifest["records"]:
+                self.assertEqual(record["case_id"], 1)
+                self.assertEqual(len(record["trace_files"]), 2)
+                for path in record["trace_files"]:
+                    self.assertEqual(Path(path).parent, Path("timelines"))
+                    self.assertTrue((Path(tmp) / path).is_file())
+            self.assertFalse((Path(tmp) / "cache_profiles").exists())
+            self.assertFalse((Path(tmp) / "cache_grid_results.json").exists())
+            before = (Path(tmp) / "manifest.json").read_bytes()
+            again = self.runner(
+                tmp,
+                profile_runs=1,
+                profile_case_ids=[1],
+                profile_only=True,
+                profile_flat_output=True,
+            )
+            later_events = self.wire(again)
+            with self.assertRaises(FileExistsError):
+                again.run()
+            self.assertEqual(later_events, [])
+            self.assertEqual((Path(tmp) / "manifest.json").read_bytes(), before)
+
+    def test_flat_profile_failure_preserves_failed_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(
+                tmp,
+                profile_runs=1,
+                profile_case_ids=[1],
+                profile_only=True,
+                profile_flat_output=True,
+            )
+            self.wire(runner, bad_reuse=True)
+            with self.assertRaisesRegex(RuntimeError, "shape/reuse mismatch"):
+                runner.run()
+            manifest = json.loads((Path(tmp) / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["records"][0]["status"], "failed")
+
     cases = [
         {"case_id": 1, "batch_size": 1, "input_len": 16, "cache_len": 8},
         {"case_id": 2, "batch_size": 1, "input_len": 16, "cache_len": 0},

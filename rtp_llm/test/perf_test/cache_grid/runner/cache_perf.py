@@ -14,6 +14,12 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     load_profile,
     profile_environment,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
+    WORKSPACE_TOKENS,
+    fixed_workspace_grid,
+    grid_token_budget,
+    validate_fixed_workspace,
+)
 
 TARGET = "//rtp_llm/test/perf_test:cache_grid_perf_test"
 REPO = Path(__file__).resolve().parents[5]
@@ -266,11 +272,41 @@ def build_plan(args, inherited=None):
             updates["cache_commit_tail_tokens"] = profile.get("cache_grid", {}).get(
                 "commit_tail_tokens", 4096
             )
+        fixed_workspace = (
+            fixed_workspace_grid(payload) or "--cache_fixed_workspace" in baseline
+        )
+        if fixed_workspace:
+            # Freeze effective capacities in argv, not just in mutable grid metadata.
+            updates.update(
+                max_seq_len=WORKSPACE_TOKENS,
+                max_context_batch_size=1,
+                max_batch_tokens_size=grid_token_budget(payload),
+                concurrency_limit=max(c["batch_size"] for c in cases),
+            )
         runner = replace_args(
             baseline,
             updates,
-            ("cache_profile_only", "require_cache_resume", "allow_resume_mismatch"),
+            (
+                "cache_profile_only",
+                "cache_profile_flat_output",
+                "require_cache_resume",
+                "allow_resume_mismatch",
+            ),
         )
+        if fixed_workspace:
+            if "--cache_fixed_workspace" not in runner:
+                runner.append("--cache_fixed_workspace")
+            tail = next(
+                (
+                    int(a.split("=", 1)[1])
+                    for a in runner
+                    if a.startswith("--cache_commit_tail_tokens=")
+                ),
+                4096,
+            )
+            validate_fixed_workspace(
+                cases, commit_tail=tail, token_budget=grid_token_budget(payload)
+            )
         if args.mode == "profile":
             if any(a.split("=")[0] == "--cache_shared_seed" for a in runner):
                 raise ValueError(
@@ -283,9 +319,11 @@ def build_plan(args, inherited=None):
                     "cache_profile_trace_timeout": args.trace_timeout,
                 },
             )
-            runner += ["--cache_profile_only", "--cache_profile_case_ids"] + list(
-                map(str, ids)
-            )
+            runner += [
+                "--cache_profile_only",
+                "--cache_profile_flat_output",
+                "--cache_profile_case_ids",
+            ] + list(map(str, ids))
         env["PERF_PROFILE_RUNS"] = "0"
         # Make all resolved names part of test_info and the existing resume guard.
         # Bazel --test_env supplies the values before imports; these defaults only

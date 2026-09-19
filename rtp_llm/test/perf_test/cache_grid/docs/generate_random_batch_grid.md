@@ -5,34 +5,47 @@
 ## 生成多个固定 batch 的文件
 
 ```bash
-python3 rtp_llm/test/perf_test/cache_grid/runner/generate_random_batch_grid.py \
+python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_random_batch_grid \
   --output-dir /home/admin/tmp/dsv4_batch_grids \
   --num-cases 100 \
-  --batch-sizes 1 2 4 8 16 31 \
+  --batch-sizes 2 4 8 16 32 \
   --max-batch-tokens 1048576 \
   --max-input-tokens 262144 \
   --seed 20260917
 ```
 
 每个 batch size 生成一个 JSON，每个文件包含 100 个随机 case。
-目录模式下，单请求 input 上限取
-`min(max_input_tokens, max_batch_tokens // batch_size)`，再按 input alignment 向下取整。
-因此 batch=1/2/4 的上限是 256K，batch=8 是 128K，batch=16 是 64K，
-batch=31 是 33792 tokens。默认 min input 为 8192；过大的 batch 可能无法满足最低长度。
+新生成的 JSON 带有 `generator.workspace_policy="fixed_cp8_1m_v1"`。
+该策略适用于 DSV4 TP8/CP8、逻辑 cache block4096、decode=1：
+固定 `max_seq_len=1048576`、`max_context_batch_size=1`，不再随 batch 提升后者。
+`max_batch_tokens_size` 使用 `--max-batch-tokens`，默认 1048576，不能超过该值。
+
+生成和启动前同时检查：
+
+- 所有请求的完整 input 长度之和（包括 cache）不超过 token 预算。
+- `batch_size × align_up(最长 input + 1, 16) <= 1048576`。
+  这里预留 1 个输出 token，并包含 CP8 对齐；仅限制 input 总和不够。
+- seed batch 和缓存探针也必须满足容量限制；独立前缀逐请求 seed，组内共享前缀逐组 seed。
+
+目录模式将上述单请求容量上限与 `max_input_tokens`、
+`max_batch_tokens // batch_size` 取最小值，再按 input alignment 向下取整。
+默认 input alignment=256 时，batch=2/4/8/16/32 的上限分别为
+262144/261888/130816/65280/32512 tokens；batch=31 为 33792。
+默认 min input 为 8192；无法满足最低长度时直接报错。
 文件名包含 batch 和取整前的 input 上限，实际长度约束以 JSON 内容为准。
 
 可单独指定某个 batch 的上限（仍不能超过 256K 和全局 max input）：
 
 ```bash
-python3 rtp_llm/test/perf_test/cache_grid/runner/generate_random_batch_grid.py \
+python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_random_batch_grid \
   --output-dir /home/admin/tmp/dsv4_batch_grids_custom \
   --batch-sizes 8 16 31 --num-cases 100 \
   --max-batch-tokens 1048576 \
   --batch-input-limit 16:32768 --batch-input-limit 31:32768
 ```
 
-显式上限允许大于 `max_batch_tokens // batch_size`；总 batch input 仍受总预算约束，
-但启动时 `batch_size * max_seq_len` 可能变大，需要考虑 workspace 显存。
+显式上限仍会被固定 workspace 容量上限截断，不能绕过对齐矩形约束。
+它可以大于较小的自定义 token 预算除以 batch，但总 input 仍受该预算约束。
 
 每条请求使用 count=1 的 request_group，前缀独立。input 默认按 256 对齐，
 cache 默认按 4096 对齐；命中请求至少保留 4096 新 token。
@@ -50,7 +63,7 @@ cache 默认按 4096 对齐；命中请求至少保留 4096 新 token。
 先保留原启动脚本中正确的 PATH、LD_LIBRARY_PATH 等环境配置，再运行：
 
 ```bash
-python3 rtp_llm/test/perf_test/cache_grid/runner/run_random_batch_grids.py \
+python3 -m rtp_llm.test.perf_test.cache_grid.runner.run_random_batch_grids \
   --grid-dir /home/admin/tmp/dsv4_batch_grids \
   --model-dir /mnt/fuse/smoke-test/deepseek-ai/DeepSeek-V4-Flash/ \
   --mega-moe-se 0 \
@@ -70,10 +83,11 @@ Pro 模型改用对应 model-dir 和 `--mega-moe-se 1`（默认值）。
 
 每个文件单独执行一次 Bazel test，重新初始化服务：
 
-- `concurrency_limit` 和 `max_context_batch_size` 设置为该文件的 batch size。
-- `max_seq_len` 设置为文件中最大请求 input 长度加 1（decode=1），
-  并确保覆盖缓存粒度探针需要的 8192 tokens 和 seed commit tail。
-- `max_batch_tokens_size` 设置为文件中最大的总 input，且覆盖探针长度。
+- `concurrency_limit` 设置为该文件的 batch size；测试入口保证 `max_generate_batch_size` 至少为 batch size。
+- 固定 `max_context_batch_size=1`、`max_seq_len=1048576`。
+- `max_batch_tokens_size` 使用生成时的 token 预算，缺省为 1048576。
+- 显式启用 `--cache_fixed_workspace`，超限直接拒绝，不自动拆 batch，也不偷偷提升容量。
+- 使用 `dashsc_input_ids`，逐请求验证实际 cache reuse。
 - 使用 TP8/EP8/CP8、physical block512、logical cache block4096 的原配置。
 - 每个 JSON 使用独立的结果子目录；根目录 `batch_runs.json` 记录实际参数、
   命令、运行状态与退出码。已有结果不会被覆盖。
@@ -85,17 +99,33 @@ Pro 模型改用对应 model-dir 和 `--mega-moe-se 1`（默认值）。
 不接受额外 `--test_arg`，以免覆盖每个文件的 batch/长度配置。
 脚本通过当前 PATH 找到 gcc/g++，不会自动修复编译工具或依赖版本不匹配。
 
-降低 max_seq_len 可降低相关 workspace 的分配量，但不保证所有配置都能避免 OOM；
-KV 容量、模型权重与其他 workspace 仍需要实际测量。
+Pro 的 CP gather workspace 在该配置下约为每卡 20 GiB，而不是乘以 batch 的约 620 GiB。
+这只约束该 workspace，不保证总显存足够：KV/state pool、模型权重和其他临时缓冲仍可能 OOM。
+这里的 batch 由测试专用调度器按 case 请求数凑齐，不能将其当作普通线上服务的调度保证。
+
+## 使用简化入口
+
+新生成的文件也可直接交给 `tools/cache_perf`：
+
+```bash
+./tools/cache_perf run --profile /path/local.jsonc \
+  --grid /path/generated_batch_grid.json --result-dir /path/new_result
+./tools/cache_perf resume --result-dir /path/new_result
+```
+
+策略标记会覆盖 profile 中的上述容量参数并冻结有效启动配置；模型路径、编译器和环境仍来自 profile。
+`resume` 使用冻结配置，`retest` 继承固定容量策略；`profile` 仍只支持未分组 batch=1。
+未带标记的旧 grid 在简化入口和底层测试入口保留原来的自动扩容行为，旧 checkpoint 不变。
+多文件启动器 `run_random_batch_grids` 则一律执行固定容量校验，包括旧 JSON；超限文件需重新生成或缩短请求。
 
 ## 原单文件模式
 
 原来的 `--output /path/grid.json --batch-sizes 2 4 8` 用法继续支持；
-它在同一个文件里随机选择 batch size，适合原启动脚本，不适合这个固定 batch 的多文件启动器。
+它在同一个文件里随机选择 batch size，可使用 `tools/cache_perf`，不适合只接受固定 batch 文件的多文件启动器。
 
 ## CPU 测试
 
 ```bash
-python3 -m unittest discover -s rtp_llm/test/perf_test \
+python3 -m unittest discover -s rtp_llm/test/perf_test/cache_grid/tests \
   -p generate_random_batch_grid_test.py -v
 ```

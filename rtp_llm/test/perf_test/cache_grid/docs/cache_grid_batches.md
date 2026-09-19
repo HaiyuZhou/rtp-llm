@@ -51,8 +51,12 @@ HTTP 每个请求槽使用独立 session，Dash-SC gRPC 也支持并发。
 `median_batch_wall_time_ms`。逐请求 TTFT 不能当作整批耗时。
 
 此模式要求独占的 `BatchDecodeScheduler` 测试服务及 DP=1；调度器等齐指定数量后
-统一调度，不能用于混入其他流量的共享服务。CLI 会确保 `concurrency_limit`、
-`max_context_batch_size` 不小于 B，并保证 `max_batch_tokens_size` 足以容纳完整 batch。
+统一调度，不能用于混入其他流量的共享服务。CLI 会确保 `concurrency_limit` 不小于 B。
+对于新随机 grid 的 `fixed_cp8_1m_v1` 策略（或底层显式 `--cache_fixed_workspace`），
+固定 `max_context_batch_size=1`、`max_seq_len=1048576`，启动前校验正式 batch、seed 和探针的
+总 input 预算及 CP 对齐矩形；超限拒绝，不自动拆批。见[固定容量策略](generate_random_batch_grid.md)。
+未启用该策略的旧 grid 保留原行为：提升 `max_context_batch_size` 至少为 B，
+并提升 `max_batch_tokens_size` 容纳完整 batch。
 直接调用 runner 时需要调用方保证相同的服务配置。DP>1 的 CLI 配置会在启动前拒绝。
 请求发送失败可能让固定 batch 等不齐，因此即使关闭 fail_fast，也会停止后续测量，
 保存失败结果并恢复调度器，避免残留请求混入下一批。

@@ -278,6 +278,20 @@ py_test(
     deps = [":perf_test_lib"],
 )
 
+py_test(
+    name = "cache_workspace_budget_test",
+    main = "cache_grid/tests/workspace_budget_test.py",
+    srcs = ["cache_grid/tests/workspace_budget_test.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
+    name = "generate_random_batch_grid_test",
+    main = "cache_grid/tests/generate_random_batch_grid_test.py",
+    srcs = ["cache_grid/tests/generate_random_batch_grid_test.py"],
+    deps = [":perf_test_lib"],
+)
+
 # Prefix-cache mode: measures an explicit total-sequence × cache-length grid.
 # Invoke with --test_arg=--cache_grid_json=<file> and --test_arg=--partial=2.
 # The runner seeds each requested prefix and verifies reuse_len on every

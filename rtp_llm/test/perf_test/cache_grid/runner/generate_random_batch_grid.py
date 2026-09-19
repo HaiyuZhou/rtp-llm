@@ -6,7 +6,19 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
+
+# Keep the canonical script usable both as a module and by file path.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
+
+from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
+    FIXED_POLICY,
+    WORKSPACE_TOKENS,
+    input_limit,
+    validate_fixed_workspace,
+)
 
 MAX_REQUEST_TOKENS = 256 * 1024
 
@@ -32,6 +44,8 @@ def generate_grid(args: argparse.Namespace) -> dict:
         args.kv_budget_tokens is not None and args.kv_budget_tokens <= 0
     ):
         raise ValueError("token budgets must be positive")
+    if args.max_batch_tokens > WORKSPACE_TOKENS:
+        raise ValueError("max-batch-tokens cannot exceed fixed workspace 1048576")
     minimum = round_up(args.min_input_tokens, args.input_alignment)
     maximum = args.max_input_tokens // args.input_alignment * args.input_alignment
     block = args.cache_alignment
@@ -39,6 +53,10 @@ def generate_grid(args: argparse.Namespace) -> dict:
     if minimum > maximum:
         raise ValueError("input range contains no aligned length")
     for batch in args.batch_sizes:
+        if minimum > input_limit(batch):
+            raise ValueError(
+                f"batch={batch} cannot fit minimum inputs in fixed workspace"
+            )
         if batch * minimum > args.max_batch_tokens:
             raise ValueError(
                 f"batch={batch} cannot fit minimum inputs in max-batch-tokens"
@@ -64,7 +82,9 @@ def generate_grid(args: argparse.Namespace) -> dict:
         for index in range(batch):
             remaining = batch - index - 1
             upper = min(
-                maximum, args.max_batch_tokens - input_sum - remaining * minimum
+                maximum,
+                input_limit(batch),
+                args.max_batch_tokens - input_sum - remaining * minimum,
             )
             if args.kv_budget_tokens is not None:
                 available = args.kv_budget_tokens - peak_kv - remaining * minimum_kv
@@ -116,12 +136,19 @@ def generate_grid(args: argparse.Namespace) -> dict:
         raise ValueError(
             "not enough distinct batches; reduce num-cases or widen input bounds"
         )
+    validate_fixed_workspace(
+        cases,
+        commit_tail=args.commit_tail_tokens,
+        block=block,
+        token_budget=args.max_batch_tokens,
+    )
     return {
         "schema_version": 2,
         "kind": "random_independent_cache_batch",
         "generator": {
             "name": "generate_random_batch_grid",
-            "version": 1,
+            "version": 2,
+            "workspace_policy": FIXED_POLICY,
             "seed": args.seed,
             "alignment": args.input_alignment,
             "cache_alignment": block,
@@ -194,6 +221,10 @@ def build_plans(args):
         # Also constrain B * max_input: the engine sizes workspace by config.
         local.max_input_tokens = limits.get(
             batch, min(args.max_input_tokens, args.max_batch_tokens // batch)
+        )
+        local.max_input_tokens = min(local.max_input_tokens, input_limit(batch))
+        local.max_input_tokens = (
+            local.max_input_tokens // args.input_alignment * args.input_alignment
         )
         local.seed = args.seed + batch
         grid = generate_grid(local)

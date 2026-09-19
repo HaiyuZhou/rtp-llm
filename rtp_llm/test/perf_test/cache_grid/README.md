@@ -66,9 +66,25 @@ cache_grid/
 | run | 全 grid | 关闭 | 指定的新目录 |
 | resume | checkpoint 中未完成 case | 保留原运行配置 | 原目录 |
 | retest | 只选定 case，默认原测量轮数 | 关闭 | `cache_perf_replays/retest_<id>/` |
-| profile | 跳过 | 只选定 case，默认一次 | `cache_perf_replays/profile_<id>/cache_profile_replays/<id>/` |
+| profile | 跳过 | 只选定 case，默认一次 | `cache_perf_replays/profile_<id>/` |
 
 retest/profile 会保留原 case_id 和请求分布，但使用新结果目录；不会改原 checkpoint 或报告。
+简化入口的 profile 输出统一在一层隔离目录下：
+
+```text
+cache_perf_replays/profile_<id>/
+├── manifest.json          # 会话 ID、case、轮次、录制状态、trace 相对路径
+├── test_info.json
+├── profile.snapshot.json
+├── grid.snapshot.json
+├── cache_perf_launch.json
+└── timelines/             # 各 TP rank 的 trace JSON
+```
+
+入口自动传递内部参数 `--cache_profile_flat_output`，底层不再创建重复隔离目录。
+隐藏标记 `.cache_profile_started` 防止同一目录被重复或并发使用；失败后再次执行 profile 会创建新目录。
+直接使用原 Bazel `--cache_profile_only`（不传内部参数）仍保留原隔离布局；已有历史结果不移动、不删除。
+
 case_id 来自同一个原始 grid，不要拿另一份 grid 的 ID 混用。
 未知或被对齐去重删除的 ID 会在启动 Bazel/模型前报错。
 当前 profile 仅支持未分组 batch=1，不支持 shared seed；profiler 耗时不能替代正式性能数据。
@@ -120,6 +136,9 @@ resume 校验快照 SHA256，再交由原 runner 的 grid/profile/run_config 守
 - [runner/generate_cache_grid.py](runner/generate_cache_grid.py)：普通 cache grid。
 - [runner/generate_random_batch_grid.py](runner/generate_random_batch_grid.py)：随机 batch 计划；[说明](docs/generate_random_batch_grid.md)。
 - [runner/run_random_batch_grids.py](runner/run_random_batch_grids.py)：随机 batch 多计划执行。
+  新生成的随机 grid 使用固定 CP8 容量策略：`max_seq_len=1048576`、`max_context_batch_size=1`，
+  生成及启动前同时检查总 input 和 CP 对齐后的 batch 矩形；简化入口自动识别策略标记。
+  这不代表 batch 被限制为 1，也不保证模型/KV 等总显存不会 OOM。详见[容量约束及命令](docs/generate_random_batch_grid.md)。
 - [runner/run_cache_grid_pipeline.py](runner/run_cache_grid_pipeline.py)：完整测试后拟合和绘图。
 - [plot/generate_batch_interactive_chart.py](plot/generate_batch_interactive_chart.py)：batch/cache/compute/TTFT 交互图。
 - [plot/generate_prefill_interactive_chart.py](plot/generate_prefill_interactive_chart.py)：单 batch prefill 交互图。

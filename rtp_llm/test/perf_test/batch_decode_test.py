@@ -36,6 +36,11 @@ from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
     resume_config_fingerprint,
     validate_cache_grid_resume,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
+    WORKSPACE_TOKENS,
+    fixed_workspace_grid,
+    validate_fixed_workspace,
+)
 from rtp_llm.test.perf_test.dataset import KNOWN_DATASETS, extract_arg
 from rtp_llm.test.perf_test.distribution_runner import DistributionRunner
 from rtp_llm.test.perf_test.grid_runner import GridRunner
@@ -189,6 +194,11 @@ def parse_args(argv: Optional[List[str]] = None):
         help="Override PERF_PROFILE_RUNS for every case.",
     )
     perf.add_argument(
+        "--cache_fixed_workspace",
+        action="store_true",
+        help="Fixed DSV4 CP8 workspace: max_seq_len=1048576, max_context_batch_size=1; reject oversized batches.",
+    )
+    perf.add_argument(
         "--cache_profile_runs",
         type=int,
         default=0,
@@ -211,6 +221,11 @@ def parse_args(argv: Optional[List[str]] = None):
             "Skip formal measurements; write a new isolated replay directory "
             "below result_dir."
         ),
+    )
+    perf.add_argument(
+        "--cache_profile_flat_output",
+        action="store_true",
+        help="Use an already isolated profile-only result directory (cache_perf internal).",
     )
     perf.add_argument(
         "--cache_profile_trace_timeout",
@@ -338,6 +353,8 @@ def parse_args(argv: Optional[List[str]] = None):
         parser.error(
             "--cache_profile_runs and --cache_profile_case_ids must be supplied together"
         )
+    if args.cache_profile_flat_output and not args.cache_profile_only:
+        parser.error("--cache_profile_flat_output requires --cache_profile_only")
     if args.cache_profile_only and args.require_cache_resume:
         parser.error(
             "--cache_profile_only creates a fresh replay directory; "
@@ -747,6 +764,51 @@ def _load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
 def _configure_cache_batch_limits(args, remaining, cases):
     """Ensure admission and context limits can accommodate every fixed batch."""
     batch_size = max(c["batch_size"] for c in cases)
+    if getattr(args, "cache_fixed_workspace", False):
+        if args.dp_size != 1 or extract_arg(remaining, "tp_size") != "8":
+            raise ValueError("fixed workspace requires dp_size=1 and tp_size=8")
+        if (
+            extract_arg(remaining, "cp_rotate_method") != "ALL_GATHER"
+            or extract_arg(remaining, "prefill_cp_kv_cache_sharded") != "1"
+        ):
+            raise ValueError(
+                "fixed workspace requires CP8 ALL_GATHER with sharded KV cache"
+            )
+        if args.cache_shared_seed:
+            raise ValueError("fixed workspace does not support cache_shared_seed mode")
+        budget = int(
+            extract_arg(remaining, "max_batch_tokens_size") or WORKSPACE_TOKENS
+        )
+        budget = budget or WORKSPACE_TOKENS
+        stats = validate_fixed_workspace(
+            cases,
+            commit_tail=args.cache_commit_tail_tokens,
+            block=args.expected_cache_block_size or 4096,
+            output_tokens=args.decode_test_length,
+            token_budget=budget,
+        )
+        args.max_seq_len = WORKSPACE_TOKENS
+        args.concurrency_limit = max(args.concurrency_limit, batch_size)
+        limits = {
+            "max_context_batch_size": 1,
+            "max_batch_tokens_size": budget,
+        }
+        index, cleaned = 0, []
+        while index < len(remaining):
+            item = remaining[index]
+            name = item.split("=", 1)[0].lstrip("-")
+            if name in limits:
+                index += 1 if "=" in item else 2
+            else:
+                cleaned.append(item)
+                index += 1
+        remaining[:] = cleaned + [f"--{key}={value}" for key, value in limits.items()]
+        logging.info(
+            "cache fixed workspace: max_seq_len=%d max_context_batch_size=1 capacity=%s",
+            WORKSPACE_TOKENS,
+            stats,
+        )
+        return
     if batch_size <= 1:
         return
     if args.dp_size != 1:
@@ -1037,6 +1099,24 @@ def _ensure_xgrammar_lib_path() -> None:
             return
 
 
+def _prepare_cache_profile_result_dir(args):
+    if not args.cache_profile_only:
+        return
+    if not args.cache_profile_flat_output:
+        args.result_dir = str(
+            Path(args.result_dir) / "cache_profile_replays" / uuid.uuid4().hex
+        )
+        return
+    directory = Path(args.result_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    allowed = {"cache_perf_launch.json", "profile.snapshot.json", "grid.snapshot.json"}
+    if any(p.name not in allowed or not p.is_file() for p in directory.iterdir()):
+        raise ValueError("flat profile output requires a fresh isolated directory")
+    # Exclusive claim prevents concurrent/repeated invocations from overwriting results.
+    with (directory / ".cache_profile_started").open("x") as stream:
+        stream.write("profile-only isolated output\n")
+
+
 def main() -> str:
     from rtp_llm.config.log_config import setup_logging
 
@@ -1069,11 +1149,7 @@ def main() -> str:
         raise ValueError(
             "cache-grid profiling currently requires DP=1; all TP ranks are captured"
         )
-    if args.cache_profile_only:
-        # Preserve the original report, manifest and resume checkpoint byte-for-byte.
-        args.result_dir = str(
-            Path(args.result_dir) / "cache_profile_replays" / uuid.uuid4().hex
-        )
+    _prepare_cache_profile_result_dir(args)
     os.makedirs(args.result_dir, exist_ok=True)
     # Cache-grid mode writes its manifest after resolving the grid and resume
     # fingerprint, but still before tokenizer/model initialization.
@@ -1102,10 +1178,13 @@ def main() -> str:
             )
 
         cases = _load_cache_grid_cases(args.cache_grid_json)
-        _configure_cache_batch_limits(args, remaining, cases)
         with open(args.cache_grid_json, "rb") as stream:
             grid_bytes = stream.read()
         grid_payload = json.loads(grid_bytes)
+        args.cache_fixed_workspace = args.cache_fixed_workspace or fixed_workspace_grid(
+            grid_payload
+        )
+        _configure_cache_batch_limits(args, remaining, cases)
         grid_metadata = {
             key: grid_payload.get(key)
             for key in ("schema_version", "kind", "generator", "summary")
@@ -1339,6 +1418,7 @@ def main() -> str:
                 profile_runs=args.cache_profile_runs,
                 profile_case_ids=args.cache_profile_case_ids,
                 profile_only=args.cache_profile_only,
+                profile_flat_output=args.cache_profile_flat_output,
                 profile_tp_size=int(
                     extract_arg(remaining, "tp_size") or os.environ.get("TP_SIZE", "1")
                 ),

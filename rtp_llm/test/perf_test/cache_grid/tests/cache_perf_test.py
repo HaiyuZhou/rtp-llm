@@ -159,6 +159,66 @@ class CachePerfTest(unittest.TestCase):
         self.assertIn("--test_arg=--require_cache_resume", after["command"])
         self.assertEqual(after["artifacts"], {})
 
+    def test_fixed_workspace_capacities_are_frozen_and_replayed(self):
+        payload = json.loads(self.grid.read_text())
+        payload["generator"] = {
+            "workspace_policy": "fixed_cp8_1m_v1",
+            "parameters": {"max_batch_tokens": 65536},
+        }
+        for case in payload["cases"]:
+            case["batch_size"] = 4
+        self.grid.write_text(json.dumps(payload))
+        first = self.save_run()
+        plans = [first]
+        for mode in ("resume", "retest"):
+            extra = [] if mode == "resume" else ["--cases", "7"]
+            plans.append(
+                cli.build_plan(self.args(mode, extra=extra, explicit=False), {})
+            )
+        for plan in plans:
+            for arg in (
+                "--max_seq_len=1048576",
+                "--max_context_batch_size=1",
+                "--max_batch_tokens_size=65536",
+                "--concurrency_limit=4",
+                "--cache_fixed_workspace",
+            ):
+                self.assertIn("--test_arg=" + arg, plan["command"])
+
+    def test_fixed_workspace_rejects_oversized_rectangle_before_launch(self):
+        self.grid.write_text(
+            json.dumps(
+                {
+                    "generator": {"workspace_policy": "fixed_cp8_1m_v1"},
+                    "cases": [
+                        {
+                            "case_id": 1,
+                            "batch_size": 8,
+                            "request_groups": [
+                                {"count": 1, "input_len": 200000, "cache_len": 0},
+                                {"count": 7, "input_len": 8192, "cache_len": 0},
+                            ],
+                        }
+                    ],
+                }
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "rectangle"):
+            cli.build_plan(self.args(), {})
+        self.assertFalse(self.result.exists())
+
+    def test_fixed_workspace_batch_one_profile_keeps_capacity(self):
+        payload = json.loads(self.grid.read_text())
+        payload["generator"] = {"workspace_policy": "fixed_cp8_1m_v1"}
+        self.grid.write_text(json.dumps(payload))
+        self.save_run()
+        plan = cli.build_plan(
+            self.args("profile", extra=["--cases", "7"], explicit=False), {}
+        )
+        self.assertIn("--test_arg=--cache_fixed_workspace", plan["command"])
+        self.assertIn("--test_arg=--max_context_batch_size=1", plan["command"])
+        self.assertIn("--test_arg=--max_seq_len=1048576", plan["command"])
+
     def test_resume_missing_checkpoint_or_overrides_rejected(self):
         with self.assertRaisesRegex(ValueError, "existing"):
             cli.build_plan(self.args("resume", explicit=False), {})
@@ -194,6 +254,7 @@ class CachePerfTest(unittest.TestCase):
             self.args("profile", extra=["--cases", "7", "--runs", "2"]), {}
         )
         self.assertIn("--test_arg=--cache_profile_only", plan["command"])
+        self.assertIn("--test_arg=--cache_profile_flat_output", plan["command"])
         self.assertIn("--test_arg=--cache_profile_runs=2", plan["command"])
         self.assertEqual(plan["summary"]["planned_cases"], 1)
         self.assertFalse(plan["summary"]["reads_checkpoint"])
@@ -202,6 +263,27 @@ class CachePerfTest(unittest.TestCase):
         for options in (["--cases", "888"], ["--cases", "7", "--runs", "0"]):
             with self.assertRaises(ValueError):
                 cli.build_plan(self.args("retest", extra=options), {})
+
+    def test_profile_plan_uses_same_isolated_directory_in_backend(self):
+        from rtp_llm.test.perf_test.batch_decode_test import (
+            _prepare_cache_profile_result_dir,
+            parse_args,
+        )
+
+        plan = cli.build_plan(self.args("profile", extra=["--cases", "7"]), {})
+        directory = plan["destination"]
+        directory.mkdir(parents=True)
+        for name, data in plan["artifacts"].items():
+            (directory / name).write_bytes(data)
+        argv = json.loads(plan["artifacts"][cli.MANIFEST])["runner_args"]
+        args, _ = parse_args(argv)
+        _prepare_cache_profile_result_dir(args)
+        self.assertEqual(Path(args.result_dir), directory)
+        self.assertTrue(args.cache_profile_flat_output)
+        self.assertTrue(args.cache_profile_only)
+        self.assertFalse((directory / "cache_profile_replays").exists())
+        for name, data in plan["artifacts"].items():
+            self.assertEqual((directory / name).read_bytes(), data)
 
     def test_main_propagates_bazel_exit_code(self):
         with patch.object(cli.subprocess, "run") as run, patch("builtins.print"):

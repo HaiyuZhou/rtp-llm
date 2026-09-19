@@ -128,7 +128,7 @@ class RandomBatchGridTest(unittest.TestCase):
             ]
         )
         self.assertEqual(
-            build_plans(args)[0][1]["summary"]["max_request_tokens"], 65536
+            build_plans(args)[0][1]["summary"]["max_request_tokens"], 33792
         )
         args.batch_input_limit = ["31:262145"]
         with self.assertRaises(ValueError):
@@ -192,9 +192,7 @@ class RandomBatchGridTest(unittest.TestCase):
             files = sorted(grids.glob("*.json"))
             self.assertEqual(len(files), 2)
             inspected = [inspect_grid(path) for path in files]
-            self.assertNotEqual(
-                inspected[0]["max_seq_len"], inspected[1]["max_seq_len"]
-            )
+            self.assertEqual(inspected[0]["max_seq_len"], inspected[1]["max_seq_len"])
             runner_args = [
                 "--grid-dir",
                 str(grids),
@@ -226,7 +224,7 @@ class RandomBatchGridTest(unittest.TestCase):
                         f"--test_arg=--max_seq_len={plan['max_seq_len']}", command
                     )
                     self.assertIn(
-                        f"--test_arg=--max_context_batch_size={plan['batch_size']}",
+                        "--test_arg=--max_context_batch_size=1",
                         command,
                     )
                     self.assertNotIn("--test_arg=--cache_shared_seed", command)
@@ -277,7 +275,7 @@ class RandomBatchGridTest(unittest.TestCase):
             path = Path(temporary) / "grid.json"
             case = {"case_id": 0, "batch_size": 1, "input_len": 256, "cache_len": 0}
             path.write_text(json.dumps({"cases": [case]}))
-            self.assertEqual(inspect_grid(path)["max_seq_len"], 8193)
+            self.assertEqual(inspect_grid(path)["max_seq_len"], 1048576)
             path.write_text(json.dumps({"cases": [case, {**case, "batch_size": 2}]}))
             with self.assertRaisesRegex(ValueError, "mixed batch"):
                 inspect_grid(path)

@@ -1,0 +1,87 @@
+  {
+    // JSONC supports // line comments and /* block comments */. No trailing commas.
+    // 先复制成本机配置；不要把凭证、token、access key 写在这里。
+    "schema_version": 1,
+    "label": "GLM-5.2-FP8 cache-grid",
+    "model_label": "GLM-5.2-FP8",
+
+    "engine": {
+      "model_type": "glm_5",
+      // 必改：模型和 tokenizer 在测试机器/容器内可读的绝对路径。
+      "checkpoint_path": "/data5/nanjun.cp/GLM-5.2-FP8",
+      "tokenizer_path": "/data5/nanjun.cp/GLM-5.2-FP8",
+      // 按实际 GPU 拓扑修改；当前配置是 8 卡 TP/EP、DP=1。
+      "tp_size": 1,
+      "dp_size": 8,
+      "ep_size": 8,
+      "world_size": 8,
+      "world_rank": 0,
+      "local_world_size": 8,
+
+      "max_seq_len": 262144,
+      "seq_size_per_block": 64,
+      "kernel_seq_size_per_block": 64,
+      "max_context_batch_size": 1,
+      "max_batch_tokens_size": 262144,
+      "concurrency_limit": 8
+    },
+
+    "engine_args": {
+      "--timeout_keep_alive": 3600,
+      "--moe_strategy": "mega_moe_fp8",
+      "--fp8_kv_cache": 1,
+      "--act_type": "BF16",
+      "--warm_up": 0,
+      "--reserver_runtime_mem_mb": 36864,
+      "--use_deepep_moe": 0,
+      "--use_deepep_low_latency": 0,
+      "--use_all_gather": 0
+    },
+
+    "cache_grid": {
+      // CP8 × physical block512 = visible reuse4096；不是 kernel block128。
+      "cache_alignment": 64,
+      "expected_block_size": 64,
+      "commit_tail_tokens": 64,
+      "measure_runs": 3
+    },
+
+    "engine_env": {
+      // 影响执行路径的配置，续测不得悄悄修改；Pro batch 需要 MegaMoE。
+      "MOE_STRATEGY": "mega_moe_fp8",
+      "USE_GATHER_PATH": "1",
+      "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+
+      "DSV4_MOE_CHUNK_PREFILL": "1",
+      "DSV4_MOE_CHUNK_TOKENS": "16384",
+      "DSV4_FP8_INDEXER_SCORE_CHUNK_ROWS": "8192",
+
+      "GLM5_MEGA_MOE_PRE_KERNEL_BARRIER": "1",
+      "MAX_BATCH_TOKENS_SIZE": "262144",
+
+      "WORLD_SIZE": "8",
+      "LOCAL_WORLD_SIZE": "8",
+      "TOKENIZERS_PARALLELISM": "false",
+      "PERF_PROFILE_RUNS": "0"
+    },
+
+    "runtime_env": {
+      // 必改/确认：编译器、CUDA 和库路径；这里不会展开 $PATH、~ 或执行命令。
+      "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"
+      // 必改：有写权限的持久化缓存目录；多个实验可复用 JIT cache。
+    },
+
+    "chart": {
+      "title": "GLM-5.2-FP8 Prefill Cache Performance",
+      "model_label": "GLM-5.2-FP8",
+      "formula_filename": "glm52_prefill_formula.txt",
+      "formula_key": "PREFILL_TIME_FORMULA",
+      "token_unit": 1024
+    },
+
+    "bazel": {
+      "executable": "bazelisk",
+      "configs": ["cuda13", "sm10x"],
+      "test_timeout": 345600
+    }
+  }

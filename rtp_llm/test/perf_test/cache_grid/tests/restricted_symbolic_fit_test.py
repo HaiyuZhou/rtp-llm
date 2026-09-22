@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,11 @@ from rtp_llm.test.perf_test.cache_grid.formula.deepseek_v4_prefill_formula_fit i
 )
 from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
     LIBRARY_VERSION,
+    PARSER_AGGREGATES,
+    PARSER_BATCH_VARIABLES,
+    PARSER_FUNCTIONS,
+    PARSER_OPERATORS,
+    PARSER_PER_REQUEST_VARIABLES,
     build_candidate_library,
     fit_restricted_symbolic,
 )
@@ -19,14 +25,50 @@ from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
 class RestrictedSymbolicLibraryTest(unittest.TestCase):
     def test_library_is_versioned_and_flexlb_compatible(self):
         terms = build_candidate_library(65536)
-        self.assertEqual(LIBRARY_VERSION, "dsv4-restricted-v1")
-        self.assertEqual(len(terms), 52)
+        self.assertEqual(LIBRARY_VERSION, "dsv4-restricted-v2")
+        self.assertEqual(len(terms), 67)
         expressions = " ".join(term.expression for term in terms)
         self.assertNotIn("log1p", expressions)
         self.assertNotIn("**", expressions)
         self.assertIn("log(1 +", expressions)
         self.assertIn("pow(", expressions)
         self.assertIn("max(", expressions)
+        self.assertIn("min(", expressions)
+        self.assertIn("abs(", expressions)
+        self.assertIn("exp(", expressions)
+        self.assertIn(" ^ ", expressions)
+        self.assertIn("hasHitCache", expressions)
+
+    def test_library_covers_java_parser_primitives_with_finite_candidates(self):
+        self.assertEqual(PARSER_OPERATORS, ("+", "-", "*", "/", "^"))
+        self.assertEqual(
+            PARSER_FUNCTIONS,
+            ("sqrt", "log", "exp", "abs", "max", "min", "pow"),
+        )
+        self.assertEqual(PARSER_AGGREGATES, ("sum",))
+        self.assertEqual(
+            PARSER_PER_REQUEST_VARIABLES,
+            ("inputTokens", "hitCacheTokens", "computeTokens", "hasHitCache"),
+        )
+        self.assertEqual(
+            PARSER_BATCH_VARIABLES,
+            (
+                "batchSize",
+                "totalInputTokens",
+                "totalHitCacheTokens",
+                "totalComputeTokens",
+                "maxInputTokens",
+                "maxComputeTokens",
+            ),
+        )
+        rows = (
+            Observation(1, 1, 0, 1.0, "minimum", 0),
+            Observation(1, 1048575, 0, 1.0, "cold-maximum", 0),
+            Observation(1, 1048575, 1040384, 1.0, "hit-maximum", 1040384),
+        )
+        for term in build_candidate_library(65536):
+            for row in rows:
+                self.assertTrue(math.isfinite(term.evaluate(row)), term.name)
 
     def test_forward_selection_recovers_linear_compute_term(self):
         rows = []

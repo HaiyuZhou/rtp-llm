@@ -12,8 +12,26 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Sequence, TypeVar
 
-LIBRARY_VERSION = "dsv4-restricted-v1"
+LIBRARY_VERSION = "dsv4-restricted-v2"
 DEFAULT_HINGE_TOKENS = (16384, 32768, 65536, 131072, 262144, 524288)
+DEFAULT_EXP_DECAY_TOKENS = (16384, 65536, 262144)
+PARSER_OPERATORS = ("+", "-", "*", "/", "^")
+PARSER_FUNCTIONS = ("sqrt", "log", "exp", "abs", "max", "min", "pow")
+PARSER_AGGREGATES = ("sum",)
+PARSER_PER_REQUEST_VARIABLES = (
+    "inputTokens",
+    "hitCacheTokens",
+    "computeTokens",
+    "hasHitCache",
+)
+PARSER_BATCH_VARIABLES = (
+    "batchSize",
+    "totalInputTokens",
+    "totalHitCacheTokens",
+    "totalComputeTokens",
+    "maxInputTokens",
+    "maxComputeTokens",
+)
 _POWERS = (0.25, 0.75, 1.25, 1.5, 1.75, 2.5)
 
 ObservationT = TypeVar("ObservationT")
@@ -41,29 +59,40 @@ class RestrictedSymbolicModel:
         )
 
 
-def _variables(row: object, token_unit: int) -> tuple[float, float, float]:
+def _variables(row: object, token_unit: int) -> tuple[float, float, float, float]:
     input_len = float(getattr(row, "input_len"))
     cache_len = float(getattr(row, "cache_len"))
     compute_len = input_len - cache_len
-    return compute_len / token_unit, cache_len / token_unit, input_len / token_unit
+    return (
+        compute_len / token_unit,
+        cache_len / token_unit,
+        input_len / token_unit,
+        float(cache_len > 0),
+    )
 
 
 def build_candidate_library(
     token_unit: int,
     hinge_tokens: Sequence[int] = DEFAULT_HINGE_TOKENS,
+    exp_decay_tokens: Sequence[int] = DEFAULT_EXP_DECAY_TOKENS,
 ) -> tuple[CandidateTerm, ...]:
     if token_unit <= 0:
         raise ValueError("token_unit must be positive")
     if any(value <= 0 for value in hinge_tokens):
         raise ValueError("hinge token thresholds must be positive")
+    if any(value <= 0 for value in exp_decay_tokens):
+        raise ValueError("exp decay token scales must be positive")
 
     u = f"(computeTokens / {token_unit}.0)"
     c = f"(hitCacheTokens / {token_unit}.0)"
     s = f"(inputTokens / {token_unit}.0)"
+    h = "hasHitCache"
     terms: list[CandidateTerm] = [CandidateTerm("1", "1", lambda row: 1.0)]
 
     def add(
-        name: str, expression: str, fn: Callable[[tuple[float, float, float]], float]
+        name: str,
+        expression: str,
+        fn: Callable[[tuple[float, float, float, float]], float],
     ) -> None:
         terms.append(
             CandidateTerm(
@@ -75,13 +104,14 @@ def build_candidate_library(
 
     add("u", u, lambda values: values[0])
     add("c", c, lambda values: values[1])
-    add("u**2", f"{u} * {u}", lambda values: values[0] ** 2)
+    add("hasHitCache", h, lambda values: values[3])
+    add("u**2", f"({u} ^ 2)", lambda values: values[0] ** 2)
     add("u*c", f"{u} * {c}", lambda values: values[0] * values[1])
-    add("c**2", f"{c} * {c}", lambda values: values[1] ** 2)
-    add("u**3", f"{u} * {u} * {u}", lambda values: values[0] ** 3)
+    add("c**2", f"({c} ^ 2)", lambda values: values[1] ** 2)
+    add("u**3", f"({u} ^ 3)", lambda values: values[0] ** 3)
     add("u**2*c", f"{u} * {u} * {c}", lambda values: values[0] ** 2 * values[1])
     add("u*c**2", f"{u} * {c} * {c}", lambda values: values[0] * values[1] ** 2)
-    add("c**3", f"{c} * {c} * {c}", lambda values: values[1] ** 3)
+    add("c**3", f"({c} ^ 3)", lambda values: values[1] ** 3)
 
     variables = (("u", u, 0), ("c", c, 1), ("s", s, 2))
     for name, expression, index in variables:
@@ -101,6 +131,22 @@ def build_candidate_library(
                 f"pow({expression}, {power})",
                 lambda values, index=index, power=power: values[index] ** power,
             )
+        for scale_tokens in exp_decay_tokens:
+            scale = scale_tokens / float(token_unit)
+            scale_label = f"{scale:.15g}"
+            add(
+                f"exp(-{name}/{scale_label})",
+                f"exp(-{expression} / {scale_label})",
+                lambda values, index=index, scale=scale: math.exp(
+                    -values[index] / scale
+                ),
+            )
+
+    add("abs(u-c)", f"abs({u} - {c})", lambda values: abs(values[0] - values[1]))
+    add("max(u,c)", f"max({u}, {c})", lambda values: max(values[0], values[1]))
+    add("min(u,c)", f"min({u}, {c})", lambda values: min(values[0], values[1]))
+    add("u/(1+c)", f"{u} / (1 + {c})", lambda values: values[0] / (1 + values[1]))
+    add("c/(1+u)", f"{c} / (1 + {u})", lambda values: values[1] / (1 + values[0]))
 
     for name, expression, index in (("c", c, 1), ("s", s, 2), ("u", u, 0)):
         add(
@@ -153,6 +199,7 @@ def fit_restricted_symbolic(
     *,
     token_unit: int,
     hinge_tokens: Sequence[int] = DEFAULT_HINGE_TOKENS,
+    exp_decay_tokens: Sequence[int] = DEFAULT_EXP_DECAY_TOKENS,
     max_terms: int = 15,
     complexity_tolerance_pct: float = 5.0,
 ) -> RestrictedSymbolicModel:
@@ -172,12 +219,20 @@ def fit_restricted_symbolic(
     if complexity_tolerance_pct < 0:
         raise ValueError("complexity_tolerance_pct must be nonnegative")
 
-    terms = build_candidate_library(token_unit, hinge_tokens)
+    terms = build_candidate_library(token_unit, hinge_tokens, exp_decay_tokens)
     max_terms = min(max_terms, len(terms))
 
     def matrix(rows: Sequence[ObservationT]):
+        values = [[term.evaluate(row) for term in terms] for row in rows]
+        for row_index, row_values in enumerate(values):
+            for term, value in zip(terms, row_values):
+                if not math.isfinite(value):
+                    raise ValueError(
+                        f"candidate {term.name!r} produced non-finite value "
+                        f"at row {row_index}"
+                    )
         return torch.tensor(
-            [[term.evaluate(row) for term in terms] for row in rows],
+            values,
             dtype=torch.float64,
             device="cpu",
         )
@@ -280,6 +335,18 @@ def fit_restricted_symbolic(
         "candidate_count": len(terms),
         "candidate_names": [term.name for term in terms],
         "hinge_tokens": list(hinge_tokens),
+        "exp_decay_tokens": list(exp_decay_tokens),
+        "parser_coverage": {
+            "operators": list(PARSER_OPERATORS),
+            "functions": list(PARSER_FUNCTIONS),
+            "aggregates": list(PARSER_AGGREGATES),
+            "per_request_variables": list(PARSER_PER_REQUEST_VARIABLES),
+            "excluded_batch_variables": list(PARSER_BATCH_VARIABLES),
+            "excluded_batch_variables_reason": (
+                "the fit observations contain one aggregate input/cache geometry, "
+                "not the per-request lists required to distinguish batch aggregates"
+            ),
+        },
         "max_terms": max_terms,
         "complexity_tolerance_pct": complexity_tolerance_pct,
         "selection_rule": "smallest expression within tolerance of best validation relative MSE",

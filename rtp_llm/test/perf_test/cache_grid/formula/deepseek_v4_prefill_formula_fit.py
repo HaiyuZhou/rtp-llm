@@ -50,7 +50,12 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     resolve_str,
 )
 from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
+    DEFAULT_EXP_DECAY_TOKENS,
     DEFAULT_HINGE_TOKENS,
+    PARSER_AGGREGATES,
+    PARSER_FUNCTIONS,
+    PARSER_OPERATORS,
+    PARSER_PER_REQUEST_VARIABLES,
     fit_restricted_symbolic,
 )
 
@@ -964,12 +969,21 @@ def run_fit(args: argparse.Namespace) -> int:
             )
             or DEFAULT_HINGE_TOKENS
         )
+        exp_decay_tokens = (
+            tuple(
+                int(value)
+                for value in getattr(args, "symbolic_exp_decay_tokens", "").split(",")
+                if value.strip()
+            )
+            or DEFAULT_EXP_DECAY_TOKENS
+        )
         symbolic_model = fit_restricted_symbolic(
             splits["train"],
             splits["validation"],
             [*splits["train"], *splits["validation"]],
             token_unit=token_unit,
             hinge_tokens=hinge_tokens,
+            exp_decay_tokens=exp_decay_tokens,
             max_terms=getattr(args, "symbolic_max_terms", 15),
             complexity_tolerance_pct=getattr(
                 args, "symbolic_complexity_tolerance_pct", 5.0
@@ -983,9 +997,9 @@ def run_fit(args: argparse.Namespace) -> int:
         symbolic_report = symbolic_model.search_report
         formula_compatibility = {
             "parser": "org.flexlb.balance.prediction.PrefillTimeFormula",
-            "variables": ["inputTokens", "computeTokens", "hitCacheTokens"],
-            "functions": ["sum", "sqrt", "log", "max", "pow"],
-            "operators": ["+", "-", "*", "/", "(", ")"],
+            "variables": list(PARSER_PER_REQUEST_VARIABLES),
+            "functions": [*PARSER_AGGREGATES, *PARSER_FUNCTIONS],
+            "operators": [*PARSER_OPERATORS, "(", ")"],
             "unsupported_constructs_used": [],
         }
         objective_name = "mean_squared_relative_error"
@@ -1349,6 +1363,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--symbolic-hinge-tokens",
         default=",".join(str(value) for value in DEFAULT_HINGE_TOKENS),
         help="Comma-separated token thresholds for compute/input hinge candidates.",
+    )
+    fit.add_argument(
+        "--symbolic-exp-decay-tokens",
+        default=",".join(str(value) for value in DEFAULT_EXP_DECAY_TOKENS),
+        help="Comma-separated positive token scales for safe exp(-tokens/scale) candidates.",
     )
     fit.add_argument("--allow-insufficient-data", action="store_true")
     _add_common_profile_args(fit)

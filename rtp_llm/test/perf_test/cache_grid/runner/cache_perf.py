@@ -154,6 +154,10 @@ def load_cases(path, profile):
 
 def build_plan(args, inherited=None):
     inherited = dict(os.environ if inherited is None else inherited)
+    if args.profile_backend == "nsys" and args.mode != "profile":
+        raise ValueError("--profile-backend=nsys requires profile mode")
+    if not 0 <= args.nsys_tail_seconds <= 60:
+        raise ValueError("--nsys-tail-seconds must be between 0 and 60")
     source = args.result_dir.resolve()
     replay = args.mode in ("retest", "profile")
     if args.mode == "run" and source.exists() and any(source.iterdir()):
@@ -264,6 +268,10 @@ def build_plan(args, inherited=None):
             result_dir=str(dest),
             cache_profile_runs=0,
             cache_profile_case_ids=None,
+            cache_profile_backend="kineto",
+            cache_nsys_session=None,
+            cache_nsys_path=None,
+            cache_nsys_tail_seconds=None,
             profile_runs=0,
         )
         if args.runs is not None and args.mode != "profile":
@@ -323,6 +331,20 @@ def build_plan(args, inherited=None):
                 {
                     "cache_profile_runs": args.runs or 1,
                     "cache_profile_trace_timeout": args.trace_timeout,
+                    "cache_profile_backend": args.profile_backend,
+                    "cache_nsys_path": (
+                        args.nsys_path if args.profile_backend == "nsys" else None
+                    ),
+                    "cache_nsys_session": (
+                        args.nsys_session or ("cacheperf_" + uuid.uuid4().hex)
+                        if args.profile_backend == "nsys"
+                        else None
+                    ),
+                    "cache_nsys_tail_seconds": (
+                        args.nsys_tail_seconds
+                        if args.profile_backend == "nsys"
+                        else None
+                    ),
                 },
             )
             runner += [
@@ -330,6 +352,9 @@ def build_plan(args, inherited=None):
                 "--cache_profile_flat_output",
                 "--cache_profile_case_ids",
             ] + list(map(str, ids))
+            if args.profile_backend == "nsys":
+                env["GEN_TIMELINE_SYNC"] = "0"
+                runner = replace_args(runner, {"gen_timeline_sync": "False"})
         env["PERF_PROFILE_RUNS"] = "0"
         # Make all resolved names part of test_info and the existing resume guard.
         # Bazel --test_env supplies the values before imports; these defaults only
@@ -360,6 +385,25 @@ def build_plan(args, inherited=None):
     ]
     command += ["--test_env=" + k + "=" + v for k, v in sorted(env.items())]
     command += ["--test_arg=" + arg for arg in runner]
+    if args.mode == "profile" and args.profile_backend == "nsys":
+        session = next(
+            a.split("=", 1)[1] for a in runner if a.startswith("--cache_nsys_session=")
+        )
+        command.append(
+            "--run_under="
+            + shlex.join(
+                [
+                    args.nsys_path,
+                    "launch",
+                    "--show-output=true",
+                    "--session-new=" + session,
+                    "--trace=cuda,nvtx,osrt",
+                    "--sample=process-tree",
+                    "--cpuctxsw=process-tree",
+                    "--wait=all",
+                ]
+            )
+        )
     process_env = {k: v for k, v in inherited.items() if not managed_env(k)}
     process_env.update(env)
     return dict(
@@ -372,6 +416,7 @@ def build_plan(args, inherited=None):
             planned_cases=len(cases),
             selected_case_ids=ids,
             profiler=args.mode == "profile",
+            profile_backend=args.profile_backend if args.mode == "profile" else None,
             skip_reuse_validation="--cache_skip_reuse_validation" in runner,
             reads_checkpoint=args.mode == "resume",
             output=str(dest),
@@ -398,6 +443,17 @@ def parser():
     p.add_argument("--output-base")
     p.add_argument("--bazel")
     p.add_argument("--trace-timeout", type=int, default=180)
+    p.add_argument("--profile-backend", choices=("kineto", "nsys"), default="kineto")
+    p.add_argument(
+        "--nsys-path", default="nsys", help="nsys executable in the test environment"
+    )
+    p.add_argument("--nsys-session", help="new nsys session (default: unique name)")
+    p.add_argument(
+        "--nsys-tail-seconds",
+        type=float,
+        default=0.1,
+        help="extra capture after request completion; not a GPU barrier (0..60)",
+    )
     p.add_argument(
         "--skip-reuse-validation",
         action="store_true",

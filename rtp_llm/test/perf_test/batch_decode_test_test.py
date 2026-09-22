@@ -1,6 +1,7 @@
 import argparse
 import json
 import struct
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -858,6 +859,17 @@ class BatchDecodeTest(unittest.TestCase):
 
 
 class EngineServerSchedulerModeTest(unittest.TestCase):
+    @patch("rtp_llm.test.perf_test.server.MagaServerManager")
+    def test_nsys_disables_environment_and_cli_timeline(self, manager):
+        server = self._server()
+        server._args.cache_profile_backend = "nsys"
+        server._build_engine_cli = Mock(return_value="--gen_timeline_sync=True")
+        manager.return_value.start_server.return_value = True
+        server.start(8192, 1)
+        options = manager.call_args.kwargs
+        self.assertEqual(options["env_args"]["GEN_TIMELINE_SYNC"], "0")
+        self.assertTrue(options["smoke_args_str"].endswith("--gen_timeline_sync=False"))
+
     def _server(self):
         args = argparse.Namespace(partial=2, result_dir="/tmp/result", dp_size=1)
         server = EngineServer(args, [])
@@ -898,6 +910,156 @@ class EngineServerSchedulerModeTest(unittest.TestCase):
 
 
 class CacheGridProfileTest(unittest.TestCase):
+    def nsys_runner(self, tmp, **kwargs):
+        return self.runner(
+            tmp,
+            profile_runs=kwargs.pop("profile_runs", 1),
+            profile_case_ids=[1],
+            profile_only=True,
+            profile_flat_output=True,
+            profile_backend="nsys",
+            nsys_session="test_session",
+            nsys_path="/test/nsys",
+            nsys_tail_seconds=0,
+            **kwargs,
+        )
+
+    def test_nsys_three_rounds_skip_kineto_and_export_before_next_seed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.nsys_runner(tmp, profile_runs=3)
+            events = self.wire(runner, write_traces=False)
+            outputs = []
+
+            def control(command, **kwargs):
+                action = command[1]
+                events.append(action)
+                self.assertIn("--session=test_session", command)
+                if action == "start":
+                    outputs.append(
+                        Path(
+                            next(
+                                x.split("=", 1)[1]
+                                for x in command
+                                if x.startswith("--output=")
+                            )
+                        )
+                    )
+                else:
+                    outputs[-1].with_suffix(".nsys-rep").write_bytes(b"mock report")
+                return subprocess.CompletedProcess(command, 0, "ok", "")
+
+            with patch(
+                "rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner.subprocess.run",
+                side_effect=control,
+            ):
+                records = runner.run()
+            self.assertEqual(events, ["seed", "start", "profile", "stop"] * 3)
+            runner._http_session.post.assert_not_called()
+            self.assertEqual(len(set(outputs)), 3)
+            for record in records:
+                self.assertEqual(record["status"], "ok")
+                self.assertTrue((Path(tmp) / record["trace_files"][0]).is_file())
+                self.assertEqual(
+                    [c["returncode"] for c in record["nsys_commands"]], [0, 0]
+                )
+            self.assertFalse((Path(tmp) / "timelines").exists())
+            self.assertEqual(
+                json.loads((Path(tmp) / "manifest.json").read_text())[
+                    "profile_backend"
+                ],
+                "nsys",
+            )
+
+    def test_nsys_start_failure_prevents_target_and_attempts_stop(self):
+        for timeout in [False, True]:
+            with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as tmp:
+                runner = self.nsys_runner(tmp)
+                events = self.wire(runner, write_traces=False)
+                failure = (
+                    subprocess.TimeoutExpired("nsys", 1)
+                    if timeout
+                    else subprocess.CompletedProcess([], 1, "", "start failed")
+                )
+                with patch(
+                    "rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner.subprocess.run",
+                    side_effect=[failure, subprocess.CompletedProcess([], 0, "", "")],
+                ) as call:
+                    with self.assertRaises((RuntimeError, subprocess.TimeoutExpired)):
+                        runner.run()
+                self.assertEqual(events, ["seed"])
+                self.assertEqual(
+                    [c.args[0][1] for c in call.call_args_list], ["start", "stop"]
+                )
+                self.assertEqual(
+                    json.loads((Path(tmp) / "manifest.json").read_text())["status"],
+                    "failed",
+                )
+
+    def test_nsys_request_exception_preserved_when_cleanup_also_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.nsys_runner(tmp)
+            runner._post_request = Mock(
+                side_effect=[{"success": True}, ValueError("request broke")]
+            )
+            runner._http_session.post = Mock()
+            with patch(
+                "rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner.subprocess.run",
+                side_effect=[
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 1, "", "stop failed"),
+                ],
+            ):
+                with self.assertRaisesRegex(ValueError, "request broke"):
+                    runner.run()
+            record = json.loads((Path(tmp) / "manifest.json").read_text())["records"][0]
+            self.assertIn("stop failed", record["nsys_stop_error"])
+            self.assertIn("request broke", record["error"])
+            runner._http_session.post.assert_not_called()
+
+    def test_nsys_missing_report_or_stop_failure_is_not_success(self):
+        for code in [0, 1]:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
+                runner = self.nsys_runner(tmp)
+                self.wire(runner, write_traces=False)
+                with patch(
+                    "rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner.subprocess.run",
+                    side_effect=[
+                        subprocess.CompletedProcess([], 0, "", ""),
+                        subprocess.CompletedProcess([], code, "", "stop failed"),
+                    ],
+                ):
+                    with self.assertRaises(RuntimeError):
+                        runner.run()
+                self.assertEqual(
+                    json.loads((Path(tmp) / "manifest.json").read_text())["status"],
+                    "failed",
+                )
+
+    def test_nsys_bad_request_result_still_exports_and_marks_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.nsys_runner(tmp)
+            events = self.wire(runner, bad_reuse=True, write_traces=False)
+            outputs = []
+
+            def control(command, **kwargs):
+                events.append(command[1])
+                if command[1] == "start":
+                    outputs.append(Path(command[-1].split("=", 1)[1]))
+                else:
+                    outputs[-1].with_suffix(".nsys-rep").write_bytes(b"mock report")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch(
+                "rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner.subprocess.run",
+                side_effect=control,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "shape/reuse mismatch"):
+                    runner.run()
+            self.assertEqual(events, ["seed", "start", "profile", "stop"])
+            record = json.loads((Path(tmp) / "manifest.json").read_text())["records"][0]
+            self.assertEqual(record["status"], "failed")
+            self.assertTrue((Path(tmp) / record["trace_files"][0]).is_file())
+
     def test_flat_output_directory_is_claimed_without_nesting(self):
         with tempfile.TemporaryDirectory() as tmp:
             for name in (

@@ -243,6 +243,12 @@ def parse_args(argv: Optional[List[str]] = None):
         help="Seconds to wait for complete trace JSON from every TP rank.",
     )
     perf.add_argument(
+        "--cache_profile_backend", choices=("kineto", "nsys"), default="kineto"
+    )
+    perf.add_argument("--cache_nsys_path", default="nsys")
+    perf.add_argument("--cache_nsys_session", default="")
+    perf.add_argument("--cache_nsys_tail_seconds", type=float, default=0.1)
+    perf.add_argument(
         "--engine_arg",
         action="append",
         default=[],
@@ -362,6 +368,12 @@ def parse_args(argv: Optional[List[str]] = None):
         parser.error(
             "--cache_profile_runs and --cache_profile_case_ids must be supplied together"
         )
+    if args.cache_profile_backend == "nsys" and (
+        not args.cache_profile_only or not args.cache_nsys_session
+    ):
+        parser.error("nsys requires --cache_profile_only and --cache_nsys_session")
+    if not 0 <= args.cache_nsys_tail_seconds <= 60:
+        parser.error("cache_nsys_tail_seconds must be between 0 and 60")
     if args.cache_profile_flat_output and not args.cache_profile_only:
         parser.error("--cache_profile_flat_output requires --cache_profile_only")
     if args.cache_profile_only and args.require_cache_resume:
@@ -1065,6 +1077,10 @@ def _write_test_info(
         "cache_profile_case_ids": args.cache_profile_case_ids,
         "cache_profile_only": args.cache_profile_only,
         "cache_profile_trace_timeout": args.cache_profile_trace_timeout,
+        "cache_profile_backend": args.cache_profile_backend,
+        "cache_nsys_session": args.cache_nsys_session,
+        "cache_nsys_path": args.cache_nsys_path,
+        "cache_nsys_tail_seconds": args.cache_nsys_tail_seconds,
         "cache_request_transport": (
             args.cache_request_transport if args.cache_grid_json else None
         ),
@@ -1437,6 +1453,10 @@ def main() -> str:
                     extract_arg(remaining, "tp_size") or os.environ.get("TP_SIZE", "1")
                 ),
                 profile_trace_timeout=args.cache_profile_trace_timeout,
+                profile_backend=args.cache_profile_backend,
+                nsys_path=args.cache_nsys_path,
+                nsys_session=args.cache_nsys_session,
+                nsys_tail_seconds=args.cache_nsys_tail_seconds,
             ).run()
             _collect_timeline_files(args.result_dir)
         finally:

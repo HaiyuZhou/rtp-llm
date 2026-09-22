@@ -37,6 +37,7 @@ import logging
 import os
 import statistics
 import struct
+import subprocess
 import threading
 import time
 import uuid
@@ -972,6 +973,10 @@ class CacheGridRunner:
         profile_flat_output: bool = False,
         profile_tp_size: int = 1,
         profile_trace_timeout: float = 120.0,
+        profile_backend: str = "kineto",
+        nsys_path: str = "nsys",
+        nsys_session: str = "",
+        nsys_tail_seconds: float = 0.1,
     ):
         self.port = port
         if request_transport not in {"http_prompt", "dashsc_input_ids"}:
@@ -1036,6 +1041,16 @@ class CacheGridRunner:
             raise ValueError("flat profile output requires profile-only mode")
         self.profile_tp_size = profile_tp_size
         self.profile_trace_timeout = profile_trace_timeout
+        self.profile_backend = profile_backend
+        self.nsys_path = nsys_path
+        self.nsys_session = nsys_session
+        self.nsys_tail_seconds = nsys_tail_seconds
+        if profile_backend not in {"kineto", "nsys"}:
+            raise ValueError("unknown profile backend")
+        if profile_backend == "nsys" and (not profile_only or not nsys_session):
+            raise ValueError("nsys requires profile-only mode and a named session")
+        if not 0 <= nsys_tail_seconds <= 60:
+            raise ValueError("nsys tail seconds must be between 0 and 60")
         if profile_runs < 0 or profile_trace_timeout <= 0 or profile_tp_size <= 0:
             raise ValueError("invalid cache profile runs, timeout or TP size")
         if bool(profile_runs) != bool(self.profile_case_ids) or (
@@ -1848,6 +1863,97 @@ class CacheGridRunner:
                 )
             time.sleep(0.5)
 
+    def _nsys_command(self, record, action, *options):
+        command = [self.nsys_path, action, "--session=" + self.nsys_session, *options]
+        entry = {"command": command, "started_at": time.time()}
+        record.setdefault("nsys_commands", []).append(entry)
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self.profile_trace_timeout,
+                check=False,
+            )
+            entry.update(
+                returncode=result.returncode,
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
+            if result.returncode:
+                raise RuntimeError(
+                    f"nsys {action} failed ({result.returncode}): "
+                    f"{result.stderr or result.stdout}"
+                )
+        except BaseException as exc:
+            entry["error"] = repr(exc)
+            raise
+        finally:
+            entry["finished_at"] = time.time()
+
+    def _run_nsys_request(self, record, prompts, directory):
+        output = (directory / "nsys" / record["trace_name"]).resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        report = output.with_suffix(".nsys-rep")
+        if report.exists():
+            raise FileExistsError(report)
+        record["capture_scope"] = (
+            "target request plus tail; not an all-rank GPU barrier"
+        )
+        record["nsys_tail_seconds"] = self.nsys_tail_seconds
+        record["nsys_report_expected"] = str(report)
+        # A start timeout can occur after activation. Attempt stop even on that
+        # path, but never send the target unless start completed successfully.
+        try:
+            self._nsys_command(record, "start", "--output=" + str(output))
+            record["result"] = self._post_request(
+                prompts.run_texts[0],
+                prompts.run_ids[0],
+                record["trace_name"] + ":profile",
+            )
+            if self.nsys_tail_seconds:
+                time.sleep(self.nsys_tail_seconds)
+        except BaseException:
+            try:
+                self._nsys_command(record, "stop")
+            except BaseException as stop_error:
+                record["nsys_stop_error"] = repr(stop_error)
+            raise
+        else:
+            self._nsys_command(record, "stop")
+        # Stop/export completes before the caller tears down the model service.
+        if not report.is_file() or report.stat().st_size == 0:
+            raise RuntimeError(f"nsys stop did not produce a nonempty report: {report}")
+        record["trace_files"] = [str(report.relative_to(self.result_dir.resolve()))]
+        return record["result"]
+
+    def _run_kineto_request(self, record, prompts, trace_name):
+        # Await the all-TP acknowledgement before submitting the target.
+        response = self._http_session.post(
+            f"http://127.0.0.1:{self.port}/start_profile",
+            json={
+                "gen_timeline": True,
+                "trace_name": trace_name,
+                "start_step": 0,
+                "num_steps": 1,
+                "enable_all_rank": True,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        acknowledgement = response.json()
+        if acknowledgement.get("status") != "ok" or acknowledgement.get("error"):
+            raise RuntimeError(f"start_profile failed: {acknowledgement}")
+        record["profile_request"] = acknowledgement
+        result = self._post_request(
+            prompts.run_texts[0], prompts.run_ids[0], f"{trace_name}:profile"
+        )
+        record["result"] = result
+        if not result.get("success"):
+            raise RuntimeError(f"profile request failed: {result}")
+        record["trace_files"] = self._wait_profile_traces(trace_name)
+        return result
+
     def _run_profiles(self) -> List[Dict[str, Any]]:
         """Replay selected geometries after measurements, never adding to runs[]."""
         if not self.profile_runs:
@@ -1865,6 +1971,10 @@ class CacheGridRunner:
             "schema_version": 1,
             "session_id": session_id,
             "diagnostic_only": True,
+            "profile_backend": self.profile_backend,
+            "nsys_session": (
+                self.nsys_session if self.profile_backend == "nsys" else None
+            ),
             "profile_runs": self.profile_runs,
             "profile_case_ids": sorted(self.profile_case_ids),
             "profile_tp_size": self.profile_tp_size,
@@ -1921,35 +2031,13 @@ class CacheGridRunner:
                         )
                         if not record["seed"].get("success"):
                             raise RuntimeError(f"profile seed failed: {record['seed']}")
-                    # Await the all-TP acknowledgement before submitting the target.
-                    # One real forward consumes the window; idle TP sync does not.
-                    response = self._http_session.post(
-                        f"http://127.0.0.1:{self.port}/start_profile",
-                        json={
-                            "gen_timeline": True,
-                            "trace_name": trace_name,
-                            "start_step": 0,
-                            "num_steps": 1,
-                            "enable_all_rank": True,
-                        },
-                        timeout=60,
-                    )
-                    response.raise_for_status()
-                    acknowledgement = response.json()
-                    if acknowledgement.get("status") != "ok" or acknowledgement.get(
-                        "error"
-                    ):
-                        raise RuntimeError(f"start_profile failed: {acknowledgement}")
-                    record["profile_request"] = acknowledgement
-                    result = self._post_request(
-                        prompts.run_texts[0],
-                        prompts.run_ids[0],
-                        f"{trace_name}:profile",
-                    )
+                    if self.profile_backend == "nsys":
+                        result = self._run_nsys_request(record, prompts, directory)
+                    else:
+                        result = self._run_kineto_request(record, prompts, trace_name)
                     record["result"] = result
                     if not result.get("success"):
                         raise RuntimeError(f"profile request failed: {result}")
-                    record["trace_files"] = self._wait_profile_traces(trace_name)
                     if (
                         result.get("input_len") != total_len
                         or result.get("reuse_len") != cache_len

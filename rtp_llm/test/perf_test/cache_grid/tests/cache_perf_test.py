@@ -1,5 +1,6 @@
 import importlib
 import json
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -91,6 +92,57 @@ class CachePerfTest(unittest.TestCase):
         )
         with self.assertRaises(ProfileError):
             strip_json_comments("{ /* missing close")
+
+    def test_nsys_profile_wraps_bazel_and_forwards_capture_options(self):
+        plan = cli.build_plan(
+            self.args(
+                "profile",
+                extra=[
+                    "--cases=7",
+                    "--runs=3",
+                    "--profile-backend=nsys",
+                    "--nsys-path=/opt/nsys tools/nsys",
+                    "--nsys-session=case19314",
+                    "--nsys-tail-seconds=0.2",
+                ],
+            ),
+            {},
+        )
+        command = plan["command"]
+        wrapper = shlex.split(
+            next(x.split("=", 1)[1] for x in command if x.startswith("--run_under="))
+        )
+        self.assertEqual(wrapper[:2], ["/opt/nsys tools/nsys", "launch"])
+        self.assertIn("--session-new=case19314", wrapper)
+        self.assertIn("--wait=all", wrapper)
+        self.assertIn("--test_arg=--cache_profile_backend=nsys", command)
+        self.assertIn("--test_arg=--cache_profile_runs=3", command)
+        self.assertIn("--test_arg=--cache_nsys_tail_seconds=0.2", command)
+        self.assertIn("--test_env=GEN_TIMELINE_SYNC=0", command)
+        self.assertIn("--test_arg=--gen_timeline_sync=False", command)
+        manifest = json.loads(plan["artifacts"][cli.MANIFEST])
+        self.assertIn("--cache_nsys_session=case19314", manifest["runner_args"])
+        self.assertFalse(plan["destination"].exists())
+
+    def test_nsys_default_session_is_unique_and_kineto_has_no_wrapper(self):
+        args = self.args("profile", extra=["--cases=7", "--profile-backend=nsys"])
+        commands = [cli.build_plan(args, {})["command"] for _ in range(2)]
+        sessions = [
+            next(x for x in c if x.startswith("--test_arg=--cache_nsys_session="))
+            for c in commands
+        ]
+        self.assertNotEqual(*sessions)
+        normal = cli.build_plan(self.args("profile", extra=["--cases=7"]), {})
+        self.assertFalse(any(x.startswith("--run_under=") for x in normal["command"]))
+
+    def test_nsys_rejects_nonprofile_and_invalid_tail(self):
+        for mode, extra in [
+            ("run", ["--profile-backend=nsys"]),
+            ("profile", ["--cases=7", "--nsys-tail-seconds=-1"]),
+            ("profile", ["--cases=7", "--nsys-tail-seconds=nan"]),
+        ]:
+            with self.subTest(mode=mode, extra=extra), self.assertRaises(ValueError):
+                cli.build_plan(self.args(mode, extra=extra), {})
 
     def test_standard_json_still_rejects_comments(self):
         path = self.root / "strict.json"

@@ -8,8 +8,8 @@
     "engine": {
       "model_type": "glm_5",
       // 必改：模型和 tokenizer 在测试机器/容器内可读的绝对路径。
-      "checkpoint_path": "/data5/nanjun.cp/GLM-5.2-FP8",
-      "tokenizer_path": "/data5/nanjun.cp/GLM-5.2-FP8",
+      "checkpoint_path": "/mnt/fuse/smoke-test/zai-org/GLM-5.3",
+      "tokenizer_path": "/mnt/fuse/smoke-test/zai-org/GLM-5.3",
       // 按实际 GPU 拓扑修改；当前配置是 8 卡 TP/EP、DP=1。
       "tp_size": 1,
       "dp_size": 8,
@@ -19,8 +19,8 @@
       "local_world_size": 8,
 
       "max_seq_len": 262144,
-      "seq_size_per_block": 64,
-      "kernel_seq_size_per_block": 64,
+      "seq_size_per_block": 512,
+      "kernel_seq_size_per_block": 128,
       "max_context_batch_size": 1,
       "max_batch_tokens_size": 262144,
       "concurrency_limit": 8

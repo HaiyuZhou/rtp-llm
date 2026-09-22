@@ -9,7 +9,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase, PreTrainedToken
 from rtp_llm.utils.fuser import fetch_remote_file_to_local
 
 
-def _load_tokenizer(tokenizer_path: str) -> PreTrainedTokenizerBase:
+def load_tokenizer(tokenizer_path: str) -> PreTrainedTokenizerBase:
     local_path = fetch_remote_file_to_local(os.path.expanduser(tokenizer_path.strip()))
     try:
         return AutoTokenizer.from_pretrained(local_path, trust_remote_code=True)
@@ -40,7 +40,7 @@ def get_prompt(tokenizer: Any, prompt: str, seqlen: int):
 def _create_query_worker(args: Tuple[str, int]) -> Tuple[int, str]:
     """Top-level worker for ProcessPoolExecutor (must be picklable)."""
     tokenizer_path, input_len = args
-    tokenizer = _load_tokenizer(tokenizer_path)
+    tokenizer = load_tokenizer(tokenizer_path)
     base_query = "hello " * (input_len + 20)
     left, right = 0, len(base_query)
     while left < right:

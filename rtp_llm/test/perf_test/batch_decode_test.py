@@ -50,7 +50,11 @@ from rtp_llm.test.perf_test.hub_download import (
 )
 from rtp_llm.test.perf_test.sampling import prepare_distribution_config
 from rtp_llm.test.perf_test.server import EngineServer
-from rtp_llm.test.perf_test.test_util import create_query, create_reuse_cache_queries
+from rtp_llm.test.perf_test.test_util import (
+    create_query,
+    create_reuse_cache_queries,
+    load_tokenizer,
+)
 
 
 def run_single(
@@ -1445,11 +1449,7 @@ def main() -> str:
                 "cache-grid mode requires --tokenizer_path or --checkpoint_path"
             )
 
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path, trust_remote_code=True
-        )
+        tokenizer = load_tokenizer(tokenizer_path)
 
         if args.materialize_cache_cases:
             store = MaterializedCaseStore(args.materialize_cache_cases)

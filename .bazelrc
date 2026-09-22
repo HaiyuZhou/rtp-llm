@@ -106,9 +106,17 @@ build:cuda12_9 --define=using_cuda12_9_x86=true
 build:cuda13_base --config=cuda12
 build:cuda13_base --action_env PATH="/opt/rh/gcc-toolset-13/root/usr/bin:/opt/conda310/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 build:cuda13_base --host_action_env PATH="/opt/rh/gcc-toolset-13/root/usr/bin:/opt/conda310/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+# GCC 13's linker needs its own libctf; put the toolset lib directory ahead of
+# /lib64 so ld resolves the matching libctf.so.0.
+build:cuda13_base --action_env LD_LIBRARY_PATH="/opt/rh/gcc-toolset-13/root/usr/lib64:/lib64:/opt/conda310/lib/:/usr/local/cuda/compat/:/usr/local/nvidia/lib64:/usr/lib64:/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs/:/usr/local/cuda/extras/CUPTI/lib64/"
+build:cuda13_base --host_action_env LD_LIBRARY_PATH="/opt/rh/gcc-toolset-13/root/usr/lib64:/lib64:/opt/conda310/lib/:/usr/local/cuda/compat/:/usr/local/nvidia/lib64:/usr/lib64:/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs/:/usr/local/cuda/extras/CUPTI/lib64/"
 # GCC 13 adds overloaded-virtual to -Wall; attention parameter helpers
 # intentionally overload the base fillParams signature.
 build:cuda13_base --cxxopt=-Wno-overloaded-virtual
+# PyTorch 2.11 headers use std::hardware_destructive_interference_size, which
+# GCC 13 promotes to an error under -Werror=interference-size.
+build:cuda13_base --cxxopt=-Wno-interference-size
+build:cuda13_base --host_cxxopt=-Wno-interference-size
 build:cuda13_base --copt="-DUSING_CUDA12_9=1"
 build:cuda13_base --action_env TF_CUDA_VERSION="13.2"
 build:cuda13_base --host_action_env TF_CUDA_VERSION="13.2"

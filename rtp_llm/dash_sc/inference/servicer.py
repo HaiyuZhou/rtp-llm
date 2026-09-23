@@ -1770,6 +1770,11 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
             think_runtime if think_runtime is not None else _ThinkRuntime()
         )
         self._seq_counter = AtomicCounter()
+        # Cache-grid measurements may pin sequential seed/hit requests to the
+        # same DP rank by advancing the snowflake sequence in DP-sized steps.
+        self._request_id_stride = max(
+            int(os.environ.get("DASHSC_REQUEST_ID_STRIDE", "1")), 1
+        )
         set_request_id_factory = getattr(
             self._backend_visitor, "set_request_id_factory", None
         )
@@ -1947,7 +1952,9 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         self._request_metrics.close()
 
     def _next_rtp_llm_request_id(self) -> int:
-        sequence = self._seq_counter.increment() % 4096  # 12 bits
+        sequence = (
+            self._seq_counter.increment() * self._request_id_stride
+        ) % 4096  # 12 bits
         return generate_request_id(
             self._ip, self._port, self._snowflake_server_id, sequence
         )

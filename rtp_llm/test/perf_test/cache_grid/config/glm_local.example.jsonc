@@ -2,15 +2,15 @@
     // JSONC supports // line comments and /* block comments */. No trailing commas.
     // 先复制成本机配置；不要把凭证、token、access key 写在这里。
     "schema_version": 1,
-    "label": "GLM-5.2-FP8 cache-grid",
-    "model_label": "GLM-5.2-FP8",
+    "label": "GLM-5.3-FP8 cache-grid",
+    "model_label": "GLM-5.3-FP8",
 
     "engine": {
       "model_type": "glm_5",
       // 必改：模型和 tokenizer 在测试机器/容器内可读的绝对路径。
       "checkpoint_path": "/mnt/fuse/smoke-test/zai-org/GLM-5.3",
       "tokenizer_path": "/mnt/fuse/smoke-test/zai-org/GLM-5.3",
-      // 按实际 GPU 拓扑修改；当前配置是 8 卡 TP/EP、DP=1。
+      // GLM5 稀疏 FlashMLA 要求每 rank 64 个 query heads，因此使用 TP=1、DP=8。
       "tp_size": 1,
       "dp_size": 8,
       "ep_size": 8,
@@ -19,8 +19,8 @@
       "local_world_size": 8,
 
       "max_seq_len": 262144,
-      "seq_size_per_block": 512,
-      "kernel_seq_size_per_block": 128,
+      "seq_size_per_block": 64,
+      "kernel_seq_size_per_block": 64,
       "max_context_batch_size": 1,
       "max_batch_tokens_size": 262144,
       "concurrency_limit": 8
@@ -29,6 +29,8 @@
     "engine_args": {
       "--timeout_keep_alive": 3600,
       "--moe_strategy": "mega_moe_fp8",
+      "--reuse_cache": 1,
+      "--enable_device_cache": 1,
       "--fp8_kv_cache": 1,
       "--act_type": "BF16",
       "--warm_up": 0,
@@ -39,7 +41,7 @@
     },
 
     "cache_grid": {
-      // CP8 × physical block512 = visible reuse4096；不是 kernel block128。
+      // 无 CP 分片时，物理缓存复用粒度与 seq_size_per_block 一致。
       "cache_alignment": 64,
       "expected_block_size": 64,
       "commit_tail_tokens": 64,
@@ -61,6 +63,7 @@
 
       "WORLD_SIZE": "8",
       "LOCAL_WORLD_SIZE": "8",
+      "DASHSC_REQUEST_ID_STRIDE": "8",
       "TOKENIZERS_PARALLELISM": "false",
       "PERF_PROFILE_RUNS": "0"
     },
@@ -72,8 +75,8 @@
     },
 
     "chart": {
-      "title": "GLM-5.2-FP8 Prefill Cache Performance",
-      "model_label": "GLM-5.2-FP8",
+      "title": "GLM-5.3-FP8 Prefill Cache Performance",
+      "model_label": "GLM-5.3-FP8",
       "formula_filename": "glm52_prefill_formula.txt",
       "formula_key": "PREFILL_TIME_FORMULA",
       "token_unit": 1024

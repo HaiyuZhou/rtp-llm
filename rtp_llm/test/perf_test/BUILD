@@ -78,21 +78,21 @@ py_library(
 
 py_library(
     name = "prefill_formula_fit_lib",
-    srcs = ["cache_grid/formula/deepseek_v4_prefill_formula_fit.py"],
+    srcs = ["cache_grid/formula/prefill_formula_fit.py"],
     deps = [":perf_test_lib"],
 )
 
 py_binary(
-    name = "deepseek_v4_prefill_formula_fit",
-    main = "cache_grid/formula/deepseek_v4_prefill_formula_fit.py",
-    srcs = ["cache_grid/formula/deepseek_v4_prefill_formula_fit.py"],
+    name = "prefill_formula_fit",
+    main = "cache_grid/formula/prefill_formula_fit.py",
+    srcs = ["cache_grid/formula/prefill_formula_fit.py"],
     deps = [":perf_test_lib"],
 )
 
 py_test(
-    name = "deepseek_v4_prefill_formula_fit_test",
-    main = "cache_grid/tests/deepseek_v4_prefill_formula_fit_test.py",
-    srcs = ["cache_grid/tests/deepseek_v4_prefill_formula_fit_test.py"],
+    name = "prefill_formula_fit_test",
+    main = "cache_grid/tests/prefill_formula_fit_test.py",
+    srcs = ["cache_grid/tests/prefill_formula_fit_test.py"],
     deps = [
         ":prefill_formula_fit_lib",
         ":perf_test_lib",
@@ -161,29 +161,11 @@ py_binary(
     deps = [":perf_test_lib"],
 )
 
-py_library(
-    name = "cache_grid_pipeline_lib",
-    srcs = ["cache_grid/runner/run_cache_grid_pipeline.py"],
-    deps = [":perf_test_lib"],
-)
-
-py_binary(
-    name = "run_cache_grid_pipeline",
-    main = "cache_grid/runner/run_cache_grid_pipeline.py",
-    srcs = ["cache_grid/runner/run_cache_grid_pipeline.py"],
-    deps = [
-        ":perf_test_lib",
-        ":prefill_3d_chart_lib",
-        ":prefill_formula_fit_lib",
-        ":prefill_interactive_chart_lib",
-    ],
-)
-
 py_test(
-    name = "run_cache_grid_pipeline_test",
-    main = "cache_grid/tests/run_cache_grid_pipeline_test.py",
-    srcs = ["cache_grid/tests/run_cache_grid_pipeline_test.py"],
-    deps = [":cache_grid_pipeline_lib"],
+    name = "cache_perf_pipeline_test",
+    main = "cache_grid/tests/cache_perf_pipeline_test.py",
+    srcs = ["cache_grid/tests/cache_perf_pipeline_test.py"],
+    deps = [":perf_test_lib"],
 )
 
 py_test(

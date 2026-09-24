@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "kind": "dsv4_pro_prefill_full_template",
+  "kind": "prefill_full_template",
   "description": "Compact full-range DSV4-Pro CP=8 prefill cache grid; expanded by batch_decode_test.py at load time",
   "generator": {
     "name": "linear_with_dense_prefix",

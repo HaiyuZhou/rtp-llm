@@ -63,6 +63,8 @@ class WorkspaceBudgetTest(unittest.TestCase):
             [
                 "--output",
                 "/tmp/not-written.json",
+                "--workspace-policy",
+                FIXED_POLICY,
                 "--batch-sizes",
                 "2",
                 "4",

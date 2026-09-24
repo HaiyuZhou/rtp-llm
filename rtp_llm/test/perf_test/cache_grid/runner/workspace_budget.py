@@ -1,4 +1,4 @@
-"""CPU-only admission checks for the fixed DSV4 CP8 prefill workspace policy."""
+"""CPU-only admission checks for the opt-in legacy CP8/1M workspace preset."""
 
 FIXED_POLICY = "fixed_cp8_1m_v1"
 WORKSPACE_TOKENS = 1048576
@@ -11,7 +11,7 @@ def aligned(value, alignment=CP_ALIGNMENT):
 
 def fixed_workspace_grid(payload):
     policy = payload.get("generator", {}).get("workspace_policy")
-    if policy is not None and policy != FIXED_POLICY:
+    if policy not in (None, "none", FIXED_POLICY):
         raise ValueError(f"unsupported cache-grid workspace policy: {policy}")
     return policy == FIXED_POLICY
 

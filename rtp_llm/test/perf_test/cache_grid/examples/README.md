@@ -215,7 +215,7 @@ PY
 ## 公共模型和引擎参数
 
 下面的单请求、batch 和全量命令共用同一组参数。当前可读模型路径是
-`/data4/nanjun.cp/DeepSeek-V4-Pro`；换模型时只修改 `DSV4_CACHE_MODEL_DIR`。
+`/data4/nanjun.cp/DeepSeek-V4-Pro`；更换同类模型权重时修改 `DSV4_CACHE_MODEL_DIR`；其他模型请使用通用 profile 模板。
 
 ```bash
 cd /data7/zhouhaiyu.zhy/RTP-LLM/github-opensource
@@ -381,22 +381,14 @@ bazelisk test //rtp_llm/test/perf_test:cache_grid_perf_test \
 - 无法解释 `run_config_sha256` 差异；
 - 原目录只有 journal、缺少基础 `cache_grid_results.json`。
 
-使用 pipeline 续测时，这两个参数属于 runner 参数，必须放在第二个 `--` 后，不要写成
-`--test_arg`：
+统一入口续测并生成图表：
 
 ```bash
-bazelisk run //rtp_llm/test/perf_test:run_cache_grid_pipeline -- \
-  --cache-grid-json="${DSV4_CACHE_GRID_JSON}" \
-  --result-dir="${DSV4_CACHE_PIPELINE_RESULT_DIR}" \
-  --batch-size=1 \
-  --estimator=median \
-  -- \
-  ...首次运行的全部 runner/引擎参数... \
-  --require_cache_resume
+./tools/cache_perf pipeline --test-mode resume \
+  --result-dir="${DSV4_CACHE_PIPELINE_RESULT_DIR}" --estimator median
 ```
 
-`--skip-test` 会完全跳过 runner，只重新拟合和绘图，因此不要与上述两个续测参数组合。
-`--cache_profile_only` 会创建隔离的 replay 目录，也不能与 `--require_cache_resume` 同时使用。
+续测使用冻结配置，不重新传入模型或 grid 参数。`--skip-test` 仅用于完整结果的后处理。
 
 结果目录中的主要文件：
 
@@ -411,97 +403,42 @@ cache_profiles/               # profiler manifest
 
 ## 一条命令完成全量测试、拟合和绘图
 
-`run_cache_grid_pipeline` 依次执行 cache-grid runner、公式拟合、静态 SVG 和交互式 HTML
-绘图。只有 `cache_grid_results.json` 标记为完整时才会进入后处理。
-
-pipeline 的参数分为两段：第一个 `--` 后是 pipeline 自己的参数，第二个 `--` 后是直接转发给
-`batch_decode_test.py` 的 runner/引擎参数。这里不能复用前面的
-`DSV4_CACHE_COMMON_ARGS`，因为其中的 `--test_arg` 和 `--test_env` 只适用于 `bazelisk test`。
-
-先把原先通过 `--test_env` 传递的环境变量导出到当前 shell：
+`tools/cache_perf pipeline` 依次执行统一的 Bazel 测试、公式拟合、静态 SVG 和交互式 HTML。
+只有 `cache_grid_results.json` 标记为完整时才会进入后处理。
+复制 `config/dsv4_local.example.jsonc` 设置本机模型、拓扑、cache 和环境；其他模型使用
+`config/local.example.jsonc`。从仓库根目录运行：
 
 ```bash
-export WORLD_SIZE=8
-export DG_JIT_CPP_STANDARD=20
-export DG_JIT_CACHE_DIR=/data7/zhouhaiyu.zhy/dsv4_perf_work/jit_cache
-export TRITON_CACHE_DIR=/data7/zhouhaiyu.zhy/dsv4_perf_work/triton_cache
-export TILELANG_CACHE_DIR=/data7/zhouhaiyu.zhy/dsv4_perf_work/tilelang_cache
-export DSV4_USE_MEGA_MOE=1
-export DSV4_CHUNK_TOKENS=8192
-export DSV4_PREFILL_CP_OVERLAP=0
-export PERF_PROFILE_RUNS=0
-export TOKENIZERS_PARALLELISM=false
+./tools/cache_perf pipeline \
+  --profile /path/local.jsonc \
+  --grid "${DSV4_CACHE_GRID_JSON}" \
+  --result-dir "${DSV4_CACHE_PIPELINE_RESULT_DIR}" \
+  --runs 3 --batch-size 1 --estimator median
 ```
 
-运行全量 pipeline：
-
-```bash
-cd /data7/zhouhaiyu.zhy/RTP-LLM/github-opensource
-
-export DSV4_CACHE_MODEL_DIR=/data4/nanjun.cp/DeepSeek-V4-Pro
-export DSV4_CACHE_CONFIG_DIR="$PWD/rtp_llm/test/perf_test/cache_grid/examples"
-export DSV4_CACHE_GRID_JSON="${DSV4_CACHE_CONFIG_DIR}/dsv4_pro_prefill_full_template.json"
-export DSV4_CACHE_PIPELINE_RESULT_DIR="/data7/zhouhaiyu.zhy/tmp/dsv4_pro_prefill_pipeline_$(date +%Y%m%d_%H%M%S)"
-
-bazelisk run //rtp_llm/test/perf_test:run_cache_grid_pipeline \
-  --config=cuda13 --config=sm10x -- \
-  --cache-grid-json="${DSV4_CACHE_GRID_JSON}" \
-  --result-dir="${DSV4_CACHE_PIPELINE_RESULT_DIR}" \
-  --batch-size=1 \
-  --estimator=median \
-  -- \
-  --decode_test_length=1 \
-  --concurrency_limit=1 \
-  --model_type=deepseek_v4 \
-  --checkpoint_path="${DSV4_CACHE_MODEL_DIR}" \
-  --tokenizer_path="${DSV4_CACHE_MODEL_DIR}" \
-  --max_seq_len=1048576 \
-  --max_batch_tokens_size=1048576 \
-  --tp_size=8 \
-  --ep_size=8 \
-  --world_size=8 \
-  --cp_rotate_method=ALL_GATHER \
-  --prefill_cp_kv_cache_sharded=1 \
-  --seq_size_per_block=512 \
-  --kernel_seq_size_per_block=128 \
-  --fp8_kv_cache=1 \
-  --use_deepep_moe=1 \
-  --use_deepep_low_latency=0 \
-  --act_type=BF16 \
-  --load_method=fastsafetensors \
-  --reserver_runtime_mem_mb=81920
-```
-
-pipeline 自动管理 `--cache_grid_json`、`--partial=2` 和 `--result_dir`，不要在第二个 `--`
-后重复传入。`--cache_measure_runs=3`、`--cache_commit_tail_tokens=4096`、
-`--cache_request_transport=dashsc_input_ids` 使用 runner 默认值；预期 cache block 会从模板的
-`generator.cache_alignment=4096` 读取。
-
-输出除 `cache_grid_results.json` 外，还包括：
+引擎参数和环境写入 profile；`--config`、`--env` 等覆盖参数与 `cache_perf run` 相同。
+不再使用 `bazelisk run` 或第二段 `--` 传递 runner 参数。
+后处理读取冻结的 profile 快照，默认输出：
 
 ```text
-formula/deepseek_v4_prefill_formula.txt
+formula/<model_label>_prefill_formula.txt    # 自动使用模型名称
 formula/fit_report.json
 formula/fit_gap.svg
 prefill_3d.svg
 prefill_cold_miss.svg
 prefill_3d.interactive.html
+prefill_tpm_per_card.interactive.html
 pipeline_summary.json
 ```
 
-拟合质量门禁未通过时，pipeline 仍会生成图表，并在 `pipeline_summary.json` 中写入
-`fit_rejected`，最终命令返回非零状态。不要因为图表已经生成就把公式视为可交付。
-
-若测试已经完整结束，只需要重新拟合或绘图，可复用原结果目录并加 `--skip-test`：
+拟合质量门禁未通过时仍生成图表，summary 写入 `fit_rejected`，最终返回 3。
+已有完整结果可只做后处理：
 
 ```bash
-bazelisk run //rtp_llm/test/perf_test:run_cache_grid_pipeline -- \
-  --cache-grid-json="${DSV4_CACHE_GRID_JSON}" \
-  --result-dir="${DSV4_CACHE_PIPELINE_RESULT_DIR}" \
-  --batch-size=1 \
-  --estimator=median \
-  --skip-test
+./tools/cache_perf pipeline --skip-test \
+  --result-dir "${DSV4_CACHE_PIPELINE_RESULT_DIR}" --estimator median
 ```
+
 # 随机混合 batch 的交互图
 
 使用 `../plot/generate_batch_interactive_chart.py` 从已分析的
@@ -543,7 +480,7 @@ node rtp_llm/test/perf_test/cache_grid/tests/generate_batch_interactive_chart_te
 ## 可选：共享长前缀 seed
 
 默认仍按每个 cache-hit case 独立 seed。添加 `--test_arg=--cache_shared_seed`
-（直接运行 Python 或 pipeline 时使用 `--cache_shared_seed`）可开启共享前缀模式。
+（直接运行底层 Python 时使用 `--cache_shared_seed`）可开启共享前缀模式。
 使用全新结果目录，并关闭 cache profiler：
 
 ```bash

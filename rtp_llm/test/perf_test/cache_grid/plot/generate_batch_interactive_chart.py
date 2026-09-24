@@ -5,6 +5,7 @@ Input contains measurement_contract and rows exported by the batch analysis.
 No GPU, serving libraries, network/CDN, or experiment-specific paths are required.
 """
 import argparse
+import html
 import json
 from pathlib import Path
 
@@ -13,9 +14,9 @@ from plotly.offline import get_plotlyjs
 CONTRACT = "batch_input_ids_wall_barrier_to_last_response_ms"
 
 
-def render_html(rows, partial=False):
+def render_html(rows, partial=False, model_label="Model"):
     page = r"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
-<title>DSV4 batch / cache / compute / TTFT</title>
+<title>__MODEL__ batch / cache / compute / TTFT</title>
 <style>
 body{font:15px system-ui;margin:0;background:#f4f7fb;color:#183049}main{max-width:1400px;margin:auto;padding:28px}
 h1{font-size:30px;margin:0 0 8px}p{line-height:1.6;color:#526477}.card{background:white;border:1px solid #dce5ef;border-radius:14px;padding:18px;margin-top:18px}
@@ -70,7 +71,7 @@ draw();
     page = page.replace("__PLOTLY__", get_plotlyjs()).replace(
         "__DATA__", json.dumps(rows, ensure_ascii=False).replace("</", "<\\/")
     )
-    return page
+    return page.replace("__MODEL__", html.escape(model_label))
 
 
 def main():
@@ -84,6 +85,7 @@ def main():
     parser.add_argument(
         "--partial", action="store_true", help="Label incomplete data as preview"
     )
+    parser.add_argument("--model-label", default=None)
     args = parser.parse_args()
     data = json.loads(args.input.read_text(encoding="utf-8"))
     if data.get("measurement_contract") != CONTRACT:
@@ -91,7 +93,14 @@ def main():
     if not data.get("rows"):
         parser.error("No chart rows")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(render_html(data["rows"], args.partial), encoding="utf-8")
+    args.output.write_text(
+        render_html(
+            data["rows"],
+            args.partial,
+            args.model_label or data.get("model_label") or "Model",
+        ),
+        encoding="utf-8",
+    )
     print(args.output)
 
 

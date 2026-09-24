@@ -712,6 +712,7 @@ class BatchDecodeTest(unittest.TestCase):
         profile = (
             Path(__file__).parent / "cache_grid" / "config" / "dsv4_pro_prefill.json"
         )
+        engine = json.loads(profile.read_text())["engine"]
         _, remaining = parse_args(["--profile", str(profile)])
 
         self.assertIn("--model_type", remaining)
@@ -719,12 +720,12 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertIn("--checkpoint_path", remaining)
         self.assertEqual(
             remaining[remaining.index("--checkpoint_path") + 1],
-            "/data5/nanjun.cp/DeepSeek-V4-Pro",
+            engine["checkpoint_path"],
         )
         self.assertIn("--tokenizer_path", remaining)
         self.assertEqual(
             remaining[remaining.index("--tokenizer_path") + 1],
-            "/data5/nanjun.cp/DeepSeek-V4-Pro",
+            engine["tokenizer_path"],
         )
 
     def test_redact_argv_hides_embedded_engine_secret(self):

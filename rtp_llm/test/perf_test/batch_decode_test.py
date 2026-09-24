@@ -205,7 +205,7 @@ def parse_args(argv: Optional[List[str]] = None):
     perf.add_argument(
         "--cache_fixed_workspace",
         action="store_true",
-        help="Fixed DSV4 CP8 workspace: max_seq_len=1048576, max_context_batch_size=1; reject oversized batches.",
+        help="Opt-in legacy CP8 workspace: max_seq_len=1048576, max_context_batch_size=1; reject oversized batches.",
     )
     perf.add_argument(
         "--cache_profile_runs",
@@ -1098,6 +1098,45 @@ def _write_test_info(
         "profile": profile,
         "profile_sha256": profile_sha256,
     }
+    launch_path = os.path.join(args.result_dir, "cache_perf_launch.json")
+    if args.cache_grid_json and os.path.isfile(launch_path):
+        # The unified launcher already owns the reproducible configuration.
+        # Keep results' run_config as the authoritative effective config used
+        # by the resume guard; do not repeat it or the raw argv in test_info.
+        with open(launch_path, encoding="utf-8") as stream:
+            launch = json.load(stream)
+        if launch.get("schema_version") not in (1, 2):
+            raise ValueError("unsupported launch manifest")
+        status_keys = (
+            "status",
+            "started_at",
+            "updated_at",
+            "last_attempt_started_at",
+            "attempt_count",
+            "resume_config_sha256",
+            "profile_sha256",
+            # Small report-facing summary retained for existing analysis tools.
+            "model_type",
+            "checkpoint_path",
+            "tp_size",
+            "dp_size",
+            "cache_grid_json",
+        )
+        info = {key: info[key] for key in status_keys}
+        info.update(
+            schema_version=4,
+            config_files={
+                "launch": "cache_perf_launch.json",
+                "profile": launch.get("profile_file", "profile.snapshot.json"),
+                "grid": "grid.snapshot.json",
+            },
+            config_file_sha256={
+                "cache_perf_launch.json": hashlib.sha256(
+                    Path(launch_path).read_bytes()
+                ).hexdigest(),
+                **launch.get("snapshots", {}),
+            },
+        )
     tmp_path = path + ".tmp"
     with open(tmp_path, "w") as stream:
         json.dump(info, stream, indent=2)

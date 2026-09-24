@@ -4,7 +4,7 @@ Run in the same container/user environment as the GPU service:
 
 ```bash
 ./tools/cache_perf profile \
-  --result-dir /home/admin/tmp/dsv4_pro_prefill_full_20260911_005558_back2 \
+  --result-dir /path/to/cache_grid_results \
   --cases 19314 --runs 3 \
   --profile-backend=nsys \
   --nsys-path=/usr/local/cuda-12.6/bin/nsys
@@ -50,7 +50,7 @@ cleanup failures are recorded separately. `--trace-timeout` (default 180s)
 also bounds each nsys control command, including report export. After an export
 timeout, inspect the recorded commands and live session before rerunning.
 
-First capture one replay and verify that all eight GPU worker processes have
+First capture one replay and verify that all configured GPU worker processes have
 CUDA activity and CPU scheduling information. Report existence alone does not
 prove all workers were captured. Existing PyTorch `record_function` ranges do
 not automatically become NVTX ranges; source-level NVTX instrumentation is a

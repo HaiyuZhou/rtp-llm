@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Sequence, TypeVar
 
-LIBRARY_VERSION = "dsv4-restricted-v2"
+LIBRARY_VERSION = "prefill-restricted-v2"
 DEFAULT_HINGE_TOKENS = (16384, 32768, 65536, 131072, 262144, 524288)
 DEFAULT_EXP_DECAY_TOKENS = (16384, 65536, 262144)
 PARSER_OPERATORS = ("+", "-", "*", "/", "^")

@@ -14,6 +14,7 @@
     "ep_size": 8,
     "dp_size": 1,
     "world_size": 8,
+    // 按照实际情况修改并发和推理长度等
     "max_seq_len": 1048576,
     "max_batch_tokens_size": 1048576,
     "max_context_batch_size": 1,
@@ -23,6 +24,7 @@
   },
   "engine_args": {
     "--timeout_keep_alive": 3600,
+    // 按照实际上线的功能配置开关进行配置
     "--cp_rotate_method": "ALL_GATHER",
     "--prefill_cp_kv_cache_sharded": 1,
     "--fp8_kv_cache": 1,
@@ -40,12 +42,13 @@
     "cache_alignment": 4096,
     "expected_block_size": 4096,
     "commit_tail_tokens": 4096,
+    // 每个case 运行次数
     "measure_runs": 3
   },
   "engine_env": {
     // 影响执行路径的配置，续测不得悄悄修改；Pro batch 需要 MegaMoE。
     "DSV4_USE_MEGA_MOE": "1",
-    "DSV4_USE_MEGA_MOE_SE": "0",
+    "DSV4_USE_MEGA_MOE_SE": "1",
     "DSV4_CHUNK_TOKENS": "8192",
     "DSV4_PREFILL_CP_OVERLAP": "0",
     "DG_JIT_CPP_STANDARD": "20",
@@ -55,6 +58,7 @@
   },
   "runtime_env": {
     // 必改/确认：编译器、CUDA 和库路径；这里不会展开 $PATH、~ 或执行命令。
+    // 可以使用command -v gcc, command -v g++来确认位置
     "CC": "/opt/rh/gcc-toolset-12/root/usr/bin/gcc",
     "CXX": "/opt/rh/gcc-toolset-12/root/usr/bin/g++",
     "CUDAHOSTCXX": "/opt/rh/gcc-toolset-12/root/usr/bin/g++",

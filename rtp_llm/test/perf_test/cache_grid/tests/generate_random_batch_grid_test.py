@@ -68,7 +68,7 @@ class RandomBatchGridTest(unittest.TestCase):
 
     def test_impossible_and_oversized_inputs_rejected(self):
         for extra in [
-            ("--max-input-tokens", "262145"),
+            ("--max-input-tokens", "0"),
             ("--max-batch-tokens", "100"),
             ("--kv-budget-tokens", "100"),
             ("--commit-tail-tokens", "1"),
@@ -140,84 +140,65 @@ class RandomBatchGridTest(unittest.TestCase):
             for group in case["request_groups"]:
                 self.assertEqual(group["cache_len"] % 8192, 0)
 
-    def test_pro_keeps_mega_moe_family_enabled(self):
+    def profile(self, root, model_type="qwen_2", engine_env=None):
+        path = root / "profile.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "engine": {
+                        "model_type": model_type,
+                        "checkpoint_path": "/weights/model",
+                        "tokenizer_path": "/weights/model",
+                        "tp_size": 1,
+                        "dp_size": 1,
+                        "max_seq_len": 2097152,
+                    },
+                    "cache_grid": {
+                        "expected_block_size": 4096,
+                        "commit_tail_tokens": 4096,
+                    },
+                    "engine_env": engine_env or {},
+                    "bazel": {"configs": ["cuda12"]},
+                }
+            )
+        )
+        return path
+
+    def test_generic_grid_accepts_other_geometry_and_larger_budget(self):
+        grid = generate_grid(
+            self.args(
+                "--num-cases",
+                "10",
+                "--batch-sizes",
+                "2",
+                "--min-input-tokens",
+                "524288",
+                "--max-input-tokens",
+                "1048576",
+                "--max-batch-tokens",
+                "4194304",
+                "--cache-alignment",
+                "64",
+                "--input-alignment",
+                "64",
+                "--commit-tail-tokens",
+                "64",
+            )
+        )
+        self.assertEqual(grid["generator"]["workspace_policy"], "none")
+        for case in grid["cases"]:
+            for group in case["request_groups"]:
+                self.assertGreater(group["input_len"], 262144)
+                self.assertEqual(group["cache_len"] % 64, 0)
+
+    def test_directory_writer_and_profile_runner(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             main(
                 [
                     "--output-dir",
                     str(root / "grids"),
-                    "--num-cases",
-                    "1",
-                    "--batch-sizes",
-                    "1",
-                ]
-            )
-            with patch(
-                "rtp_llm.test.perf_test.cache_grid.runner.run_random_batch_grids.subprocess.run"
-            ) as run:
-                run.return_value.returncode = 0
-                self.assertEqual(
-                    run_main(
-                        [
-                            "--grid-dir",
-                            str(root / "grids"),
-                            "--model-dir",
-                            "/weights/Pro",
-                            "--result-root",
-                            str(root / "results"),
-                        ]
-                    ),
-                    0,
-                )
-                command = run.call_args.args[0]
-                self.assertIn("--test_env=DSV4_USE_MEGA_MOE_SE=1", command)
-                self.assertIn("--test_env=DSV4_USE_MEGA_MOE=1", command)
-
-    def test_runner_can_forward_skip_reuse_validation(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            main(
-                [
-                    "--output-dir",
-                    str(root / "grids"),
-                    "--num-cases",
-                    "1",
-                    "--batch-sizes",
-                    "2",
-                ]
-            )
-            with patch(
-                "rtp_llm.test.perf_test.cache_grid.runner.run_random_batch_grids.subprocess.run"
-            ) as run:
-                run.return_value.returncode = 0
-                self.assertEqual(
-                    run_main(
-                        [
-                            "--grid-dir",
-                            str(root / "grids"),
-                            "--model-dir",
-                            "/weights/Pro",
-                            "--result-root",
-                            str(root / "results"),
-                            "--skip-reuse-validation",
-                        ]
-                    ),
-                    0,
-                )
-                self.assertIn(
-                    "--test_arg=--cache_skip_reuse_validation",
-                    run.call_args.args[0],
-                )
-
-    def test_directory_writer_and_serial_runner(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            grids = root / "grids"
-            main(
-                [
-                    "--output-dir",
-                    str(grids),
                     "--num-cases",
                     "3",
                     "--batch-sizes",
@@ -225,51 +206,83 @@ class RandomBatchGridTest(unittest.TestCase):
                     "16",
                 ]
             )
-            files = sorted(grids.glob("*.json"))
-            self.assertEqual(len(files), 2)
-            inspected = [inspect_grid(path) for path in files]
-            self.assertEqual(inspected[0]["max_seq_len"], inspected[1]["max_seq_len"])
-            runner_args = [
+            profile = self.profile(root)
+            argv = [
                 "--grid-dir",
-                str(grids),
-                "--model-dir",
-                "/weights/Pro",
+                str(root / "grids"),
+                "--profile",
+                str(profile),
                 "--result-root",
                 str(root / "results"),
                 "--output-base",
                 str(root / "bazel"),
-                "--mega-moe-se",
-                "0",
+                "--skip-reuse-validation",
             ]
-            with patch(
-                "rtp_llm.test.perf_test.cache_grid.runner.run_random_batch_grids.subprocess.run"
+            with patch.dict("os.environ", {}, clear=True), patch(
+                "rtp_llm.test.perf_test.cache_grid.runner.cache_perf.subprocess.run"
             ) as run:
                 run.return_value.returncode = 0
-                self.assertEqual(run_main(runner_args + ["--dry-run"]), 0)
+                self.assertEqual(run_main(argv + ["--dry-run"]), 0)
                 run.assert_not_called()
                 self.assertFalse((root / "results").exists())
-                self.assertEqual(run_main(runner_args), 0)
+                self.assertEqual(run_main(argv), 0)
                 self.assertEqual(run.call_count, 2)
-                for call, plan in zip(run.call_args_list, inspected):
+                for call in run.call_args_list:
                     command = call.args[0]
-                    self.assertEqual(command[1], f"--output_base={root / 'bazel'}")
-                    self.assertEqual(command[2], "test")
-                    self.assertIn("--test_env=DSV4_USE_MEGA_MOE_SE=0", command)
-                    self.assertIn("--test_env=DSV4_USE_MEGA_MOE=1", command)
-                    self.assertIn(
-                        f"--test_arg=--max_seq_len={plan['max_seq_len']}", command
-                    )
-                    self.assertIn(
-                        "--test_arg=--max_context_batch_size=1",
-                        command,
-                    )
-                    self.assertNotIn("--test_arg=--cache_shared_seed", command)
+                    self.assertIn("--config=cuda12", command)
+                    self.assertNotIn("--config=sm10x", command)
+                    self.assertIn("--test_arg=--cache_skip_reuse_validation", command)
+                    self.assertNotIn("--test_arg=--cache_fixed_workspace", command)
+                    self.assertNotIn("DSV4", " ".join(command))
+                    self.assertNotIn("deepseek", " ".join(command))
             manifest = json.loads((root / "results" / "batch_runs.json").read_text())
-            self.assertEqual(
-                [p["status"] for p in manifest["runs"]], ["completed", "completed"]
-            )
+            self.assertEqual([p["status"] for p in manifest["runs"]], ["completed"] * 2)
+            for plan in manifest["runs"]:
+                result = Path(plan["result_dir"])
+                saved = json.loads((result / "profile.snapshot.json").read_text())
+                self.assertEqual(saved["engine"]["model_type"], "qwen_2")
+                self.assertEqual(saved["engine"]["tp_size"], 1)
+                self.assertTrue((result / "cache_perf_launch.json").exists())
+                self.assertTrue((result / "grid.snapshot.json").exists())
             with self.assertRaises(SystemExit):
-                run_main(runner_args)
+                run_main(argv)
+
+    def test_model_specific_environment_is_explicit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            main(
+                [
+                    "--output-dir",
+                    str(root / "grids"),
+                    "--num-cases",
+                    "1",
+                    "--batch-sizes",
+                    "1",
+                ]
+            )
+            profile = self.profile(root, "deepseek_v4", {"DSV4_USE_MEGA_MOE": "1"})
+            with patch.dict("os.environ", {}, clear=True), patch(
+                "rtp_llm.test.perf_test.cache_grid.runner.cache_perf.subprocess.run"
+            ) as run:
+                run.return_value.returncode = 0
+                self.assertEqual(
+                    run_main(
+                        [
+                            "--grid-dir",
+                            str(root / "grids"),
+                            "--profile",
+                            str(profile),
+                            "--result-root",
+                            str(root / "results"),
+                            "--env",
+                            "DSV4_USE_MEGA_MOE_SE=0",
+                        ]
+                    ),
+                    0,
+                )
+                command = run.call_args.args[0]
+                self.assertIn("--test_env=DSV4_USE_MEGA_MOE=1", command)
+                self.assertIn("--test_env=DSV4_USE_MEGA_MOE_SE=0", command)
 
     def test_runner_stops_on_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -286,15 +299,15 @@ class RandomBatchGridTest(unittest.TestCase):
                 ]
             )
             with patch(
-                "rtp_llm.test.perf_test.cache_grid.runner.run_random_batch_grids.subprocess.run"
+                "rtp_llm.test.perf_test.cache_grid.runner.cache_perf.subprocess.run"
             ) as run:
                 run.return_value.returncode = 3
                 code = run_main(
                     [
                         "--grid-dir",
                         str(root / "grids"),
-                        "--model-dir",
-                        "/weights/Pro",
+                        "--profile",
+                        str(self.profile(root)),
                         "--result-root",
                         str(root / "results"),
                     ]
@@ -306,12 +319,12 @@ class RandomBatchGridTest(unittest.TestCase):
                 [p["status"] for p in manifest["runs"]], ["failed", "pending"]
             )
 
-    def test_probe_length_floor_and_mixed_batch_rejection(self):
+    def test_generic_inspection_and_mixed_batch_rejection(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "grid.json"
-            case = {"case_id": 0, "batch_size": 1, "input_len": 256, "cache_len": 0}
+            case = {"case_id": 0, "batch_size": 1, "input_len": 524288, "cache_len": 64}
             path.write_text(json.dumps({"cases": [case]}))
-            self.assertEqual(inspect_grid(path)["max_seq_len"], 1048576)
+            self.assertEqual(inspect_grid(path)["batch_size"], 1)
             path.write_text(json.dumps({"cases": [case, {**case, "batch_size": 2}]}))
             with self.assertRaisesRegex(ValueError, "mixed batch"):
                 inspect_grid(path)

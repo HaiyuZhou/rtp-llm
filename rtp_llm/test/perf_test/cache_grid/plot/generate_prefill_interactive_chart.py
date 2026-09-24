@@ -316,18 +316,50 @@ def apply_z_metric(
     return enriched
 
 
-def detect_cards(input_path: Path) -> float | None:
-    """Read tp_size from an embedded run_config, when present."""
+def profile_cards(profile: dict | None) -> float | None:
+    """Use total workers, or TP x DP x PP; EP/CP are not extra GPU factors."""
+    engine = (profile or {}).get("engine") or {}
+
+    def count(value):
+        parsed = number(value)
+        if (
+            isinstance(value, bool)
+            or parsed is None
+            or parsed <= 0
+            or not parsed.is_integer()
+        ):
+            raise ValueError("profile GPU counts must be positive integers")
+        return parsed
+
+    if "world_size" in engine:
+        return count(engine["world_size"])
+    if any(key in engine for key in ("tp_size", "dp_size", "pp_size")):
+        return math.prod(
+            count(engine.get(key, 1)) for key in ("tp_size", "dp_size", "pp_size")
+        )
+    return None
+
+
+def detect_cards(input_path: Path, profile: dict | None = None) -> float | None:
+    """Prefer profile topology, then legacy result run_config metadata."""
+    cards = profile_cards(profile)
+    if cards is not None:
+        return cards
     try:
         data = json.loads(input_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict):
         return None
+    cards = profile_cards(extract_embedded_profile(data))
+    if cards is not None:
+        return cards
     run_config = data.get("run_config")
     if not isinstance(run_config, dict):
         return None
     engine = run_config.get("engine", {})
+    if "world_size" in engine:
+        return profile_cards({"engine": engine})
     tp_size = number(engine.get("tp_size"))
     if tp_size is None or tp_size <= 0:
         # tp_size often only survives inside the engine's CLI args.
@@ -382,7 +414,8 @@ def main() -> None:
         default=None,
         help=(
             "Accelerator count used to normalize TPM to per-card throughput. "
-            "Defaults to tp_size from the input's embedded run_config; use 1 "
+            "Defaults to profile engine.world_size (or TP x DP x PP), then "
+            "legacy run_config tp_size; use 1 "
             "to keep the whole-system TPM."
         ),
     )
@@ -462,7 +495,7 @@ def main() -> None:
                     else profile_fingerprint(profile)
                 )
 
-    model_label = resolve_label(profile, args.model_label, "DeepSeek-V4-Pro")
+    model_label = resolve_label(profile, args.model_label, "Model")
 
     rows = load_rows(args.input, args.batch_size, all_runs=args.all_runs)
     if not rows:
@@ -472,11 +505,16 @@ def main() -> None:
     z_key = z_spec["key"]
     cards = 1.0
     if args.z_metric != "rt":
-        cards = (
-            args.cards if args.cards is not None else (detect_cards(args.input) or 1.0)
-        )
-        if cards <= 0:
-            parser.error("--cards must be greater than 0")
+        try:
+            cards = (
+                args.cards
+                if args.cards is not None
+                else (detect_cards(args.input, profile) or 1.0)
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        if not math.isfinite(cards) or cards <= 0 or not cards.is_integer():
+            parser.error("--cards must be a positive integer")
     rows = apply_z_metric(rows, args.z_metric, cards=cards)
     if not rows:
         parser.error(f"no usable rows for z_metric={args.z_metric} in {args.input}")

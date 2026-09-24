@@ -456,7 +456,7 @@ nvidia-smi
 
 ```bash
 cd /data0/luoli.hn/work/rtp_llm_4/dsv4-cache-affinity-1OIKUM
-FIT=rtp_llm/test/perf_test/cache_grid/formula/deepseek_v4_prefill_formula_fit.py
+FIT=rtp_llm/test/perf_test/cache_grid/formula/prefill_formula_fit.py
 DATA=/path/to/cache_grid_results.json
 OUT=/path/to/formula_output
 
@@ -587,40 +587,34 @@ Y=observed cached tokens、Z=TTFT。
 
 ### 一条命令完成测试、拟合和绘图
 
-`run_cache_grid_pipeline` 会先运行 cache-grid 测试，并且只在
-`cache_grid_results.json` 标记为完整后依次生成拟合公式、静态 SVG 和可旋转的
-HTML 三维图。cache 请求默认使用 `dashsc_input_ids`，直接通过 Dash-SC gRPC
-发送已经校验的 INT32 token IDs；需要兼容旧链路时可显式传
-`--cache_request_transport=http_prompt`。`--` 后的参数原样转发给 cache runner：
+`tools/cache_perf pipeline` 通过与 `run` 相同的 Bazel、环境与快照接口执行测试，
+只在 `cache_grid_results.json` 标记为完整后生成公式、SVG 和 HTML。
+模型、并行度、cache geometry 和专用环境变量统一放入本机 profile：
 
 ```bash
-bazelisk run //rtp_llm/test/perf_test:run_cache_grid_pipeline \
-  --config=cuda13 --config=sm10x -- \
-  --cache-grid-json=/path/to/cache_grid_128.json \
-  --result-dir=/path/to/results \
-  --profile=rtp_llm/test/perf_test/cache_grid/config/dsv4_pro_prefill.json \
-  --estimator=median \
-  -- \
-  --cache_measure_runs=3 \
-  --cache_commit_tail_tokens=4096 \
-  --expected_cache_block_size=4096
+./tools/cache_perf pipeline --config cuda13 --config sm10x \
+  --grid /path/to/cache_grid_128.json \
+  --result-dir /path/to/results \
+  --profile /path/to/local.jsonc --runs 3 --estimator median
 ```
 
 默认产物为：
 
 ```text
 results/cache_grid_results.json
-results/formula/deepseek_v4_prefill_formula.txt
+results/formula/DeepSeek-V4-Pro_prefill_formula.txt
 results/formula/fit_report.json
 results/formula/fit_gap.svg
 results/prefill_3d.svg
 results/prefill_cold_miss.svg
 results/prefill_3d.interactive.html
+results/prefill_tpm_per_card.interactive.html
 results/pipeline_summary.json
 ```
 
-模型和并行参数可以由 `--profile` 提供，也可以放在第二个 `--` 后传给 runner。
-已有完整测试结果需要重新拟合或绘图时，加 `--skip-test`。拟合质量门禁不通过时，
+模型和并行参数由 `--profile` 提供，后处理读取冻结快照，不再转发末尾 runner 参数。
+已有完整结果使用 `./tools/cache_perf pipeline --skip-test --result-dir /path/to/results`；
+续测后处理使用 `./tools/cache_perf pipeline --test-mode resume --result-dir /path/to/results`。拟合质量门禁不通过时，
 脚本仍会生成 SVG 和 HTML，但最终返回拟合脚本的非零状态，并在
 `pipeline_summary.json` 中记录 `fit_rejected`。
 
@@ -639,8 +633,9 @@ results/pipeline_summary.json
 3. **输入中嵌入的 profile**（结果 JSON 的 `profile` 键，不传 `--profile` 时自动继承）
 4. **Legacy 默认值**（之前的硬编码值）
 
-不传 `--profile` 时，所有输出文件与 profile 化之前的版本字节一致——不会多出
-额外的键，也不会改变文件名。
+当前 profile 不再配置 `chart`：模型名称取顶层 `model_label`，图表标题自动生成。
+公式文件名由 `model_label` 拼接为 `DeepSeek-V4-Pro_prefill_formula.txt`，key 为 `PREFILL_TIME_FORMULA`，token 单位为 1024；
+cold 标注阈值使用代码默认值 1048575。旧结果快照中的 `chart` 配置仍兼容读取。
 
 ### 使用示例
 
@@ -660,13 +655,13 @@ bazelisk test //rtp_llm/test/perf_test:cache_grid_perf_test \
   --test_arg=--decode_test_length=1 \
   --test_arg=--expected_cache_block_size=4096
 
-# 拟合公式（profile 提供 token_unit、model_label 等）
-python3 deepseek_v4_prefill_formula_fit.py fit \
+# 拟合公式（profile 提供模型名称，其他输出参数使用代码默认值）
+python3 prefill_formula_fit.py fit \
   --inputs cache_grid_results.json --output-dir formula/ \
   --profile $PROFILE --estimator min
 
 # 异常分析
-python3 deepseek_v4_prefill_formula_fit.py analyze-anomalies \
+python3 prefill_formula_fit.py analyze-anomalies \
   --inputs cache_grid_results.json --output-dir anomalies/ \
   --profile $PROFILE --estimator min
 ```

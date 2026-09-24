@@ -5,7 +5,7 @@ Examples::
 
   python3 generate_prefill_3d_chart.py \
     --input /path/Prefill_Result.final.json \
-    --output /tmp/deepseek_v4_prefill_3d.svg --batch-size 1
+    --output /tmp/prefill_3d.svg --batch-size 1
 
 The plot has exactly three data coordinates: X=compute tokens, Y=cached
 tokens, Z=measured prefill RT (TTFT) in milliseconds. Every usable row for the
@@ -96,7 +96,7 @@ def _run_rt(run: dict[str, Any]) -> float | None:
 
 
 def load_rows(path: pathlib.Path, batch_size: int) -> list[dict[str, float]]:
-    """Load DSV4 grid JSON or a compatible predictions CSV."""
+    """Load cache-grid JSON or a compatible predictions CSV."""
     rows: list[dict[str, float]] = []
     if path.suffix.lower() == ".csv":
         with path.open(newline="", encoding="utf-8") as handle:
@@ -122,7 +122,7 @@ def load_rows(path: pathlib.Path, batch_size: int) -> list[dict[str, float]]:
     for item in metrics:
         # GridRunner records failed requests and cache-seed mismatches in the
         # same JSON as successful measurements.  Never plot those as if they
-        # were DSV4 observations; they would create a visually plausible but
+        # were measured observations; they would create a visually plausible but
         # invalid cache surface.
         status = str(item.get("status", "")).lower()
         if status and status not in {
@@ -499,7 +499,10 @@ def data_metrics(path: pathlib.Path) -> list[Any]:
 
 
 def render_cold_miss_2d(
-    rows: list[dict[str, float]], source: pathlib.Path, batch_size: int
+    rows: list[dict[str, float]],
+    source: pathlib.Path,
+    batch_size: int,
+    model_label: str = "Model",
 ) -> str:
     """Render the cache-miss sequence-length trend as a readable 2-D SVG.
 
@@ -557,7 +560,7 @@ def render_cold_miss_2d(
 .axis{{font-size:20px;fill:#334155;font-weight:600}} .tick{{font-size:15px;fill:#475569}}
 .paneltitle{{font-size:23px;font-weight:700}} .body{{font-size:17px;fill:#334155}}
 .note{{font-size:15px;fill:#64748b}}</style>
-<text x="70" y="55" class="title">DeepSeek-V4-Pro：Cache miss 的 seq_len–RT 趋势</text>
+<text x="70" y="55" class="title">{esc_text(model_label)}：Cache miss 的 seq_len–RT 趋势</text>
 <text x="70" y="88" class="sub">BS={batch_size} · observed cache_len=0 · 每个 seq_len 使用三次成功测量的中位 prefill RT / TTFT</text>"""
     ]
     out.append(line(x0, y1, x1, y1, "#0f172a", 2))
@@ -691,7 +694,7 @@ def render_clean(
     source: pathlib.Path,
     batch_size: int,
     *,
-    title: str = "DeepSeek-V4-Pro Prefill — readable 3D view",
+    title: str = "Model Prefill — readable 3D view",
     annotate_cold_threshold: int = 1_048_575,
 ) -> str:
     """Render a legible 3-D view without the old dense drop-line clutter.
@@ -1043,7 +1046,7 @@ def main() -> None:
                     else profile_fingerprint(profile)
                 )
 
-    model_label = resolve_label(profile, args.model_label, "DeepSeek-V4-Pro")
+    model_label = resolve_label(profile, args.model_label, "Model")
     default_title = f"{model_label} Prefill — readable 3D view"
     title = resolve_title(profile, args.title, default_title)
     cold_threshold = args.annotate_cold_threshold
@@ -1070,7 +1073,8 @@ def main() -> None:
         f"{args.output.stem}_cold_miss{args.output.suffix}"
     )
     cold_output.write_text(
-        render_cold_miss_2d(rows, args.input, args.batch_size), encoding="utf-8"
+        render_cold_miss_2d(rows, args.input, args.batch_size, model_label),
+        encoding="utf-8",
     )
     print(
         json.dumps(

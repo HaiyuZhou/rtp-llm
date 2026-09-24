@@ -218,6 +218,104 @@ class CachePerfTest(unittest.TestCase):
                 {},
             )
 
+    def test_launch_v2_stores_profile_and_environment_once(self):
+        plan = self.save_run()
+        raw = json.loads(plan["artifacts"][cli.MANIFEST])
+        self.assertEqual(raw["schema_version"], 2)
+        self.assertNotIn("profile", raw)
+        self.assertEqual(raw["profile_file"], "profile.snapshot.json")
+        self.assertFalse(any(a.startswith("--engine_env=") for a in raw["runner_args"]))
+        saved = cli.load_saved(self.result)
+        self.assertEqual(saved["profile"], load_profile(self.profile))
+        for key, value in saved["env"].items():
+            self.assertEqual(
+                saved["runner_args"].count(f"--engine_env={key}={value}"), 1
+            )
+
+    def test_v1_launch_manifest_remains_replayable(self):
+        plan = self.save_run()
+        saved = cli.load_saved(self.result)
+        saved["schema_version"] = 1
+        saved.pop("profile_file")
+        (self.result / cli.MANIFEST).write_text(json.dumps(saved))
+        replay = cli.build_plan(self.args("resume", explicit=False), {})
+        before = [a for a in plan["command"] if a.startswith("--test_env=")]
+        after = [a for a in replay["command"] if a.startswith("--test_env=")]
+        self.assertEqual(before, after)
+        self.assertEqual(replay["artifacts"], {})
+
+    def test_compact_test_info_preserves_attempts_and_resume_fingerprint(self):
+        from rtp_llm.test.perf_test.batch_decode_test import (
+            _build_cache_resume_config,
+            _write_test_info,
+            parse_args,
+        )
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            resume_config_fingerprint,
+        )
+
+        plan = self.save_run()
+        saved = cli.load_saved(self.result)
+        args, remaining = parse_args(saved["runner_args"])
+        with patch.dict("os.environ", saved["env"], clear=True):
+            config = _build_cache_resume_config(
+                args, remaining, list(saved["env"]), 4096
+            )
+            for status in ("running", "completed", "running", "completed"):
+                _write_test_info(
+                    args,
+                    remaining,
+                    list(saved["env"]),
+                    status=status,
+                    expected_cache_block_size=4096,
+                    resume_config=config,
+                )
+        text = (self.result / "test_info.json").read_text()
+        info = json.loads(text)
+        self.assertEqual(info["schema_version"], 4)
+        self.assertEqual(info["attempt_count"], 2)
+        self.assertEqual(info["status"], "completed")
+        self.assertEqual(
+            info["resume_config_sha256"], resume_config_fingerprint(config)
+        )
+        for field in (
+            "engine_env_names",
+            "engine_environment",
+            "engine_args",
+            "argv",
+            "resume_config",
+            "profile",
+        ):
+            self.assertNotIn(field, info)
+        self.assertNotIn("DSV4_CHUNK_TOKENS", text)
+        self.assertEqual(
+            info["config_file_sha256"][cli.MANIFEST],
+            cli.sha(plan["artifacts"][cli.MANIFEST]),
+        )
+        resumed = cli.build_plan(self.args("resume", explicit=False), {})
+        self.assertEqual(resumed["summary"]["environment"], saved["env"])
+        resumed_args = [
+            a[len("--test_arg=") :]
+            for a in resumed["command"]
+            if a.startswith("--test_arg=")
+        ]
+        new_args, new_remaining = parse_args(resumed_args)
+        with patch.dict("os.environ", saved["env"], clear=True):
+            new_config = _build_cache_resume_config(
+                new_args, new_remaining, list(saved["env"]), 4096
+            )
+        self.assertEqual(
+            resume_config_fingerprint(new_config), resume_config_fingerprint(config)
+        )
+        raw = json.loads((self.result / cli.MANIFEST).read_text())
+        raw["env"]["DSV4_CHUNK_TOKENS"] = "999"
+        (self.result / cli.MANIFEST).write_text(json.dumps(raw))
+        with self.assertRaisesRegex(ValueError, "saved configuration changed"):
+            cli.load_saved(self.result)
+        (self.result / cli.MANIFEST).unlink()
+        with self.assertRaisesRegex(ValueError, "compact test_info requires"):
+            cli.load_saved(self.result)
+
     def test_run_refuses_existing_results(self):
         self.save_run()
         with self.assertRaisesRegex(ValueError, "empty/new"):

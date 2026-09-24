@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from rtp_llm.test.perf_test.cache_grid.formula.deepseek_v4_prefill_formula_fit import (
+from rtp_llm.test.perf_test.cache_grid.formula.prefill_formula_fit import (
     Observation,
     build_parser,
 )
@@ -25,7 +25,7 @@ from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
 class RestrictedSymbolicLibraryTest(unittest.TestCase):
     def test_library_is_versioned_and_flexlb_compatible(self):
         terms = build_candidate_library(65536)
-        self.assertEqual(LIBRARY_VERSION, "dsv4-restricted-v2")
+        self.assertEqual(LIBRARY_VERSION, "prefill-restricted-v2")
         self.assertEqual(len(terms), 67)
         expressions = " ".join(term.expression for term in terms)
         self.assertNotIn("log1p", expressions)
@@ -74,15 +74,16 @@ class RestrictedSymbolicLibraryTest(unittest.TestCase):
         rows = []
         for index in range(1, 61):
             input_len = index * 4096
-            compute_units = input_len / 65536.0
+            cache_len = input_len * (index % 4) // 4
+            compute_units = (input_len - cache_len) / 65536.0
             rows.append(
                 Observation(
                     batch_size=1,
                     input_len=input_len,
-                    cache_len=0,
+                    cache_len=cache_len,
                     target_ms=20.0 + 7.5 * compute_units,
                     source=f"synthetic:{index}",
-                    requested_cache_len=0,
+                    requested_cache_len=cache_len,
                 )
             )
         model = fit_restricted_symbolic(
@@ -155,7 +156,7 @@ class RestrictedSymbolicCliTest(unittest.TestCase):
             self.assertEqual(
                 report["symbolic_search"]["library_version"], LIBRARY_VERSION
             )
-            formula = (output_dir / "deepseek_v4_prefill_formula.txt").read_text()
+            formula = (output_dir / "Model_prefill_formula.txt").read_text()
             self.assertNotIn("log1p", formula)
             self.assertNotIn("**", formula)
 

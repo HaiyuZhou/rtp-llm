@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from rtp_llm.test.perf_test.cache_grid.formula.deepseek_v4_prefill_formula_fit import (
+from rtp_llm.test.perf_test.cache_grid.formula.prefill_formula_fit import (
     DEFAULT_TOKEN_UNIT,
     FEATURE_NAMES,
     Observation,
@@ -25,7 +25,7 @@ from rtp_llm.test.perf_test.cache_grid.formula.deepseek_v4_prefill_formula_fit i
 )
 
 
-class DeepseekV4PrefillFormulaFitTest(unittest.TestCase):
+class PrefillFormulaFitTest(unittest.TestCase):
 
     def test_features_use_compute_and_hit_tokens(self) -> None:
         row = Observation(
@@ -268,11 +268,40 @@ class RunFitTest(unittest.TestCase):
             self.assertIsNone(report["profile"])
             self.assertIsNone(report["profile_sha256"])
             self.assertEqual(report["token_unit"], DEFAULT_TOKEN_UNIT)
-            self.assertTrue((output_dir / "deepseek_v4_prefill_formula.txt").exists())
-            formula_content = (
-                output_dir / "deepseek_v4_prefill_formula.txt"
-            ).read_text()
+            self.assertTrue((output_dir / "Model_prefill_formula.txt").exists())
+            formula_content = (output_dir / "Model_prefill_formula.txt").read_text()
             self.assertTrue(formula_content.startswith("PREFILL_TIME_FORMULA="))
+
+    def test_default_filename_uses_top_level_model_label(self):
+        for label, filename in (
+            ("DeepSeek-V4-Pro", "DeepSeek-V4-Pro_prefill_formula.txt"),
+            ("../Qwen/Model", "Qwen_Model_prefill_formula.txt"),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                source = root / "results.json"
+                _write_cache_grid_result(source, _make_observations(40))
+                profile = root / "profile.json"
+                profile.write_text(
+                    json.dumps({"schema_version": 1, "model_label": label})
+                )
+                output = root / "formula"
+                args = build_parser().parse_args(
+                    [
+                        "fit",
+                        "--inputs",
+                        str(source),
+                        "--output-dir",
+                        str(output),
+                        "--profile",
+                        str(profile),
+                        "--min-valid-rows",
+                        "6",
+                    ]
+                )
+                self.assertIn(run_fit(args), (0, 3))
+                self.assertTrue((output / filename).is_file())
+                self.assertEqual(len(list(output.glob("*.txt"))), 1)
 
     def test_fit_with_profile(self):
         rows = _make_observations(40)
@@ -313,6 +342,9 @@ class RunFitTest(unittest.TestCase):
             self.assertIn(exit_code, (0, 3))
             report = json.loads((output_dir / "fit_report.json").read_text())
             self.assertEqual(report["model"], "Test Model")
+            gap = (output_dir / "fit_gap.svg").read_text()
+            self.assertIn("Test Model", gap)
+            self.assertNotIn("DeepSeek", gap)
             self.assertIsNotNone(report["profile"])
             self.assertIsNotNone(report["profile_sha256"])
             self.assertEqual(report["token_unit"], 2048)

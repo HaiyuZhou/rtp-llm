@@ -245,7 +245,7 @@ def resolve_label(
     cli_model_label: Optional[str],
     default: str,
 ) -> str:
-    """Resolve a display label: CLI > profile.chart.model_label > default."""
+    """Resolve a display label: CLI > chart label > profile label > engine model type > default."""
     if cli_model_label is not None and cli_model_label != "":
         return cli_model_label
     if profile is not None:
@@ -253,6 +253,12 @@ def resolve_label(
         raw = chart.get("model_label")
         if raw is not None and raw != "":
             return str(raw)
+        for raw in (
+            profile.get("model_label"),
+            engine_section(profile).get("model_type"),
+        ):
+            if raw is not None and raw != "":
+                return str(raw)
     return default
 
 

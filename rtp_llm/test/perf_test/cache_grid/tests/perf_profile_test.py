@@ -193,8 +193,18 @@ class ResolveTest(unittest.TestCase):
         profile = {"schema_version": 1, "chart": {"model_label": "P"}}
         self.assertEqual(resolve_label(profile, None, "D"), "P")
 
+    def test_resolve_label_uses_model_metadata(self):
+        profile = {"schema_version": 1, "engine": {"model_type": "qwen_2"}}
+        self.assertEqual(resolve_label(profile, None, "Model"), "qwen_2")
+        profile["model_label"] = "My Model"
+        self.assertEqual(resolve_label(profile, None, "Model"), "My Model")
+        profile["chart"] = {"model_label": "Chart Model"}
+        self.assertEqual(resolve_label(profile, None, "Model"), "Chart Model")
+        self.assertEqual(resolve_label(profile, "CLI", "Model"), "CLI")
+
     def test_resolve_label_default_when_none(self):
         self.assertEqual(resolve_label(None, None, "D"), "D")
+        self.assertEqual(resolve_label({"engine": None}, None, "D"), "D")
 
     def test_resolve_title(self):
         profile = {"schema_version": 1, "chart": {"title": "PT"}}

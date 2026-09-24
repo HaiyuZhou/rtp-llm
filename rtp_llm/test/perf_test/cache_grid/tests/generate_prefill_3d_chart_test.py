@@ -6,6 +6,7 @@ from pathlib import Path
 from rtp_llm.test.perf_test.cache_grid.plot.generate_prefill_3d_chart import (
     load_rows,
     render_clean,
+    render_cold_miss_2d,
 )
 
 
@@ -46,14 +47,21 @@ class GeneratePrefill3dChartTest(unittest.TestCase):
         self.assertIn("cached tokens (Y)", svg)
         self.assertIn("TTFT / prefill RT (Z, ms)", svg)
 
-    def test_default_title_is_dsv4_pro(self):
+    def test_cold_chart_uses_escaped_model_label(self):
+        rows = [{"input": 1024.0, "compute": 1024.0, "cache": 0.0, "rt": 10.0}]
+        svg = render_cold_miss_2d(rows, Path("results.json"), 1, "Qwen <test>")
+        self.assertIn("Qwen &lt;test&gt;", svg)
+        self.assertNotIn("DeepSeek", svg)
+
+    def test_default_title_is_generic(self):
         payload = _sample_payload()
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "results.json"
             source.write_text(json.dumps(payload), encoding="utf-8")
             rows = load_rows(source, 1)
             svg = render_clean(rows, source, 1)
-        self.assertIn("DeepSeek-V4-Pro Prefill", svg)
+        self.assertIn("Model Prefill", svg)
+        self.assertNotIn("DeepSeek", svg)
 
     def test_custom_title(self):
         payload = _sample_payload()

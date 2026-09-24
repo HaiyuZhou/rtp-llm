@@ -27,13 +27,19 @@ def round_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+def _input_limit(args, batch):
+    if args.workspace_policy == FIXED_POLICY:
+        return input_limit(batch)
+    return args.max_batch_tokens // batch
+
+
 def generate_grid(args: argparse.Namespace) -> dict:
     if args.num_cases <= 0 or not args.batch_sizes or min(args.batch_sizes) <= 0:
         raise ValueError("num-cases and batch-sizes must be positive")
     if args.input_alignment <= 0 or args.cache_alignment <= 0:
         raise ValueError("alignments must be positive")
-    if not 0 < args.min_input_tokens <= args.max_input_tokens <= MAX_REQUEST_TOKENS:
-        raise ValueError("input bounds must satisfy 0 < min <= max <= 262144 (256K)")
+    if not 0 < args.min_input_tokens <= args.max_input_tokens:
+        raise ValueError("input bounds must satisfy 0 < min <= max")
     if args.commit_tail_tokens <= 0 or args.commit_tail_tokens % args.cache_alignment:
         raise ValueError(
             "commit-tail-tokens must be a positive multiple of cache-alignment"
@@ -44,7 +50,10 @@ def generate_grid(args: argparse.Namespace) -> dict:
         args.kv_budget_tokens is not None and args.kv_budget_tokens <= 0
     ):
         raise ValueError("token budgets must be positive")
-    if args.max_batch_tokens > WORKSPACE_TOKENS:
+    if (
+        args.workspace_policy == FIXED_POLICY
+        and args.max_batch_tokens > WORKSPACE_TOKENS
+    ):
         raise ValueError("max-batch-tokens cannot exceed fixed workspace 1048576")
     minimum = round_up(args.min_input_tokens, args.input_alignment)
     maximum = args.max_input_tokens // args.input_alignment * args.input_alignment
@@ -53,9 +62,9 @@ def generate_grid(args: argparse.Namespace) -> dict:
     if minimum > maximum:
         raise ValueError("input range contains no aligned length")
     for batch in args.batch_sizes:
-        if minimum > input_limit(batch):
+        if minimum > _input_limit(args, batch):
             raise ValueError(
-                f"batch={batch} cannot fit minimum inputs in fixed workspace"
+                f"batch={batch} cannot fit minimum inputs in the configured token capacity"
             )
         if batch * minimum > args.max_batch_tokens:
             raise ValueError(
@@ -83,7 +92,7 @@ def generate_grid(args: argparse.Namespace) -> dict:
             remaining = batch - index - 1
             upper = min(
                 maximum,
-                input_limit(batch),
+                _input_limit(args, batch),
                 args.max_batch_tokens - input_sum - remaining * minimum,
             )
             if args.kv_budget_tokens is not None:
@@ -136,19 +145,20 @@ def generate_grid(args: argparse.Namespace) -> dict:
         raise ValueError(
             "not enough distinct batches; reduce num-cases or widen input bounds"
         )
-    validate_fixed_workspace(
-        cases,
-        commit_tail=args.commit_tail_tokens,
-        block=block,
-        token_budget=args.max_batch_tokens,
-    )
+    if args.workspace_policy == FIXED_POLICY:
+        validate_fixed_workspace(
+            cases,
+            commit_tail=args.commit_tail_tokens,
+            block=block,
+            token_budget=args.max_batch_tokens,
+        )
     return {
         "schema_version": 2,
         "kind": "random_independent_cache_batch",
         "generator": {
             "name": "generate_random_batch_grid",
-            "version": 2,
-            "workspace_policy": FIXED_POLICY,
+            "version": 3,
+            "workspace_policy": args.workspace_policy,
             "seed": args.seed,
             "alignment": args.input_alignment,
             "cache_alignment": block,
@@ -172,6 +182,12 @@ def parse_args(argv=None):
     output.add_argument("--output-dir", type=Path)
     parser.add_argument(
         "--batch-input-limit", action="append", default=[], metavar="B:TOKENS"
+    )
+    parser.add_argument(
+        "--workspace-policy",
+        choices=("none", FIXED_POLICY),
+        default="none",
+        help="Optional legacy CP8/1M workspace preset; ordinary grids use token budgets",
     )
     parser.add_argument("--num-cases", type=int, default=100)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[2, 4, 8])
@@ -199,8 +215,8 @@ def build_plans(args):
         return [(args.output, generate_grid(args))]
     if not args.batch_sizes or min(args.batch_sizes) <= 0:
         raise ValueError("batch-sizes must be positive")
-    if not 0 < args.max_input_tokens <= MAX_REQUEST_TOKENS:
-        raise ValueError("max-input-tokens must be between 1 and 262144")
+    if args.max_input_tokens <= 0:
+        raise ValueError("max-input-tokens must be positive")
     limits = {}
     for item in args.batch_input_limit:
         try:
@@ -222,7 +238,7 @@ def build_plans(args):
         local.max_input_tokens = limits.get(
             batch, min(args.max_input_tokens, args.max_batch_tokens // batch)
         )
-        local.max_input_tokens = min(local.max_input_tokens, input_limit(batch))
+        local.max_input_tokens = min(local.max_input_tokens, _input_limit(args, batch))
         local.max_input_tokens = (
             local.max_input_tokens // args.input_alignment * args.input_alignment
         )

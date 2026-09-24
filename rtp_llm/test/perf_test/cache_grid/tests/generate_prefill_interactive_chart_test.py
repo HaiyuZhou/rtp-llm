@@ -13,6 +13,7 @@ from rtp_llm.test.perf_test.cache_grid.plot.generate_prefill_interactive_chart i
     number,
     observed_cache_len,
     prefill_rt,
+    profile_cards,
     representative_levels,
     representative_slice,
 )
@@ -367,6 +368,91 @@ class ZMetricTest(unittest.TestCase):
             "Effective TPM per card (Z, tokens/min)",
             figure.layout.scene.zaxis.title.text,
         )
+
+    def test_main_all_run_tpm_uses_explicit_profile_world_size(self):
+        payload = {
+            "run_config": {"engine": {"tp_size": 8}},
+            "metrics": [
+                {
+                    "batch_size": 1,
+                    "input_len": 2048,
+                    "cache_len_requested": 512,
+                    "cache_len_observed": [512, 512, 512],
+                    "measure_runs": 3,
+                    "success_runs": 3,
+                    "status": "ok",
+                    "runs": [
+                        {"success": True, "reuse_len": 512, "prefill_time_ms": rt}
+                        for rt in (10.0, 20.0, 30.0)
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "results.json"
+            source.write_text(json.dumps(payload), encoding="utf-8")
+            profile = Path(directory) / "profile.json"
+            profile.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "engine": {"world_size": 16, "tp_size": 8, "ep_size": 8},
+                    }
+                )
+            )
+            with patch(
+                "sys.argv",
+                [
+                    "chart",
+                    "--input",
+                    str(source),
+                    "--z-metric",
+                    "tpm-effective",
+                    "--profile",
+                    str(profile),
+                    "--all-runs",
+                ],
+            ), patch(
+                "plotly.graph_objects.Figure.write_html", autospec=True
+            ) as write_html:
+                main()
+        figure = write_html.call_args.args[0]
+        points = next(trace for trace in figure.data if trace.name == "measurements")
+        self.assertEqual(len(points.z), 3)
+        for value, rt in zip(points.z, (10.0, 20.0, 30.0)):
+            self.assertAlmostEqual(value, 2048 * 60000 / rt / 16.0)
+        self.assertIn(
+            "Effective TPM per card (Z, tokens/min)",
+            figure.layout.scene.zaxis.title.text,
+        )
+
+    def test_profile_card_topology(self):
+        self.assertEqual(
+            profile_cards({"engine": {"world_size": 8, "tp_size": 8, "ep_size": 8}}), 8
+        )
+        self.assertEqual(
+            profile_cards(
+                {"engine": {"tp_size": 2, "dp_size": 4, "pp_size": 2, "ep_size": 8}}
+            ),
+            16,
+        )
+        self.assertIsNone(profile_cards({}))
+        for value in (0, -1, 1.5, "nan", True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                profile_cards({"engine": {"world_size": value}})
+
+    def test_embedded_profile_precedes_legacy_tp_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "results.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "profile": {"schema_version": 1, "engine": {"world_size": 16}},
+                        "run_config": {"engine": {"tp_size": 8}},
+                    }
+                )
+            )
+            self.assertEqual(detect_cards(source), 16)
 
     def test_main_explicit_cards_one_keeps_system_tpm(self):
         payload = {

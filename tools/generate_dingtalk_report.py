@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a DingTalk-friendly DOCX/PDF bundle from a DSV4 Markdown report."""
+"""Build a DingTalk-friendly DOCX/PDF bundle from a performance Markdown report."""
 
 from __future__ import annotations
 
@@ -18,11 +18,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-json", type=Path, required=True)
     parser.add_argument("--font", type=Path, required=True)
     parser.add_argument("--expected-runs", type=int, default=None)
+    parser.add_argument("--model-label", default="Model")
     return parser.parse_args()
 
 
 def add_chart_previews(
-    report_dir: Path, source_json: Path, expected_runs: int | None
+    report_dir: Path,
+    source_json: Path,
+    expected_runs: int | None,
+    model_label: str = "Model",
 ) -> dict[str, Path]:
     import matplotlib
 
@@ -78,7 +82,9 @@ def add_chart_previews(
         axis.set_xlabel("Uncached compute tokens (K)")
         axis.set_ylabel("Observed cached tokens (K)")
         axis.set_zlabel(label)
-        axis.set_title(f"DSV4 Flash Prefill — {label} — all {len(rows):,} formal runs")
+        axis.set_title(
+            f"{model_label} Prefill — {label} — all {len(rows):,} formal runs"
+        )
         axis.view_init(elev=24, azim=-128)
         colorbar = fig.colorbar(scatter, ax=axis, shrink=0.62, pad=0.08)
         colorbar.set_label(f"log10({label})")
@@ -259,7 +265,9 @@ def add_inline_runs(paragraph: Any, text: str) -> None:
             paragraph.add_run(chunk)
 
 
-def build_docx(report_dir: Path, elements: Iterable[tuple[Any, ...]]) -> Path:
+def build_docx(
+    report_dir: Path, elements: Iterable[tuple[Any, ...]], model_label: str = "Model"
+) -> Path:
     from docx import Document
     from docx.enum.section import WD_SECTION
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -343,9 +351,9 @@ def build_docx(report_dir: Path, elements: Iterable[tuple[Any, ...]]) -> Path:
 
     footer = section.footer.paragraphs[0]
     footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    footer.add_run("DSV4 Flash Prefill 全量测试分析 · DingTalk delivery copy")
+    footer.add_run(f"{model_label} Prefill 全量测试分析 · DingTalk delivery copy")
     output = report_dir / "REPORT_DINGTALK.docx"
-    document.core_properties.title = "DSV4 Flash Prefill 全量测试分析"
+    document.core_properties.title = f"{model_label} Prefill 全量测试分析"
     document.core_properties.subject = "DingTalk-ready report with embedded charts"
     document.save(output)
     return output
@@ -501,12 +509,12 @@ def main() -> int:
     args = parse_args()
     report_dir = args.report_dir.resolve()
     previews = add_chart_previews(
-        report_dir, args.source_json.resolve(), args.expected_runs
+        report_dir, args.source_json.resolve(), args.expected_runs, args.model_label
     )
     previews["fit"] = add_fit_gap_preview(report_dir)
     markdown = (report_dir / "REPORT.md").read_text(encoding="utf-8")
     elements = markdown_elements(markdown, report_dir, previews)
-    docx = build_docx(report_dir, elements)
+    docx = build_docx(report_dir, elements, args.model_label)
     pdf = build_pdf(report_dir, elements, args.font.resolve())
     update_manifest(report_dir, previews, [docx, pdf])
     result = {

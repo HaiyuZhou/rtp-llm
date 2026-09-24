@@ -1905,7 +1905,13 @@ class CacheGridRunner:
         # A start timeout can occur after activation. Attempt stop even on that
         # path, but never send the target unless start completed successfully.
         try:
-            self._nsys_command(record, "start", "--output=" + str(output))
+            self._nsys_command(
+                record,
+                "start",
+                "--sample=process-tree",
+                "--cpuctxsw=process-tree",
+                "--output=" + str(output),
+            )
             record["result"] = self._post_request(
                 prompts.run_texts[0],
                 prompts.run_ids[0],

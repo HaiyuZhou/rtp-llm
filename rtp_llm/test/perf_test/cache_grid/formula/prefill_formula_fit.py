@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Fit and audit a DeepSeek-V4-Pro prefill latency formula.
+"""Fit and audit a model prefill latency formula.
 
-The input is the raw ``cache_grid_results.json`` emitted by the DSV4
-prefill grid runner.  A grid file can contain successful measurements,
+The input is the raw ``cache_grid_results.json`` emitted by the cache-grid
+runner.  A grid file can contain successful measurements,
 failed requests, and successful requests whose cache seed was not actually
 reused.  This tool accepts a row only when the runner marks it successful and
 all measured reuse lengths exactly match the requested cache length.
@@ -10,12 +10,12 @@ all measured reuse lengths exactly match the requested cache length.
 * every requested measurement run succeeded;
 * every run has output length one and finite end-to-end TTFT;
 * observed reuse is constant and exactly matches the request; and
-* the selected batch size is fixed (the DSV4 Pro configuration uses 1).
+* the selected batch size is fixed.
 
 The exported expression uses the names and aggregate syntax implemented by
 ``PrefillTimeFormula``: ``computeTokens``, ``hitCacheTokens``, ``sum()``,
 numbers, arithmetic operators, and parentheses.  It does not invent an alias
-such as ``tokens``.  The DSV4-Pro measurements currently use batch size one;
+such as ``tokens``.  The default fit selects batch size one;
 ``sum()`` keeps the per-request terms well-defined if the same expression is
 evaluated through FlexLB's batch path.
 
@@ -32,10 +32,12 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import html
 import json
 import math
 import pathlib
 import random
+import re
 import statistics
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
@@ -702,7 +704,9 @@ def formula_text(
 
 
 def write_fit_gap_svg(
-    predictions: Sequence[dict[str, Any]], path: pathlib.Path
+    predictions: Sequence[dict[str, Any]],
+    path: pathlib.Path,
+    model_label: str = "Model",
 ) -> None:
     """Write an all-point measured-vs-predicted and absolute-error chart."""
     if not predictions:
@@ -747,7 +751,7 @@ def write_fit_gap_svg(
         ),
         (
             '<text x="900" y="48" text-anchor="middle" class="title">'
-            "DeepSeek-V4-Pro：实测 TTFT 与拟合误差</text>"
+            f"{html.escape(model_label)}：实测 TTFT 与拟合误差</text>"
         ),
         (
             f'<text x="900" y="82" text-anchor="middle" class="sub">'
@@ -907,15 +911,14 @@ def run_fit(args: argparse.Namespace) -> int:
         DEFAULT_TOKEN_UNIT,
     )
     names = build_feature_names(token_unit)
-    model_label = resolve_label(
-        profile, getattr(args, "model_label", None), "DeepSeek-V4-Pro"
-    )
+    model_label = resolve_label(profile, getattr(args, "model_label", None), "Model")
+    filename_label = re.sub(r"[^\w.-]+", "_", model_label).strip("._") or "Model"
     formula_filename = resolve_str(
         profile or {},
         "chart",
         "formula_filename",
         getattr(args, "formula_filename", None),
-        "deepseek_v4_prefill_formula.txt",
+        f"{filename_label}_prefill_formula.txt",
     )
     formula_key = resolve_str(
         profile or {},
@@ -1066,7 +1069,7 @@ def run_fit(args: argparse.Namespace) -> int:
         )
         writer.writeheader()
         writer.writerows(predictions)
-    write_fit_gap_svg(predictions, output / "fit_gap.svg")
+    write_fit_gap_svg(predictions, output / "fit_gap.svg", model_label)
     report = {
         "schema_version": 1,
         "model": model_label,
@@ -1128,9 +1131,7 @@ def run_validate(args: argparse.Namespace) -> int:
     profile = None
     if getattr(args, "profile", None):
         profile = load_profile(args.profile)
-    model_label = resolve_label(
-        profile, getattr(args, "model_label", None), "DeepSeek-V4-Pro"
-    )
+    model_label = resolve_label(profile, getattr(args, "model_label", None), "Model")
     rows, audit = load_observations(
         [pathlib.Path(value) for value in args.inputs],
         batch_size=args.batch_size,
@@ -1167,9 +1168,7 @@ def run_analyze_anomalies(args: argparse.Namespace) -> int:
     profile = None
     if getattr(args, "profile", None):
         profile = load_profile(args.profile)
-    model_label = resolve_label(
-        profile, getattr(args, "model_label", None), "DeepSeek-V4-Pro"
-    )
+    model_label = resolve_label(profile, getattr(args, "model_label", None), "Model")
 
     token_unit = resolve_int(
         profile or {},

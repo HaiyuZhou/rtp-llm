@@ -37,6 +37,10 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     resolve_label,
     resolve_title,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    MetricFormatError,
+    single_request_metric,
+)
 
 QUERY_DENSITY_PALETTE = ("#dbeafe", "#93c5fd", "#60a5fa", "#2563eb", "#1e3a8a")
 
@@ -120,6 +124,12 @@ def load_rows(path: pathlib.Path, batch_size: int) -> list[dict[str, float]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     metrics = data.get("metrics", data.get("results", []))
     for item in metrics:
+        if not isinstance(item, dict) or int(item.get("batch_size", 1)) != batch_size:
+            continue
+        try:
+            item = single_request_metric(item)
+        except MetricFormatError:
+            continue
         # GridRunner records failed requests and cache-seed mismatches in the
         # same JSON as successful measurements.  Never plot those as if they
         # were measured observations; they would create a visually plausible but

@@ -33,6 +33,10 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     resolve_label,
     resolve_title,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    MetricFormatError,
+    single_request_metric,
+)
 
 
 def number(value: Any) -> float | None:
@@ -65,9 +69,12 @@ def observed_cache_len(item: dict[str, Any]) -> float | None:
 
 def prefill_rt(item: dict[str, Any]) -> float | None:
     for key in (
+        "median_ttft_ms",
+        "avg_ttft_ms",
+        "ttft_ms",
+        "client_wall_time_ms",
         "avg_prefill_time",
         "target_ms",
-        "ttft_ms",
         "prefill_time_ms",
         "prefill_ms",
     ):
@@ -78,7 +85,7 @@ def prefill_rt(item: dict[str, Any]) -> float | None:
     runs = item.get("runs")
     if isinstance(runs, list):
         values = [
-            number(run.get("prefill_time_ms"))
+            run_prefill_rt(run)
             for run in runs
             if isinstance(run, dict) and run.get("success", True)
         ]
@@ -89,7 +96,7 @@ def prefill_rt(item: dict[str, Any]) -> float | None:
 
 
 def run_prefill_rt(run: dict[str, Any]) -> float | None:
-    for key in ("prefill_time_ms", "ttft_ms", "total_time_ms"):
+    for key in ("ttft_ms", "client_wall_time_ms", "prefill_time_ms", "total_time_ms"):
         value = number(run.get(key))
         if value is not None:
             return value
@@ -109,6 +116,10 @@ def load_rows(
         if not isinstance(item, dict):
             continue
         if int(number(item.get("batch_size", 1)) or 1) != batch_size:
+            continue
+        try:
+            item = single_request_metric(item)
+        except MetricFormatError:
             continue
         status = str(item.get("status", "")).lower()
         if status and status not in {

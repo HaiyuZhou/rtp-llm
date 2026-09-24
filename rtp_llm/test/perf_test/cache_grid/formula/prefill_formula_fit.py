@@ -60,6 +60,11 @@ from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
     PARSER_PER_REQUEST_VARIABLES,
     fit_restricted_symbolic,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    MetricFormatError,
+    request_runs,
+    single_request_metric,
+)
 
 DEFAULT_TOKEN_UNIT = 1024
 
@@ -273,7 +278,7 @@ def load_observations(
                 else []
             )
             if isinstance(item, dict)
-            for run in item.get("runs", [])
+            for run in request_runs(item)
             if isinstance(run, dict) and run.get("ttft_source")
         }
         if len(file_sources) > 1:
@@ -300,6 +305,12 @@ def load_observations(
             batch = _integer(item.get("batch_size")) or 1
             if batch != batch_size:
                 rejected["batch_size"] = rejected.get("batch_size", 0) + 1
+                continue
+            try:
+                item = single_request_metric(item)
+            except MetricFormatError as error:
+                reason = str(error)
+                rejected[reason] = rejected.get(reason, 0) + 1
                 continue
             input_len = _integer(item.get("input_len"))
             cache_len = _integer(item.get("cache_len_requested"))

@@ -359,7 +359,11 @@ class CacheGridBatchTest(unittest.TestCase):
             case = self.case()
             runner = CacheGridRunner(12345, _WordTokenizer(), [case], tmp)
             runner._results[runner.case_key(case)] = {
+                **normalize_cache_case(case),
                 "case_key": runner.case_key(case),
+                "measure_runs": 3,
+                "success_runs": 3,
+                "runs": [],
                 "status": "ok",
             }
             runner._save(complete=True)
@@ -1706,11 +1710,22 @@ class CacheGridRunnerStoreTest(unittest.TestCase):
 
 class CacheGridRunnerResumeGuardTest(unittest.TestCase):
     def _write_existing_results(self, result_dir, payload):
-        import json
-
         path = Path(result_dir) / "cache_grid_results.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        checkpoint = {
+            "schema_version": 2,
+            "mode": "prefix_cache_grid",
+            "seed_mode": "independent",
+            "grid_sha256": None,
+            "profile_sha256": None,
+            "run_config_sha256": None,
+            "measure_runs": 3,
+            "cache_commit_tail_tokens": 4096,
+            "expected_block_size": 0,
+            "request_transport": "http_prompt",
+            **payload,
+        }
+        path.write_text(json.dumps(checkpoint), encoding="utf-8")
 
     def test_resume_with_matching_results_succeeds(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1771,6 +1786,21 @@ class CacheGridRunnerResumeGuardTest(unittest.TestCase):
                     "metrics": [
                         {
                             "case_key": "bs1_seq1024_cache512",
+                            "batch_size": 1,
+                            "input_len": 1024,
+                            "cache_len_requested": 512,
+                            "measure_runs": 3,
+                            "success_runs": 3,
+                            "runs": [
+                                {
+                                    "success": True,
+                                    "ttft_ms": 5,
+                                    "input_len": 1024,
+                                    "output_len": 1,
+                                    "reuse_len": 512,
+                                }
+                            ]
+                            * 3,
                             "status": "ok",
                         }
                     ],
@@ -1846,12 +1876,27 @@ class CacheGridRunnerResumeGuardTest(unittest.TestCase):
                     "metrics": [
                         {
                             "case_key": "bs1_seq8_cache0",
+                            "batch_size": 1,
+                            "input_len": 8,
+                            "cache_len_requested": 0,
+                            "measure_runs": 1,
+                            "success_runs": 1,
+                            "runs": [
+                                {
+                                    "success": True,
+                                    "ttft_ms": 5,
+                                    "input_len": 8,
+                                    "output_len": 1,
+                                    "reuse_len": 0,
+                                }
+                            ],
                             "case_id": 0,
                             "status": "ok",
                         }
                     ],
                     "measure_runs": 1,
                     "request_transport": "http_prompt",
+                    "cache_commit_tail_tokens": 4,
                     "started_at": "2026-09-08T00:00:00+0800",
                 },
             )
@@ -1890,6 +1935,20 @@ class CacheGridRunnerResumeGuardTest(unittest.TestCase):
             first._save(complete=False)
             metric = {
                 "case_key": first.case_key(cases[0]),
+                "batch_size": 1,
+                "input_len": 8,
+                "cache_len_requested": 0,
+                "measure_runs": 1,
+                "success_runs": 1,
+                "runs": [
+                    {
+                        "success": True,
+                        "ttft_ms": 5,
+                        "input_len": 8,
+                        "output_len": 1,
+                        "reuse_len": 0,
+                    }
+                ],
                 "case_id": 0,
                 "status": "ok",
             }

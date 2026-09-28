@@ -21,8 +21,10 @@ from rtp_llm.test.perf_test.cache_grid.plot.generate_prefill_interactive_chart i
     representative_slice,
 )
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    current_metrics,
     finite_number,
     integer,
+    status_ok,
 )
 
 REQUIRED_CSV_COLUMNS = (
@@ -245,21 +247,16 @@ def aggregate_production_csvs(
     return rows, summary, global_reservoir
 
 
-def _metric_status_ok(item: dict[str, Any]) -> bool:
-    status = str(item.get("status", "")).lower()
-    return not status or status in {"ok", "success", "passed"}
-
-
 def _benchmark_metric(
     item: dict[str, Any], batch_size: int
 ) -> tuple[BenchmarkPoint | None, str | None]:
-    if integer(item.get("batch_size", 1)) != batch_size:
+    if integer(item.get("batch_size")) != batch_size:
         return None, "different_batch_size"
-    if not _metric_status_ok(item):
+    if not status_ok(item):
         return None, "status_not_ok"
-    input_len = integer(item.get("input_len", item.get("seq_len")))
-    requested_cache = integer(item.get("cache_len_requested", item.get("cache_len", 0)))
-    expected_runs = integer(item.get("measure_runs")) or 3
+    input_len = integer(item.get("input_len"))
+    requested_cache = integer(item.get("cache_len_requested"))
+    expected_runs = integer(item.get("measure_runs"))
     success_runs = integer(item.get("success_runs"))
     runs = item.get("runs")
     if input_len is None or requested_cache is None:
@@ -274,20 +271,9 @@ def _benchmark_metric(
         return None, "incomplete_runs"
     if success_runs != expected_runs:
         return None, "success_runs_mismatch"
-    observed = item.get("cache_len_observed")
-    observed_values = (
-        [integer(value) for value in observed] if isinstance(observed, list) else []
-    )
-    observed_values = [value for value in observed_values if value is not None]
-    if len(observed_values) != expected_runs:
-        observed_values = []
-        for run in runs:
-            if not isinstance(run, dict):
-                return None, "invalid_run"
-            value = integer(run.get("reuse_len"))
-            if value is None:
-                return None, "missing_observed_reuse"
-            observed_values.append(value)
+    observed_values = [integer(run.get("reuse_len")) for run in runs]
+    if any(value is None for value in observed_values):
+        return None, "missing_observed_reuse"
     if len(set(observed_values)) != 1:
         return None, "observed_reuse_not_constant"
     cache_len = observed_values[0]
@@ -313,9 +299,7 @@ def load_benchmark(
     path: Path, batch_size: int
 ) -> tuple[list[BenchmarkPoint], dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8"))
-    metrics = data.get("metrics") if isinstance(data, dict) else None
-    if not isinstance(metrics, list):
-        raise ValueError(f"{path}: expected a JSON object containing metrics[]")
+    metrics = current_metrics(data, str(path))
     grouped: defaultdict[tuple[int, int], list[float]] = defaultdict(list)
     rejected: Counter[str] = Counter()
     selected = 0

@@ -1140,3 +1140,10 @@ py_test(
     srcs = ["cache_grid/tests/result_schema_test.py"],
     deps = [":perf_test_lib"],
 )
+
+py_test(
+    name = "migrate_cache_perf_test",
+    main = "cache_grid/tests/migrate_cache_perf_test.py",
+    srcs = ["cache_grid/tests/migrate_cache_perf_test.py"],
+    deps = [":perf_test_lib"],
+)

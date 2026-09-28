@@ -20,8 +20,8 @@ such as ``tokens``.  The default fit selects batch size one;
 evaluated through FlexLB's batch path.
 
 New runner output uses client HTTP wall time with ``max_new_tokens=1`` as
-TTFT.  The server's ``first_token_cost_time`` is retained for diagnostics and
-is used only as a backward-compatible fallback for legacy inputs.
+TTFT.  The server's ``first_token_cost_time`` is retained only for diagnostics;
+historical input formats must be migrated before fitting.
 
 The report keeps the fit and the production gate separate: a formula can be
 useful for analysis while still failing a tail-error gate.
@@ -60,7 +60,10 @@ from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
     PARSER_PER_REQUEST_VARIABLES,
     fit_restricted_symbolic,
 )
-from rtp_llm.test.perf_test.cache_grid.runner.result_schema import MetricFormatError
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    MetricFormatError,
+    current_metrics,
+)
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
     finite_number as _finite,
 )
@@ -121,13 +124,13 @@ def _median_run_time(
     runs = item.get("runs")
     if not isinstance(runs, list) or not runs:
         return None, None, "missing_runs"
-    expected_runs = _integer(item.get("measure_runs")) or 3
+    expected_runs = _integer(item.get("measure_runs"))
     success_runs = _integer(item.get("success_runs"))
     if success_runs != expected_runs or len(runs) != expected_runs:
         return None, None, "incomplete_runs"
     values: list[float] = []
     input_len = _integer(item.get("input_len"))
-    requested_cache_len = _integer(item.get("cache_len_requested")) or 0
+    requested_cache_len = _integer(item.get("cache_len_requested"))
     if item.get("reuse_exact") is False and not item.get(
         "reuse_validation_skipped", False
     ):
@@ -146,12 +149,7 @@ def _median_run_time(
         run_input = _integer(run.get("input_len"))
         output_len = _integer(run.get("output_len"))
         reuse_len = _integer(run.get("reuse_len"))
-        latency = _finite(
-            run.get(
-                "ttft_ms",
-                run.get("client_wall_time_ms", run.get("prefill_time_ms")),
-            )
-        )
+        latency = _finite(run.get("ttft_ms"))
         if run_input != input_len or output_len != 1:
             return None, None, "request_shape_mismatch"
         if reuse_len != cache_len:
@@ -160,18 +158,6 @@ def _median_run_time(
             return None, None, "invalid_latency"
         values.append(latency)
     return _run_time_statistic(values, estimator), cache_len, None
-
-
-def _iter_json_metrics(path: pathlib.Path) -> Iterable[tuple[int, dict[str, Any]]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    metrics = (
-        data.get("metrics", data.get("results", [])) if isinstance(data, dict) else []
-    )
-    if not isinstance(metrics, list):
-        raise ValueError(f"{path}: expected a JSON object containing metrics[]")
-    for index, item in enumerate(metrics):
-        if isinstance(item, dict):
-            yield index, item
 
 
 def load_observations(
@@ -187,35 +173,26 @@ def load_observations(
     for path in paths:
         if path.suffix.lower() == ".csv":
             with path.open(newline="", encoding="utf-8") as stream:
-                rows = list(csv.DictReader(stream))
+                reader = csv.DictReader(stream)
+                if not {"batch_size", "input_len", "cache_len", "target_ms"} <= set(
+                    reader.fieldnames or []
+                ):
+                    raise ValueError(
+                        f"{path}: expected current observation CSV columns; migrate legacy CSV first"
+                    )
+                rows = list(reader)
             source_count = len(rows)
             for index, item in enumerate(rows, 2):
-                batch = _integer(item.get("batch_size")) or 1
+                batch = _integer(item.get("batch_size"))
                 if batch != batch_size:
                     rejected["batch_size"] = rejected.get("batch_size", 0) + 1
                     continue
                 input_len = _integer(item.get("input_len"))
-                cache_len = (
-                    _integer(item.get("cache_len_requested", item.get("cache_len")))
-                    or 0
-                )
-                target = _finite(
-                    item.get(
-                        "avg_ttft_ms",
-                        item.get(
-                            "ttft_ms",
-                            item.get(
-                                "client_wall_time_ms",
-                                item.get(
-                                    "avg_prefill_time_ms",
-                                    item.get("prefill_time_ms", item.get("target_ms")),
-                                ),
-                            ),
-                        ),
-                    )
-                )
+                cache_len = _integer(item.get("cache_len"))
+                target = _finite(item.get("target_ms"))
                 if (
                     input_len is None
+                    or cache_len is None
                     or cache_len < 0
                     or cache_len >= input_len
                     or target is None
@@ -241,13 +218,10 @@ def load_observations(
             continue
 
         json_payload = json.loads(path.read_text(encoding="utf-8"))
+        metrics = current_metrics(json_payload, str(path))
         file_sources = {
             str(run.get("ttft_source"))
-            for item in (
-                json_payload.get("metrics", json_payload.get("results", []))
-                if isinstance(json_payload, dict)
-                else []
-            )
+            for item in metrics
             if isinstance(item, dict)
             for run in request_runs(item)
             if isinstance(run, dict) and run.get("ttft_source")
@@ -268,12 +242,12 @@ def load_observations(
         if contract:
             measurement_contracts.add(contract)
         source_count = 0
-        for index, item in _iter_json_metrics(path):
+        for index, item in enumerate(metrics):
             source_count += 1
             if not _status_ok(item):
                 rejected["status"] = rejected.get("status", 0) + 1
                 continue
-            batch = _integer(item.get("batch_size")) or 1
+            batch = _integer(item.get("batch_size"))
             if batch != batch_size:
                 rejected["batch_size"] = rejected.get("batch_size", 0) + 1
                 continue
@@ -1058,10 +1032,7 @@ def run_fit(args: argparse.Namespace) -> int:
         "model_family": model_family,
         "backend": backend,
         "objective": objective_name,
-        "target": (
-            f"{args.estimator} of successful client TTFT runs; falls back to "
-            "server prefill_time_ms only for legacy input"
-        ),
+        "target": (f"{args.estimator} of successful per-request client ttft_ms"),
         "formula": formula,
         "token_unit": token_unit,
         "formula_compatibility": formula_compatibility,

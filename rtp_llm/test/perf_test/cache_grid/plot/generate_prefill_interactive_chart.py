@@ -216,7 +216,7 @@ def main() -> None:
         help=(
             "Accelerator count used to normalize TPM to per-card throughput. "
             "Defaults to profile engine.world_size (or TP x DP x PP), then "
-            "legacy run_config tp_size; use 1 "
+            "recorded run_config topology; use 1 "
             "to keep the whole-system TPM."
         ),
     )

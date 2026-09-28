@@ -134,7 +134,16 @@ class RestrictedSymbolicCliTest(unittest.TestCase):
             )
         with tempfile.TemporaryDirectory() as tmpdir:
             result_path = Path(tmpdir) / "cache_grid_results.json"
-            result_path.write_text(json.dumps({"metrics": metrics}), encoding="utf-8")
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mode": "prefix_cache_grid",
+                        "metrics": metrics,
+                    }
+                ),
+                encoding="utf-8",
+            )
             output_dir = Path(tmpdir) / "formula"
             args = build_parser().parse_args(
                 [

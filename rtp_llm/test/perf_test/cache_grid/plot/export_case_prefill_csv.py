@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import current_metrics
+
 
 @dataclass(frozen=True)
 class ResultSource:
@@ -45,15 +47,7 @@ def parse_case_ids(values: Iterable[str]) -> list[int]:
 
 
 def _metrics_from_payload(payload: Any, path: Path) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        metrics = payload
-    elif isinstance(payload, dict):
-        metrics = payload.get("metrics", payload.get("results"))
-    else:
-        metrics = None
-    if not isinstance(metrics, list):
-        raise ValueError(f"{path}: expected a top-level metrics/results list")
-    return [item for item in metrics if isinstance(item, dict)]
+    return current_metrics(payload, str(path))
 
 
 def _safe_label(value: str) -> str:
@@ -172,7 +166,9 @@ def _case_metadata(item: dict[str, Any], context: str) -> dict[str, Any]:
     elif observed is not None:
         reuse_values.append(observed)
     if not any(value is not None for value in reuse_values):
-        reuse_values.extend([item.get("expected_reuse_len"), item.get("cache_len_requested")])
+        reuse_values.extend(
+            [item.get("expected_reuse_len"), item.get("cache_len_requested")]
+        )
     reuse_len = _consistent_integer(reuse_values, "reuse_len", context)
 
     return {
@@ -192,7 +188,7 @@ def _prefill_values(item: dict[str, Any], run_count: int) -> list[Any]:
             values.append("")
             continue
         run = runs[index]
-        value = run.get("prefill_time_ms") if run.get("success", True) else None
+        value = run.get("prefill_time_ms") if run.get("success") is True else None
         values.append("" if value is None else value)
     return values
 

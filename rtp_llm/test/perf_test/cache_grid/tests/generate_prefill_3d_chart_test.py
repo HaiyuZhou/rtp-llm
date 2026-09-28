@@ -12,6 +12,8 @@ from rtp_llm.test.perf_test.cache_grid.plot.generate_prefill_3d_chart import (
 
 def _sample_payload():
     return {
+        "schema_version": 2,
+        "mode": "prefix_cache_grid",
         "metrics": [
             {
                 "batch_size": 1,
@@ -25,12 +27,12 @@ def _sample_payload():
                     {
                         "success": True,
                         "reuse_len": 256,
-                        "prefill_time_ms": value,
+                        "ttft_ms": value,
                     }
                     for value in (9.0, 10.0, 11.0)
                 ],
             }
-        ]
+        ],
     }
 
 
@@ -82,7 +84,7 @@ class GeneratePrefill3dChartTest(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "results.json"
-            source.write_text(json.dumps({"metrics": rows}), encoding="utf-8")
+            source.write_text(json.dumps(_sample_payload()), encoding="utf-8")
             svg = render_clean(rows, source, 1)
         self.assertEqual(svg.count('data-query-density="3"'), 3)
         self.assertEqual(svg.count('data-query-density="1"'), 1)
@@ -93,6 +95,8 @@ class GeneratePrefill3dChartTest(unittest.TestCase):
 
     def test_annotate_cold_threshold(self):
         payload = {
+            "schema_version": 2,
+            "mode": "prefix_cache_grid",
             "metrics": [
                 {
                     "batch_size": 1,
@@ -106,12 +110,12 @@ class GeneratePrefill3dChartTest(unittest.TestCase):
                         {
                             "success": True,
                             "reuse_len": 0,
-                            "prefill_time_ms": value,
+                            "ttft_ms": value,
                         }
                         for value in (50.0, 51.0, 52.0)
                     ],
                 }
-            ]
+            ],
         }
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "results.json"

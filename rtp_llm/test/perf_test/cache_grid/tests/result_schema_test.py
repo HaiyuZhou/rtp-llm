@@ -74,7 +74,15 @@ class GroupedSingleRequestTest(unittest.TestCase):
             original = copy.deepcopy(item)
             with self.subTest(cached=cached), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "results.json"
-                path.write_text(json.dumps({"metrics": [item]}))
+                path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 2,
+                            "mode": "prefix_cache_grid",
+                            "metrics": [item],
+                        }
+                    )
+                )
                 observations, audit = load_observations([path])
                 self.assertEqual(audit["rejected_counts"], {})
                 self.assertEqual(audit["valid_observation_count"], 1)
@@ -122,7 +130,15 @@ class GroupedSingleRequestTest(unittest.TestCase):
                 with self.subTest(index=index):
                     item = grouped_metric()
                     mutate(item)
-                    path.write_text(json.dumps({"metrics": [item]}))
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 2,
+                                "mode": "prefix_cache_grid",
+                                "metrics": [item],
+                            }
+                        )
+                    )
                     observations, audit = load_observations([path])
                     self.assertEqual(observations, [])
                     self.assertEqual(sum(audit["rejected_counts"].values()), 1)
@@ -135,13 +151,21 @@ class GroupedSingleRequestTest(unittest.TestCase):
         item["request_groups"][0]["count"] = 2
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "results.json"
-            path.write_text(json.dumps({"metrics": [item]}))
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mode": "prefix_cache_grid",
+                        "metrics": [item],
+                    }
+                )
+            )
             observations, audit = load_observations([path], batch_size=2)
             self.assertEqual(observations, [])
             self.assertEqual(audit["rejected_counts"], {"unsupported_grouped_batch": 1})
             self.assertEqual(interactive_rows(path, 2, all_runs=True), [])
 
-    def test_legacy_rows_are_unchanged(self):
+    def test_scalar_rows_are_unchanged(self):
         item = {"batch_size": 1, "input_len": 100, "cache_len_requested": 0, "runs": []}
         self.assertIs(single_request_metric(item), item)
 
@@ -150,7 +174,15 @@ class GroupedSingleRequestTest(unittest.TestCase):
         item["runs"][0]["requests"][0]["ttft_source"] = "different_transport"
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "results.json"
-            path.write_text(json.dumps({"metrics": [item]}))
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mode": "prefix_cache_grid",
+                        "metrics": [item],
+                    }
+                )
+            )
             with self.assertRaisesRegex(ValueError, "mixed ttft_source"):
                 load_observations([path])
 
@@ -167,7 +199,15 @@ class ReaderPolicyTest(unittest.TestCase):
             run.update(reuse_len=2048, reuse_exact=False)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "results.json"
-            path.write_text(json.dumps({"metrics": [item]}))
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mode": "prefix_cache_grid",
+                        "metrics": [item],
+                    }
+                )
+            )
             self.assertEqual(load_observations([path])[0], [])
             self.assertEqual(static_rows(path, 1), [])
             rows = interactive_rows(path, 1)
@@ -180,17 +220,28 @@ class ReaderPolicyTest(unittest.TestCase):
             "input_len": 8192,
             "cache_len_requested": 0,
             "cache_len_observed": [0],
-            "ttft_ms": 10,
+            "status": "ok",
+            "measure_runs": 1,
+            "success_runs": 1,
+            "runs": [{"success": True, "reuse_len": 0, "ttft_ms": 10}],
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "results.json"
             for batch in (0, None, "invalid"):
                 with self.subTest(batch=batch):
                     item["batch_size"] = batch
-                    path.write_text(json.dumps({"metrics": [item]}))
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 2,
+                                "mode": "prefix_cache_grid",
+                                "metrics": [item],
+                            }
+                        )
+                    )
                     self.assertEqual(static_rows(path, 1), [])
 
-    def test_legacy_latency_field_precedence_remains_specific_to_each_chart(self):
+    def test_aggregate_only_legacy_metrics_require_migration(self):
         item = {
             "batch_size": 1,
             "input_len": 8192,
@@ -202,9 +253,18 @@ class ReaderPolicyTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "results.json"
-            path.write_text(json.dumps({"metrics": [item]}))
-            self.assertEqual(static_rows(path, 1)[0]["rt"], 20)
-            self.assertEqual(interactive_rows(path, 1)[0]["prefill_rt"], 30)
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mode": "prefix_cache_grid",
+                        "metrics": [item],
+                    }
+                )
+            )
+            for reader in (static_rows, interactive_rows):
+                with self.assertRaisesRegex(ValueError, "Migrate"):
+                    reader(path, 1)
 
 
 if __name__ == "__main__":

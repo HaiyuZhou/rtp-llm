@@ -1,4 +1,4 @@
-"""CPU-only adapters for measured cache-grid result formats."""
+"""Validation and shared readers for the current cache-grid result schema."""
 
 import math
 from collections import defaultdict
@@ -8,6 +8,76 @@ from typing import Any
 
 class MetricFormatError(ValueError):
     """A metric cannot be represented as a single-request observation."""
+
+
+RESULT_SCHEMA_VERSION = 2
+MIGRATION_HINT = "Migrate with: python3 tools/migrate_cache_perf results --help"
+CURRENT_STATUSES = {
+    "ok",
+    "invalid_reuse",
+    "invalid_shape",
+    "invalid_timing",
+    "failed",
+    "error",
+}
+
+
+def current_metrics(data, context="result"):
+    """Require the current result envelope; historical decoding belongs to migration."""
+    if (
+        not isinstance(data, dict)
+        or data.get("schema_version") != RESULT_SCHEMA_VERSION
+        or data.get("mode") != "prefix_cache_grid"
+        or not isinstance(data.get("metrics"), list)
+    ):
+        raise ValueError(
+            f"{context}: expected cache-grid result schema v2 (mode=prefix_cache_grid, metrics[]). {MIGRATION_HINT}"
+        )
+    for index, item in enumerate(data["metrics"]):
+        if (
+            not isinstance(item, dict)
+            or item.get("status") not in CURRENT_STATUSES
+            or "batch_size" not in item
+            or "input_len" not in item
+        ):
+            raise ValueError(
+                f"{context}: metric {index} has an unsupported format. {MIGRATION_HINT}"
+            )
+        if item["status"] == "error":
+            continue
+        if (
+            not isinstance(item.get("runs"), list)
+            or "measure_runs" not in item
+            or "success_runs" not in item
+        ):
+            raise ValueError(
+                f"{context}: metric {index} requires runs/measure_runs/success_runs. {MIGRATION_HINT}"
+            )
+        if "request_groups" not in item and "cache_len_requested" not in item:
+            raise ValueError(
+                f"{context}: metric {index} requires cache_len_requested. {MIGRATION_HINT}"
+            )
+        for round_ in item["runs"]:
+            if not isinstance(round_, dict) or (
+                "requests" in round_
+                and (
+                    not isinstance(round_["requests"], list)
+                    or any(not isinstance(r, dict) for r in round_["requests"])
+                )
+            ):
+                raise ValueError(
+                    f"{context}: metric {index} requires request objects. {MIGRATION_HINT}"
+                )
+        for run in request_runs(item):
+            if type(run.get("success")) is not bool:
+                raise ValueError(
+                    f"{context}: metric {index} requires explicit request success. {MIGRATION_HINT}"
+                )
+            if run.get("success") is True and "ttft_ms" not in run:
+                raise ValueError(
+                    f"{context}: metric {index} requires per-request ttft_ms; server prefill time is not client TTFT. {MIGRATION_HINT}"
+                )
+    return data["metrics"]
 
 
 def request_runs(item):
@@ -93,7 +163,7 @@ def single_request_metric(item):
             observed != cache or request.get("reuse_exact") is False
         ):
             raise MetricFormatError("requested_reuse_mismatch")
-        latency = request.get("ttft_ms", request.get("client_wall_time_ms"))
+        latency = request.get("ttft_ms")
         if (
             isinstance(latency, bool)
             or not isinstance(latency, (int, float))
@@ -133,39 +203,8 @@ def measurement_status(
     return "ok"
 
 
-SUCCESS_STATUSES = frozenset(("ok", "success", "passed"))
-DIAGNOSTIC_STATUSES = SUCCESS_STATUSES | {"unknown", "invalid_reuse"}
-STATIC_RUN_TIME_FIELDS = (
-    "ttft_ms",
-    "client_wall_time_ms",
-    "prefill_time_ms",
-    "prefill_ms",
-    "avg_prefill_time",
-    "first_token_time_ms",
-)
-STATIC_TIME_FIELDS = (
-    "median_ttft_ms",
-    "avg_ttft_ms",
-    "avg_prefill_time",
-    "target_ms",
-    "ttft_ms",
-)
-DIAGNOSTIC_RUN_TIME_FIELDS = (
-    "ttft_ms",
-    "client_wall_time_ms",
-    "prefill_time_ms",
-    "total_time_ms",
-)
-DIAGNOSTIC_TIME_FIELDS = (
-    "median_ttft_ms",
-    "avg_ttft_ms",
-    "ttft_ms",
-    "client_wall_time_ms",
-    "avg_prefill_time",
-    "target_ms",
-    "prefill_time_ms",
-    "prefill_ms",
-)
+SUCCESS_STATUSES = frozenset(("ok",))
+DIAGNOSTIC_STATUSES = SUCCESS_STATUSES | {"invalid_reuse"}
 
 
 def finite_number(value: Any) -> float | None:
@@ -182,77 +221,48 @@ def integer(value: Any) -> int | None:
 
 
 def status_ok(item, allowed=SUCCESS_STATUSES):
-    status = str(item.get("status", "")).lower()
-    return not status or status in allowed
-
-
-def first_number(item, fields):
-    for field in fields:
-        value = finite_number(item.get(field))
-        if value is not None:
-            return value
-    return None
+    return item.get("status") in allowed
 
 
 def observed_reuse_values(item, parse=finite_number):
-    """Read per-run reuse, falling back to runs when the observed list is empty."""
-    observed = item.get("cache_len_observed")
-    values = [parse(value) for value in observed] if isinstance(observed, list) else []
-    values = [value for value in values if value is not None]
-    if not values and isinstance(item.get("runs"), list):
-        values = [
-            parse(run.get("reuse_len")) for run in item["runs"] if isinstance(run, dict)
-        ]
-        values = [value for value in values if value is not None]
-    return values
-
-
-def aggregate_latency(item, fields, run_fields, *, successful_only=True):
-    value = first_number(item, fields)
-    if value is not None:
-        return value
-    runs = item.get("runs")
-    if isinstance(runs, list):
-        values = [
-            first_number(run, run_fields)
-            for run in runs
-            if isinstance(run, dict)
-            and (not successful_only or run.get("success", True))
-        ]
-        values = [value for value in values if value is not None]
-        if values:
-            return median(values)
-    return None
+    """Read the canonical per-request observed reuse values."""
+    return [
+        value
+        for run in request_runs(item)
+        if run.get("success") is True
+        and (value := parse(run.get("reuse_len"))) is not None
+    ]
 
 
 def consistent_value(values: list[float]) -> float | None:
     return values[0] if values and len(set(values)) == 1 else None
 
 
-def observed_cache_len(item: dict[str, Any]) -> float | None:
-    observed = item.get("cache_len_observed")
-    if isinstance(observed, list):
-        values = [finite_number(value) for value in observed if value is not None]
-        return consistent_value(values)
-    if observed is not None:
-        return finite_number(observed)
-
-    runs = item.get("runs")
-    if isinstance(runs, list):
-        values = [
-            finite_number(run.get("reuse_len")) for run in runs if isinstance(run, dict)
-        ]
-        values = [value for value in values if value is not None]
-        return consistent_value(values)
-    return None
+def observed_cache_len(item):
+    values = [
+        finite_number(run.get("reuse_len"))
+        for run in request_runs(item)
+        if run.get("success") is True
+    ]
+    return (
+        consistent_value(values) if all(value is not None for value in values) else None
+    )
 
 
 def prefill_rt(item):
-    return aggregate_latency(item, DIAGNOSTIC_TIME_FIELDS, DIAGNOSTIC_RUN_TIME_FIELDS)
+    values = [
+        run_prefill_rt(run) for run in request_runs(item) if run.get("success") is True
+    ]
+    return (
+        median(values)
+        if values and all(value is not None for value in values)
+        else None
+    )
 
 
 def run_prefill_rt(run):
-    return first_number(run, DIAGNOSTIC_RUN_TIME_FIELDS)
+    value = finite_number(run.get("ttft_ms"))
+    return value if value is not None and value > 0 else None
 
 
 def measurement_rows(data, batch_size, *, strict, all_runs=False):
@@ -262,22 +272,12 @@ def measurement_rows(data, batch_size, *, strict, all_runs=False):
     keep successful observations even when the requested cache was not hit.
     Fitting adds its stronger request-level checks separately.
     """
-    metrics = (
-        data if isinstance(data, list) else data.get("metrics", data.get("results", []))
-    )
+    metrics = current_metrics(data)
     rows = []
     for item in metrics:
         if not isinstance(item, dict):
             continue
-        selected_batch = (
-            item.get("batch_size", 1)
-            if strict
-            else (finite_number(item.get("batch_size", 1)) or 1)
-        )
-        try:
-            if int(selected_batch) != batch_size:
-                continue
-        except (TypeError, ValueError, OverflowError):
+        if integer(item["batch_size"]) != batch_size:
             continue
         try:
             item = single_request_metric(item)
@@ -285,7 +285,7 @@ def measurement_rows(data, batch_size, *, strict, all_runs=False):
             continue
         if not status_ok(item, SUCCESS_STATUSES if strict else DIAGNOSTIC_STATUSES):
             continue
-        input_len = finite_number(item.get("input_len", item.get("seq_len")))
+        input_len = finite_number(item["input_len"])
         if strict:
             if item.get("reuse_exact") is False and not item.get(
                 "reuse_validation_skipped", False
@@ -293,35 +293,25 @@ def measurement_rows(data, batch_size, *, strict, all_runs=False):
                 continue
             if item.get("success_runs") is not None:
                 try:
-                    if int(item["success_runs"]) != int(item.get("measure_runs", 3)):
+                    if int(item["success_runs"]) != int(item["measure_runs"]):
                         continue
                 except (TypeError, ValueError):
                     continue
-            cache_len = consistent_value(observed_reuse_values(item))
-            requested = finite_number(
-                item.get(
-                    "target_cache_len",
-                    item.get("cache_len_requested", item.get("cache_len")),
-                )
-            )
-            if cache_len != (requested if requested is not None else 0):
+            cache_len = observed_cache_len(item)
+            if cache_len != finite_number(item.get("cache_len_requested")):
                 continue
-            rt = aggregate_latency(
-                item, STATIC_TIME_FIELDS, STATIC_RUN_TIME_FIELDS, successful_only=False
-            )
         else:
             cache_len = observed_cache_len(item)
-            rt = prefill_rt(item)
+        rt = prefill_rt(item)
 
         runs = item.get("runs") if isinstance(item.get("runs"), list) else []
         if all_runs and runs:
             samples = []
             for index, run in enumerate(runs, 1):
-                if not isinstance(run, dict) or not run.get("success", True):
+                if not isinstance(run, dict) or not run.get("success") is True:
                     continue
-                reuse = finite_number(run.get("reuse_len"))
                 samples.append(
-                    (cache_len if reuse is None else reuse, run_prefill_rt(run), index)
+                    (finite_number(run.get("reuse_len")), run_prefill_rt(run), index)
                 )
         else:
             samples = [(cache_len, rt, None)]

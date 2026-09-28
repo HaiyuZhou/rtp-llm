@@ -232,17 +232,14 @@ class CachePerfTest(unittest.TestCase):
                 saved["runner_args"].count(f"--engine_env={key}={value}"), 1
             )
 
-    def test_v1_launch_manifest_remains_replayable(self):
-        plan = self.save_run()
+    def test_v1_launch_manifest_requires_migration(self):
+        self.save_run()
         saved = cli.load_saved(self.result)
         saved["schema_version"] = 1
         saved.pop("profile_file")
         (self.result / cli.MANIFEST).write_text(json.dumps(saved))
-        replay = cli.build_plan(self.args("resume", explicit=False), {})
-        before = [a for a in plan["command"] if a.startswith("--test_env=")]
-        after = [a for a in replay["command"] if a.startswith("--test_env=")]
-        self.assertEqual(before, after)
-        self.assertEqual(replay["artifacts"], {})
+        with self.assertRaisesRegex(ValueError, "Migrate"):
+            cli.build_plan(self.args("resume", explicit=False), {})
 
     def test_compact_test_info_preserves_attempts_and_resume_fingerprint(self):
         from rtp_llm.test.perf_test.batch_decode_test import (
@@ -313,7 +310,7 @@ class CachePerfTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "saved configuration changed"):
             cli.load_saved(self.result)
         (self.result / cli.MANIFEST).unlink()
-        with self.assertRaisesRegex(ValueError, "compact test_info requires"):
+        with self.assertRaisesRegex(ValueError, "current run requires"):
             cli.load_saved(self.result)
 
     def test_run_refuses_existing_results(self):
@@ -484,7 +481,7 @@ class CachePerfTest(unittest.TestCase):
         )
         self.assertEqual(args.cache_measure_runs, 3)
 
-    def test_legacy_metadata_retest(self):
+    def test_legacy_metadata_requires_explicit_migration(self):
         self.result.mkdir()
         info = {
             "argv": [
@@ -500,10 +497,10 @@ class CachePerfTest(unittest.TestCase):
             "profile": None,
         }
         (self.result / "test_info.json").write_text(json.dumps(info))
-        plan = cli.build_plan(
-            self.args("retest", extra=["--cases", "7"], explicit=False), {}
-        )
-        self.assertIn("--test_arg=--checkpoint_path=/model", plan["command"])
+        with self.assertRaisesRegex(ValueError, "Migrate"):
+            cli.build_plan(
+                self.args("retest", extra=["--cases", "7"], explicit=False), {}
+            )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ DeepSeek-V4-Pro across four scripts.  Every consumer resolves values through
 the same priority chain:
 
     CLI explicit (including explicit ``0``) > profile field > input result
-    metadata (embedded profile) > legacy default.
+    metadata (embedded profile) > built-in default.
 
 The fingerprint is ``sha256`` of the canonical JSON (sorted keys, no
 whitespace, ``ensure_ascii``).  Two profiles with the same observable

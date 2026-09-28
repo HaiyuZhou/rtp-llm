@@ -38,12 +38,12 @@ def _sample_metrics(statuses=None):
                 "success_runs": 3,
                 "status": status,
                 "runs": [
-                    {"success": True, "reuse_len": 512, "prefill_time_ms": 10.0 + idx}
+                    {"success": True, "reuse_len": 512, "ttft_ms": 10.0 + idx}
                     for _ in range(3)
                 ],
             }
         )
-    return {"metrics": metrics}
+    return {"schema_version": 2, "mode": "prefix_cache_grid", "metrics": metrics}
 
 
 class LoadRowsTest(unittest.TestCase):
@@ -65,6 +65,8 @@ class LoadRowsTest(unittest.TestCase):
 
     def test_deduplicates_by_geometry_median(self):
         payload = {
+            "schema_version": 2,
+            "mode": "prefix_cache_grid",
             "metrics": [
                 {
                     "batch_size": 1,
@@ -75,7 +77,7 @@ class LoadRowsTest(unittest.TestCase):
                     "success_runs": 3,
                     "status": "ok",
                     "runs": [
-                        {"success": True, "reuse_len": 512, "prefill_time_ms": rt}
+                        {"success": True, "reuse_len": 512, "ttft_ms": rt}
                         for rt in (9.0, 10.0, 11.0)
                     ],
                 },
@@ -88,11 +90,11 @@ class LoadRowsTest(unittest.TestCase):
                     "success_runs": 3,
                     "status": "ok",
                     "runs": [
-                        {"success": True, "reuse_len": 512, "prefill_time_ms": rt}
+                        {"success": True, "reuse_len": 512, "ttft_ms": rt}
                         for rt in (19.0, 20.0, 21.0)
                     ],
                 },
-            ]
+            ],
         }
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "results.json"
@@ -153,12 +155,15 @@ class AllRunsTest(unittest.TestCase):
                 "success_runs": 3,
                 "status": "ok",
                 "runs": [
-                    {"success": True, "reuse_len": 512, "prefill_time_ms": rt}
-                    for rt in rts
+                    {"success": True, "reuse_len": 512, "ttft_ms": rt} for rt in rts
                 ],
             }
 
-        payload = {"metrics": [metric((9.0, 10.0, 11.0)), metric((19.0, 20.0, 21.0))]}
+        payload = {
+            "schema_version": 2,
+            "mode": "prefix_cache_grid",
+            "metrics": [metric((9.0, 10.0, 11.0)), metric((19.0, 20.0, 21.0))],
+        }
         with tempfile.TemporaryDirectory() as directory:
             source = self._write(directory, payload)
             rows = load_rows(source, 1, all_runs=True)
@@ -172,6 +177,8 @@ class AllRunsTest(unittest.TestCase):
 
     def test_uses_run_level_reuse_len(self):
         payload = {
+            "schema_version": 2,
+            "mode": "prefix_cache_grid",
             "metrics": [
                 {
                     "batch_size": 1,
@@ -181,11 +188,9 @@ class AllRunsTest(unittest.TestCase):
                     "measure_runs": 1,
                     "success_runs": 1,
                     "status": "ok",
-                    "runs": [
-                        {"success": True, "reuse_len": 256, "prefill_time_ms": 10.0}
-                    ],
+                    "runs": [{"success": True, "reuse_len": 256, "ttft_ms": 10.0}],
                 }
-            ]
+            ],
         }
         with tempfile.TemporaryDirectory() as directory:
             source = self._write(directory, payload)
@@ -196,6 +201,8 @@ class AllRunsTest(unittest.TestCase):
 
     def test_skips_failed_runs(self):
         payload = {
+            "schema_version": 2,
+            "mode": "prefix_cache_grid",
             "metrics": [
                 {
                     "batch_size": 1,
@@ -206,11 +213,11 @@ class AllRunsTest(unittest.TestCase):
                     "success_runs": 1,
                     "status": "ok",
                     "runs": [
-                        {"success": True, "reuse_len": 512, "prefill_time_ms": 10.0},
-                        {"success": False, "reuse_len": 512, "prefill_time_ms": 99.0},
+                        {"success": True, "reuse_len": 512, "ttft_ms": 10.0},
+                        {"success": False, "reuse_len": 512, "ttft_ms": 99.0},
                     ],
                 }
-            ]
+            ],
         }
         with tempfile.TemporaryDirectory() as directory:
             source = self._write(directory, payload)
@@ -332,11 +339,18 @@ class ZMetricTest(unittest.TestCase):
     def test_detect_cards_missing_config(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "results.json"
-            source.write_text(json.dumps({"metrics": []}), encoding="utf-8")
+            source.write_text(
+                json.dumps(
+                    {"schema_version": 2, "mode": "prefix_cache_grid", "metrics": []}
+                ),
+                encoding="utf-8",
+            )
             self.assertIsNone(detect_cards(source))
 
     def test_main_per_card_tpm_uses_detected_tp_size(self):
         payload = {
+            "schema_version": 2,
+            "mode": "prefix_cache_grid",
             "run_config": {"engine": {"tp_size": 8}},
             "metrics": [
                 {
@@ -348,7 +362,7 @@ class ZMetricTest(unittest.TestCase):
                     "success_runs": 3,
                     "status": "ok",
                     "runs": [
-                        {"success": True, "reuse_len": 512, "prefill_time_ms": 10.0}
+                        {"success": True, "reuse_len": 512, "ttft_ms": 10.0}
                         for _ in range(3)
                     ],
                 }
@@ -375,6 +389,8 @@ class ZMetricTest(unittest.TestCase):
 
     def test_main_all_run_tpm_uses_explicit_profile_world_size(self):
         payload = {
+            "schema_version": 2,
+            "mode": "prefix_cache_grid",
             "run_config": {"engine": {"tp_size": 8}},
             "metrics": [
                 {
@@ -386,7 +402,7 @@ class ZMetricTest(unittest.TestCase):
                     "success_runs": 3,
                     "status": "ok",
                     "runs": [
-                        {"success": True, "reuse_len": 512, "prefill_time_ms": rt}
+                        {"success": True, "reuse_len": 512, "ttft_ms": rt}
                         for rt in (10.0, 20.0, 30.0)
                     ],
                 }
@@ -460,6 +476,8 @@ class ZMetricTest(unittest.TestCase):
 
     def test_main_explicit_cards_one_keeps_system_tpm(self):
         payload = {
+            "schema_version": 2,
+            "mode": "prefix_cache_grid",
             "run_config": {"engine": {"tp_size": 8}},
             "metrics": [
                 {
@@ -470,9 +488,7 @@ class ZMetricTest(unittest.TestCase):
                     "measure_runs": 1,
                     "success_runs": 1,
                     "status": "ok",
-                    "runs": [
-                        {"success": True, "reuse_len": 0, "prefill_time_ms": 10.0}
-                    ],
+                    "runs": [{"success": True, "reuse_len": 0, "ttft_ms": 10.0}],
                 }
             ],
         }
@@ -545,9 +561,9 @@ class NumberTest(unittest.TestCase):
 
 
 class ObservedCacheLenTest(unittest.TestCase):
-    def test_from_observed_list(self):
+    def test_aggregate_reuse_is_not_a_fallback(self):
         item = {"cache_len_observed": [512, 512, 512]}
-        self.assertEqual(observed_cache_len(item), 512.0)
+        self.assertIsNone(observed_cache_len(item))
 
     def test_inconsistent_list(self):
         item = {"cache_len_observed": [512, 256, 512]}
@@ -556,25 +572,25 @@ class ObservedCacheLenTest(unittest.TestCase):
     def test_from_runs(self):
         item = {
             "runs": [
-                {"reuse_len": 512},
-                {"reuse_len": 512},
-                {"reuse_len": 512},
+                {"success": True, "reuse_len": 512},
+                {"success": True, "reuse_len": 512},
+                {"success": True, "reuse_len": 512},
             ]
         }
         self.assertEqual(observed_cache_len(item), 512.0)
 
 
 class PrefillRtTest(unittest.TestCase):
-    def test_from_direct_key(self):
-        item = {"prefill_time_ms": 42.0}
-        self.assertEqual(prefill_rt(item), 42.0)
+    def test_aggregate_latency_is_not_a_fallback(self):
+        item = {"ttft_ms": 42.0}
+        self.assertIsNone(prefill_rt(item))
 
     def test_from_runs(self):
         item = {
             "runs": [
-                {"success": True, "prefill_time_ms": 9.0},
-                {"success": True, "prefill_time_ms": 11.0},
-                {"success": True, "prefill_time_ms": 10.0},
+                {"success": True, "ttft_ms": 9.0},
+                {"success": True, "ttft_ms": 11.0},
+                {"success": True, "ttft_ms": 10.0},
             ]
         }
         self.assertEqual(prefill_rt(item), 10.0)

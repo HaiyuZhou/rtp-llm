@@ -100,7 +100,7 @@ def _write_cache_grid_result(
                     "input_len": row.input_len,
                     "output_len": 1,
                     "reuse_len": row.cache_len,
-                    "prefill_time_ms": row.target_ms,
+                    "ttft_ms": row.target_ms,
                 }
             )
         metrics.append(
@@ -120,7 +120,7 @@ def _write_cache_grid_result(
             }
         )
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": "prefix_cache_grid",
         "complete": True,
         "metrics": metrics,
@@ -145,7 +145,6 @@ class MeasurementContractTest(unittest.TestCase):
                 for metric in payload["metrics"]:
                     for run in metric["runs"]:
                         run["ttft_source"] = source
-                        run["ttft_ms"] = run["prefill_time_ms"]
                 path.write_text(json.dumps(payload), encoding="utf-8")
                 paths.append(path)
             with self.assertRaisesRegex(ValueError, "incompatible request transports"):

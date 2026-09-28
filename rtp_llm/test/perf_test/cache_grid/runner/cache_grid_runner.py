@@ -49,7 +49,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 
-from rtp_llm.test.perf_test.cache_grid.runner.result_schema import measurement_status
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    current_metrics,
+    measurement_status,
+)
 from rtp_llm.test.perf_test.cache_grid.runner.scheduler import configure_scheduler
 
 
@@ -187,8 +190,23 @@ def validate_cache_grid_resume(
     with result_path.open(encoding="utf-8") as stream:
         payload = json.load(stream)
 
+    current_metrics(payload, str(result_path))
+    required = {
+        "seed_mode",
+        "grid_sha256",
+        "profile_sha256",
+        "measure_runs",
+        "cache_commit_tail_tokens",
+        "request_transport",
+        "expected_block_size",
+        "run_config_sha256",
+    }
+    if required - payload.keys() or payload.get("resume_compatible") is False:
+        raise ValueError(
+            "checkpoint lacks current resume guards; migrate with tools/migrate_cache_perf run, or retest"
+        )
     expected_seed_mode = "shared_prefix_v1" if shared_seed else "independent"
-    if payload.get("seed_mode", "independent") != expected_seed_mode:
+    if payload["seed_mode"] != expected_seed_mode:
         raise ValueError("cache seed mode mismatch; use a new result directory")
     mismatches = []
     checks = (
@@ -202,25 +220,21 @@ def validate_cache_grid_resume(
         ),
         (
             "request_transport",
-            payload.get("request_transport", "http_prompt"),
+            payload["request_transport"],
             request_transport,
         ),
     )
     for name, old, new in checks:
-        if old is not None and new is not None and str(old) != str(new):
+        if old != new:
             mismatches.append(f"{name}: {old} vs {new}")
     old_block_size = payload.get("expected_block_size")
-    if (
-        old_block_size is not None
-        and expected_block_size > 0
-        and int(old_block_size) != expected_block_size
-    ):
+    if old_block_size != expected_block_size:
         mismatches.append(
             f"expected_block_size: {old_block_size} vs {expected_block_size}"
         )
     old_config_sha = payload.get("run_config_sha256")
     new_config_sha = resume_config_fingerprint(run_config)
-    if old_config_sha and new_config_sha and old_config_sha != new_config_sha:
+    if old_config_sha != new_config_sha:
         mismatches.append(f"run_config_sha256: {old_config_sha} vs {new_config_sha}")
 
     if mismatches:
@@ -571,15 +585,10 @@ class PrefixPromptFactory:
 
 
 class MaterializedCaseStore:
-    """Precomputed cache-grid prompts persisted on disk (plan A).
+    """Current v2 prompt records, with explicit seed text or marker/filler counts.
 
-    All cached-case seed prefixes share one marker and a filler pattern, so
-    every seed text is a character prefix of the longest one.  The store keeps
-    that single base text under ``prefixes/base.txt`` plus one tiny JSON
-    record per case (tail markers and filler counts); a case is rebuilt by
-    string slicing and concatenation without touching the tokenizer.  Cases
-    whose prompts could not be decomposed (legacy fallback) fall back to
-    verbatim text records.
+    Verbatim records handle tokenizer-dependent prompts that cannot be compressed.
+    Historical shared base prefixes are expanded by the offline migration tool.
     """
 
     SCHEMA_VERSION = 2
@@ -591,9 +600,6 @@ class MaterializedCaseStore:
         self._records: Dict[int, Dict[str, Any]] = {}
         self._loaded = False
         self._word = " hello"
-        self._marker = PrefixPromptFactory.SHARED_PREFIX_MARKER
-        self._marker_ids_len = -1
-        self._base_text: Optional[str] = None
         self.run_count = -1
         self.grid_metadata: Dict[str, Any] = {}
         self.grid_sha256 = ""
@@ -612,7 +618,6 @@ class MaterializedCaseStore:
         if run_count <= 0:
             raise ValueError("run_count must be positive")
         self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / "prefixes").mkdir(exist_ok=True)
         stats = {
             "cases": 0,
             "cached_cases": 0,
@@ -620,11 +625,8 @@ class MaterializedCaseStore:
             "verbatim_runs": 0,
             "bytes": 0,
         }
-        base_text = ""
-        base_cache_len = -1
         case_list = [normalize_cache_case(case) for case in cases]
         self._records = {}
-        marker_ids = _encode(factory.tokenizer, factory.SHARED_PREFIX_MARKER)
         for case in case_list:
             if is_grouped_case(case):
                 members = build_grouped_prompts(factory, case, run_count)
@@ -683,16 +685,12 @@ class MaterializedCaseStore:
         with self.manifest_path.open("w", encoding="utf-8") as manifest:
             for record in self._records.values():
                 manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
-        (self.root / "prefixes" / "base.txt").write_text(base_text, encoding="utf-8")
         self.info_path.write_text(
             json.dumps(
                 {
                     "schema_version": self.SCHEMA_VERSION,
                     "run_count": run_count,
                     "word": factory._word,
-                    "marker": factory.SHARED_PREFIX_MARKER,
-                    "marker_ids_len": len(marker_ids),
-                    "max_cache_len": base_cache_len,
                     "case_count": stats["cases"],
                     "grid_metadata": grid_metadata or {},
                     "grid_sha256": grid_sha256,
@@ -712,8 +710,6 @@ class MaterializedCaseStore:
         self.grid_metadata = grid_metadata or {}
         self.grid_sha256 = grid_sha256
         self.profile_sha256 = profile_sha256
-        self._marker_ids_len = len(marker_ids)
-        self._base_text = base_text
         return stats
 
     def load_cases(self) -> List[Dict[str, Any]]:
@@ -749,7 +745,9 @@ class MaterializedCaseStore:
                     record["seed_fillers"]
                 )
             else:
-                seed_text = self._base_prefix_text(cache_len)
+                raise ValueError(
+                    "legacy materialized prefix; migrate with tools/migrate_cache_perf case-store"
+                )
         run_texts: List[str] = []
         for spec in record["runs"]:
             if "text" in spec:
@@ -772,20 +770,6 @@ class MaterializedCaseStore:
             for member in record["members"]
         ]
 
-    def _base_prefix_text(self, cache_len: int) -> str:
-        if self._base_text is None:
-            path = self.root / "prefixes" / "base.txt"
-            self._base_text = path.read_text(encoding="utf-8")
-        if self._marker_ids_len < 0:
-            raise ValueError("store_info.json is missing marker_ids_len")
-        chars = len(self._marker) + len(self._word) * (cache_len - self._marker_ids_len)
-        if chars < 0 or chars > len(self._base_text):
-            raise ValueError(
-                f"prefix of {cache_len} tokens needs {chars} chars but the "
-                f"materialized base text only has {len(self._base_text)}"
-            )
-        return self._base_text[:chars]
-
     def _ensure_loaded(self) -> None:
         if self._loaded:
             return
@@ -794,21 +778,38 @@ class MaterializedCaseStore:
                 f"{self.root} is not a materialized case store "
                 f"(missing manifest.jsonl)"
             )
-        if self.info_path.exists():
-            info = json.loads(self.info_path.read_text(encoding="utf-8"))
-            self._word = info.get("word", self._word)
-            self._marker = info.get("marker", self._marker)
-            self._marker_ids_len = int(info.get("marker_ids_len", -1))
-            self.run_count = int(info.get("run_count", -1))
-            self.grid_metadata = info.get("grid_metadata", {})
-            self.grid_sha256 = info.get("grid_sha256", "")
-            self.profile_sha256 = info.get("profile_sha256", "")
+        if not self.info_path.is_file():
+            raise ValueError(
+                "materialized store_info.json required; use tools/migrate_cache_perf case-store"
+            )
+        info = json.loads(self.info_path.read_text(encoding="utf-8"))
+        if info.get("schema_version") != self.SCHEMA_VERSION:
+            raise ValueError(
+                "materialized schema v2 required; use tools/migrate_cache_perf case-store"
+            )
+        if (
+            "word" not in info
+            or type(info.get("run_count")) is not int
+            or info["run_count"] <= 0
+        ):
+            raise ValueError(
+                "materialized v2 store requires word and positive run_count"
+            )
+        self._word = info["word"]
+        self.run_count = info["run_count"]
+        self.grid_metadata = info.get("grid_metadata", {})
+        self.grid_sha256 = info.get("grid_sha256", "")
+        self.profile_sha256 = info.get("profile_sha256", "")
         with self.manifest_path.open(encoding="utf-8") as manifest:
             for line in manifest:
                 line = line.strip()
                 if not line:
                     continue
                 record = json.loads(line)
+                if record.get("schema_version") != self.SCHEMA_VERSION:
+                    raise ValueError(
+                        "materialized record schema v2 required; use tools/migrate_cache_perf case-store"
+                    )
                 self._records[int(record["case_id"])] = record
         self._loaded = True
 
@@ -1179,7 +1180,15 @@ class CacheGridRunner:
                         line_number,
                     )
                     continue
-                if isinstance(row, dict) and row.get("case_key") in planned_keys:
+                current_metrics(
+                    {
+                        "schema_version": 2,
+                        "mode": "prefix_cache_grid",
+                        "metrics": [row],
+                    },
+                    str(self.journal_path),
+                )
+                if row.get("case_key") in planned_keys:
                     self._results[str(row["case_key"])] = row
                     loaded += 1
         if loaded:
@@ -1274,6 +1283,7 @@ class CacheGridRunner:
         payload = {
             "schema_version": 2,
             "mode": "prefix_cache_grid",
+            "seed_mode": "shared_prefix_v1" if self.shared_seed else "independent",
             "complete": complete,
             "status": "completed" if complete else "in_progress",
             "started_at": self._started_at,
@@ -1297,7 +1307,6 @@ class CacheGridRunner:
             "metrics": list(self._results.values()),
         }
         if self.shared_seed:
-            payload["seed_mode"] = "shared_prefix_v1"
             payload["shared_seed"] = self._shared_seed_record
             payload["shared_seed_refreshes"] = self._shared_seed_refreshes
         if asynchronous:

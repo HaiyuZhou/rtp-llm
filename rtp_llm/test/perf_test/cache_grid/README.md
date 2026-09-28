@@ -109,9 +109,9 @@ resume 显示原计划 case 总数，实际剩余 case 由底层 checkpoint/jour
 - 允许继承的变量包括 PATH/LD_LIBRARY_PATH、编译器、CUDA_VISIBLE_DEVICES，以及 DSV4_/PERF_/DG_JIT_/TRITON_/TILELANG_ 等性能相关变量。最终值在摘要和快照中可查看。
 - Bazel 参数可放 `bazel` 段，或由 `--config`（可重复）、`--output-base`、`--bazel` 覆盖。
 
-直接使用旧 `bazelisk test --test_arg=--profile=...` 也支持 JSONC 和环境默认值，
+直接使用 `bazelisk test --test_arg=--profile=...` 也支持 JSONC 和环境默认值，
 但只能影响测试进程；不能反向改变已经启动的 Bazel 的编译环境。
-旧入口保持“已有进程环境/--test_env 优先于 --engine_env 默认值，后者优先于 profile 默认值”的兼容行为。
+直接 Bazel 入口使用“已有进程环境/--test_env 优先于 --engine_env 默认值，后者优先于 profile 默认值”的优先级。
 要统一控制构建和测试环境，应使用新入口。
 
 ## 4. 快照、旧结果和安全边界
@@ -130,23 +130,55 @@ run 保存 `profile.snapshot.json`、`grid.snapshot.json`、`cache_perf_launch.j
 启动清单不再内嵌 profile，也不再将环境值重复写入 `runner_args`；加载时从 `env` 重建参数。
 `test_info.json` 不再重复保存 argv、引擎参数、环境变量、完整 profile 和 resume_config。
 原始 profile 与实际生效环境仍分开保存，因为 CLI 覆盖和运行时调整可能改变值。
-旧 v1 启动清单和旧 test_info 仍兼容读取；历史文件不会被批量重写。
-未经过统一入口、没有启动清单的底层直接测试继续使用完整 v3 test_info，确保可恢复。
+正常入口只读取 v2 启动清单及其快照；旧 v1 清单或只有旧 test_info 的目录必须先显式迁移。
+底层直接 Bazel 测试仍写完整 v3 test_info；它是直接测试的当前元数据，不作为统一入口的隐式启动配置。
 精简版 test_info 必须与启动清单、快照一起保留，不能单独作为恢复配置。
 
 resume 校验快照 SHA256，再交由原 runner 的 grid/profile/run_config 守卫验证；不会关闭不匹配检查。
 运行失败但尚未产生 checkpoint 时，不要用 resume 猜测恢复；检查错误后使用新结果目录重试。
 
-旧结果目录没有 launch manifest 时，可从 `test_info.json` 读取原 argv、环境与 grid 路径；
-缺少 metadata、包含脱敏占位符、grid 路径不可用或内容变化会拒绝自动恢复。
-旧运行仍须保留它引用的配置文件，不能声称已经获得历史完整环境。
-若只需独立 retest/profile，可显式传入匹配原运行的 `--profile` 和 `--grid`；这是新隔离测试，不会尝试绕过旧 checkpoint 守卫。
+历史数据使用独立的 [迁移工具](../../../../tools/migrate_cache_perf)。它只写新文件或新目录，不会改写原始数据，也不会启动模型：
 
 ```bash
-./tools/cache_perf profile --result-dir /path/legacy-results \
-  --profile /path/matching-local.jsonc --grid /path/original-grid.json \
-  --cases 2077 --runs 1 --dry-run
+# 旧结果 JSON 或观测 CSV → 当前结果文件（输出文件必须不存在）
+python3 tools/migrate_cache_perf results --input /path/old.json --output /path/current.json
+
+# 旧运行目录 → 冻结的 v2 启动快照、v4 元信息、当前结果
+python3 tools/migrate_cache_perf run --input-dir /path/old-run --output-dir /path/migrated-run
+
+# 旧共享 base.txt → 每个 case 的显式 seed 记录
+python3 tools/migrate_cache_perf case-store --input-dir /path/old-store --output-dir /path/current-store
+
+# 从迁移后的配置启动新的重测
+python3 tools/cache_perf retest --result-dir /path/migrated-run --cases 2077 --runs 3 --dry-run
 ```
+
+JSON 迁移产物或迁移报告记录来源文件的 SHA256；CSV 输出仍使用 `.csv`，来源路径与 SHA256 写入附加列。运行目录迁移检查已有快照指纹，
+将 journal 中的新记录合入 checkpoint；损坏的 journal 必须先恢复，不能静默丢弃。
+旧配置路径失效时可用 `run --profile ... --grid ...` 指定重测配置；
+脱敏或缺失的启动参数不会被猜测补齐。这里只迁移配置与测量结果，trace 和旧报告保留在原目录。
+迁移产物标记为 `resume_compatible=false`，用于分析和独立 retest/profile；
+不把补写的版本号或配置指纹当作历史续测安全的证明。新测量仍可按正常流程续测。
+
+当前数据契约：
+
+- profile 仍为 schema v1；单请求和 grouped batch 都是当前合法用例。
+- 原始结果必须为 `schema_version=2`、`mode=prefix_cache_grid`、`metrics` 数组。
+  metric 明确记录 `batch_size/input_len/status/measure_runs/success_runs/runs`；
+  scalar metric 使用 `cache_len_requested`，grouped metric 保留 `request_groups` 和逐轮 `requests`。
+  执行异常的 `status=error` 记录可以没有测量轮次。
+- 拟合与 TTFT 图只读取成功请求的 `ttft_ms`；缓存命中量来自逐请求 `reuse_len`。
+  不再接受 `results`、裸列表、`seq_len`、状态别名或聚合耗时回退。
+  观测 CSV 必须含 `batch_size,input_len,cache_len,target_ms`。
+- 迁移工具转换可证明等价的旧字段。仅记录 `client_wall_time_ms` 时还要求 `output_len=1`；
+  只有服务端 `prefill_time_ms`、聚合值、缺少计划轮数或成功状态的结果不能伪造为完整客户端测量，需重测。
+  服务端 prefill 专用报告继续读取当前结果中的服务端指标。
+- 续测要求 seed mode、transport、grid/profile/run_config 指纹和测量参数明确存在并匹配；
+  `allow_resume_mismatch` 不能绕过旧格式拒绝或迁移产物的续测限制。
+- 物化用例要求 store_info 和 record 均为 v2，seed 明确写成文本或 marker/filler；
+  正常读取不再访问 `prefixes/base.txt`。
+- 生成 grid 必须通过 `--cache-alignment` 或 profile 明确给出正的缓存对齐值，
+  不再将 0 或缺省值解释为 input alignment。
 
 ## 5. 分类工具入口
 
@@ -184,7 +216,7 @@ python3 -m unittest discover -s rtp_llm/test/perf_test/cache_grid/tests -p '*_te
 新 profile 只在顶层设置一次 `model_label`，缺省时取 `engine.model_type`，再缺省为 `Model`。
 图表标题自动生成，不需要 `chart` 配置；公式文件名由模型名称拼接为 `<model_label>_prefill_formula.txt`、
 key `PREFILL_TIME_FORMULA`、token 单位 1024，cold 标注阈值默认 1048575。
-旧 profile 的 `chart` 字段和工具 CLI 覆盖能力继续兼容。
+当前 profile 的可选 `chart` 字段和工具 CLI 可覆盖图表默认值。
 DSV4 配置保留在 `config/dsv4_*.json*`，作为显式选用的模型 preset。
 随机 batch 启动器现在要求 `--profile`，固定 CP8 workspace 需显式选择，详见
 [随机 batch 文档](docs/generate_random_batch_grid.md)。

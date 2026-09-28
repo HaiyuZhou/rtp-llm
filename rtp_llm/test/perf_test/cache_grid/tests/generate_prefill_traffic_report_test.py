@@ -47,6 +47,7 @@ def benchmark_metric(input_len=2048, cache_len=1024, times=(10.0, 12.0, 14.0)):
                 "input_len": input_len,
                 "reuse_len": cache_len,
                 "prefill_time_ms": value,
+                "ttft_ms": value + 1,
             }
             for value in times
         ],
@@ -124,7 +125,11 @@ class BenchmarkLoadingTest(unittest.TestCase):
         duplicate = benchmark_metric(times=(20.0, 30.0, 40.0))
         rejected = benchmark_metric()
         rejected["runs"][1]["reuse_len"] = 0
-        payload = {"metrics": [valid, duplicate, rejected]}
+        payload = {
+            "schema_version": 2,
+            "mode": "prefix_cache_grid",
+            "metrics": [valid, duplicate, rejected],
+        }
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "benchmark.json"
             source.write_text(json.dumps(payload), encoding="utf-8")
@@ -134,14 +139,25 @@ class BenchmarkLoadingTest(unittest.TestCase):
         self.assertEqual(points[0].cache_len, 1024)
         self.assertEqual(points[0].offline_prefill_ms, 21.0)
         self.assertEqual(audit["metrics_rejected"], 1)
-        self.assertEqual(audit["rejected_by_reason"], {"run_reuse_mismatch": 1})
+        self.assertEqual(
+            audit["rejected_by_reason"], {"observed_reuse_not_constant": 1}
+        )
 
     def test_excludes_another_batch_without_counting_rejection(self):
         item = benchmark_metric()
         item["batch_size"] = 2
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "benchmark.json"
-            source.write_text(json.dumps({"metrics": [item]}), encoding="utf-8")
+            source.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mode": "prefix_cache_grid",
+                        "metrics": [item],
+                    }
+                ),
+                encoding="utf-8",
+            )
             points, audit = load_benchmark(source, 1)
         self.assertEqual(points, [])
         self.assertEqual(audit["metrics_selected_batch"], 0)

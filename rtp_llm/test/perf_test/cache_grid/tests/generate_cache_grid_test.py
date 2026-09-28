@@ -65,7 +65,7 @@ class GenerateCacheGridTest(unittest.TestCase):
         self.assertTrue(inputs)
         self.assertTrue(all(x % 128 == 0 for x in inputs))
 
-    def test_cache_alignment_zero_falls_back_to_input_alignment(self):
+    def test_cache_alignment_zero_is_rejected(self):
         args = argparse.Namespace(
             min_input_len=2048,
             max_input_len=65536,
@@ -81,17 +81,15 @@ class GenerateCacheGridTest(unittest.TestCase):
             allow_large_grid=False,
             measure_runs=3,
         )
-        plan = build_grid(args)
-        self.assertEqual(plan["generator"]["cache_sampling"]["alignment"], 128)
-        for case in plan["cases"]:
-            self.assertEqual(case["cache_len"] % 128, 0)
+        with self.assertRaisesRegex(ValueError, "cache-alignment"):
+            build_grid(args)
 
     def test_case_limit_rejects_oversized_plan(self):
         args = argparse.Namespace(
             min_input_len=256,
             max_input_len=8192,
             alignment=128,
-            cache_alignment=0,
+            cache_alignment=128,
             input_points=32,
             input_mode="stratified",
             seed=DEFAULT_SEED,
@@ -140,7 +138,7 @@ class GenerateCacheGridProfileTest(unittest.TestCase):
 
     def test_without_profile_no_profile_keys_in_output(self):
         with tempfile.TemporaryDirectory() as tmp:
-            payload = self._run_grid([], tmp)
+            payload = self._run_grid(["--cache-alignment", "128"], tmp)
         self.assertNotIn("profile", payload)
         self.assertNotIn("profile_sha256", payload)
 
@@ -176,15 +174,15 @@ class GenerateCacheGridProfileTest(unittest.TestCase):
             self.assertEqual(case["cache_len"] % 256, 0)
         self.assertEqual(payload["generator"]["cache_sampling"]["alignment"], 256)
 
-    def test_byte_identity_without_profile(self):
-        """Output without --profile must be identical to pre-profile code."""
+    def test_explicit_alignment_matches_direct_build(self):
+        """The CLI and direct API use the same explicit alignment."""
         with tempfile.TemporaryDirectory() as tmp:
-            payload = self._run_grid(["--cache-alignment", "0"], tmp)
+            payload = self._run_grid(["--cache-alignment", "128"], tmp)
         args = argparse.Namespace(
             min_input_len=2048,
             max_input_len=65536,
             alignment=128,
-            cache_alignment=0,
+            cache_alignment=128,
             input_points=8,
             input_mode="stratified",
             seed=DEFAULT_SEED,

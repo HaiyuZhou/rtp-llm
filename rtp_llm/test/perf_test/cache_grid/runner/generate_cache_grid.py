@@ -140,13 +140,11 @@ def build_grid(args: argparse.Namespace) -> dict[str, Any]:
         args.input_mode,
         args.seed,
     )
-    # Cache reuse granularity is the engine's physical block size
-    # (--seq_size_per_block, multiplied by CP size when
-    # PREFILL_CP_KV_CACHE_SHARDED=1), not the input alignment.  Points finer
-    # than one block floor onto the same physical bucket, so callers should
-    # pin --cache-alignment to the block size; 0 keeps --alignment for
-    # compatibility with grids generated before this distinction existed.
-    cache_alignment = getattr(args, "cache_alignment", 0) or args.alignment
+    cache_alignment = getattr(args, "cache_alignment", None)
+    if cache_alignment is None or cache_alignment <= 0:
+        raise ValueError(
+            "specify --cache-alignment or profile.cache_grid.cache_alignment explicitly"
+        )
     cases = []
     for input_len in inputs:
         cache_lengths = generate_cache_lengths(
@@ -223,7 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Alignment in tokens for cache lengths; defaults to --alignment. "
+            "Required cache alignment from CLI or profile. "
             "Set to the engine's physical reuse granularity "
             "(--seq_size_per_block, multiplied by CP size when "
             "PREFILL_CP_KV_CACHE_SHARDED=1) so every cache point is exactly "

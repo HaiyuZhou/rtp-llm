@@ -19,12 +19,17 @@ def _metric(case_id, input_len, reuse_len, values, case_key=None):
         "batch_size": 1,
         "input_len": input_len,
         "cache_len_observed": [reuse_len] * len(values),
+        "cache_len_requested": reuse_len,
+        "status": "ok",
+        "measure_runs": len(values),
+        "success_runs": sum(value is not None for value in values),
         "runs": [
             {
                 "success": value is not None,
                 "input_len": input_len,
                 "reuse_len": reuse_len,
                 "prefill_time_ms": value,
+                "ttft_ms": value,
             }
             for value in values
         ],
@@ -34,7 +39,14 @@ def _metric(case_id, input_len, reuse_len, values, case_key=None):
 def _write_result(path, started_at, metrics):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({"started_at": started_at, "metrics": metrics}),
+        json.dumps(
+            {
+                "schema_version": 2,
+                "mode": "prefix_cache_grid",
+                "started_at": started_at,
+                "metrics": metrics,
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -106,7 +118,9 @@ class ExportCasePrefillCsvTest(unittest.TestCase):
         self.assertEqual(rows[1][:6], ["7", "case_7", "1", "2048", "512", "1536"])
         self.assertEqual(rows[1][6:9], ["10.0", "11.0", "12.0"])
         earlier_index = rows[0].index("re_aaaaaa_run0")
-        self.assertEqual(rows[1][earlier_index : earlier_index + 3], ["40.0", "", "42.0"])
+        self.assertEqual(
+            rows[1][earlier_index : earlier_index + 3], ["40.0", "", "42.0"]
+        )
 
     def test_rejects_replay_hash_prefix_collision(self):
         with tempfile.TemporaryDirectory() as directory:

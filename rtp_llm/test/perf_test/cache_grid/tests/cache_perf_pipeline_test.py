@@ -52,6 +52,9 @@ class CachePerfPipelineTest(unittest.TestCase):
         (self.result / "cache_grid_results.json").write_text(
             json.dumps(
                 {
+                    "schema_version": 2,
+                    "mode": "prefix_cache_grid",
+                    "metrics": [],
                     "complete": complete,
                     "completed_cases": 1,
                     "total_cases": 1,

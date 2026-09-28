@@ -16,6 +16,7 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     load_profile,
     profile_environment,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import current_metrics
 from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
     WORKSPACE_TOKENS,
     fixed_workspace_grid,
@@ -101,63 +102,40 @@ def replace_args(argv, updates, flags=()):
 
 def load_saved(directory):
     path = directory / MANIFEST
-    if path.exists():
-        info_path = directory / "test_info.json"
-        if info_path.exists():
-            info = json.loads(info_path.read_text())
-            if info.get("schema_version") == 4:
-                expected = info["config_file_sha256"][MANIFEST]
-                if sha(path.read_bytes()) != expected:
-                    raise ValueError("saved configuration changed: " + MANIFEST)
-        saved = json.loads(path.read_text())
-        version = saved.get("schema_version")
-        if version not in (1, 2):
-            raise ValueError("unsupported launch manifest")
-        for filename, digest in saved["snapshots"].items():
-            if sha((directory / filename).read_bytes()) != digest:
-                raise ValueError(f"saved configuration changed: {filename}")
-        if version == 2:
-            profile_file = saved["profile_file"]
-            if profile_file not in saved["snapshots"]:
-                raise ValueError("profile snapshot is not fingerprinted")
-            saved["profile"] = load_profile(directory / profile_file)
-            # Materialize the old in-memory interface, never duplicate env on disk.
-            saved["runner_args"] = list(saved["runner_args"]) + [
-                "--engine_env=" + k + "=" + v for k, v in sorted(saved["env"].items())
-            ]
-        return saved
+    hint = "Migrate with: python3 tools/migrate_cache_perf run --help"
+    if not path.is_file():
+        raise ValueError(f"current run requires {MANIFEST}. {hint}")
+    saved = json.loads(path.read_text())
+    if not isinstance(saved, dict) or saved.get("schema_version") != 2:
+        raise ValueError(f"launch manifest schema v2 required. {hint}")
+    required = {"snapshots", "profile_file", "grid", "env", "runner_args"}
+    if required - saved.keys():
+        raise ValueError(f"incomplete launch manifest schema v2. {hint}")
+    if (
+        saved["grid"] != str(directory.resolve() / "grid.snapshot.json")
+        or "grid.snapshot.json" not in saved["snapshots"]
+    ):
+        raise ValueError(
+            f"current launch requires a fingerprinted local grid snapshot. {hint}"
+        )
     info_path = directory / "test_info.json"
-    if not info_path.exists():
-        raise ValueError(
-            "no launch manifest/test_info; supply --profile and --grid for retest/profile"
-        )
-    info = json.loads(info_path.read_text())
-    if info.get("schema_version") == 4:
-        raise ValueError(
-            "compact test_info requires cache_perf_launch.json and its snapshots"
-        )
-    argv = info.get("argv", [])[1:]
-    env = info.get("engine_environment", {})
-    if not argv or any("***" in arg for arg in argv) or "***" in env.values():
-        raise ValueError(
-            "legacy metadata missing or redacted; use explicit --profile and --grid"
-        )
-    grid = Path(info["cache_grid_json"])
-    if not grid.is_absolute():
-        raise ValueError("legacy grid path is relative; provide explicit configuration")
-    result = directory / "cache_grid_results.json"
-    if result.exists():
-        checkpoint = json.loads(result.read_text())
-        if checkpoint.get("grid_sha256") != sha(grid.read_bytes()):
-            raise ValueError("legacy grid differs from checkpoint")
-    return dict(
-        profile=info.get("profile") or {"schema_version": 1},
-        grid=str(grid),
-        env=env,
-        runner_args=argv,
-        bazel={},
-        legacy=True,
-    )
+    if info_path.exists():
+        info = json.loads(info_path.read_text())
+        if info.get("schema_version") != 4:
+            raise ValueError(f"launch-managed test_info schema v4 required. {hint}")
+        if sha(path.read_bytes()) != info["config_file_sha256"][MANIFEST]:
+            raise ValueError("saved configuration changed: " + MANIFEST)
+    for filename, digest in saved["snapshots"].items():
+        if sha((directory / filename).read_bytes()) != digest:
+            raise ValueError(f"saved configuration changed: {filename}")
+    profile_file = saved["profile_file"]
+    if profile_file not in saved["snapshots"]:
+        raise ValueError("profile snapshot is not fingerprinted")
+    saved["profile"] = load_profile(directory / profile_file)
+    saved["runner_args"] = list(saved["runner_args"]) + [
+        "--engine_env=" + k + "=" + v for k, v in sorted(saved["env"].items())
+    ]
+    return saved
 
 
 def load_cases(path, profile):
@@ -225,10 +203,6 @@ def build_plan(args, inherited=None):
     if saved and args.env:
         overrides = environment({}, args.env, {})
         env.update(overrides)
-    if saved and saved.get("legacy"):
-        for key in ENV_NAMES:
-            if key in inherited and key not in env:
-                env[key] = inherited[key]
     bazel = copy.deepcopy((saved or {}).get("bazel") or profile.get("bazel", {}))
     configs = args.config or bazel.get("configs", [])
     if not isinstance(configs, list) or not all(isinstance(v, str) for v in configs):
@@ -257,16 +231,6 @@ def build_plan(args, inherited=None):
         ]
     )
     if args.mode == "resume":
-        if saved.get("legacy"):
-            # Keep the exact legacy configuration; runner performs full fingerprint validation.
-            for i, arg in enumerate(baseline):
-                if (
-                    arg.startswith("--profile=")
-                    and not Path(arg.split("=", 1)[1]).is_file()
-                ):
-                    raise ValueError(
-                        "legacy profile no longer exists; restore it before resume"
-                    )
         runner = replace_args(
             baseline, {}, ("require_cache_resume", "allow_resume_mismatch")
         ) + ["--require_cache_resume"]
@@ -492,7 +456,8 @@ def _load_completed_result(path: Path) -> dict:
         raise RuntimeError(f"cache-grid result was not produced: {path}") from error
     except json.JSONDecodeError as error:
         raise RuntimeError(f"cache-grid result is not valid JSON: {path}") from error
-    if not isinstance(payload, dict) or not payload.get("complete"):
+    current_metrics(payload, str(path))
+    if not payload.get("complete"):
         status = payload.get("status") if isinstance(payload, dict) else None
         raise RuntimeError(
             "refusing to post-process an incomplete cache-grid result: "

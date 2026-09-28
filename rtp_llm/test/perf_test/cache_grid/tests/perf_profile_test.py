@@ -281,6 +281,8 @@ class MergeEngineArgsTest(unittest.TestCase):
 class ExtractEmbeddedProfileTest(unittest.TestCase):
     def test_extracts_profile(self):
         data = {
+            "schema_version": 2,
+            "mode": "prefix_cache_grid",
             "metrics": [],
             "profile": {"schema_version": 1, "label": "test"},
         }
@@ -288,7 +290,11 @@ class ExtractEmbeddedProfileTest(unittest.TestCase):
         self.assertEqual(result, {"schema_version": 1, "label": "test"})
 
     def test_returns_none_when_absent(self):
-        self.assertIsNone(extract_embedded_profile({"metrics": []}))
+        self.assertIsNone(
+            extract_embedded_profile(
+                {"schema_version": 2, "mode": "prefix_cache_grid", "metrics": []}
+            )
+        )
 
     def test_returns_none_when_not_dict(self):
         self.assertIsNone(extract_embedded_profile({"profile": "not a dict"}))

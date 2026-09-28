@@ -1054,7 +1054,7 @@ def _write_test_info(
         # by the resume guard; do not repeat it or the raw argv in test_info.
         with open(launch_path, encoding="utf-8") as stream:
             launch = json.load(stream)
-        if launch.get("schema_version") not in (1, 2):
+        if launch.get("schema_version") != 2:
             raise ValueError("unsupported launch manifest")
         info.update(
             schema_version=4,

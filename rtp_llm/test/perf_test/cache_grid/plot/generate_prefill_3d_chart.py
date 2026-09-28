@@ -37,6 +37,7 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     resolve_label,
     resolve_title,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import current_metrics
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
     finite_number as _number,
 )
@@ -81,12 +82,19 @@ def load_rows(path: pathlib.Path, batch_size: int) -> list[dict[str, float]]:
     rows: list[dict[str, float]] = []
     if path.suffix.lower() == ".csv":
         with path.open(newline="", encoding="utf-8") as handle:
-            for item in csv.DictReader(handle):
-                if int(float(item.get("batch_size", 1))) != batch_size:
+            reader = csv.DictReader(handle)
+            if not {"batch_size", "input_len", "cache_len", "target_ms"} <= set(
+                reader.fieldnames or []
+            ):
+                raise ValueError(
+                    "expected current observation CSV; migrate legacy CSV first"
+                )
+            for item in reader:
+                if int(float(item["batch_size"])) != batch_size:
                     continue
                 inp = _number(item.get("input_len"))
-                cache = _number(item.get("cache_len", item.get("target_cache_len")))
-                rt = _number(item.get("target_ms", item.get("avg_prefill_time")))
+                cache = _number(item.get("cache_len"))
+                rt = _number(item.get("target_ms"))
                 if (
                     inp is not None
                     and cache is not None
@@ -400,7 +408,7 @@ def data_metrics(path: pathlib.Path) -> list[Any]:
         with path.open(newline="", encoding="utf-8") as handle:
             return list(csv.DictReader(handle))
     data = json.loads(path.read_text(encoding="utf-8"))
-    return data.get("metrics", data.get("results", []))
+    return current_metrics(data, str(path))
 
 
 def render_cold_miss_2d(

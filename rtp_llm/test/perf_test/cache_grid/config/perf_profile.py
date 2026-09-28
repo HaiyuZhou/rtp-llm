@@ -278,28 +278,6 @@ def resolve_title(
     return default
 
 
-def engine_args_tokens(profile: Dict[str, Any]) -> List[str]:
-    """Flatten ``engine_args`` into CLI token pairs.
-
-    Keys may optionally start with ``--``; the output always uses ``--key
-    value`` form.  Both ``engine_args`` and ``engine`` sections contribute:
-    ``engine`` keys that are not in the namespace set (``dp_size``,
-    ``max_seq_len``, ``concurrency_limit``) are emitted as ``--key value``.
-    """
-    tokens: List[str] = []
-    engine = engine_section(profile)
-    for key, value in sorted(engine.items()):
-        if key in _ENGINE_ARGS_NAMESPACE_KEYS:
-            continue
-        cli_key = key if key.startswith("--") else f"--{key}"
-        tokens.extend([cli_key, str(value)])
-    engine_args = engine_args_section(profile)
-    for key, value in sorted(engine_args.items()):
-        cli_key = key if key.startswith("--") else f"--{key}"
-        tokens.extend([cli_key, str(value)])
-    return tokens
-
-
 def _extract_arg_value(
     argv: Sequence[str], key: str
 ) -> Tuple[Optional[str], Optional[int]]:

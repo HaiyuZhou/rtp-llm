@@ -49,6 +49,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import measurement_status
+from rtp_llm.test.perf_test.cache_grid.runner.scheduler import configure_scheduler
+
 
 def normalize_cache_case(raw: Dict[str, Any], index: int = 0) -> Dict[str, Any]:
     """Validate groups while retaining legacy single-request geometries."""
@@ -1600,22 +1603,13 @@ class CacheGridRunner:
 
     def _set_prefill_batch_size(self, batch_size):
         """Wait for scheduler acknowledgement before submitting a complete batch."""
-        response = self._http_session.post(
-            f"http://127.0.0.1:{self.port}/update_scheduler_info",
-            json={"batch_size": batch_size, "mode": "prefill"},
+        return configure_scheduler(
+            self.port,
+            batch_size=batch_size,
+            mode="prefill",
+            post=self._http_session.post,
             timeout=min(self.request_timeout, 60),
         )
-        response.raise_for_status()
-        acknowledgement = response.json()
-        if acknowledgement.get("status") != "ok" or acknowledgement.get("error"):
-            raise RuntimeError(
-                f"scheduler rejected batch_size={batch_size}: {acknowledgement}"
-            )
-        logging.info(
-            "[CACHE_BATCH] scheduler batch_size=%d mode=prefill acknowledged",
-            batch_size,
-        )
-        return acknowledgement
 
     def _seed_grouped_payload(self, payload):
         seeds = list(payload["seeds"].items())
@@ -1773,35 +1767,9 @@ class CacheGridRunner:
         reuse = all(r["reuse_exact"] for r in results)
         timing = all(r["timing_valid"] for r in results)
         success = all(r.get("success") for r in results)
-        validation_status = (
-            "failed"
-            if not success
-            else (
-                "invalid_shape"
-                if not shape
-                else (
-                    "invalid_reuse"
-                    if not reuse
-                    else "invalid_timing" if not timing else "ok"
-                )
-            )
-        )
-        status = (
-            "failed"
-            if not success
-            else (
-                "invalid_shape"
-                if not shape
-                else (
-                    "invalid_timing"
-                    if not timing
-                    else (
-                        "invalid_reuse"
-                        if not reuse and not self.skip_reuse_validation
-                        else "ok"
-                    )
-                )
-            )
+        validation_status = measurement_status(success, shape, reuse, timing)
+        status = measurement_status(
+            success, shape, reuse, timing, skip_reuse=self.skip_reuse_validation
         )
         return {
             **case,
@@ -2190,42 +2158,18 @@ class CacheGridRunner:
                                 if float(r.get("ttft_ms", 0.0)) > 0.0
                             ]
                             timing_valid = len(ttft_values) == self.measure_runs
-                            validation_status = (
-                                "ok"
-                                if reuse_exact and shape_exact and timing_valid
-                                else (
-                                    "invalid_shape"
-                                    if len(successful) == self.measure_runs
-                                    and not shape_exact
-                                    else (
-                                        "invalid_timing"
-                                        if len(successful) == self.measure_runs
-                                        and not timing_valid
-                                        else (
-                                            "invalid_reuse"
-                                            if len(successful) == self.measure_runs
-                                            else "failed"
-                                        )
-                                    )
-                                )
+                            validation_status = measurement_status(
+                                len(successful) == self.measure_runs,
+                                shape_exact,
+                                reuse_exact,
+                                timing_valid,
                             )
-                            status = (
-                                "failed"
-                                if len(successful) != self.measure_runs
-                                else (
-                                    "invalid_shape"
-                                    if not shape_exact
-                                    else (
-                                        "invalid_timing"
-                                        if not timing_valid
-                                        else (
-                                            "invalid_reuse"
-                                            if not reuse_exact
-                                            and not self.skip_reuse_validation
-                                            else "ok"
-                                        )
-                                    )
-                                )
+                            status = measurement_status(
+                                len(successful) == self.measure_runs,
+                                shape_exact,
+                                reuse_exact,
+                                timing_valid,
+                                skip_reuse=self.skip_reuse_validation,
                             )
                             metric = {
                                 "case_key": key,

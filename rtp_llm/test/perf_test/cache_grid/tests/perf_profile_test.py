@@ -6,7 +6,6 @@ from pathlib import Path
 from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     ProfileError,
     engine_args_section,
-    engine_args_tokens,
     engine_section,
     extract_embedded_profile,
     fingerprint,
@@ -211,37 +210,6 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(resolve_title(profile, None, "DT"), "PT")
         self.assertEqual(resolve_title(profile, "CT", "DT"), "CT")
         self.assertEqual(resolve_title(None, None, "DT"), "DT")
-
-
-class EngineArgsTokensTest(unittest.TestCase):
-    def test_empty_profile(self):
-        self.assertEqual(engine_args_tokens({"schema_version": 1}), [])
-
-    def test_emits_engine_non_namespace_keys(self):
-        profile = {
-            "schema_version": 1,
-            "engine": {"tp_size": 8, "dp_size": 4, "model_type": "deepseek_v4"},
-        }
-        tokens = engine_args_tokens(profile)
-        self.assertIn("--model_type", tokens)
-        self.assertIn("--tp_size", tokens)
-        self.assertNotIn("--dp_size", tokens)
-
-    def test_emits_engine_args_section(self):
-        profile = {
-            "schema_version": 1,
-            "engine_args": {"--use_deepep_moe": "1", "--fp8_kv_cache": 1},
-        }
-        tokens = engine_args_tokens(profile)
-        self.assertEqual(tokens, ["--fp8_kv_cache", "1", "--use_deepep_moe", "1"])
-
-    def test_keys_already_prefixed_with_dashes(self):
-        profile = {
-            "schema_version": 1,
-            "engine_args": {"use_deepep_moe": "1"},
-        }
-        tokens = engine_args_tokens(profile)
-        self.assertIn("--use_deepep_moe", tokens)
 
 
 class SetEngineArgTest(unittest.TestCase):

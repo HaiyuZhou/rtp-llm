@@ -186,6 +186,7 @@ class CacheGridBatchTest(unittest.TestCase):
         transport="http_prompt",
         store=False,
         skip_reuse_validation=False,
+        bad_timing=False,
     ):
         gate = threading.Barrier(4)
         seed_gate = threading.Barrier(2 if policy == "shared_by_group" else 3)
@@ -219,7 +220,7 @@ class CacheGridBatchTest(unittest.TestCase):
                 "input_len": len(ids),
                 "reuse_len": reuse,
                 "output_len": 1,
-                "ttft_ms": 2.0,
+                "ttft_ms": 0.0 if bad_timing else 2.0,
             }
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -294,6 +295,19 @@ class CacheGridBatchTest(unittest.TestCase):
         self.assertEqual(row["success_runs"], 2)
         self.assertEqual(row["cache_len_observed"], [8, 16, 16, 0] * 2)
         self.assertGreater(row["median_batch_wall_time_ms"], 0)
+
+    def test_skipping_reuse_does_not_hide_invalid_timing(self):
+        for skip in (False, True):
+            with self.subTest(skip=skip):
+                row = self.run_mock_batch(
+                    "independent",
+                    bad_slot=1,
+                    bad_timing=True,
+                    skip_reuse_validation=skip,
+                )
+                self.assertEqual(row["status"], "invalid_timing")
+                self.assertEqual(row["validation_status"], "invalid_timing")
+                self.assertIsNone(row["median_batch_wall_time_ms"])
 
     def test_materialized_grpc_batch(self):
         self.assertEqual(
@@ -892,7 +906,7 @@ class EngineServerSchedulerModeTest(unittest.TestCase):
             timeout=60,
         )
 
-    @patch("rtp_llm.test.perf_test.server.time.sleep")
+    @patch("rtp_llm.test.perf_test.cache_grid.runner.scheduler.time.sleep")
     @patch("rtp_llm.test.perf_test.server.requests.post")
     def test_set_scheduler_mode_fails_after_retries(self, post, sleep):
         post.side_effect = ConnectionError("server unavailable")
@@ -901,13 +915,48 @@ class EngineServerSchedulerModeTest(unittest.TestCase):
             self._server().set_scheduler_mode(batch_size=1, mode="prefill")
 
         self.assertEqual(post.call_count, 20)
-        self.assertEqual(sleep.call_count, 20)
+        self.assertEqual(sleep.call_count, 19)
 
     @patch("rtp_llm.test.perf_test.server.requests.post")
     def test_set_scheduler_mode_rejects_invalid_mode(self, post):
         with self.assertRaisesRegex(ValueError, "unsupported scheduler mode"):
             self._server().set_scheduler_mode(batch_size=1, mode="invalid")
         post.assert_not_called()
+
+    @patch("rtp_llm.test.perf_test.cache_grid.runner.scheduler.time.sleep")
+    @patch("rtp_llm.test.perf_test.server.requests.post")
+    def test_startup_retries_rejected_acknowledgement(self, post, sleep):
+        rejected, accepted = Mock(), Mock()
+        rejected.json.return_value = {"status": "ok", "error": "not ready"}
+        accepted.json.return_value = {"status": "ok"}
+        post.side_effect = [rejected, accepted]
+        self.assertEqual(
+            self._server().set_scheduler_mode(batch_size=1, mode="prefill"),
+            {"status": "ok"},
+        )
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once_with(3)
+
+    def test_measurement_rejects_missing_or_error_ack_without_retry(self):
+        for ack in (
+            {},
+            {"status": "ok", "error": "not ready"},
+            {"status": "error"},
+            [],
+        ):
+            with self.subTest(ack=ack):
+                session = Mock()
+                session.post.return_value.json.return_value = ack
+                runner = argparse.Namespace(
+                    port=12345, request_timeout=120, _http_session=session
+                )
+                with self.assertRaisesRegex(RuntimeError, "scheduler rejected"):
+                    CacheGridRunner._set_prefill_batch_size(runner, 2)
+                session.post.assert_called_once_with(
+                    "http://127.0.0.1:12345/update_scheduler_info",
+                    json={"batch_size": 2, "mode": "prefill"},
+                    timeout=60,
+                )
 
 
 class CacheGridProfileTest(unittest.TestCase):

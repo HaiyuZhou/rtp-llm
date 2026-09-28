@@ -20,6 +20,10 @@ from rtp_llm.test.perf_test.cache_grid.plot.generate_prefill_interactive_chart i
     representative_levels,
     representative_slice,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    finite_number,
+    integer,
+)
 
 REQUIRED_CSV_COLUMNS = (
     "ds",
@@ -33,19 +37,6 @@ REQUIRED_CSV_COLUMNS = (
 
 class CsvSchemaError(ValueError):
     pass
-
-
-def finite_number(value: Any) -> float | None:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
-
-
-def integer(value: Any) -> int | None:
-    result = finite_number(value)
-    return int(result) if result is not None and result.is_integer() else None
 
 
 def quantile(values: list[float], percentile: float) -> float | None:

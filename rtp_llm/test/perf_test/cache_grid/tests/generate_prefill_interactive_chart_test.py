@@ -5,17 +5,21 @@ import warnings
 from pathlib import Path
 from unittest.mock import patch
 
+from rtp_llm.test.perf_test.cache_grid.config.topology import profile_cards
 from rtp_llm.test.perf_test.cache_grid.plot.generate_prefill_interactive_chart import (
     apply_z_metric,
     detect_cards,
     load_rows,
     main,
-    number,
-    observed_cache_len,
-    prefill_rt,
-    profile_cards,
     representative_levels,
     representative_slice,
+)
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    finite_number as number,
+)
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    observed_cache_len,
+    prefill_rt,
 )
 
 

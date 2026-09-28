@@ -1017,9 +1017,6 @@ def _write_test_info(
     checkpoint_path = extract_arg(remaining_args, "checkpoint_path") or os.environ.get(
         "CHECKPOINT_PATH"
     )
-    tokenizer_path = extract_arg(remaining_args, "tokenizer_path") or os.environ.get(
-        "TOKENIZER_PATH"
-    )
     profile = getattr(args, "_profile", None)
     profile_sha256 = getattr(args, "_profile_sha256", None)
     path = os.path.join(args.result_dir, "test_info.json")
@@ -1035,7 +1032,6 @@ def _write_test_info(
     if status == "running":
         attempt_count += 1
     info = {
-        "schema_version": 3,
         "status": status,
         "started_at": previous.get("started_at", now),
         "updated_at": now,
@@ -1045,57 +1041,10 @@ def _write_test_info(
         "attempt_count": attempt_count,
         "model_type": model_type,
         "checkpoint_path": checkpoint_path,
-        "tokenizer_path": tokenizer_path,
         "tp_size": extract_arg(remaining_args, "tp_size", "1"),
         "dp_size": args.dp_size,
-        "max_seq_len": args.max_seq_len,
-        "concurrency_limit": args.concurrency_limit,
-        "decode_test_length": args.decode_test_length,
-        "seq_size_per_block": extract_arg(remaining_args, "seq_size_per_block", None),
         "cache_grid_json": args.cache_grid_json or None,
-        "cache_measure_runs": (
-            args.cache_measure_runs if args.cache_grid_json else None
-        ),
-        "cache_skip_reuse_validation": (
-            args.cache_skip_reuse_validation if args.cache_grid_json else None
-        ),
-        "cache_request_timeout": (
-            args.cache_request_timeout if args.cache_grid_json else None
-        ),
-        "cache_commit_tail_tokens": (
-            args.cache_commit_tail_tokens if args.cache_grid_json else None
-        ),
-        "partial": args.partial,
-        "warmup_runs": int(os.environ.get("PERF_FORMAL_WARMUP_RUNS", "1")),
-        "measure_runs": int(os.environ.get("PERF_MEASURE_RUNS", "1")),
-        "profile_runs": int(os.environ.get("PERF_PROFILE_RUNS", "1")),
-        "expected_cache_block_size": (
-            expected_cache_block_size if args.cache_grid_json else None
-        ),
-        "cache_case_store": args.cache_case_files or None,
-        "cache_profile_runs": args.cache_profile_runs,
-        "cache_profile_case_ids": args.cache_profile_case_ids,
-        "cache_profile_only": args.cache_profile_only,
-        "cache_profile_trace_timeout": args.cache_profile_trace_timeout,
-        "cache_profile_backend": args.cache_profile_backend,
-        "cache_nsys_session": args.cache_nsys_session,
-        "cache_nsys_path": args.cache_nsys_path,
-        "cache_nsys_tail_seconds": args.cache_nsys_tail_seconds,
-        "cache_request_transport": (
-            args.cache_request_transport if args.cache_grid_json else None
-        ),
-        "cache_grpc_port": (
-            args.cache_grpc_port or None if args.cache_grid_json else None
-        ),
-        "dataset_name": args.dataset_name or None,
-        "dataset_path": args.dataset_path or args.dataset or None,
-        "engine_args": _redact_argv(remaining_args),
-        "engine_env_names": sorted(engine_env_names or []),
-        "engine_environment": _capture_reproduction_env(engine_env_names),
-        "argv": _redact_argv(sys.argv),
-        "resume_config": resume_config,
         "resume_config_sha256": resume_config_fingerprint(resume_config),
-        "profile": profile,
         "profile_sha256": profile_sha256,
     }
     launch_path = os.path.join(args.result_dir, "cache_perf_launch.json")
@@ -1107,22 +1056,6 @@ def _write_test_info(
             launch = json.load(stream)
         if launch.get("schema_version") not in (1, 2):
             raise ValueError("unsupported launch manifest")
-        status_keys = (
-            "status",
-            "started_at",
-            "updated_at",
-            "last_attempt_started_at",
-            "attempt_count",
-            "resume_config_sha256",
-            "profile_sha256",
-            # Small report-facing summary retained for existing analysis tools.
-            "model_type",
-            "checkpoint_path",
-            "tp_size",
-            "dp_size",
-            "cache_grid_json",
-        )
-        info = {key: info[key] for key in status_keys}
         info.update(
             schema_version=4,
             config_files={
@@ -1136,6 +1069,64 @@ def _write_test_info(
                 ).hexdigest(),
                 **launch.get("snapshots", {}),
             },
+        )
+    else:
+        tokenizer_path = extract_arg(
+            remaining_args, "tokenizer_path"
+        ) or os.environ.get("TOKENIZER_PATH")
+        info.update(
+            {
+                "schema_version": 3,
+                "tokenizer_path": tokenizer_path,
+                "max_seq_len": args.max_seq_len,
+                "concurrency_limit": args.concurrency_limit,
+                "decode_test_length": args.decode_test_length,
+                "seq_size_per_block": extract_arg(
+                    remaining_args, "seq_size_per_block", None
+                ),
+                "cache_measure_runs": (
+                    args.cache_measure_runs if args.cache_grid_json else None
+                ),
+                "cache_skip_reuse_validation": (
+                    args.cache_skip_reuse_validation if args.cache_grid_json else None
+                ),
+                "cache_request_timeout": (
+                    args.cache_request_timeout if args.cache_grid_json else None
+                ),
+                "cache_commit_tail_tokens": (
+                    args.cache_commit_tail_tokens if args.cache_grid_json else None
+                ),
+                "partial": args.partial,
+                "warmup_runs": int(os.environ.get("PERF_FORMAL_WARMUP_RUNS", "1")),
+                "measure_runs": int(os.environ.get("PERF_MEASURE_RUNS", "1")),
+                "profile_runs": int(os.environ.get("PERF_PROFILE_RUNS", "1")),
+                "expected_cache_block_size": (
+                    expected_cache_block_size if args.cache_grid_json else None
+                ),
+                "cache_case_store": args.cache_case_files or None,
+                "cache_profile_runs": args.cache_profile_runs,
+                "cache_profile_case_ids": args.cache_profile_case_ids,
+                "cache_profile_only": args.cache_profile_only,
+                "cache_profile_trace_timeout": args.cache_profile_trace_timeout,
+                "cache_profile_backend": args.cache_profile_backend,
+                "cache_nsys_session": args.cache_nsys_session,
+                "cache_nsys_path": args.cache_nsys_path,
+                "cache_nsys_tail_seconds": args.cache_nsys_tail_seconds,
+                "cache_request_transport": (
+                    args.cache_request_transport if args.cache_grid_json else None
+                ),
+                "cache_grpc_port": (
+                    args.cache_grpc_port or None if args.cache_grid_json else None
+                ),
+                "dataset_name": args.dataset_name or None,
+                "dataset_path": args.dataset_path or args.dataset or None,
+                "engine_args": _redact_argv(remaining_args),
+                "engine_env_names": sorted(engine_env_names or []),
+                "engine_environment": _capture_reproduction_env(engine_env_names),
+                "argv": _redact_argv(sys.argv),
+                "resume_config": resume_config,
+                "profile": profile,
+            }
         )
     tmp_path = path + ".tmp"
     with open(tmp_path, "w") as stream:

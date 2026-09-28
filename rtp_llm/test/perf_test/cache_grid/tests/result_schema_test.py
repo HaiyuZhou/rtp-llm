@@ -155,5 +155,57 @@ class GroupedSingleRequestTest(unittest.TestCase):
                 load_observations([path])
 
 
+class ReaderPolicyTest(unittest.TestCase):
+    def test_diagnostic_reuse_mismatch_is_excluded_from_fit_and_static_chart(self):
+        item = single_request_metric(grouped_metric(cache_len=4096))
+        item.pop("request_groups")
+        item.pop("execution_mode")
+        item.update(
+            status="invalid_reuse", reuse_exact=False, cache_len_observed=[2048] * 3
+        )
+        for run in item["runs"]:
+            run.update(reuse_len=2048, reuse_exact=False)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.json"
+            path.write_text(json.dumps({"metrics": [item]}))
+            self.assertEqual(load_observations([path])[0], [])
+            self.assertEqual(static_rows(path, 1), [])
+            rows = interactive_rows(path, 1)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["cache_len"], 2048)
+            self.assertEqual(len(interactive_rows(path, 1, all_runs=True)), 3)
+
+    def test_strict_chart_does_not_default_invalid_batch_to_one(self):
+        item = {
+            "input_len": 8192,
+            "cache_len_requested": 0,
+            "cache_len_observed": [0],
+            "ttft_ms": 10,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.json"
+            for batch in (0, None, "invalid"):
+                with self.subTest(batch=batch):
+                    item["batch_size"] = batch
+                    path.write_text(json.dumps({"metrics": [item]}))
+                    self.assertEqual(static_rows(path, 1), [])
+
+    def test_legacy_latency_field_precedence_remains_specific_to_each_chart(self):
+        item = {
+            "batch_size": 1,
+            "input_len": 8192,
+            "cache_len_requested": 0,
+            "cache_len_observed": [0],
+            "status": "ok",
+            "avg_prefill_time": 20,
+            "ttft_ms": 30,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.json"
+            path.write_text(json.dumps({"metrics": [item]}))
+            self.assertEqual(static_rows(path, 1)[0]["rt"], 20)
+            self.assertEqual(interactive_rows(path, 1)[0]["prefill_rt"], 30)
+
+
 if __name__ == "__main__":
     unittest.main()

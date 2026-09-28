@@ -17,7 +17,6 @@ import argparse
 import json
 import math
 import warnings
-from collections import defaultdict
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -33,170 +32,19 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     resolve_label,
     resolve_title,
 )
-from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
-    MetricFormatError,
-    single_request_metric,
-)
-
-
-def number(value: Any) -> float | None:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
-
-
-def consistent_value(values: list[float]) -> float | None:
-    return values[0] if values and len(set(values)) == 1 else None
-
-
-def observed_cache_len(item: dict[str, Any]) -> float | None:
-    observed = item.get("cache_len_observed")
-    if isinstance(observed, list):
-        values = [number(value) for value in observed if value is not None]
-        return consistent_value(values)
-    if observed is not None:
-        return number(observed)
-
-    runs = item.get("runs")
-    if isinstance(runs, list):
-        values = [number(run.get("reuse_len")) for run in runs if isinstance(run, dict)]
-        values = [value for value in values if value is not None]
-        return consistent_value(values)
-    return None
-
-
-def prefill_rt(item: dict[str, Any]) -> float | None:
-    for key in (
-        "median_ttft_ms",
-        "avg_ttft_ms",
-        "ttft_ms",
-        "client_wall_time_ms",
-        "avg_prefill_time",
-        "target_ms",
-        "prefill_time_ms",
-        "prefill_ms",
-    ):
-        value = number(item.get(key))
-        if value is not None:
-            return value
-
-    runs = item.get("runs")
-    if isinstance(runs, list):
-        values = [
-            run_prefill_rt(run)
-            for run in runs
-            if isinstance(run, dict) and run.get("success", True)
-        ]
-        values = [value for value in values if value is not None]
-        if values:
-            return median(values)
-    return None
-
-
-def run_prefill_rt(run: dict[str, Any]) -> float | None:
-    for key in ("ttft_ms", "client_wall_time_ms", "prefill_time_ms", "total_time_ms"):
-        value = number(run.get(key))
-        if value is not None:
-            return value
-    return None
+from rtp_llm.test.perf_test.cache_grid.config.topology import detect_cards
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import measurement_rows
 
 
 def load_rows(
     input_path: Path, batch_size: int, all_runs: bool = False
 ) -> list[dict[str, float]]:
-    data = json.loads(input_path.read_text(encoding="utf-8"))
-    metrics = (
-        data if isinstance(data, list) else data.get("metrics", data.get("results", []))
+    return measurement_rows(
+        json.loads(input_path.read_text(encoding="utf-8")),
+        batch_size,
+        strict=False,
+        all_runs=all_runs,
     )
-    rows: list[dict[str, float]] = []
-
-    for item in metrics:
-        if not isinstance(item, dict):
-            continue
-        if int(number(item.get("batch_size", 1)) or 1) != batch_size:
-            continue
-        try:
-            item = single_request_metric(item)
-        except MetricFormatError:
-            continue
-        status = str(item.get("status", "")).lower()
-        if status and status not in {
-            "ok",
-            "success",
-            "passed",
-            "unknown",
-            "invalid_reuse",
-        }:
-            continue
-
-        runs = item.get("runs") if isinstance(item.get("runs"), list) else []
-        if all_runs and runs:
-            input_len = number(item.get("input_len", item.get("seq_len")))
-            case_cache_len = observed_cache_len(item)
-            for run_index, run in enumerate(runs, 1):
-                if not isinstance(run, dict) or not run.get("success", True):
-                    continue
-                rt = run_prefill_rt(run)
-                cache_len = number(run.get("reuse_len"))
-                if cache_len is None:
-                    cache_len = case_cache_len
-                if (
-                    input_len is None
-                    or cache_len is None
-                    or rt is None
-                    or input_len < 0
-                    or cache_len < 0
-                    or cache_len > input_len
-                ):
-                    continue
-                rows.append(
-                    {
-                        "input_len": input_len,
-                        "cache_len": cache_len,
-                        "compute_len": input_len - cache_len,
-                        "prefill_rt": rt,
-                        "run_index": run_index,
-                    }
-                )
-            continue
-
-        input_len = number(item.get("input_len", item.get("seq_len")))
-        cache_len = observed_cache_len(item)
-        rt = prefill_rt(item)
-        if (
-            input_len is None
-            or cache_len is None
-            or rt is None
-            or input_len < 0
-            or cache_len < 0
-            or cache_len > input_len
-        ):
-            continue
-
-        rows.append(
-            {
-                "input_len": input_len,
-                "cache_len": cache_len,
-                "compute_len": input_len - cache_len,
-                "prefill_rt": rt,
-            }
-        )
-
-    if all_runs:
-        return rows
-
-    grouped: defaultdict[tuple[float, float, float], list[dict[str, float]]] = (
-        defaultdict(list)
-    )
-    for row in rows:
-        grouped[(row["input_len"], row["cache_len"], row["compute_len"])].append(row)
-    deduped = [
-        {**values[0], "prefill_rt": median(item["prefill_rt"] for item in values)}
-        for _, values in sorted(grouped.items())
-    ]
-    return deduped
 
 
 def representative_levels(rows: list[dict[str, float]], key: str) -> list[float]:
@@ -325,64 +173,6 @@ def apply_z_metric(
             value = value / divisor
         enriched.append({**row, spec["key"]: value})
     return enriched
-
-
-def profile_cards(profile: dict | None) -> float | None:
-    """Use total workers, or TP x DP x PP; EP/CP are not extra GPU factors."""
-    engine = (profile or {}).get("engine") or {}
-
-    def count(value):
-        parsed = number(value)
-        if (
-            isinstance(value, bool)
-            or parsed is None
-            or parsed <= 0
-            or not parsed.is_integer()
-        ):
-            raise ValueError("profile GPU counts must be positive integers")
-        return parsed
-
-    if "world_size" in engine:
-        return count(engine["world_size"])
-    if any(key in engine for key in ("tp_size", "dp_size", "pp_size")):
-        return math.prod(
-            count(engine.get(key, 1)) for key in ("tp_size", "dp_size", "pp_size")
-        )
-    return None
-
-
-def detect_cards(input_path: Path, profile: dict | None = None) -> float | None:
-    """Prefer profile topology, then legacy result run_config metadata."""
-    cards = profile_cards(profile)
-    if cards is not None:
-        return cards
-    try:
-        data = json.loads(input_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    cards = profile_cards(extract_embedded_profile(data))
-    if cards is not None:
-        return cards
-    run_config = data.get("run_config")
-    if not isinstance(run_config, dict):
-        return None
-    engine = run_config.get("engine", {})
-    if "world_size" in engine:
-        return profile_cards({"engine": engine})
-    tp_size = number(engine.get("tp_size"))
-    if tp_size is None or tp_size <= 0:
-        # tp_size often only survives inside the engine's CLI args.
-        for arg in (
-            engine.get("args", []) if isinstance(engine.get("args"), list) else []
-        ):
-            if isinstance(arg, str) and arg.startswith("--tp_size="):
-                tp_size = number(arg.split("=", 1)[1])
-                break
-    if tp_size is None or tp_size <= 0:
-        return None
-    return tp_size
 
 
 def main() -> None:
@@ -524,7 +314,7 @@ def main() -> None:
             )
         except ValueError as error:
             parser.error(str(error))
-        if not math.isfinite(cards) or cards <= 0 or not cards.is_integer():
+        if not math.isfinite(cards) or cards <= 0 or not float(cards).is_integer():
             parser.error("--cards must be a positive integer")
     rows = apply_z_metric(rows, args.z_metric, cards=cards)
     if not rows:

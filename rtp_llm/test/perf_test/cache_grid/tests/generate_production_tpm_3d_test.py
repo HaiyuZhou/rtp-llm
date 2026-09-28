@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 from rtp_llm.test.perf_test.cache_grid.plot.generate_production_tpm_3d import (
     MS_PER_MINUTE,
-    _tp_size_from_args,
     compute_tpm,
     detect_cards,
     main,
@@ -35,16 +34,6 @@ def bucket(compute_len, reuse_len, count, ttft_mean, ttft_p95=None):
         "online_ttft_p95_ms": ttft_p95 if ttft_p95 is not None else ttft_mean,
         "online_ttft_p99_ms": ttft_p95 if ttft_p95 is not None else ttft_mean,
     }
-
-
-class TpSizeParsingTest(unittest.TestCase):
-    def test_reads_tp_size_argument(self):
-        self.assertEqual(_tp_size_from_args(["--model_type=x", "--tp_size=8"]), 8)
-
-    def test_rejects_non_positive_or_malformed(self):
-        self.assertIsNone(_tp_size_from_args(["--tp_size=0"]))
-        self.assertIsNone(_tp_size_from_args(["--tp_size=abc"]))
-        self.assertIsNone(_tp_size_from_args(["--ep_size=8"]))
 
 
 class DetectCardsTest(unittest.TestCase):
@@ -73,6 +62,37 @@ class DetectCardsTest(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(detect_cards(source, None), 8)
+
+    def test_profile_and_legacy_topology_use_all_worker_dimensions(self):
+        cases = [
+            ({"profile": {"engine": {"tp_size": 8, "ep_size": 8}}}, 8),
+            (
+                {
+                    "profile": {"engine": {"world_size": 16}},
+                    "run_config": {"engine": {"tp_size": 8}},
+                },
+                16,
+            ),
+            (
+                {
+                    "run_config": {
+                        "engine": {
+                            "args": ["--tp_size", "2", "--pp_size=2"],
+                            "dp_size": 4,
+                        }
+                    }
+                },
+                16,
+            ),
+            ({"run_config": {"tp_size": 2, "dp_size": 4}}, 8),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "bench.json"
+            for payload, expected in cases:
+                with self.subTest(payload=payload):
+                    source.write_text(json.dumps(payload))
+                    self.assertEqual(detect_cards(source, None), expected)
+                    self.assertEqual(detect_cards(source, 3), 3)
 
     def test_missing_benchmark_defaults_to_one(self):
         self.assertEqual(detect_cards(Path("/nonexistent/bench.json"), None), 1)
@@ -149,7 +169,12 @@ class MainSummaryTest(unittest.TestCase):
             benchmark = root / "bench.json"
             benchmark.write_text(
                 json.dumps(
-                    {"run_config": {"engine": {"args": ["--tp_size=8", "--ep_size=8"]}}}
+                    {
+                        "profile": {
+                            "schema_version": 1,
+                            "engine": {"tp_size": 8, "ep_size": 8},
+                        }
+                    }
                 ),
                 encoding="utf-8",
             )

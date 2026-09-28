@@ -8,6 +8,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from rtp_llm.test.perf_test.cache_grid.plot.traffic_chart import render_traffic_chart
+
 
 def load_traffic_histogram(input_path: Path) -> list[dict[str, Any]]:
     data = json.loads(input_path.read_text(encoding="utf-8"))
@@ -99,87 +101,33 @@ def main() -> None:
     if not points:
         parser.error(f"no valid TTFT values for z_metric={args.z_metric}")
 
-    try:
-        import plotly.graph_objects as go
-    except ModuleNotFoundError as error:
-        raise SystemExit(
-            "Plotly is required. Install it with: python3 -m pip install --user plotly"
-        ) from error
-
     output = args.output or args.input.with_name(
         f"{args.input.stem}.ttft_3d.{args.z_metric}.html"
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
 
-    counts = [p["count"] for p in points]
-    color_values = counts
-
-    if args.log_color:
-        color_values = [math.log1p(c) for c in counts]
-
-    if args.color_min_percentile > 0 or args.color_max_percentile < 100:
-        sorted_counts = sorted(color_values)
-        n = len(sorted_counts)
-        color_min = sorted_counts[int(n * args.color_min_percentile / 100)]
-        color_max = sorted_counts[
-            min(n - 1, int(n * args.color_max_percentile / 100) - 1)
-        ]
-        color_values = [max(color_min, min(color_max, v)) for v in color_values]
-    figure = go.Figure(
-        data=[
-            go.Scatter3d(
-                x=[p["x"] for p in points],
-                y=[p["y"] for p in points],
-                z=[p["z"] for p in points],
-                mode="markers",
-                marker={
-                    "size": args.marker_size,
-                    "color": color_values,
-                    "colorscale": "Hot",
-                    "reversescale": True,
-                    "colorbar": {
-                        "title": "请求数（热度）" + (" (log)" if args.log_color else "")
-                    },
-                    "opacity": 0.8,
-                },
-                customdata=[
-                    [
-                        p["input_len"],
-                        p["reuse_len"],
-                        p["p50"],
-                        p["p95"],
-                        p["p99"],
-                        p["count"],
-                    ]
-                    for p in points
-                ],
-                hovertemplate=(
-                    "Compute tokens: %{x:,.0f}<br>"
-                    "Reuse tokens: %{y:,.0f}<br>"
-                    f"TTFT {args.z_metric}: %{{z:.1f}} ms<br>"
-                    "Input: %{customdata[0]:,.0f}<br>"
-                    "Reuse: %{customdata[1]:,.0f}<br>"
-                    "TTFT p50/p95/p99: %{customdata[2]:.1f} / %{customdata[3]:.1f} / %{customdata[4]:.1f} ms<br>"
-                    "请求数: %{customdata[5]:,d}"
-                    "<extra></extra>"
-                ),
-                name="线上 TTFT 热力点",
-            )
-        ]
+    render_traffic_chart(
+        points,
+        output,
+        title=(f"线上 TTFT 3D 热力图（Z = {args.z_metric.upper()}，颜色 = 请求热度）"),
+        z_title=(f"线上 TTFT {args.z_metric.upper()} (ms, Z)"),
+        trace_name=("线上 TTFT 热力点"),
+        hovertemplate=(
+            "Compute tokens: %{x:,.0f}<br>"
+            "Reuse tokens: %{y:,.0f}<br>"
+            f"TTFT {args.z_metric}: %{{z:.1f}} ms<br>"
+            "Input: %{customdata[0]:,.0f}<br>"
+            "Reuse: %{customdata[1]:,.0f}<br>"
+            "TTFT p50/p95/p99: %{customdata[2]:.1f} / %{customdata[3]:.1f} / %{customdata[4]:.1f} ms<br>"
+            "请求数: %{customdata[5]:,d}"
+            "<extra></extra>"
+        ),
+        custom_fields=(("input_len", "reuse_len", "p50", "p95", "p99", "count")),
+        marker_size=args.marker_size,
+        log_z=args.log_z,
+        log_color=args.log_color,
+        color_max_percentile=args.color_max_percentile,
+        color_min_percentile=args.color_min_percentile,
     )
-    figure.update_layout(
-        title=f"线上 TTFT 3D 热力图（Z = {args.z_metric.upper()}，颜色 = 请求热度）",
-        scene={
-            "xaxis_title": "非缓存 compute tokens (X)",
-            "yaxis_title": "缓存 reuse tokens (Y)",
-            "zaxis_title": f"线上 TTFT {args.z_metric.upper()} (ms, Z)",
-            "zaxis_type": "log" if args.log_z else "linear",
-            "aspectmode": "manual",
-            "aspectratio": {"x": 1, "y": 1, "z": 0.7},
-        },
-        margin={"l": 0, "r": 0, "b": 0, "t": 50},
-    )
-    figure.write_html(output, include_plotlyjs=True, full_html=True)
     print(
         json.dumps(
             {

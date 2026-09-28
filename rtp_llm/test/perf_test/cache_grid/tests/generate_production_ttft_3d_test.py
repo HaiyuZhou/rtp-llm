@@ -101,6 +101,19 @@ class MainFigureTest(unittest.TestCase):
         # index int(4 * 0.5) - 1 = 1 -> sorted median 10 caps the scale.
         self.assertEqual(colors, [1, 10, 10, 10])
 
+    def test_color_clip_handles_percentile_endpoints(self):
+        buckets = [bucket(100, 0, 1, 1, 2, 3), bucket(200, 0, 10, 1, 2, 3)]
+        for percentile, expected in ((0, [1, 1]), (100, [10, 10])):
+            with self.subTest(percentile=percentile):
+                figure = self.run_main(
+                    buckets,
+                    "--color-min-percentile",
+                    str(percentile),
+                    "--color-max-percentile",
+                    str(percentile),
+                )
+                self.assertEqual(list(figure.data[0].marker.color), expected)
+
     def test_log_color_transforms_before_clipping(self):
         counts = [1, 10, 100, 1000]
         buckets = [

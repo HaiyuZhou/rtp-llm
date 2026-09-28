@@ -38,9 +38,9 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     resolve_title,
 )
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
-    MetricFormatError,
-    single_request_metric,
+    finite_number as _number,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import measurement_rows
 
 QUERY_DENSITY_PALETTE = ("#dbeafe", "#93c5fd", "#60a5fa", "#2563eb", "#1e3a8a")
 
@@ -76,29 +76,6 @@ def _query_density_color(density: int, maximum: int) -> str:
     return QUERY_DENSITY_PALETTE[index]
 
 
-def _number(value: Any) -> float | None:
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return None
-    return value if value == value and abs(value) != float("inf") else None
-
-
-def _run_rt(run: dict[str, Any]) -> float | None:
-    for key in (
-        "ttft_ms",
-        "client_wall_time_ms",
-        "prefill_time_ms",
-        "prefill_ms",
-        "avg_prefill_time",
-        "first_token_time_ms",
-    ):
-        value = _number(run.get(key))
-        if value is not None:
-            return value
-    return None
-
-
 def load_rows(path: pathlib.Path, batch_size: int) -> list[dict[str, float]]:
     """Load cache-grid JSON or a compatible predictions CSV."""
     rows: list[dict[str, float]] = []
@@ -122,96 +99,14 @@ def load_rows(path: pathlib.Path, batch_size: int) -> list[dict[str, float]]:
         return rows
 
     data = json.loads(path.read_text(encoding="utf-8"))
-    metrics = data.get("metrics", data.get("results", []))
-    for item in metrics:
-        if not isinstance(item, dict) or int(item.get("batch_size", 1)) != batch_size:
-            continue
-        try:
-            item = single_request_metric(item)
-        except MetricFormatError:
-            continue
-        # GridRunner records failed requests and cache-seed mismatches in the
-        # same JSON as successful measurements.  Never plot those as if they
-        # were measured observations; they would create a visually plausible but
-        # invalid cache surface.
-        status = str(item.get("status", "")).lower()
-        if status and status not in {
-            "ok",
-            "success",
-            "passed",
-        }:
-            continue
-        if item.get("reuse_exact") is False and not item.get(
-            "reuse_validation_skipped", False
-        ):
-            continue
-        if item.get("success_runs") is not None:
-            try:
-                if int(item.get("success_runs")) != int(item.get("measure_runs", 3)):
-                    continue
-            except (TypeError, ValueError):
-                continue
-        if int(item.get("batch_size", 1)) != batch_size:
-            continue
-        inp = _number(item.get("input_len", item.get("seq_len")))
-        requested_cache = _number(
-            item.get(
-                "target_cache_len",
-                item.get("cache_len_requested", item.get("cache_len")),
-            )
-        )
-        observed = item.get("cache_len_observed")
-        observed_values = (
-            [_number(value) for value in observed] if isinstance(observed, list) else []
-        )
-        observed_values = [value for value in observed_values if value is not None]
-        if not observed_values and isinstance(item.get("runs"), list):
-            observed_values = [
-                _number(run.get("reuse_len"))
-                for run in item["runs"]
-                if isinstance(run, dict)
-            ]
-            observed_values = [value for value in observed_values if value is not None]
-        if not observed_values or len(set(observed_values)) != 1:
-            continue
-        cache = observed_values[0]
-        # The strict cache runner publishes aggregate end-to-end request
-        # latency as median_ttft_ms/avg_ttft_ms.  Prefer the median because it
-        # is the fit target and is less sensitive to one noisy HTTP round.
-        # Older result formats remain supported after the two authoritative
-        # fields.
-        rt = None
-        for key in (
-            "median_ttft_ms",
-            "avg_ttft_ms",
-            "avg_prefill_time",
-            "target_ms",
-            "ttft_ms",
-        ):
-            rt = _number(item.get(key))
-            if rt is not None:
-                break
-        if rt is None and isinstance(item.get("runs"), list):
-            values = [_run_rt(run) for run in item["runs"] if isinstance(run, dict)]
-            values = [value for value in values if value is not None]
-            if values:
-                rt = median(values)
-        if requested_cache is None:
-            requested_cache = 0
-        if inp is None or cache is None or rt is None or cache < 0 or cache >= inp:
-            continue
-        if cache != requested_cache:
-            continue
-        rows.append({"compute": inp - cache, "cache": cache, "rt": rt, "input": inp})
-    # Keep one deterministic point per exact requested geometry.
-    grouped: defaultdict[tuple[float, float, float], list[dict[str, float]]] = (
-        defaultdict(list)
-    )
-    for row in rows:
-        grouped[(row["input"], row["cache"], row["compute"])].append(row)
     return [
-        {**values[0], "rt": median(item["rt"] for item in values)}
-        for _, values in sorted(grouped.items())
+        {
+            "compute": row["compute_len"],
+            "cache": row["cache_len"],
+            "rt": row["prefill_rt"],
+            "input": row["input_len"],
+        }
+        for row in measurement_rows(data, batch_size, strict=True)
     ]
 
 

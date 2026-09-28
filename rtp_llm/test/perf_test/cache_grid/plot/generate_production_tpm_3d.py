@@ -12,47 +12,23 @@ import math
 from pathlib import Path
 from typing import Any
 
-MS_PER_MINUTE = 60_000.0
-
-
-def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _tp_size_from_args(args: list[str]) -> int | None:
-    for arg in args:
-        if arg.startswith("--tp_size="):
-            try:
-                value = int(arg.split("=", 1)[1])
-                if value > 0:
-                    return value
-            except (ValueError, IndexError):
-                continue
-    return None
+from rtp_llm.test.perf_test.cache_grid.config.topology import (
+    detect_cards as infer_cards,
+)
+from rtp_llm.test.perf_test.cache_grid.plot.traffic_chart import render_traffic_chart
 
 
 def detect_cards(benchmark_path: Path, default_cards: int | None) -> int:
     if default_cards is not None:
         return default_cards
-    try:
-        data = load_json(benchmark_path)
-    except Exception:
-        return 1
-    if not isinstance(data, dict):
-        return 1
-    run_config = data.get("run_config")
-    if isinstance(run_config, dict):
-        tp_size = run_config.get("tp_size")
-        if isinstance(tp_size, int) and tp_size > 0:
-            return tp_size
-        engine = run_config.get("engine", {})
-        if isinstance(engine, dict):
-            args = engine.get("args", [])
-            if isinstance(args, list):
-                tp_size = _tp_size_from_args(args)
-                if tp_size is not None:
-                    return tp_size
-    return 1
+    return infer_cards(benchmark_path) or 1
+
+
+MS_PER_MINUTE = 60_000.0
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def compute_tpm(mean_input_len: float, ttft_ms: float, cards: int) -> float | None:
@@ -188,88 +164,46 @@ def main() -> None:
         weighted_token_tpm / total_input_tokens if total_input_tokens > 0 else None
     )
 
-    try:
-        import plotly.graph_objects as go
-    except ModuleNotFoundError as error:
-        raise SystemExit(
-            "Plotly is required. Install it with: python3 -m pip install --user plotly"
-        ) from error
-
     output = args.output or args.input.with_name(
         f"{args.input.stem}.tpm_3d.{args.ttft_metric}.html"
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
 
-    counts = [p["count"] for p in points]
-    color_values = [math.log1p(c) if args.log_color else c for c in counts]
-    if args.color_max_percentile < 100:
-        sorted_values = sorted(color_values)
-        n = len(sorted_values)
-        color_max = sorted_values[
-            min(n - 1, int(n * args.color_max_percentile / 100) - 1)
-        ]
-        color_values = [min(color_max, v) for v in color_values]
-
-    figure = go.Figure(
-        data=[
-            go.Scatter3d(
-                x=[p["x"] for p in points],
-                y=[p["y"] for p in points],
-                z=[p["z"] for p in points],
-                mode="markers",
-                marker={
-                    "size": args.marker_size,
-                    "color": color_values,
-                    "colorscale": "Hot",
-                    "reversescale": True,
-                    "colorbar": {
-                        "title": "请求数（热度）" + (" (log)" if args.log_color else "")
-                    },
-                    "opacity": 0.8,
-                },
-                customdata=[
-                    [
-                        p["input_len"],
-                        p["reuse_len"],
-                        p["compute_len"],
-                        p["ttft_ms"],
-                        p["count"],
-                        p["input_token_sum"],
-                    ]
-                    for p in points
-                ],
-                hovertemplate=(
-                    "Compute tokens: %{x:,.0f}<br>"
-                    "Reuse tokens: %{y:,.0f}<br>"
-                    "单卡 TPM: %{z:,.0f}<br>"
-                    "Input: %{customdata[0]:,.0f}<br>"
-                    "Reuse: %{customdata[1]:,.0f}<br>"
-                    "Compute: %{customdata[2]:,.0f}<br>"
-                    "TTFT: %{customdata[3]:.1f} ms<br>"
-                    "请求数: %{customdata[4]:,d}<br>"
-                    "Input token sum: %{customdata[5]:,d}"
-                    "<extra></extra>"
-                ),
-                name="线上单卡 TPM",
-            )
-        ]
-    )
-    figure.update_layout(
+    render_traffic_chart(
+        points,
+        output,
         title=(
             f"线上单卡 TPM 3D 热力图（Z = TPM，TTFT 口径 = {args.ttft_metric.upper()}，"
             f"颜色 = 请求热度，{cards} 卡）"
         ),
-        scene={
-            "xaxis_title": "非缓存 compute tokens (X)",
-            "yaxis_title": "缓存 reuse tokens (Y)",
-            "zaxis_title": f"单卡 TPM (tokens/min, Z, TTFT={args.ttft_metric.upper()})",
-            "zaxis_type": "log" if args.log_z else "linear",
-            "aspectmode": "manual",
-            "aspectratio": {"x": 1, "y": 1, "z": 0.7},
-        },
-        margin={"l": 0, "r": 0, "b": 0, "t": 50},
+        z_title=(f"单卡 TPM (tokens/min, Z, TTFT={args.ttft_metric.upper()})"),
+        trace_name=("线上单卡 TPM"),
+        hovertemplate=(
+            "Compute tokens: %{x:,.0f}<br>"
+            "Reuse tokens: %{y:,.0f}<br>"
+            "单卡 TPM: %{z:,.0f}<br>"
+            "Input: %{customdata[0]:,.0f}<br>"
+            "Reuse: %{customdata[1]:,.0f}<br>"
+            "Compute: %{customdata[2]:,.0f}<br>"
+            "TTFT: %{customdata[3]:.1f} ms<br>"
+            "请求数: %{customdata[4]:,d}<br>"
+            "Input token sum: %{customdata[5]:,d}"
+            "<extra></extra>"
+        ),
+        custom_fields=(
+            (
+                "input_len",
+                "reuse_len",
+                "compute_len",
+                "ttft_ms",
+                "count",
+                "input_token_sum",
+            )
+        ),
+        marker_size=args.marker_size,
+        log_z=args.log_z,
+        log_color=args.log_color,
+        color_max_percentile=args.color_max_percentile,
     )
-    figure.write_html(output, include_plotlyjs=True, full_html=True)
 
     summary = {
         "input": str(args.input),

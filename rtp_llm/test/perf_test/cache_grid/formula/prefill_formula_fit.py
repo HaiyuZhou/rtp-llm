@@ -60,10 +60,18 @@ from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
     PARSER_PER_REQUEST_VARIABLES,
     fit_restricted_symbolic,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import MetricFormatError
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
-    MetricFormatError,
+    finite_number as _finite,
+)
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import integer as _integer
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    observed_reuse_values,
     request_runs,
     single_request_metric,
+)
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    status_ok as _status_ok,
 )
 
 DEFAULT_TOKEN_UNIT = 1024
@@ -98,34 +106,6 @@ class Observation:
         return self.input_len - self.cache_len
 
 
-def _finite(value: Any) -> float | None:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    if math.isfinite(result):
-        return result
-    return None
-
-
-def _integer(value: Any) -> int | None:
-    number = _finite(value)
-    if number is None or not number.is_integer():
-        return None
-    return int(number)
-
-
-def _status_ok(item: dict[str, Any]) -> bool:
-    status = str(item.get("status", "")).lower()
-    # Fail closed. A completed HTTP forward is not a valid cache-performance
-    # sample when the runner marked its reuse contract invalid.
-    return not status or status in {
-        "ok",
-        "success",
-        "passed",
-    }
-
-
 def _run_time_statistic(values: Sequence[float], estimator: str) -> float:
     if estimator == "min":
         return min(values)
@@ -152,16 +132,7 @@ def _median_run_time(
         "reuse_validation_skipped", False
     ):
         return None, None, "reuse_not_exact"
-    observed = item.get("cache_len_observed")
-    observed_values = (
-        [_integer(value) for value in observed] if isinstance(observed, list) else []
-    )
-    observed_values = [value for value in observed_values if value is not None]
-    if not observed_values:
-        observed_values = [
-            _integer(run.get("reuse_len")) for run in runs if isinstance(run, dict)
-        ]
-        observed_values = [value for value in observed_values if value is not None]
+    observed_values = observed_reuse_values(item, parse=_integer)
     if len(observed_values) != expected_runs or len(set(observed_values)) != 1:
         return None, None, "observed_reuse_not_constant"
     cache_len = observed_values[0]

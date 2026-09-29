@@ -54,6 +54,21 @@ def _stable_rng(seed: int, namespace: str) -> random.Random:
     return random.Random(int.from_bytes(digest[:8], "big"))
 
 
+def comma_separated_ints(value: str) -> list[int]:
+    """Parse one non-empty comma-separated integer argument."""
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or any(not part for part in parts):
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated integers, for example 4096,8192"
+        )
+    try:
+        return [int(part) for part in parts]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated integers, for example 4096,8192"
+        ) from error
+
+
 def _stratified_pick(values: list[int], count: int, seed: int) -> list[int]:
     if count >= len(values):
         return values
@@ -129,7 +144,172 @@ def generate_cache_lengths(
     return sorted(x for x in result if 0 <= x < input_len)
 
 
+def generate_fixed_cache_lengths(
+    *,
+    explicit: list[int],
+    random_count: int | None,
+    minimum: int,
+    maximum: int,
+    alignment: int,
+    seed: int,
+) -> list[int]:
+    """Resolve explicit or reproducibly sampled cache lengths."""
+    if alignment <= 0 or minimum < 0 or maximum < minimum:
+        raise ValueError("invalid fixed-cache bounds or alignment")
+    if explicit and random_count is not None:
+        raise ValueError(
+            "--fixed-cache-len and --random-cache-count are mutually exclusive"
+        )
+    if not explicit and random_count is None:
+        raise ValueError(
+            "fixed-cache-sweep requires --fixed-cache-len or --random-cache-count"
+        )
+
+    if explicit:
+        if len(explicit) != len(set(explicit)):
+            raise ValueError("--fixed-cache-len values must be unique")
+        for value in explicit:
+            if value < minimum or value > maximum:
+                raise ValueError(
+                    f"fixed cache length {value} is outside [{minimum}, {maximum}]"
+                )
+            if value % alignment:
+                raise ValueError(
+                    f"fixed cache length {value} is not aligned to {alignment}"
+                )
+        return list(explicit)
+
+    assert random_count is not None
+    if random_count <= 0:
+        raise ValueError("--random-cache-count must be positive")
+    first = ((minimum + alignment - 1) // alignment) * alignment
+    candidates = list(range(first, maximum + 1, alignment))
+    if random_count > len(candidates):
+        raise ValueError(
+            f"requested {random_count} random cache lengths, but only "
+            f"{len(candidates)} aligned values exist in [{minimum}, {maximum}]"
+        )
+    rng = _stable_rng(seed, "fixed-cache-sweep")
+    return sorted(rng.sample(candidates, random_count))
+
+
+def build_fixed_cache_sweep(args: argparse.Namespace) -> dict[str, Any]:
+    """Build fixed-cache slices while stepping the uncached compute length."""
+    if args.batch_size <= 0 or args.measure_runs <= 0 or args.max_cases <= 0:
+        raise ValueError("batch size, measure runs, and max cases must be positive")
+    cache_alignment = getattr(args, "cache_alignment", None)
+    if cache_alignment is None or cache_alignment <= 0:
+        raise ValueError(
+            "specify --cache-alignment or profile.cache_grid.cache_alignment explicitly"
+        )
+    raw_compute_steps = getattr(args, "compute_step", None)
+    if isinstance(raw_compute_steps, int):
+        compute_steps = [raw_compute_steps]
+    else:
+        compute_steps = list(raw_compute_steps or [])
+    if not compute_steps or any(step <= 0 for step in compute_steps):
+        raise ValueError("fixed-cache-sweep requires positive --compute-step values")
+    if len(compute_steps) != len(set(compute_steps)):
+        raise ValueError("--compute-step values must be unique")
+    if compute_steps != sorted(compute_steps, reverse=True):
+        raise ValueError("--compute-step values must be ordered coarse-to-fine")
+    min_compute_len = getattr(args, "min_compute_len", None)
+    if min_compute_len is None:
+        min_compute_len = compute_steps[-1]
+    if min_compute_len <= 0:
+        raise ValueError("--min-compute-len must be positive")
+    if args.max_input_len < min_compute_len:
+        raise ValueError("--max-input-len is smaller than the minimum compute length")
+
+    min_cache_len = getattr(args, "min_cache_len", 0)
+    requested_max_cache = getattr(args, "max_cache_len", None)
+    largest_usable_cache = args.max_input_len - min_compute_len
+    max_cache_len = (
+        largest_usable_cache
+        if requested_max_cache is None
+        else requested_max_cache
+    )
+    if max_cache_len > largest_usable_cache:
+        raise ValueError(
+            "--max-cache-len must leave room for --min-compute-len under "
+            "--max-input-len"
+        )
+    cache_lengths = generate_fixed_cache_lengths(
+        explicit=list(getattr(args, "fixed_cache_len", None) or []),
+        random_count=getattr(args, "random_cache_count", None),
+        minimum=min_cache_len,
+        maximum=max_cache_len,
+        alignment=cache_alignment,
+        seed=args.seed,
+    )
+
+    cases = []
+    seen = set()
+    for cache_len in cache_lengths:
+        max_compute_len = args.max_input_len - cache_len
+        for refinement_level, compute_step in enumerate(compute_steps):
+            for compute_len in range(
+                min_compute_len, max_compute_len + 1, compute_step
+            ):
+                input_len = cache_len + compute_len
+                geometry = (args.batch_size, input_len, cache_len)
+                if geometry in seen:
+                    continue
+                seen.add(geometry)
+                cases.append(
+                    {
+                        "case_id": len(cases),
+                        "batch_size": args.batch_size,
+                        "input_len": input_len,
+                        "cache_len": cache_len,
+                        "refinement_level": refinement_level,
+                        "compute_step": compute_step,
+                    }
+                )
+    if len(cases) > args.max_cases and not args.allow_large_grid:
+        raise ValueError(
+            f"generated {len(cases)} cases, exceeding --max-cases={args.max_cases}; "
+            "reduce sampling or pass --allow-large-grid"
+        )
+    return {
+        "schema_version": 2,
+        "kind": "fixed_cache_compute_sweep",
+        "generator": {
+            "name": "fixed_cache_compute_sweep",
+            "version": 2,
+            "seed": args.seed,
+            "cache_alignment": cache_alignment,
+            "cache_sampling": {
+                "mode": (
+                    "explicit"
+                    if getattr(args, "fixed_cache_len", None)
+                    else "random"
+                ),
+                "values": cache_lengths,
+                "requested_random_count": getattr(args, "random_cache_count", None),
+                "min": min_cache_len,
+                "max": max_cache_len,
+            },
+            "compute_sampling": {
+                "min": min_compute_len,
+                "steps": compute_steps,
+                "max_input_len": args.max_input_len,
+            },
+        },
+        "summary": {
+            "cache_count": len(cache_lengths),
+            "input_count": len({case["input_len"] for case in cases}),
+            "case_count": len(cases),
+            "estimated_measure_requests": len(cases) * args.measure_runs,
+            "estimated_seed_requests": sum(c["cache_len"] > 0 for c in cases),
+        },
+        "cases": cases,
+    }
+
+
 def build_grid(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "grid_mode", "stratified") == "fixed-cache-sweep":
+        return build_fixed_cache_sweep(args)
     if args.batch_size <= 0 or args.measure_runs <= 0 or args.max_cases <= 0:
         raise ValueError("batch size, measure runs, and max cases must be positive")
     inputs = generate_input_lengths(
@@ -208,6 +388,11 @@ def build_grid(args: argparse.Namespace) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--grid-mode",
+        choices=("stratified", "fixed-cache-sweep"),
+        default="stratified",
+    )
     parser.add_argument("--min-input-len", type=int, default=256)
     parser.add_argument("--max-input-len", type=int, default=1048575)
     parser.add_argument(
@@ -234,6 +419,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-points", type=int, default=1024)
     parser.add_argument("--cache-points-per-input", type=int, default=16)
     parser.add_argument("--cache-ratio-points", type=int, default=7)
+    parser.add_argument(
+        "--fixed-cache-len",
+        type=comma_separated_ints,
+        help=(
+            "Comma-separated fixed cache lengths for fixed-cache-sweep. "
+            "Mutually exclusive with --random-cache-count."
+        ),
+    )
+    parser.add_argument(
+        "--random-cache-count",
+        type=int,
+        default=None,
+        help="Reproducibly sample this many aligned cache lengths without replacement",
+    )
+    parser.add_argument("--min-cache-len", type=int, default=0)
+    parser.add_argument("--max-cache-len", type=int, default=None)
+    parser.add_argument(
+        "--compute-step",
+        type=comma_separated_ints,
+        default=None,
+        help=(
+            "Comma-separated compute-length steps ordered coarse-to-fine for "
+            "fixed-cache-sweep"
+        ),
+    )
+    parser.add_argument(
+        "--min-compute-len",
+        type=int,
+        default=None,
+        help="First compute length; defaults to the finest --compute-step",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--measure-runs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)

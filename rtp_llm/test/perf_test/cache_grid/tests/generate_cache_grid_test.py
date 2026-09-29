@@ -12,6 +12,8 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
 from rtp_llm.test.perf_test.cache_grid.runner.generate_cache_grid import (
     DEFAULT_SEED,
     build_grid,
+    comma_separated_ints,
+    generate_fixed_cache_lengths,
     generate_cache_lengths,
     generate_input_lengths,
 )
@@ -102,6 +104,110 @@ class GenerateCacheGridTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "exceeding --max-cases"):
             build_grid(args)
+
+
+class GenerateFixedCacheSweepTest(unittest.TestCase):
+    def _args(self, **overrides):
+        values = dict(
+            grid_mode="fixed-cache-sweep",
+            max_input_len=32768,
+            cache_alignment=4096,
+            fixed_cache_len=[4096, 8192],
+            random_cache_count=None,
+            min_cache_len=0,
+            max_cache_len=None,
+            compute_step=4096,
+            min_compute_len=None,
+            batch_size=1,
+            measure_runs=3,
+            seed=DEFAULT_SEED,
+            max_cases=1000,
+            allow_large_grid=False,
+        )
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_explicit_cache_lengths_generate_nonduplicate_compute_sweeps(self):
+        plan = build_grid(self._args())
+        geometries = [
+            (case["input_len"], case["cache_len"]) for case in plan["cases"]
+        ]
+        self.assertEqual(len(geometries), len(set(geometries)))
+        self.assertEqual(plan["summary"]["cache_count"], 2)
+        first_slice = [
+            case for case in plan["cases"] if case["cache_len"] == 4096
+        ]
+        self.assertEqual(
+            [case["input_len"] - case["cache_len"] for case in first_slice],
+            list(range(4096, 32768 - 4096 + 1, 4096)),
+        )
+        self.assertTrue(all(case["input_len"] <= 32768 for case in plan["cases"]))
+
+    def test_random_cache_lengths_are_unique_aligned_and_reproducible(self):
+        args = self._args(
+            fixed_cache_len=None,
+            random_cache_count=4,
+            min_cache_len=4096,
+            max_cache_len=20480,
+        )
+        first = build_grid(args)
+        second = build_grid(args)
+        caches = first["generator"]["cache_sampling"]["values"]
+        self.assertEqual(first["cases"], second["cases"])
+        self.assertEqual(len(caches), len(set(caches)))
+        self.assertTrue(all(value % 4096 == 0 for value in caches))
+
+    def test_compute_steps_run_coarse_to_fine_without_duplicates(self):
+        plan = build_grid(
+            self._args(
+                fixed_cache_len=[4096],
+                compute_step=[16384, 8192, 4096],
+            )
+        )
+        cases = plan["cases"]
+        self.assertEqual(
+            [case["input_len"] - case["cache_len"] for case in cases],
+            [4096, 20480, 12288, 28672, 8192, 16384, 24576],
+        )
+        self.assertEqual(
+            [case["refinement_level"] for case in cases],
+            [0, 0, 1, 1, 2, 2, 2],
+        )
+        self.assertEqual(len(cases), len({case["input_len"] for case in cases}))
+        self.assertEqual(
+            plan["generator"]["compute_sampling"]["steps"],
+            [16384, 8192, 4096],
+        )
+
+    def test_compute_steps_must_be_unique_and_coarse_to_fine(self):
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            build_grid(self._args(compute_step=[8192, 8192]))
+        with self.assertRaisesRegex(ValueError, "coarse-to-fine"):
+            build_grid(self._args(compute_step=[4096, 8192]))
+
+    def test_manual_and_random_cache_modes_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            build_grid(self._args(random_cache_count=2))
+
+    def test_duplicate_explicit_cache_lengths_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            build_grid(self._args(fixed_cache_len=[4096, 4096]))
+
+    def test_random_count_cannot_exceed_aligned_candidates(self):
+        with self.assertRaisesRegex(ValueError, "only 2 aligned values"):
+            generate_fixed_cache_lengths(
+                explicit=[],
+                random_count=3,
+                minimum=0,
+                maximum=4096,
+                alignment=4096,
+                seed=DEFAULT_SEED,
+            )
+
+    def test_fixed_cache_cli_value_is_comma_separated(self):
+        self.assertEqual(comma_separated_ints("4096, 8192,16384"), [4096, 8192, 16384])
+        with self.assertRaises(argparse.ArgumentTypeError):
+            comma_separated_ints("4096,,8192")
 
 
 class GenerateCacheGridProfileTest(unittest.TestCase):
@@ -197,6 +303,28 @@ class GenerateCacheGridProfileTest(unittest.TestCase):
         self.assertEqual(payload["cases"], expected["cases"])
         self.assertEqual(payload["generator"], expected["generator"])
         self.assertEqual(payload["summary"], expected["summary"])
+
+    def test_fixed_cache_sweep_cli_accepts_comma_separated_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self._run_grid(
+                [
+                    "--grid-mode",
+                    "fixed-cache-sweep",
+                    "--fixed-cache-len",
+                    "4096,8192",
+                    "--compute-step",
+                    "16384,4096",
+                    "--cache-alignment",
+                    "4096",
+                ],
+                tmp,
+            )
+        self.assertEqual(
+            payload["generator"]["cache_sampling"]["values"], [4096, 8192]
+        )
+        self.assertEqual(
+            payload["generator"]["compute_sampling"]["steps"], [16384, 4096]
+        )
 
 
 if __name__ == "__main__":

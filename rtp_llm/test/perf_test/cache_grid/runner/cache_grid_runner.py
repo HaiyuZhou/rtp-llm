@@ -1518,12 +1518,15 @@ class CacheGridRunner:
         }
 
     @staticmethod
-    def _shared_seed_case_order(case: Dict[str, Any]) -> tuple[int, int, int, int]:
+    def _shared_seed_case_order(
+        case: Dict[str, Any],
+    ) -> tuple[int, int, int, int, int]:
         """Keep the longest shared prefixes hot and defer cold cache pressure."""
         cache_len = int(case["cache_len"])
         return (
             1 if cache_len == 0 else 0,
             -cache_len,
+            int(case.get("refinement_level", 0)),
             int(case["input_len"]),
             int(case["case_id"]),
         )

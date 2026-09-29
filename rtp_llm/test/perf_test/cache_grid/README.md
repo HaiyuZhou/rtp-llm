@@ -209,6 +209,57 @@ python3 -m unittest discover -s rtp_llm/test/perf_test/cache_grid/tests -p '*_te
 已有 Bazel target 名称保持不变，直接执行本目录中的实现，不再经过旧脚本转发。
 新增测试统一放 `tests/`；Bazel 定义仍集中在父目录 BUILD，避免引入破坏旧 target 的子包边界。
 
+### 固定 cache、递增 compute 的 grid
+
+`fixed-cache-sweep` 模式固定一个或多个 cache 长度，并按固定步长增加未命中的
+compute 长度。每个 case 满足：
+
+```text
+input_len = cache_len + compute_len
+compute_len = min_compute_len + n * one_compute_step
+input_len <= max_input_len
+```
+
+`--compute-step` 接受从粗到细排列的逗号分隔步长。每一级只补充之前级别尚未
+生成的点，因此同一个 `(cache_len, compute_len)` 不会重复执行。例如
+`--compute-step 32768,8192,4096` 会先跑 32768 粒度，再补 8192 粒度，最后补
+4096 粒度。
+
+手动指定 cache 长度时，用逗号分隔传给一个 `--fixed-cache-len`：
+
+```bash
+python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_cache_grid \
+  --output /path/fixed-cache-grid.json \
+  --grid-mode fixed-cache-sweep \
+  --fixed-cache-len 32768,65536 \
+  --min-compute-len 4096 \
+  --compute-step 32768,8192,4096 \
+  --max-input-len 262144 \
+  --cache-alignment 4096
+```
+
+也可以从对齐后的 cache 候选中无放回随机抽样。相同 `--seed`、范围和数量会生成
+相同的 cache 列表：
+
+```bash
+python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_cache_grid \
+  --output /path/random-fixed-cache-grid.json \
+  --grid-mode fixed-cache-sweep \
+  --random-cache-count 16 \
+  --min-cache-len 4096 \
+  --max-cache-len 131072 \
+  --min-compute-len 4096 \
+  --compute-step 32768,8192,4096 \
+  --max-input-len 262144 \
+  --cache-alignment 4096 \
+  --seed 104729
+```
+
+`--fixed-cache-len` 与 `--random-cache-count` 二选一。手动值和随机候选都必须满足
+`--cache-alignment`；重复的手动值会直接报错。未设置 `--min-compute-len` 时从最细的
+`--compute-step` 开始。步长必须唯一并严格按从大到小排列。还要确保最小 compute 不小于运行配置中的
+`cache_grid.commit_tail_tokens`，否则 runner 会拒绝 cache-hit case。
+
 ## 通用化迁移
 
 公式入口统一为 `formula.prefill_formula_fit`，Bazel target 为 `prefill_formula_fit`，

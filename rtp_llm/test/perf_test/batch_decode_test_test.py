@@ -2164,6 +2164,24 @@ class SharedSeedTest(unittest.TestCase):
         ordered = sorted(cases, key=CacheGridRunner._shared_seed_case_order)
         self.assertEqual([case["case_id"] for case in ordered], [3, 1, 2, 4, 0])
 
+    def test_shared_seed_preserves_refinement_level_within_cache(self):
+        cases = [
+            {
+                "case_id": 0,
+                "input_len": 64,
+                "cache_len": 32,
+                "refinement_level": 1,
+            },
+            {
+                "case_id": 1,
+                "input_len": 96,
+                "cache_len": 32,
+                "refinement_level": 0,
+            },
+        ]
+        ordered = sorted(cases, key=CacheGridRunner._shared_seed_case_order)
+        self.assertEqual([case["case_id"] for case in ordered], [1, 0])
+
     def test_independent_seed_preserves_declared_order(self):
         cases = [
             {"case_id": 0, "batch_size": 1, "input_len": 64, "cache_len": 0},

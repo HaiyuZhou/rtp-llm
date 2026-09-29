@@ -94,7 +94,6 @@ class WorkspaceBudgetTest(unittest.TestCase):
             max_seq_len=8192,
             cache_shared_seed=False,
             cache_commit_tail_tokens=4096,
-            expected_cache_block_size=4096,
             decode_test_length=1,
         )
         remaining = [
@@ -103,13 +102,17 @@ class WorkspaceBudgetTest(unittest.TestCase):
             "--prefill_cp_kv_cache_sharded=1",
             "--max_context_batch_size=32",
         ]
-        _configure_cache_batch_limits(args, remaining, [self.case()])
+        _configure_cache_batch_limits(
+            args, remaining, [self.case()], cache_alignment=4096
+        )
         self.assertEqual(args.max_seq_len, WORKSPACE_TOKENS)
         self.assertEqual(extract_arg(remaining, "max_context_batch_size"), "1")
         self.assertIsNone(extract_arg(remaining, "max_generate_batch_size"))
         self.assertEqual(args.concurrency_limit, 32)
         with self.assertRaisesRegex(ValueError, "rectangle"):
-            _configure_cache_batch_limits(args, remaining, [self.case(length=32768)])
+            _configure_cache_batch_limits(
+                args, remaining, [self.case(length=32768)], cache_alignment=4096
+            )
 
     def test_policy_validation(self):
         self.assertFalse(fixed_workspace_grid({}))

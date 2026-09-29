@@ -12,10 +12,11 @@ from pathlib import Path
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
-from rtp_llm.test.perf_test.cache_grid.runner import cache_perf
-from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
-    normalize_cache_case,
+from rtp_llm.test.perf_test.batch_decode_test import (
+    _load_cache_grid_cases,
+    _resolve_cache_block_size,
 )
+from rtp_llm.test.perf_test.cache_grid.runner import cache_perf
 from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
     fixed_workspace_grid,
     grid_token_budget,
@@ -27,10 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[5]
 
 def inspect_grid(path):
     grid = json.loads(path.read_text(encoding="utf-8"))
-    raw = grid.get("cases")
-    if not isinstance(raw, list) or not raw:
-        raise ValueError(f"{path}: requires a nonempty explicit cases list")
-    cases = [normalize_cache_case(case, i) for i, case in enumerate(raw)]
+    cases = _load_cache_grid_cases(str(path))
     batches = {case["batch_size"] for case in cases}
     if len(batches) != 1:
         raise ValueError(f"{path}: split mixed batch sizes into separate files")
@@ -38,7 +36,7 @@ def inspect_grid(path):
         metadata = grid.get("generator", {})
         validate_fixed_workspace(
             cases,
-            block=int(metadata.get("cache_alignment", 4096)),
+            block=_resolve_cache_block_size(grid),
             commit_tail=int(
                 metadata.get("parameters", {}).get("commit_tail_tokens", 4096)
             ),

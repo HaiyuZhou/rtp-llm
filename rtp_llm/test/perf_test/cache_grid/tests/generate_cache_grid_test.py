@@ -13,8 +13,8 @@ from rtp_llm.test.perf_test.cache_grid.runner.generate_cache_grid import (
     DEFAULT_SEED,
     build_grid,
     comma_separated_ints,
-    generate_fixed_cache_lengths,
     generate_cache_lengths,
+    generate_fixed_cache_lengths,
     generate_input_lengths,
 )
 
@@ -61,7 +61,7 @@ class GenerateCacheGridTest(unittest.TestCase):
         plan = build_grid(args)
         for case in plan["cases"]:
             self.assertEqual(case["cache_len"] % 512, 0)
-        self.assertEqual(plan["generator"]["cache_sampling"]["alignment"], 512)
+        self.assertEqual(plan["generator"]["cache_alignment"], 512)
         # The input dimension keeps its own alignment.
         inputs = {case["input_len"] for case in plan["cases"]}
         self.assertTrue(inputs)
@@ -129,14 +129,10 @@ class GenerateFixedCacheSweepTest(unittest.TestCase):
 
     def test_explicit_cache_lengths_generate_nonduplicate_compute_sweeps(self):
         plan = build_grid(self._args())
-        geometries = [
-            (case["input_len"], case["cache_len"]) for case in plan["cases"]
-        ]
+        geometries = [(case["input_len"], case["cache_len"]) for case in plan["cases"]]
         self.assertEqual(len(geometries), len(set(geometries)))
         self.assertEqual(plan["summary"]["cache_count"], 2)
-        first_slice = [
-            case for case in plan["cases"] if case["cache_len"] == 4096
-        ]
+        first_slice = [case for case in plan["cases"] if case["cache_len"] == 4096]
         self.assertEqual(
             [case["input_len"] - case["cache_len"] for case in first_slice],
             list(range(4096, 32768 - 4096 + 1, 4096)),
@@ -278,7 +274,7 @@ class GenerateCacheGridProfileTest(unittest.TestCase):
             )
         for case in payload["cases"]:
             self.assertEqual(case["cache_len"] % 256, 0)
-        self.assertEqual(payload["generator"]["cache_sampling"]["alignment"], 256)
+        self.assertEqual(payload["generator"]["cache_alignment"], 256)
 
     def test_explicit_alignment_matches_direct_build(self):
         """The CLI and direct API use the same explicit alignment."""
@@ -319,9 +315,7 @@ class GenerateCacheGridProfileTest(unittest.TestCase):
                 ],
                 tmp,
             )
-        self.assertEqual(
-            payload["generator"]["cache_sampling"]["values"], [4096, 8192]
-        )
+        self.assertEqual(payload["generator"]["cache_sampling"]["values"], [4096, 8192])
         self.assertEqual(
             payload["generator"]["compute_sampling"]["steps"], [16384, 4096]
         )

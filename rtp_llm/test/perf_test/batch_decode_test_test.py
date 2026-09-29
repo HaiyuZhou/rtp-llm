@@ -21,7 +21,6 @@ from rtp_llm.test.perf_test.batch_decode_test import (
     _prepare_cache_profile_result_dir,
     _redact_argv,
     _resolve_cache_block_size,
-    _resolve_cache_ratios,
     _write_test_info,
     parse_args,
 )
@@ -78,13 +77,23 @@ class CacheGridBatchTest(unittest.TestCase):
             runner = CacheGridRunner(
                 12345,
                 _WordTokenizer(),
-                [{"case_id": 1, "batch_size": 2, "input_len": 24, "cache_len": 0}],
+                [
+                    {
+                        "case_id": 1,
+                        "batch_size": 2,
+                        "prefix_policy": "independent",
+                        "request_groups": [
+                            {"count": 2, "input_len": 24, "cache_len": 0}
+                        ],
+                    }
+                ],
                 tmp,
                 measure_runs=1,
             )
             with patch(
                 "rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner._post_prefill",
                 return_value={
+                    "prefill_time_ms": 1,
                     "success": True,
                     "input_len": 24,
                     "reuse_len": 0,
@@ -119,11 +128,11 @@ class CacheGridBatchTest(unittest.TestCase):
                     runner.run()
             post.assert_not_called()
 
-    def test_config_validation_and_homogeneous_compatibility(self):
-        case = normalize_cache_case({"batch_size": 3, "input_len": 24, "cache_len": 8})
-        self.assertEqual(
-            case["request_groups"], [{"count": 3, "input_len": 24, "cache_len": 8}]
-        )
+    def test_config_validation_requires_explicit_batch_groups(self):
+        with self.assertRaisesRegex(ValueError, "request_groups"):
+            normalize_cache_case(
+                {"case_id": 0, "batch_size": 3, "input_len": 24, "cache_len": 8}
+            )
         for change in (
             {"batch_size": 5},
             {"prefix_policy": "random"},
@@ -157,7 +166,15 @@ class CacheGridBatchTest(unittest.TestCase):
         second = {**self.case("shared_by_group"), "case_id": 11}
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "grid.json"
-            path.write_text(json.dumps({"cases": [first, second]}))
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "generator": {"cache_alignment": 8},
+                        "cases": [first, second],
+                    }
+                )
+            )
             cases = _load_cache_grid_cases(str(path))
         self.assertEqual(len(_dedupe_cache_grid_cases(cases, 8)), 2)
         self.assertNotEqual(
@@ -216,11 +233,12 @@ class CacheGridBatchTest(unittest.TestCase):
             if slot == bad_slot:
                 reuse += 8
             return {
+                "prefill_time_ms": 0.0 if bad_timing else 2.0,
                 "success": True,
                 "input_len": len(ids),
                 "reuse_len": reuse,
                 "output_len": 1,
-                "ttft_ms": 0.0 if bad_timing else 2.0,
+                "ttft_ms": 999.0,
             }
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -272,7 +290,7 @@ class CacheGridBatchTest(unittest.TestCase):
                 self.assertEqual(row["status"], "ok")
                 self.assertEqual(row["execution_mode"], "scheduler_fixed_batch")
                 self.assertGreater(row["median_batch_wall_time_ms"], 0)
-                self.assertNotIn("median_ttft_ms", row)
+                self.assertNotIn("median_prefill_time_ms", row)
                 for run in row["runs"]:
                     self.assertEqual(run["total_input_tokens"], 104)
                     self.assertEqual(run["new_prefill_tokens"], 72)
@@ -336,6 +354,7 @@ class CacheGridBatchTest(unittest.TestCase):
                 if slot == 1:
                     raise TimeoutError("simulated request timeout")
                 return {
+                    "prefill_time_ms": 1,
                     "success": True,
                     "input_len": len(prompt.split()),
                     "reuse_len": [8, 8, 16, 0][slot],
@@ -415,6 +434,8 @@ class BatchDecodeTest(unittest.TestCase):
 
     def test_cache_grid_loader_validates_explicit_cases(self):
         payload = {
+            "schema_version": 2,
+            "generator": {"cache_alignment": 512},
             "cases": [
                 {"case_id": 7, "batch_size": 1, "input_len": 4096, "cache_len": 0},
                 {
@@ -423,7 +444,7 @@ class BatchDecodeTest(unittest.TestCase):
                     "input_len": 4096,
                     "cache_len": 2048,
                 },
-            ]
+            ],
         }
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cache_grid.json"
@@ -432,10 +453,12 @@ class BatchDecodeTest(unittest.TestCase):
 
     def test_cache_grid_loader_rejects_duplicate_geometry(self):
         payload = {
+            "schema_version": 2,
+            "generator": {"cache_alignment": 512},
             "cases": [
-                {"batch_size": 1, "input_len": 4096, "cache_len": 2048},
-                {"batch_size": 1, "input_len": 4096, "cache_len": 2048},
-            ]
+                {"case_id": 0, "batch_size": 1, "input_len": 4096, "cache_len": 2048},
+                {"case_id": 1, "batch_size": 1, "input_len": 4096, "cache_len": 2048},
+            ],
         }
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cache_grid.json"
@@ -449,7 +472,7 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertGreater(args.cache_request_timeout, 0)
         self.assertEqual(args.cache_commit_tail_tokens, 4096)
         self.assertEqual(args.cache_grid_json, "")
-        self.assertEqual(args.expected_cache_block_size, 0)
+        self.assertFalse(hasattr(args, "expected_cache_block_size"))
         self.assertEqual(args.materialize_cache_cases, "")
         self.assertEqual(args.cache_case_files, "")
         self.assertEqual(args.cache_request_transport, "dashsc_input_ids")
@@ -458,66 +481,114 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertFalse(args.require_cache_resume)
         self.assertIsInstance(remaining, list)
 
-    def test_generated_cache_grid_uses_independent_seq_and_cache_alignment(self):
-        payload = {
-            "seq_generation": {
-                "kind": "linear_with_dense_prefix",
-                "count": 20,
-                "max_seq_len": 65535,
-            },
-            "seq_block_size": 256,
-            "cache_block_size": 4096,
+    def test_cache_grid_rejects_compact_and_missing_cases(self):
+        base = {"schema_version": 2, "generator": {"cache_alignment": 4096}}
+        for fields in (
+            {},
+            {"seq_lens": [8192]},
+            {"seq_generation": {"kind": "linear_with_dense_prefix"}},
+            {"cases": [], "cache_ratios": [0]},
+            {"cases": []},
+        ):
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "grid.json"
+                path.write_text(json.dumps({**base, **fields}))
+                with self.assertRaises(ValueError):
+                    _load_cache_grid_cases(str(path))
+
+    def test_cache_case_required_fields_are_not_filled_or_coerced(self):
+        scalar = {"case_id": 0, "batch_size": 1, "input_len": 8192, "cache_len": 0}
+        grouped = {
+            "case_id": 1,
+            "batch_size": 2,
+            "prefix_policy": "independent",
+            "request_groups": [{"count": 2, "input_len": 8192, "cache_len": 0}],
         }
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "cache_grid.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
-            cases = _load_cache_grid_cases(str(path))
-        self.assertTrue(any(case["input_len"] == 256 for case in cases))
-        self.assertTrue(
-            all(
-                case["cache_len"] == 0 or case["cache_len"] % 4096 == 0
-                for case in cases
-            )
-        )
-        self.assertTrue(
-            all(
-                case["cache_len"] == 0 or case["cache_len"] + 4096 <= case["input_len"]
-                for case in cases
-            )
-        )
+        for original in (scalar, grouped):
+            for key in original:
+                with self.subTest(missing=key, original=original), self.assertRaises(
+                    ValueError
+                ):
+                    normalize_cache_case(
+                        {k: v for k, v in original.items() if k != key}
+                    )
+        for key in ("count", "input_len", "cache_len"):
+            with self.subTest(group_missing=key), self.assertRaises(ValueError):
+                normalize_cache_case(
+                    {
+                        **grouped,
+                        "request_groups": [
+                            {
+                                k: v
+                                for k, v in grouped["request_groups"][0].items()
+                                if k != key
+                            }
+                        ],
+                    }
+                )
+        for key in scalar:
+            for value in ("1", True, 1.0, None):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    normalize_cache_case({**scalar, key: value})
+        with self.assertRaisesRegex(ValueError, "summary"):
+            normalize_cache_case({**grouped, "input_len": 4096})
 
-    def test_cache_ratio_interval_generates_uniform_ratios_below_one(self):
-        self.assertEqual(
-            _resolve_cache_ratios({"cache_ratio_interval": 0.1}),
-            [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
-        )
-
-    def test_cache_ratio_interval_expands_to_aligned_cases(self):
-        payload = {
-            "seq_lens": [65536],
-            "cache_block_size": 4096,
-            "cache_ratio_interval": 0.25,
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "cache_grid.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
-            cases = _load_cache_grid_cases(str(path))
-        self.assertEqual(
-            [case["cache_len"] for case in cases],
-            [0, 12288, 28672, 45056, 61440],
+    def test_grid_examples_and_generated_batches_pass_strict_loader(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.generate_cache_grid import (
+            build_grid,
         )
 
-    def test_cache_ratio_interval_is_mutually_exclusive_with_explicit_ratios(self):
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            _resolve_cache_ratios(
-                {"cache_ratios": [0.0, 0.5], "cache_ratio_interval": 0.25}
-            )
+        examples = Path(__file__).parent / "cache_grid" / "examples"
+        for path in sorted(examples.glob("*.json")):
+            with self.subTest(example=path.name):
+                payload = json.loads(path.read_text())
+                cases = _load_cache_grid_cases(str(path))
+                self.assertEqual(len(cases), len(payload["cases"]))
+                if "case_count" in payload.get("summary", {}):
+                    self.assertEqual(len(cases), payload["summary"]["case_count"])
+        args = argparse.Namespace(
+            min_input_len=2048,
+            max_input_len=8192,
+            alignment=128,
+            cache_alignment=512,
+            input_points=4,
+            input_mode="stratified",
+            seed=42,
+            cache_points_per_input=6,
+            cache_ratio_points=2,
+            batch_size=2,
+            max_cases=1000,
+            allow_large_grid=False,
+            measure_runs=3,
+        )
+        fixed_args = argparse.Namespace(
+            grid_mode="fixed-cache-sweep",
+            max_input_len=32768,
+            cache_alignment=4096,
+            fixed_cache_len=[4096, 8192],
+            random_cache_count=None,
+            min_cache_len=0,
+            max_cache_len=None,
+            compute_step=4096,
+            min_compute_len=None,
+            batch_size=2,
+            measure_runs=3,
+            seed=42,
+            max_cases=1000,
+            allow_large_grid=False,
+        )
+        for settings in (args, fixed_args):
+            with tempfile.TemporaryDirectory() as tmp:
+                payload = build_grid(settings)
+                path = Path(tmp) / "grid.json"
+                path.write_text(json.dumps(payload))
+                cases = _load_cache_grid_cases(str(path))
+                self.assertEqual(cases, payload["cases"])
+                self.assertTrue(all(c["prefix_policy"] == "independent" for c in cases))
 
-    def test_cache_ratio_interval_rejects_invalid_values(self):
-        for interval in (0, -0.1, 1, "nan", "bad", 0.00001):
-            with self.subTest(interval=interval):
-                with self.assertRaisesRegex(ValueError, "cache_ratio_interval"):
-                    _resolve_cache_ratios({"cache_ratio_interval": interval})
+    def test_removed_alignment_cli_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--expected_cache_block_size=4096"])
 
     def test_cache_seed_commits_one_tail_and_preserves_exact_prefix(self):
         tokenizer = _WhitespaceTokenizer()
@@ -599,29 +670,32 @@ class BatchDecodeTest(unittest.TestCase):
         )
 
     @patch("rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner._post_prefill")
-    def test_runner_accepts_only_exact_shape_reuse_and_ttft(self, post):
+    def test_runner_uses_server_latency_with_exact_shape_and_reuse(self, post):
         post.side_effect = [
             {"success": True},
             {
+                "prefill_time_ms": 12.0,
                 "success": True,
                 "input_len": 16,
                 "output_len": 1,
                 "reuse_len": 8,
-                "ttft_ms": 12.0,
+                "ttft_ms": 1200.0,
             },
             {
+                "prefill_time_ms": 10.0,
                 "success": True,
                 "input_len": 16,
                 "output_len": 1,
                 "reuse_len": 8,
-                "ttft_ms": 10.0,
+                "ttft_ms": 1000.0,
             },
             {
+                "prefill_time_ms": 11.0,
                 "success": True,
                 "input_len": 16,
                 "output_len": 1,
                 "reuse_len": 8,
-                "ttft_ms": 11.0,
+                "ttft_ms": 1100.0,
             },
         ]
         with tempfile.TemporaryDirectory() as tmp:
@@ -636,7 +710,7 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertTrue(rows[0]["shape_exact"])
         self.assertTrue(rows[0]["reuse_exact"])
         self.assertTrue(rows[0]["timing_valid"])
-        self.assertEqual(rows[0]["median_ttft_ms"], 11.0)
+        self.assertEqual(rows[0]["median_prefill_time_ms"], 11.0)
 
     @patch("rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner._post_prefill")
     def test_runner_fails_fast_and_checkpoints_invalid_reuse(self, post):
@@ -644,6 +718,7 @@ class BatchDecodeTest(unittest.TestCase):
             {"success": True},
             *[
                 {
+                    "prefill_time_ms": 10.0,
                     "success": True,
                     "input_len": 16,
                     "output_len": 1,
@@ -675,6 +750,7 @@ class BatchDecodeTest(unittest.TestCase):
             {"success": True},
             *[
                 {
+                    "prefill_time_ms": 10.0,
                     "success": True,
                     "input_len": 16,
                     "output_len": 1,
@@ -826,18 +902,28 @@ class BatchDecodeTest(unittest.TestCase):
             info["resume_config_sha256"], resume_config_fingerprint(resume_config)
         )
 
-    def test_resolve_cache_block_size_prefers_cli_value(self):
-        payload = {"generator": {"cache_alignment": 512}}
-        self.assertEqual(_resolve_cache_block_size(payload, 256), 256)
-        self.assertEqual(_resolve_cache_block_size(payload, 0), 512)
-
-    def test_resolve_cache_block_size_handles_missing_metadata(self):
-        self.assertEqual(_resolve_cache_block_size({}, 0), 0)
-        self.assertEqual(_resolve_cache_block_size({"generator": {}}, 0), 0)
-        self.assertEqual(_resolve_cache_block_size(None, 0), 0)
+    def test_resolve_cache_block_size_requires_single_canonical_location(self):
         self.assertEqual(
-            _resolve_cache_block_size({"generator": {"cache_alignment": "junk"}}, 0), 0
+            _resolve_cache_block_size({"generator": {"cache_alignment": 512}}), 512
         )
+        for payload in (
+            {},
+            None,
+            {"generator": {}},
+            {"generator": {"cache_sampling": {"alignment": 512}}},
+            {
+                "generator": {
+                    "cache_alignment": 512,
+                    "cache_sampling": {"alignment": 512},
+                }
+            },
+            {"generator": {"cache_alignment": 512}, "cache_block_size": 512},
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                _resolve_cache_block_size(payload)
+        for value in (0, -1, True, 512.0, "512", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _resolve_cache_block_size({"generator": {"cache_alignment": value}})
 
     def test_dedupe_collapses_cases_in_same_block_bucket(self):
         cases = [
@@ -1258,6 +1344,7 @@ class CacheGridProfileTest(unittest.TestCase):
                     )
             cached = "seq16_cache8" in request_id
             return {
+                "prefill_time_ms": 1000.0 if is_profile else 10.0,
                 "success": True,
                 "request_id": request_id,
                 "input_len": len(text.split()),
@@ -1276,7 +1363,7 @@ class CacheGridProfileTest(unittest.TestCase):
             events = self.wire(runner)
             rows = runner.run()
             self.assertNotIn("arm", events)
-            self.assertEqual([r["median_ttft_ms"] for r in rows], [10.0, 10.0])
+            self.assertEqual([r["median_prefill_time_ms"] for r in rows], [10.0, 10.0])
             self.assertFalse((Path(tmp) / "cache_profiles").exists())
 
     def test_selected_profiles_follow_measurements_and_preserve_baseline(self):
@@ -1288,7 +1375,7 @@ class CacheGridProfileTest(unittest.TestCase):
             rows = runner.run()
             self.assertEqual(events[-6:], ["seed", "arm", "profile"] * 2)
             self.assertEqual(events.count("measure"), 6)
-            self.assertEqual([r["median_ttft_ms"] for r in rows], [10.0, 10.0])
+            self.assertEqual([r["median_prefill_time_ms"] for r in rows], [10.0, 10.0])
             self.assertEqual([len(r["runs"]) for r in rows], [3, 3])
             manifest = json.loads(
                 next((Path(tmp) / "cache_profiles").glob("*/manifest.json")).read_text()
@@ -1342,7 +1429,7 @@ class CacheGridProfileTest(unittest.TestCase):
             baseline = json.loads((Path(tmp) / "cache_grid_results.json").read_text())
             self.assertTrue(baseline["complete"])
             self.assertEqual(
-                [r["median_ttft_ms"] for r in baseline["metrics"]], [10.0, 10.0]
+                [r["median_prefill_time_ms"] for r in baseline["metrics"]], [10.0, 10.0]
             )
             manifest = json.loads(
                 next((Path(tmp) / "cache_profiles").glob("*/manifest.json")).read_text()
@@ -1391,7 +1478,15 @@ class CacheGridProfileTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             grid = root / "grid.json"
-            grid.write_text(json.dumps({"cases": self.cases}))
+            grid.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "generator": {"cache_alignment": 8},
+                        "cases": self.cases,
+                    }
+                )
+            )
             original_info = root / "test_info.json"
             original_info.write_text('{"original": true}')
             argv = [
@@ -1716,6 +1811,7 @@ class CacheGridRunnerResumeGuardTest(unittest.TestCase):
             "schema_version": 2,
             "mode": "prefix_cache_grid",
             "seed_mode": "independent",
+            "measurement_contract": "server_first_token_cost_time_ms",
             "grid_sha256": None,
             "profile_sha256": None,
             "run_config_sha256": None,
@@ -1793,6 +1889,7 @@ class CacheGridRunnerResumeGuardTest(unittest.TestCase):
                             "success_runs": 3,
                             "runs": [
                                 {
+                                    "prefill_time_ms": 5,
                                     "success": True,
                                     "ttft_ms": 5,
                                     "input_len": 1024,
@@ -1863,6 +1960,7 @@ class CacheGridRunnerResumeGuardTest(unittest.TestCase):
             {"case_id": 1, "batch_size": 1, "input_len": 16, "cache_len": 0},
         ]
         post.return_value = {
+            "prefill_time_ms": 5.0,
             "success": True,
             "input_len": 16,
             "output_len": 1,
@@ -1883,6 +1981,7 @@ class CacheGridRunnerResumeGuardTest(unittest.TestCase):
                             "success_runs": 1,
                             "runs": [
                                 {
+                                    "prefill_time_ms": 5,
                                     "success": True,
                                     "ttft_ms": 5,
                                     "input_len": 8,
@@ -1942,6 +2041,7 @@ class CacheGridRunnerResumeGuardTest(unittest.TestCase):
                 "success_runs": 1,
                 "runs": [
                     {
+                        "prefill_time_ms": 5,
                         "success": True,
                         "ttft_ms": 5,
                         "input_len": 8,
@@ -2127,6 +2227,7 @@ class SharedSeedTest(unittest.TestCase):
                         common += 1
                     reuse = max(reuse, (common // 8) * 8)
                 return {
+                    "prefill_time_ms": 1,
                     "success": True,
                     "input_len": len(ids),
                     "output_len": 1,
@@ -2200,6 +2301,7 @@ class SharedSeedTest(unittest.TestCase):
                 runner,
                 "_post_request",
                 side_effect=lambda p, ids, r: {
+                    "prefill_time_ms": 1,
                     "success": True,
                     "input_len": len(ids),
                     "output_len": 1,
@@ -2221,6 +2323,7 @@ class SharedSeedTest(unittest.TestCase):
 
             def response(reuse, length=64):
                 return {
+                    "prefill_time_ms": 1,
                     "success": True,
                     "input_len": length,
                     "output_len": 1,
@@ -2268,6 +2371,7 @@ class SharedSeedTest(unittest.TestCase):
                     cache_len = int(request_id.split(":")[0].rsplit("cache", 1)[1])
                     reuse = 0 if request_id.endswith(":run0") else cache_len
                 return {
+                    "prefill_time_ms": 1,
                     "success": True,
                     "input_len": len(ids),
                     "output_len": 1,

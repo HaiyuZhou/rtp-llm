@@ -38,7 +38,12 @@ def _sample_metrics(statuses=None):
                 "success_runs": 3,
                 "status": status,
                 "runs": [
-                    {"success": True, "reuse_len": 512, "ttft_ms": 10.0 + idx}
+                    {
+                        "prefill_time_ms": 10.0 + idx,
+                        "success": True,
+                        "reuse_len": 512,
+                        "ttft_ms": 10.0 + idx,
+                    }
                     for _ in range(3)
                 ],
             }
@@ -77,7 +82,12 @@ class LoadRowsTest(unittest.TestCase):
                     "success_runs": 3,
                     "status": "ok",
                     "runs": [
-                        {"success": True, "reuse_len": 512, "ttft_ms": rt}
+                        {
+                            "prefill_time_ms": rt,
+                            "success": True,
+                            "reuse_len": 512,
+                            "ttft_ms": rt,
+                        }
                         for rt in (9.0, 10.0, 11.0)
                     ],
                 },
@@ -90,7 +100,12 @@ class LoadRowsTest(unittest.TestCase):
                     "success_runs": 3,
                     "status": "ok",
                     "runs": [
-                        {"success": True, "reuse_len": 512, "ttft_ms": rt}
+                        {
+                            "prefill_time_ms": rt,
+                            "success": True,
+                            "reuse_len": 512,
+                            "ttft_ms": rt,
+                        }
                         for rt in (19.0, 20.0, 21.0)
                     ],
                 },
@@ -155,7 +170,13 @@ class AllRunsTest(unittest.TestCase):
                 "success_runs": 3,
                 "status": "ok",
                 "runs": [
-                    {"success": True, "reuse_len": 512, "ttft_ms": rt} for rt in rts
+                    {
+                        "prefill_time_ms": rt,
+                        "success": True,
+                        "reuse_len": 512,
+                        "ttft_ms": rt,
+                    }
+                    for rt in rts
                 ],
             }
 
@@ -188,7 +209,14 @@ class AllRunsTest(unittest.TestCase):
                     "measure_runs": 1,
                     "success_runs": 1,
                     "status": "ok",
-                    "runs": [{"success": True, "reuse_len": 256, "ttft_ms": 10.0}],
+                    "runs": [
+                        {
+                            "prefill_time_ms": 10.0,
+                            "success": True,
+                            "reuse_len": 256,
+                            "ttft_ms": 10.0,
+                        }
+                    ],
                 }
             ],
         }
@@ -213,8 +241,18 @@ class AllRunsTest(unittest.TestCase):
                     "success_runs": 1,
                     "status": "ok",
                     "runs": [
-                        {"success": True, "reuse_len": 512, "ttft_ms": 10.0},
-                        {"success": False, "reuse_len": 512, "ttft_ms": 99.0},
+                        {
+                            "prefill_time_ms": 10.0,
+                            "success": True,
+                            "reuse_len": 512,
+                            "ttft_ms": 10.0,
+                        },
+                        {
+                            "prefill_time_ms": 99.0,
+                            "success": False,
+                            "reuse_len": 512,
+                            "ttft_ms": 99.0,
+                        },
                     ],
                 }
             ],
@@ -303,7 +341,9 @@ class ZMetricTest(unittest.TestCase):
         self.assertIn(
             "Effective TPM (Z, tokens/min)", figure.layout.scene.zaxis.title.text
         )
-        self.assertIn("Prefill RT: %{customdata[4]", points.hovertemplate)
+        self.assertIn(
+            "Server first-token latency: %{customdata[4]", points.hovertemplate
+        )
         self.assertIn("darker = lower throughput", points.marker.colorbar.title.text)
         self.assertTrue(points.marker.reversescale)
 
@@ -362,7 +402,12 @@ class ZMetricTest(unittest.TestCase):
                     "success_runs": 3,
                     "status": "ok",
                     "runs": [
-                        {"success": True, "reuse_len": 512, "ttft_ms": 10.0}
+                        {
+                            "prefill_time_ms": 10.0,
+                            "success": True,
+                            "reuse_len": 512,
+                            "ttft_ms": 10.0,
+                        }
                         for _ in range(3)
                     ],
                 }
@@ -402,7 +447,12 @@ class ZMetricTest(unittest.TestCase):
                     "success_runs": 3,
                     "status": "ok",
                     "runs": [
-                        {"success": True, "reuse_len": 512, "ttft_ms": rt}
+                        {
+                            "prefill_time_ms": rt,
+                            "success": True,
+                            "reuse_len": 512,
+                            "ttft_ms": rt,
+                        }
                         for rt in (10.0, 20.0, 30.0)
                     ],
                 }
@@ -488,7 +538,14 @@ class ZMetricTest(unittest.TestCase):
                     "measure_runs": 1,
                     "success_runs": 1,
                     "status": "ok",
-                    "runs": [{"success": True, "reuse_len": 0, "ttft_ms": 10.0}],
+                    "runs": [
+                        {
+                            "prefill_time_ms": 10.0,
+                            "success": True,
+                            "reuse_len": 0,
+                            "ttft_ms": 10.0,
+                        }
+                    ],
                 }
             ],
         }
@@ -588,9 +645,9 @@ class PrefillRtTest(unittest.TestCase):
     def test_from_runs(self):
         item = {
             "runs": [
-                {"success": True, "ttft_ms": 9.0},
-                {"success": True, "ttft_ms": 11.0},
-                {"success": True, "ttft_ms": 10.0},
+                {"prefill_time_ms": 9.0, "success": True, "ttft_ms": 9.0},
+                {"prefill_time_ms": 11.0, "success": True, "ttft_ms": 11.0},
+                {"prefill_time_ms": 10.0, "success": True, "ttft_ms": 10.0},
             ]
         }
         self.assertEqual(prefill_rt(item), 10.0)

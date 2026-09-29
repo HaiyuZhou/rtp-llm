@@ -10,6 +10,10 @@ class MetricFormatError(ValueError):
     """A metric cannot be represented as a single-request observation."""
 
 
+SERVER_LATENCY_FIELD = "prefill_time_ms"
+SERVER_LATENCY_CONTRACT = "server_first_token_cost_time_ms"
+
+
 RESULT_SCHEMA_VERSION = 2
 MIGRATION_HINT = "Migrate with: python3 tools/migrate_cache_perf results --help"
 CURRENT_STATUSES = {
@@ -73,9 +77,9 @@ def current_metrics(data, context="result"):
                 raise ValueError(
                     f"{context}: metric {index} requires explicit request success. {MIGRATION_HINT}"
                 )
-            if run.get("success") is True and "ttft_ms" not in run:
+            if run.get("success") is True and SERVER_LATENCY_FIELD not in run:
                 raise ValueError(
-                    f"{context}: metric {index} requires per-request ttft_ms; server prefill time is not client TTFT. {MIGRATION_HINT}"
+                    f"{context}: metric {index} requires per-request prefill_time_ms (server first_token_cost_time); client latency cannot substitute. {MIGRATION_HINT}"
                 )
     return data["metrics"]
 
@@ -95,8 +99,8 @@ def request_runs(item):
 def single_request_metric(item):
     """Unwrap scheduler batch=1 without changing the request latency contract.
 
-    The batch barrier wall time and server forward time are diagnostics, not
-    substitutes for the nested request's client TTFT. Multi-request batches
+    The batch barrier wall time is a client diagnostic, not
+    a substitute for the nested request's server first_token_cost_time. Multi-request batches
     cannot be reduced to one input/cache pair and are deliberately rejected.
     The input object is never modified.
     """
@@ -163,7 +167,7 @@ def single_request_metric(item):
             observed != cache or request.get("reuse_exact") is False
         ):
             raise MetricFormatError("requested_reuse_mismatch")
-        latency = request.get("ttft_ms")
+        latency = request.get(SERVER_LATENCY_FIELD)
         if (
             isinstance(latency, bool)
             or not isinstance(latency, (int, float))
@@ -172,7 +176,7 @@ def single_request_metric(item):
             or request.get("timing_valid") is False
         ):
             raise MetricFormatError("invalid_latency")
-        flat.append({**request, "ttft_ms": latency, "run_index": run.get("run_index")})
+        flat.append({**request, "run_index": run.get("run_index")})
     if item.get("measure_runs", len(flat)) != len(flat) or item.get(
         "success_runs", len(flat)
     ) != len(flat):
@@ -261,7 +265,7 @@ def prefill_rt(item):
 
 
 def run_prefill_rt(run):
-    value = finite_number(run.get("ttft_ms"))
+    value = finite_number(run.get(SERVER_LATENCY_FIELD))
     return value if value is not None and value > 0 else None
 
 

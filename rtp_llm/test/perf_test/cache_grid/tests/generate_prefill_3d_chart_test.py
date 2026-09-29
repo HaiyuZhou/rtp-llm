@@ -25,6 +25,7 @@ def _sample_payload():
                 "status": "ok",
                 "runs": [
                     {
+                        "prefill_time_ms": value,
                         "success": True,
                         "reuse_len": 256,
                         "ttft_ms": value,
@@ -47,7 +48,7 @@ class GeneratePrefill3dChartTest(unittest.TestCase):
             svg = render_clean(rows, source, 1)
         self.assertIn("compute tokens (X)", svg)
         self.assertIn("cached tokens (Y)", svg)
-        self.assertIn("TTFT / prefill RT (Z, ms)", svg)
+        self.assertIn("Server first-token latency (Z, ms)", svg)
 
     def test_cold_chart_uses_escaped_model_label(self):
         rows = [{"input": 1024.0, "compute": 1024.0, "cache": 0.0, "rt": 10.0}]
@@ -108,6 +109,7 @@ class GeneratePrefill3dChartTest(unittest.TestCase):
                     "status": "ok",
                     "runs": [
                         {
+                            "prefill_time_ms": value,
                             "success": True,
                             "reuse_len": 0,
                             "ttft_ms": value,

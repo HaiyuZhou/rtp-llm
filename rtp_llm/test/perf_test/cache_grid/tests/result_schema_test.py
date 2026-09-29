@@ -52,8 +52,8 @@ def grouped_metric(input_len=255744, cache_len=0, latencies=LATENCIES):
                         "input_len": input_len,
                         "output_len": 1,
                         "reuse_len": cache_len,
-                        "prefill_time_ms": latency - 25,
-                        "ttft_ms": latency,
+                        "prefill_time_ms": latency,
+                        "ttft_ms": latency + 25,
                         "client_wall_time_ms": latency,
                         "ttft_source": "client_dashsc_grpc_input_ids_wall_max_new_tokens_1",
                         "shape_exact": True,
@@ -88,7 +88,7 @@ class GroupedSingleRequestTest(unittest.TestCase):
                 self.assertEqual(audit["valid_observation_count"], 1)
                 self.assertEqual(
                     audit["measurement_contracts"],
-                    ["client_dashsc_grpc_input_ids_wall_max_new_tokens_1"],
+                    ["server_first_token_cost_time_ms"],
                 )
                 self.assertEqual(observations[0].target_ms, median(LATENCIES))
                 self.assertEqual(observations[0].cache_len, cached)
@@ -120,7 +120,7 @@ class GroupedSingleRequestTest(unittest.TestCase):
             lambda m: m["runs"][0]["requests"][0].update(input_len=2),
             lambda m: m["runs"][0]["requests"][0].update(output_len=2),
             lambda m: m["runs"][0]["requests"][0].update(reuse_len=4096),
-            lambda m: m["runs"][0]["requests"][0].update(ttft_ms=float("nan")),
+            lambda m: m["runs"][0]["requests"][0].update(prefill_time_ms=float("nan")),
             lambda m: m.update(success_runs=2),
             lambda m: m["request_groups"][0].update(count=2),
         ]
@@ -169,7 +169,7 @@ class GroupedSingleRequestTest(unittest.TestCase):
         item = {"batch_size": 1, "input_len": 100, "cache_len_requested": 0, "runs": []}
         self.assertIs(single_request_metric(item), item)
 
-    def test_nested_mixed_timing_sources_are_rejected(self):
+    def test_client_timing_sources_do_not_change_server_contract(self):
         item = grouped_metric()
         item["runs"][0]["requests"][0]["ttft_source"] = "different_transport"
         with tempfile.TemporaryDirectory() as tmp:
@@ -183,8 +183,11 @@ class GroupedSingleRequestTest(unittest.TestCase):
                     }
                 )
             )
-            with self.assertRaisesRegex(ValueError, "mixed ttft_source"):
-                load_observations([path])
+            observations, audit = load_observations([path])
+            self.assertEqual(len(observations), 1)
+            self.assertEqual(
+                audit["measurement_contracts"], ["server_first_token_cost_time_ms"]
+            )
 
 
 class ReaderPolicyTest(unittest.TestCase):
@@ -223,7 +226,9 @@ class ReaderPolicyTest(unittest.TestCase):
             "status": "ok",
             "measure_runs": 1,
             "success_runs": 1,
-            "runs": [{"success": True, "reuse_len": 0, "ttft_ms": 10}],
+            "runs": [
+                {"prefill_time_ms": 10, "success": True, "reuse_len": 0, "ttft_ms": 10}
+            ],
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "results.json"

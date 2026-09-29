@@ -3,13 +3,11 @@ import glob
 import hashlib
 import json
 import logging
-import math
 import os
 import shutil
 import sys
 import time
 import uuid
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -263,19 +261,6 @@ def parse_args(argv: Optional[List[str]] = None):
         help="Repeatable engine environment default; --test_env wins.",
     )
     perf.add_argument(
-        "--expected_cache_block_size",
-        type=int,
-        default=0,
-        help=(
-            "Physical prefix-cache reuse granularity in tokens: "
-            "--seq_size_per_block (DSV4 defaults to 256 when unset), "
-            "multiplied by CP size when PREFILL_CP_KV_CACHE_SHARDED=1. "
-            "0 = read from the grid JSON generator metadata, or skip. "
-            "Used to drop cases collapsing onto the same block bucket and "
-            "to probe reuse_len before measuring."
-        ),
-    )
-    perf.add_argument(
         "--materialize_cache_cases",
         type=str,
         default="",
@@ -357,6 +342,10 @@ def parse_args(argv: Optional[List[str]] = None):
     engine.add_argument("--concurrency_limit", type=int, default=64)
 
     args, remaining = parser.parse_known_args(argv)
+    if any(arg.split("=", 1)[0] == "--expected_cache_block_size" for arg in remaining):
+        parser.error(
+            "--expected_cache_block_size was removed; set grid.generator.cache_alignment"
+        )
     explicit_options = {
         item.split("=", 1)[0] for item in (argv if argv is not None else sys.argv[1:])
     }
@@ -403,17 +392,6 @@ def parse_args(argv: Optional[List[str]] = None):
                 else None
             ),
             3,
-        )
-        args.expected_cache_block_size = resolve_int(
-            profile,
-            "cache_grid",
-            "expected_block_size",
-            (
-                args.expected_cache_block_size
-                if "--expected_cache_block_size" in explicit_options
-                else None
-            ),
-            0,
         )
         if "dp_size" in engine:
             args.dp_size = resolve_int(
@@ -636,129 +614,28 @@ def resolve_perf_engine_paths(remaining: List[str]) -> List[str]:
     return out
 
 
-def _resolve_cache_ratios(config: Dict[str, Any]) -> List[float]:
-    has_ratios = "cache_ratios" in config
-    has_interval = "cache_ratio_interval" in config
-    if has_ratios and has_interval:
-        raise ValueError("cache_ratios and cache_ratio_interval are mutually exclusive")
-
-    if has_interval:
-        try:
-            interval = Decimal(str(config["cache_ratio_interval"]))
-        except (InvalidOperation, ValueError) as error:
-            raise ValueError(
-                "cache_ratio_interval must be a finite number in (0, 1)"
-            ) from error
-        if not interval.is_finite() or interval <= 0 or interval >= 1:
-            raise ValueError("cache_ratio_interval must be a finite number in (0, 1)")
-        ratio_count = int(
-            (Decimal(1) / interval).to_integral_value(rounding=ROUND_CEILING)
-        )
-        if ratio_count > 10_000:
-            raise ValueError(
-                "cache_ratio_interval generates more than 10000 cache ratios"
-            )
-        return [
-            float(ratio)
-            for index in range(ratio_count)
-            if (ratio := index * interval) < 1.0
-        ]
-
-    try:
-        ratios = [
-            float(value)
-            for value in config.get(
-                "cache_ratios",
-                [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 0.95],
-            )
-        ]
-    except (TypeError, ValueError) as error:
-        raise ValueError("cache_ratios must contain numbers in [0, 1)") from error
-    if any(not math.isfinite(ratio) or ratio < 0.0 or ratio >= 1.0 for ratio in ratios):
-        raise ValueError("cache_ratios must contain finite numbers in [0, 1)")
-    return ratios
-
-
 def _load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
-    """Load and validate an explicit total-sequence × cache-length grid.
-
-    The cache runner measures batch=1 only.  Cache length is a request-level
-    workload dimension, not an engine CLI argument, so the case file is kept
-    separate from the forwarded engine args.
-    """
+    """Load current explicit grids without generating or filling case fields."""
     with open(path, encoding="utf-8") as stream:
         config = json.load(stream)
-    if not isinstance(config, dict):
-        raise ValueError("cache grid must be a JSON object")
-    explicit_cases = "cases" in config
-    if explicit_cases:
-        raw_cases = config["cases"]
-    else:
-        seq_lens = config.get("seq_lens")
-        if seq_lens is None:
-            generation = config.get("seq_generation", {})
-            if generation.get("kind") != "linear_with_dense_prefix":
-                raise ValueError(
-                    "cache grid requires cases, seq_lens, or "
-                    "seq_generation.kind=linear_with_dense_prefix"
-                )
-            count = int(generation.get("count", 489))
-            max_seq_len = int(generation.get("max_seq_len", 1048575))
-            seq_block = int(config.get("seq_block_size", 256))
-            if count < 2 or max_seq_len <= seq_block:
-                raise ValueError("invalid seq_generation bounds")
-            values = set(range(seq_block, min(16384, max_seq_len), seq_block))
-            target_nonmax = count - 1
-            i = 0
-            while len(values) < target_nonmax:
-                raw = seq_block + round(
-                    i * (max_seq_len - 2 * seq_block) / max(1, target_nonmax - 1)
-                )
-                aligned = max(
-                    seq_block,
-                    min(
-                        max_seq_len - seq_block,
-                        round(raw / seq_block) * seq_block,
-                    ),
-                )
-                values.add(aligned)
-                i += 1
-                if i > target_nonmax * 20:
-                    raise ValueError("unable to generate unique seq lengths")
-            seq_lens = sorted(values)[:target_nonmax] + [max_seq_len]
-            if len(seq_lens) != count or len(set(seq_lens)) != count:
-                raise ValueError("generated sequence lengths are not unique")
-        ratios = _resolve_cache_ratios(config)
-        block = int(config.get("cache_block_size", 4096))
-        if block <= 0:
-            raise ValueError("cache_block_size must be positive")
-        raw_cases = []
-        case_id = 0
-        for seq_len in seq_lens:
-            seq_len = int(seq_len)
-            max_cache_len = max(0, ((seq_len - block) // block) * block)
-            for ratio in ratios:
-                cache_len = int((max(0, seq_len - 1) * ratio) // block) * block
-                raw_cases.append(
-                    {
-                        "case_id": case_id,
-                        "batch_size": 1,
-                        "input_len": seq_len,
-                        "cache_len": min(cache_len, max_cache_len),
-                    }
-                )
-                case_id += 1
-            if max_cache_len > 0:
-                raw_cases.append(
-                    {
-                        "case_id": case_id,
-                        "batch_size": 1,
-                        "input_len": seq_len,
-                        "cache_len": max_cache_len,
-                    }
-                )
-                case_id += 1
-
+    _resolve_cache_block_size(config)
+    if type(config.get("schema_version")) is not int or config["schema_version"] != 2:
+        raise ValueError("cache grid requires schema_version=2")
+    legacy = {
+        "seq_lens",
+        "seq_generation",
+        "seq_block_size",
+        "cache_block_size",
+        "cache_ratios",
+        "cache_ratio_interval",
+    } & config.keys()
+    if legacy:
+        raise ValueError(
+            f"compact grid fields are unsupported: {sorted(legacy)}; generate explicit cases"
+        )
+    if "cases" not in config:
+        raise ValueError("cache grid requires explicit cases")
+    raw_cases = config["cases"]
     if not isinstance(raw_cases, list):
         raise ValueError("cache grid cases must be a list")
     cases: List[Dict[str, int]] = []
@@ -767,11 +644,9 @@ def _load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
     for index, raw in enumerate(raw_cases):
         if not isinstance(raw, dict):
             raise ValueError(f"cache grid case {index} must be an object")
-        case = normalize_cache_case(raw, index)
+        case = normalize_cache_case(raw)
         key = CacheGridRunner.case_key(case)
         if key in seen:
-            if not explicit_cases:
-                continue
             raise ValueError(f"duplicate cache grid case: {case}")
         seen.add(key)
         if case["case_id"] in seen_ids:
@@ -783,10 +658,12 @@ def _load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
     return cases
 
 
-def _configure_cache_batch_limits(args, remaining, cases):
+def _configure_cache_batch_limits(args, remaining, cases, *, cache_alignment=None):
     """Ensure admission and context limits can accommodate every fixed batch."""
     batch_size = max(c["batch_size"] for c in cases)
     if getattr(args, "cache_fixed_workspace", False):
+        if type(cache_alignment) is not int or cache_alignment <= 0:
+            raise ValueError("fixed workspace requires grid.generator.cache_alignment")
         if args.dp_size != 1 or extract_arg(remaining, "tp_size") != "8":
             raise ValueError("fixed workspace requires dp_size=1 and tp_size=8")
         if (
@@ -805,7 +682,7 @@ def _configure_cache_batch_limits(args, remaining, cases):
         stats = validate_fixed_workspace(
             cases,
             commit_tail=args.cache_commit_tail_tokens,
-            block=args.expected_cache_block_size or 4096,
+            block=cache_alignment,
             output_tokens=args.decode_test_length,
             token_budget=budget,
         )
@@ -871,36 +748,24 @@ def _configure_cache_batch_limits(args, remaining, cases):
         )
 
 
-def _resolve_cache_block_size(grid_payload: Any, cli_value: int) -> int:
-    """Resolve the physical reuse granularity for dedup and probing.
-
-    Prefer the explicit CLI value; otherwise fall back to the alignment the
-    grid was generated with (generate_cache_grid.py records it as
-    generator.cache_alignment or generator.cache_sampling.alignment).  0
-    means unknown — skip dedup and probing.
-    """
-    if cli_value > 0:
-        return cli_value
-    generator = (
-        grid_payload.get("generator") if isinstance(grid_payload, dict) else None
-    )
+def _resolve_cache_block_size(grid_payload: Any) -> int:
+    """Read the single authoritative cache alignment in the grid."""
+    if not isinstance(grid_payload, dict):
+        raise ValueError("cache grid must be a JSON object")
+    generator = grid_payload.get("generator")
     if not isinstance(generator, dict):
-        return 0
-    for source in (
-        generator.get("cache_alignment"),
-        (
-            generator.get("cache_sampling", {}).get("alignment")
-            if isinstance(generator.get("cache_sampling"), dict)
-            else None
-        ),
+        raise ValueError("grid requires generator.cache_alignment")
+    sampling = generator.get("cache_sampling")
+    if "cache_block_size" in grid_payload or (
+        isinstance(sampling, dict) and "alignment" in sampling
     ):
-        try:
-            value = int(source or 0)
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
-            return value
-    return 0
+        raise ValueError(
+            "cache alignment must only be configured at generator.cache_alignment"
+        )
+    value = generator.get("cache_alignment")
+    if type(value) is not int or value <= 0:
+        raise ValueError("generator.cache_alignment must be a positive integer")
+    return value
 
 
 def _dedupe_cache_grid_cases(
@@ -1243,16 +1108,16 @@ def main() -> str:
         args.cache_fixed_workspace = args.cache_fixed_workspace or fixed_workspace_grid(
             grid_payload
         )
-        _configure_cache_batch_limits(args, remaining, cases)
+        expected_block_size = _resolve_cache_block_size(grid_payload)
+        _configure_cache_batch_limits(
+            args, remaining, cases, cache_alignment=expected_block_size
+        )
         grid_metadata = {
             key: grid_payload.get(key)
             for key in ("schema_version", "kind", "generator", "summary")
             if key in grid_payload
         }
         grid_sha256 = hashlib.sha256(grid_bytes).hexdigest()
-        expected_block_size = _resolve_cache_block_size(
-            grid_payload, args.expected_cache_block_size
-        )
         if expected_block_size > 0:
             deduped = _dedupe_cache_grid_cases(cases, expected_block_size)
             if len(deduped) < len(cases):

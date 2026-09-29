@@ -4,7 +4,7 @@
 The chart mirrors the static SVG's convention:
   X = uncached compute tokens = input_len - observed_cache_len
   Y = observed cached tokens
-  Z = measured prefill RT / TTFT (ms)
+  Z = server first_token_cost_time (ms, including engine wait)
 
 Every valid geometry is shown as a dot.  Coloured lines are representative
 fixed-cache (warm, solid) and fixed-compute (cool, dashed) trend guides.
@@ -128,7 +128,7 @@ def fmt_tokens(value: float) -> str:
 Z_METRICS = {
     "rt": {
         "key": "prefill_rt",
-        "label": "Prefill RT",
+        "label": "Server first-token latency",
         "unit": "ms",
         "derive": lambda row: row["prefill_rt"],
     },
@@ -183,7 +183,7 @@ def main() -> None:
         "--input",
         required=True,
         type=Path,
-        help="Path to Prefill_Result.json or cache_grid_results.json",
+        help="Path to cache_grid_results.json (server first_token_cost_time)",
     )
     parser.add_argument(
         "--output", type=Path, help="Output HTML path; defaults beside the input file"
@@ -230,7 +230,7 @@ def main() -> None:
     parser.add_argument(
         "--log-rt",
         action="store_true",
-        help="Use log scale for the Prefill RT (Z) axis",
+        help="Use log scale for the server first-token latency (Z) axis",
     )
     parser.add_argument(
         "--log-x",
@@ -241,7 +241,7 @@ def main() -> None:
         "--stretch-rt",
         type=float,
         default=None,
-        help="Visual stretch factor for the Prefill RT axis (e.g. 5 makes RT changes 5x taller)",
+        help="Visual stretch factor for the server first-token latency axis (e.g. 5 makes RT changes 5x taller)",
     )
     parser.add_argument(
         "--stretch-x",
@@ -414,7 +414,9 @@ def main() -> None:
         "Compute tokens: %{x:,.0f}<br>"
         "Cached tokens: %{y:,.0f}<br>"
         f"{z_spec['label']}: %{{z{z_format}}}{'' if args.z_metric == 'rt' else ' tokens/min'}<br>"
-        "Prefill RT: %{customdata[" + str(4 if show_run_index else 4) + "]:,.2f} ms<br>"
+        "Server first-token latency: %{customdata["
+        + str(4 if show_run_index else 4)
+        + "]:,.2f} ms<br>"
         "Input length: %{customdata[0]:,.0f}<br>"
         + (
             "Run: %{customdata[3]}<extra></extra>"

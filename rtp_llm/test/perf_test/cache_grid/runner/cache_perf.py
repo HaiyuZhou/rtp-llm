@@ -138,7 +138,7 @@ def load_saved(directory):
     return saved
 
 
-def load_cases(path, profile):
+def load_cases(path):
     from rtp_llm.test.perf_test.batch_decode_test import (
         _dedupe_cache_grid_cases,
         _load_cache_grid_cases,
@@ -147,10 +147,8 @@ def load_cases(path, profile):
 
     payload = json.loads(path.read_text())
     cases = _load_cache_grid_cases(str(path))
-    block = _resolve_cache_block_size(
-        payload, int(profile.get("cache_grid", {}).get("expected_block_size", 0))
-    )
-    return payload, _dedupe_cache_grid_cases(cases, block) if block else cases
+    block = _resolve_cache_block_size(payload)
+    return payload, _dedupe_cache_grid_cases(cases, block)
 
 
 def build_plan(args, inherited=None):
@@ -188,7 +186,7 @@ def build_plan(args, inherited=None):
         load_profile(args.profile) if args.profile else copy.deepcopy(saved["profile"])
     )
     grid = args.grid.resolve() if args.grid else Path(saved["grid"])
-    payload, cases = load_cases(grid, profile)
+    payload, cases = load_cases(grid)
     ids = sorted(set(int(s) for s in args.cases.split(","))) if args.cases else []
     missing = set(ids) - {c["case_id"] for c in cases}
     if missing:
@@ -306,7 +304,10 @@ def build_plan(args, inherited=None):
                 4096,
             )
             validate_fixed_workspace(
-                cases, commit_tail=tail, token_budget=grid_token_budget(payload)
+                cases,
+                block=payload["generator"]["cache_alignment"],
+                commit_tail=tail,
+                token_budget=grid_token_budget(payload),
             )
         if args.mode == "profile":
             if any(a.split("=")[0] == "--cache_shared_seed" for a in runner):

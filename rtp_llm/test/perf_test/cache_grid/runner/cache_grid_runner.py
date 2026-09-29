@@ -50,64 +50,65 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    SERVER_LATENCY_CONTRACT,
     current_metrics,
     measurement_status,
+    run_prefill_rt,
 )
 from rtp_llm.test.perf_test.cache_grid.runner.scheduler import configure_scheduler
 
 
-def normalize_cache_case(raw: Dict[str, Any], index: int = 0) -> Dict[str, Any]:
-    """Validate groups while retaining legacy single-request geometries."""
+def normalize_cache_case(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate explicit cases; derive only grouped summary geometry."""
+    if not isinstance(raw, dict):
+        raise ValueError("cache grid case must be an object")
 
-    def integer(value):
-        if isinstance(value, (float, bool)):
-            raise ValueError(f"cache grid fields must be integers, got {value!r}")
-        return int(value)
+    def integer(source, key):
+        if key not in source or type(source[key]) is not int:
+            raise ValueError(f"cache grid requires integer {key}: {source}")
+        return source[key]
 
     case = dict(raw)
-    case["case_id"] = integer(raw.get("case_id", index))
-    batch = integer(raw.get("batch_size", 1))
-    policy = raw.get("prefix_policy", "independent")
-    if batch <= 0 or policy not in {"independent", "shared_by_group"}:
-        raise ValueError("invalid batch_size or prefix_policy")
-    groups = raw.get("request_groups")
-    if groups is None:
-        groups = [
-            {
-                "count": batch,
-                "input_len": raw["input_len"],
-                "cache_len": raw.get("cache_len", 0),
-            }
-        ]
+    case_id = integer(raw, "case_id")
+    batch = integer(raw, "batch_size")
+    if case_id < 0 or batch <= 0:
+        raise ValueError("case_id must be nonnegative and batch_size positive")
+    if "request_groups" not in raw:
+        input_len = integer(raw, "input_len")
+        cache_len = integer(raw, "cache_len")
+        if batch != 1 or "prefix_policy" in raw:
+            raise ValueError(
+                "batch cases require explicit request_groups and prefix_policy"
+            )
+        if not 0 <= cache_len < input_len:
+            raise ValueError("require 0 <= cache_len < input_len")
+        return case
+    if raw.get("prefix_policy") not in ("independent", "shared_by_group"):
+        raise ValueError("grouped cases require explicit valid prefix_policy")
+    groups = raw["request_groups"]
     if not isinstance(groups, list) or not groups:
         raise ValueError("request_groups must be a nonempty list")
     normalized = []
     for group in groups:
         if not isinstance(group, dict):
             raise ValueError("each request group must be an object")
-        item = {
-            k: integer(group.get(k, 0)) for k in ("count", "input_len", "cache_len")
-        }
+        item = {k: integer(group, k) for k in ("count", "input_len", "cache_len")}
         if item["count"] <= 0 or not 0 <= item["cache_len"] < item["input_len"]:
             raise ValueError(f"invalid request group: {group}")
         normalized.append(item)
     if sum(g["count"] for g in normalized) != batch:
         raise ValueError("request group counts must sum to batch_size")
-    case["batch_size"] = batch
-    case["input_len"] = max(g["input_len"] for g in normalized)
-    case["cache_len"] = max(g["cache_len"] for g in normalized)
-    if batch > 1 or "request_groups" in raw or "prefix_policy" in raw:
-        case["request_groups"] = normalized
-        case["prefix_policy"] = policy
+    for key in ("input_len", "cache_len"):
+        value = max(g[key] for g in normalized)
+        if key in raw and integer(raw, key) != value:
+            raise ValueError(f"grouped summary {key} must equal group maximum")
+        case[key] = value
+    case["request_groups"] = normalized
     return case
 
 
 def is_grouped_case(case: Dict[str, Any]) -> bool:
-    return (
-        int(case.get("batch_size", 1)) > 1
-        or "request_groups" in case
-        or "prefix_policy" in case
-    )
+    return "request_groups" in case
 
 
 def build_grouped_prompts(factory, case, run_count):
@@ -204,6 +205,10 @@ def validate_cache_grid_resume(
     if required - payload.keys() or payload.get("resume_compatible") is False:
         raise ValueError(
             "checkpoint lacks current resume guards; migrate with tools/migrate_cache_perf run, or retest"
+        )
+    if payload.get("measurement_contract") != SERVER_LATENCY_CONTRACT:
+        raise ValueError(
+            "checkpoint measurement_contract differs; retest with server first_token_cost_time"
         )
     expected_seed_mode = "shared_prefix_v1" if shared_seed else "independent"
     if payload["seed_mode"] != expected_seed_mode:
@@ -1282,6 +1287,7 @@ class CacheGridRunner:
         progress = self._progress()
         payload = {
             "schema_version": 2,
+            "measurement_contract": SERVER_LATENCY_CONTRACT,
             "mode": "prefix_cache_grid",
             "seed_mode": "shared_prefix_v1" if self.shared_seed else "independent",
             "complete": complete,
@@ -1375,7 +1381,7 @@ class CacheGridRunner:
                 f"expected {block} tokens per physical block. Every cache-hitting case "
                 "would be reported as invalid_reuse. Check --seq_size_per_block (x CP "
                 "size when PREFILL_CP_KV_CACHE_SHARDED=1) or fix "
-                "--expected_cache_block_size and rerun."
+                "grid.generator.cache_alignment and rerun."
             )
         logging.info("[CACHE_GRID] block-size probe passed: reuse_len=%d", block)
 
@@ -1727,8 +1733,7 @@ class CacheGridRunner:
                             and result.get("reuse_len") == member["cache_len"]
                         )
                         result["timing_valid"] = bool(
-                            result.get("success")
-                            and 0 < float(result.get("ttft_ms", 0)) < float("inf")
+                            result.get("success") and run_prefill_rt(result) is not None
                         )
                         return result, completed
 
@@ -1801,6 +1806,14 @@ class CacheGridRunner:
             "reuse_exact": reuse,
             "timing_valid": timing,
             "cache_len_observed": [r.get("reuse_len") for r in results],
+            "median_batch_first_token_cost_time_ms": (
+                statistics.median(
+                    max(r["prefill_time_ms"] for r in round_["requests"])
+                    for round_ in rounds
+                )
+                if status == "ok"
+                else None
+            ),
             "median_batch_wall_time_ms": (
                 statistics.median(r["batch_wall_time_ms"] for r in rounds)
                 if status == "ok"
@@ -2164,12 +2177,12 @@ class CacheGridRunner:
                                     for r in successful
                                 )
                             )
-                            ttft_values = [
-                                float(r["ttft_ms"])
+                            prefill_values = [
+                                float(r["prefill_time_ms"])
                                 for r in successful
-                                if float(r.get("ttft_ms", 0.0)) > 0.0
+                                if run_prefill_rt(r) is not None
                             ]
-                            timing_valid = len(ttft_values) == self.measure_runs
+                            timing_valid = len(prefill_values) == self.measure_runs
                             validation_status = measurement_status(
                                 len(successful) == self.measure_runs,
                                 shape_exact,
@@ -2205,14 +2218,14 @@ class CacheGridRunner:
                                 "validation_status": validation_status,
                                 "shape_exact": shape_exact,
                                 "timing_valid": timing_valid,
-                                "ttft_ms": ttft_values,
-                                "median_ttft_ms": (
-                                    statistics.median(ttft_values)
+                                "prefill_time_ms": prefill_values,
+                                "median_prefill_time_ms": (
+                                    statistics.median(prefill_values)
                                     if timing_valid
                                     else None
                                 ),
-                                "avg_ttft_ms": (
-                                    statistics.fmean(ttft_values)
+                                "avg_prefill_time_ms": (
+                                    statistics.fmean(prefill_values)
                                     if timing_valid
                                     else None
                                 ),

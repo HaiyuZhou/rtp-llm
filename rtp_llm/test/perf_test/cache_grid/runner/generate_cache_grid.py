@@ -225,9 +225,7 @@ def build_fixed_cache_sweep(args: argparse.Namespace) -> dict[str, Any]:
     requested_max_cache = getattr(args, "max_cache_len", None)
     largest_usable_cache = args.max_input_len - min_compute_len
     max_cache_len = (
-        largest_usable_cache
-        if requested_max_cache is None
-        else requested_max_cache
+        largest_usable_cache if requested_max_cache is None else requested_max_cache
     )
     if max_cache_len > largest_usable_cache:
         raise ValueError(
@@ -266,6 +264,16 @@ def build_fixed_cache_sweep(args: argparse.Namespace) -> dict[str, Any]:
                         "compute_step": compute_step,
                     }
                 )
+    for case in cases:
+        if case["batch_size"] > 1:
+            case["prefix_policy"] = "independent"
+            case["request_groups"] = [
+                {
+                    "count": case["batch_size"],
+                    "input_len": case["input_len"],
+                    "cache_len": case["cache_len"],
+                }
+            ]
     if len(cases) > args.max_cases and not args.allow_large_grid:
         raise ValueError(
             f"generated {len(cases)} cases, exceeding --max-cases={args.max_cases}; "
@@ -281,9 +289,7 @@ def build_fixed_cache_sweep(args: argparse.Namespace) -> dict[str, Any]:
             "cache_alignment": cache_alignment,
             "cache_sampling": {
                 "mode": (
-                    "explicit"
-                    if getattr(args, "fixed_cache_len", None)
-                    else "random"
+                    "explicit" if getattr(args, "fixed_cache_len", None) else "random"
                 ),
                 "values": cache_lengths,
                 "requested_random_count": getattr(args, "random_cache_count", None),
@@ -343,6 +349,16 @@ def build_grid(args: argparse.Namespace) -> dict[str, Any]:
                     "cache_len": cache_len,
                 }
             )
+    for case in cases:
+        if case["batch_size"] > 1:
+            case["prefix_policy"] = "independent"
+            case["request_groups"] = [
+                {
+                    "count": case["batch_size"],
+                    "input_len": case["input_len"],
+                    "cache_len": case["cache_len"],
+                }
+            ]
     if len(cases) > args.max_cases and not args.allow_large_grid:
         raise ValueError(
             f"generated {len(cases)} cases, exceeding --max-cases={args.max_cases}; "
@@ -350,6 +366,7 @@ def build_grid(args: argparse.Namespace) -> dict[str, Any]:
         )
     generator = {
         "name": "aligned_stratified_cache_grid",
+        "cache_alignment": cache_alignment,
         "version": 1,
         "alignment": args.alignment,
         "seed": args.seed,
@@ -360,7 +377,6 @@ def build_grid(args: argparse.Namespace) -> dict[str, Any]:
             "requested_count": args.input_points,
         },
         "cache_sampling": {
-            "alignment": cache_alignment,
             "points_per_input": args.cache_points_per_input,
             "ratio_points": args.cache_ratio_points,
             "compute_points": args.cache_points_per_input - 2 - args.cache_ratio_points,

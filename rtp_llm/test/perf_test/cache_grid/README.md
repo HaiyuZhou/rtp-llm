@@ -1,5 +1,12 @@
 # Cache Grid 性能工具
 
+Grid 只接受 `schema_version: 2` 的显式 `cases`，不在运行时展开采样模板。
+`case_id/batch_size` 必填；单请求还必须填写 `input_len/cache_len`；
+分组请求必须填写 `prefix_policy` 和每组的 `count/input_len/cache_len`。
+运行时缓存对齐只读取 grid 的正整数 `generator.cache_alignment`，
+旧 CLI/profile 覆盖项和 `generator.cache_sampling.alignment` 会报错。
+生成器的 `--cache-alignment` 或 profile `cache_grid.cache_alignment` 仅用于生成 grid。
+
 本目录集中管理 cache-grid 测试、绘图与公式工具。原来的
 `//rtp_llm/test/perf_test:cache_grid_perf_test` Bazel target 不变；Python 模块和脚本统一使用本目录下的新路径。
 新的实现、测试与文档请添加在本目录，不再散落到 perf_test 根目录。
@@ -167,12 +174,17 @@ JSON 迁移产物或迁移报告记录来源文件的 SHA256；CSV 输出仍使�
   metric 明确记录 `batch_size/input_len/status/measure_runs/success_runs/runs`；
   scalar metric 使用 `cache_len_requested`，grouped metric 保留 `request_groups` 和逐轮 `requests`。
   执行异常的 `status=error` 记录可以没有测量轮次。
-- 拟合与 TTFT 图只读取成功请求的 `ttft_ms`；缓存命中量来自逐请求 `reuse_len`。
-  不再接受 `results`、裸列表、`seq_len`、状态别名或聚合耗时回退。
-  观测 CSV 必须含 `batch_size,input_len,cache_len,target_ms`。
-- 迁移工具转换可证明等价的旧字段。仅记录 `client_wall_time_ms` 时还要求 `output_len=1`；
-  只有服务端 `prefill_time_ms`、聚合值、缺少计划轮数或成功状态的结果不能伪造为完整客户端测量，需重测。
-  服务端 prefill 专用报告继续读取当前结果中的服务端指标。
+- 公式拟合、静态 SVG、交互图和 batch 图直接读取 `cache_grid_results.json`。
+  唯一分析时间是 `runs[].prefill_time_ms`，grouped batch 为 `runs[].requests[].prefill_time_ms`，
+  两者均为服务端 `aux_info.first_token_cost_time`，单位 ms，包含引擎内等待、不扣减 `wait_time`，
+  不包含输入分词及客户端通信。HTTP 与 input_ids/gRPC 使用相同的服务端口径。
+- 单请求默认对有效轮次取中位数；`--all-runs` 展示逐轮值。TPM 也以服务端时间为分母。
+  Batch 图每轮取批内请求服务端耗时的最大值，再对各轮取中位数；不使用客户端 batch wall time。
+  生成结果记录 `measurement_contract=server_first_token_cost_time_ms`。
+- `ttft_ms/client_wall_time_ms/batch_wall_time_ms` 仅保留为客户端诊断，不参与公式和图表。
+  缺少服务端耗时则报错，非正或非有限耗时按无效测量处理，不回退到客户端时间。
+  拟合和基准图不再接受 CSV 或旧分析中间文件；`predictions.csv` 仍可作为拟合输出。
+- 迁移工具仅转换已有的服务端数据；无法从客户端耗时还原服务端首 token 延迟。
 - 续测要求 seed mode、transport、grid/profile/run_config 指纹和测量参数明确存在并匹配；
   `allow_resume_mismatch` 不能绕过旧格式拒绝或迁移产物的续测限制。
 - 物化用例要求 store_info 和 record 均为 v2，seed 明确写成文本或 marker/filler；
@@ -189,7 +201,7 @@ JSON 迁移产物或迁移报告记录来源文件的 SHA256；CSV 输出仍使�
   生成及启动前同时检查总 input 和 CP 对齐后的 batch 矩形；简化入口自动识别策略标记。
   这不代表 batch 被限制为 1，也不保证模型/KV 等总显存不会 OOM。详见[容量约束及命令](docs/generate_random_batch_grid.md)。
 - `tools/cache_perf pipeline`：通过统一测试入口运行，完整结束后拟合和绘图。
-- [plot/generate_batch_interactive_chart.py](plot/generate_batch_interactive_chart.py)：batch/cache/compute/TTFT 交互图。
+- [plot/generate_batch_interactive_chart.py](plot/generate_batch_interactive_chart.py)：batch/cache/compute/服务端首 token 延迟交互图，直接传入 `--input cache_grid_results.json --output chart.html`。
 - [plot/generate_prefill_interactive_chart.py](plot/generate_prefill_interactive_chart.py)：单 batch prefill 交互图。
 - [plot/generate_prefill_3d_chart.py](plot/generate_prefill_3d_chart.py)：静态 SVG。
 - [plot/generate_prefill_traffic_report.py](plot/generate_prefill_traffic_report.py)：生产流量统计报告。

@@ -1147,3 +1147,10 @@ py_test(
     srcs = ["cache_grid/tests/migrate_cache_perf_test.py"],
     deps = [":perf_test_lib"],
 )
+
+py_test(
+    name = "cache_grid_server_latency_test",
+    main = "cache_grid/tests/server_latency_test.py",
+    srcs = ["cache_grid/tests/server_latency_test.py"],
+    deps = [":perf_test_lib"],
+)

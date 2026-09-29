@@ -49,7 +49,7 @@ class CachePerfTest(unittest.TestCase):
           // local paths are literal, not shell expressions
           "schema_version":1,
           "engine":{"checkpoint_path":"/model","tokenizer_path":"/model"},
-          "cache_grid":{"expected_block_size":4096,"measure_runs":5},
+          "cache_grid":{"measure_runs":5},
           "engine_env":{"DSV4_CHUNK_TOKENS":"8192"},
           "runtime_env":{"CC":"/gcc"}
         }"""
@@ -58,10 +58,22 @@ class CachePerfTest(unittest.TestCase):
         self.grid.write_text(
             json.dumps(
                 {
+                    "schema_version": 2,
+                    "generator": {"cache_alignment": 4096},
                     "cases": [
-                        {"case_id": 7, "input_len": 8192, "cache_len": 4096},
-                        {"case_id": 9, "input_len": 16384, "cache_len": 0},
-                    ]
+                        {
+                            "case_id": 7,
+                            "batch_size": 1,
+                            "input_len": 8192,
+                            "cache_len": 4096,
+                        },
+                        {
+                            "case_id": 9,
+                            "batch_size": 1,
+                            "input_len": 16384,
+                            "cache_len": 0,
+                        },
+                    ],
                 }
             )
         )
@@ -333,10 +345,19 @@ class CachePerfTest(unittest.TestCase):
         payload = json.loads(self.grid.read_text())
         payload["generator"] = {
             "workspace_policy": "fixed_cp8_1m_v1",
+            "cache_alignment": 4096,
             "parameters": {"max_batch_tokens": 65536},
         }
         for case in payload["cases"]:
             case["batch_size"] = 4
+            case["prefix_policy"] = "independent"
+            case["request_groups"] = [
+                {
+                    "count": 4,
+                    "input_len": case["input_len"],
+                    "cache_len": case["cache_len"],
+                }
+            ]
         self.grid.write_text(json.dumps(payload))
         first = self.save_run()
         plans = [first]
@@ -359,11 +380,16 @@ class CachePerfTest(unittest.TestCase):
         self.grid.write_text(
             json.dumps(
                 {
-                    "generator": {"workspace_policy": "fixed_cp8_1m_v1"},
+                    "schema_version": 2,
+                    "generator": {
+                        "workspace_policy": "fixed_cp8_1m_v1",
+                        "cache_alignment": 4096,
+                    },
                     "cases": [
                         {
                             "case_id": 1,
                             "batch_size": 8,
+                            "prefix_policy": "independent",
                             "request_groups": [
                                 {"count": 1, "input_len": 200000, "cache_len": 0},
                                 {"count": 7, "input_len": 8192, "cache_len": 0},
@@ -379,7 +405,10 @@ class CachePerfTest(unittest.TestCase):
 
     def test_fixed_workspace_batch_one_profile_keeps_capacity(self):
         payload = json.loads(self.grid.read_text())
-        payload["generator"] = {"workspace_policy": "fixed_cp8_1m_v1"}
+        payload["generator"] = {
+            "workspace_policy": "fixed_cp8_1m_v1",
+            "cache_alignment": 4096,
+        }
         self.grid.write_text(json.dumps(payload))
         self.save_run()
         plan = cli.build_plan(

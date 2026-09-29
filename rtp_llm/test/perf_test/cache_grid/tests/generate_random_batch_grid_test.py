@@ -155,7 +155,6 @@ class RandomBatchGridTest(unittest.TestCase):
                         "max_seq_len": 2097152,
                     },
                     "cache_grid": {
-                        "expected_block_size": 4096,
                         "commit_tail_tokens": 4096,
                     },
                     "engine_env": engine_env or {},
@@ -323,9 +322,35 @@ class RandomBatchGridTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "grid.json"
             case = {"case_id": 0, "batch_size": 1, "input_len": 524288, "cache_len": 64}
-            path.write_text(json.dumps({"cases": [case]}))
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "generator": {"cache_alignment": 64},
+                        "cases": [case],
+                    }
+                )
+            )
             self.assertEqual(inspect_grid(path)["batch_size"], 1)
-            path.write_text(json.dumps({"cases": [case, {**case, "batch_size": 2}]}))
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "generator": {"cache_alignment": 64},
+                        "cases": [
+                            case,
+                            {
+                                "case_id": 1,
+                                "batch_size": 2,
+                                "prefix_policy": "independent",
+                                "request_groups": [
+                                    {"count": 2, "input_len": 524288, "cache_len": 64}
+                                ],
+                            },
+                        ],
+                    }
+                )
+            )
             with self.assertRaisesRegex(ValueError, "mixed batch"):
                 inspect_grid(path)
 

@@ -4,7 +4,7 @@
   "schema_version": 1,
   "label": "DSV4 local cache-grid",
   "model_label": "DeepSeek-V4-Pro",
-  "engine": {
+  "engine": {// 模型和并行拓扑配置
     "model_type": "deepseek_v4",
     // 必改：模型和 tokenizer 在测试机器/容器内可读的绝对路径。
     "checkpoint_path": "/path/to/DeepSeek-V4-Pro",
@@ -22,7 +22,7 @@
     "seq_size_per_block": 512,
     "kernel_seq_size_per_block": 128
   },
-  "engine_args": {
+  "engine_args": { // 会以 --key=value 的形式传给引擎启动命令
     "--timeout_keep_alive": 3600,
     // 按照实际上线的功能配置开关进行配置
     "--cp_rotate_method": "ALL_GATHER",
@@ -40,7 +40,6 @@
   "cache_grid": {
     // CP8 × physical block512 = visible reuse4096；不是 kernel block128。
     "cache_alignment": 4096,
-    "expected_block_size": 4096,
     "commit_tail_tokens": 4096,
     // 每个case 运行次数
     "measure_runs": 3

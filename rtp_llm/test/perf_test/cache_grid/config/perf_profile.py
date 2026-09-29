@@ -159,6 +159,10 @@ def validate_profile(profile: Any) -> None:
     cache_grid = profile.get("cache_grid")
     if cache_grid is not None and not isinstance(cache_grid, dict):
         raise ProfileError("cache_grid must be a JSON object")
+    if isinstance(cache_grid, dict) and "expected_block_size" in cache_grid:
+        raise ProfileError(
+            "cache_grid.expected_block_size was removed; set grid.generator.cache_alignment"
+        )
     chart = profile.get("chart")
     if chart is not None and not isinstance(chart, dict):
         raise ProfileError("chart must be a JSON object")

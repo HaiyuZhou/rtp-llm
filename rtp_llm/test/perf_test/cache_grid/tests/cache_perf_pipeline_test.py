@@ -31,9 +31,16 @@ class CachePerfPipelineTest(unittest.TestCase):
         self.grid.write_text(
             json.dumps(
                 {
+                    "schema_version": 2,
+                    "generator": {"cache_alignment": 4096},
                     "cases": [
-                        {"case_id": 0, "input_len": 8192, "cache_len": 0},
-                    ]
+                        {
+                            "case_id": 0,
+                            "batch_size": 1,
+                            "input_len": 8192,
+                            "cache_len": 0,
+                        },
+                    ],
                 }
             )
         )

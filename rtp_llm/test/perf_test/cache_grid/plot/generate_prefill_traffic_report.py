@@ -858,7 +858,7 @@ pre {{ overflow:auto; background:#0f172a; color:#e2e8f0; padding:14px; border-ra
 </head>
 <body>
 <h1>线上流量与离线 prefill 基准对比</h1>
-<p class='note'>线上指标是 <code>first_token_cost_time</code>（含线上调度、排队、网络等开销）；离线指标是引擎侧 <code>prefill_time_ms</code>。两者的差值表示观测到的线上额外开销，不代表单独的引擎性能回归。未被离线网格覆盖的线上桶不会做插值。</p>
+<p class='note'>线上指标是 <code>first_token_cost_time</code>（服务端首 token 延迟，含引擎等待，不含客户端通信及输入分词）；离线指标是引擎侧 <code>prefill_time_ms</code>。两者均为服务端 first_token_cost_time；差值可能来自排队、配置或工作负载差异，不能解释为客户端网络开销。未被离线网格覆盖的线上桶不会做插值。</p>
 <div class='cards'>{cards_html}</div>
 <div class='panel'>{figure_3d_html}</div>
 <div class='panel'>{figure_2d_html}</div>

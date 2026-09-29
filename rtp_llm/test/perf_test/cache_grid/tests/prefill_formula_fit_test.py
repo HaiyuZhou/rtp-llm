@@ -96,6 +96,7 @@ def _write_cache_grid_result(
         for r in range(measure_runs):
             runs.append(
                 {
+                    "prefill_time_ms": row.target_ms,
                     "success": True,
                     "input_len": row.input_len,
                     "output_len": 1,
@@ -129,7 +130,7 @@ def _write_cache_grid_result(
 
 
 class MeasurementContractTest(unittest.TestCase):
-    def test_load_rejects_mixed_ttft_sources(self):
+    def test_server_contract_allows_both_client_transports(self):
         rows = _make_observations(2)
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = []
@@ -147,8 +148,11 @@ class MeasurementContractTest(unittest.TestCase):
                         run["ttft_source"] = source
                 path.write_text(json.dumps(payload), encoding="utf-8")
                 paths.append(path)
-            with self.assertRaisesRegex(ValueError, "incompatible request transports"):
-                load_observations(paths)
+            observations, audit = load_observations(paths)
+            self.assertTrue(observations)
+            self.assertEqual(
+                audit["measurement_contracts"], ["server_first_token_cost_time_ms"]
+            )
 
 
 class BuildFeatureNamesTest(unittest.TestCase):

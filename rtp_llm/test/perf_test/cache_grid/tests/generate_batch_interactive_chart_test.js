@@ -36,20 +36,20 @@ for(const view of ['mean','sum']){
    assert(elements['axis-legend'].textContent.includes('1024'));
    const trace=plots.plot.traces[0];
    assert.equal(trace.marker.reversescale,true);
-   assert.equal(trace.marker.colorbar.title.text,'整批 TTFT 中位数 (ms)');
-   assert.deepEqual(Array.from(trace.marker.color),expected.map(r=>r.median_batch_ttft_ms));
-   assert.equal(trace.marker.cmin,Math.min(...dataset.map(r=>r.median_batch_ttft_ms)));
-   assert.equal(trace.marker.cmax,Math.max(...dataset.map(r=>r.median_batch_ttft_ms)));
+   assert.equal(trace.marker.colorbar.title.text,'批内最大服务端首 token 延迟中位数 (ms)');
+   assert.deepEqual(Array.from(trace.marker.color),expected.map(r=>r.median_batch_first_token_cost_time_ms));
+   assert.equal(trace.marker.cmin,Math.min(...dataset.map(r=>r.median_batch_first_token_cost_time_ms)));
+   assert.equal(trace.marker.cmax,Math.max(...dataset.map(r=>r.median_batch_first_token_cost_time_ms)));
    assert.equal(plots.plot.layout.uirevision,(batch==='all'?'all':'single')+':'+view);
    assert(plots.plot.layout.scene.xaxis.title.text.includes('compute'));
-   assert(plots.plot.layout.scene.zaxis.title.text.includes(batch==='all'?'Batch':'TTFT'));
+   assert(plots.plot.layout.scene.zaxis.title.text.includes(batch==='all'?'Batch':'服务端'));
    assert.equal(trace.x.length,expected.length);
    if(expected.length){
     const first=expected[0];
     const compute=(view==='sum'?first.compute_tokens:first.mean_compute_tokens)/1024;
     assert.equal(trace.x[0],compute);
     assert.equal(trace.y[0],(view==='sum'?first.cached_tokens:first.mean_cached_tokens)/1024);
-    assert.equal(trace.z[0],batch==='all'?first.batch_size:first.median_batch_ttft_ms);
+    assert.equal(trace.z[0],batch==='all'?first.batch_size:first.median_batch_first_token_cost_time_ms);
     elements.plot.handler({points:[{customdata:first}]});
     assert(elements.detail.textContent.includes(String(first.case_id)));
    }

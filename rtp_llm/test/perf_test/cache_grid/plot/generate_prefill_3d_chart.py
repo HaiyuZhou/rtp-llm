@@ -8,7 +8,7 @@ Examples::
     --output /tmp/prefill_3d.svg --batch-size 1
 
 The plot has exactly three data coordinates: X=compute tokens, Y=cached
-tokens, Z=measured prefill RT (TTFT) in milliseconds. Every usable row for the
+tokens, Z=server first_token_cost_time in milliseconds. Every usable row for the
 selected batch is emitted with no point decimation. Dot colour depth shows
 local query density on the compute/cache plane; TTFT remains encoded solely by
 the Z coordinate.
@@ -16,7 +16,6 @@ the Z coordinate.
 from __future__ import annotations
 
 import argparse
-import csv
 import html
 import json
 import math
@@ -78,34 +77,7 @@ def _query_density_color(density: int, maximum: int) -> str:
 
 
 def load_rows(path: pathlib.Path, batch_size: int) -> list[dict[str, float]]:
-    """Load cache-grid JSON or a compatible predictions CSV."""
-    rows: list[dict[str, float]] = []
-    if path.suffix.lower() == ".csv":
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            if not {"batch_size", "input_len", "cache_len", "target_ms"} <= set(
-                reader.fieldnames or []
-            ):
-                raise ValueError(
-                    "expected current observation CSV; migrate legacy CSV first"
-                )
-            for item in reader:
-                if int(float(item["batch_size"])) != batch_size:
-                    continue
-                inp = _number(item.get("input_len"))
-                cache = _number(item.get("cache_len"))
-                rt = _number(item.get("target_ms"))
-                if (
-                    inp is not None
-                    and cache is not None
-                    and rt is not None
-                    and 0 <= cache <= inp
-                ):
-                    rows.append(
-                        {"compute": inp - cache, "cache": cache, "rt": rt, "input": inp}
-                    )
-        return rows
-
+    """Load server first-token latency from cache_grid_results.json."""
     data = json.loads(path.read_text(encoding="utf-8"))
     return [
         {
@@ -202,7 +174,7 @@ def render(
 .paneltitle{{font-size:23px;font-weight:700}} .body{{font-size:17px;fill:#334155}}
 .note{{font-size:15px;fill:#64748b}}</style>
 <text x="1100" y="52" text-anchor="middle" class="title">Prefill RT — dense 3D measurement view</text>
-<text x="1100" y="85" text-anchor="middle" class="sub">X = measured TTFT / prefill RT (ms) · Y = cached tokens · Z = compute tokens; every selected geometry is plotted</text>"""
+<text x="1100" y="85" text-anchor="middle" class="sub">X = measured Server first-token latency (ms) · Y = cached tokens · Z = compute tokens; every selected geometry is plotted</text>"""
     ]
 
     out.append(
@@ -328,7 +300,7 @@ def render(
             f'<text x="{p[0]-28:.1f}" y="{p[1]+5:.1f}" text-anchor="end" class="tick">{fmt_tokens(zmax*t)}</text>'
         )
     out += [
-        f'<text x="{project(.55,0,0)[0]:.1f}" y="{project(.55,0,0)[1]+78:.1f}" text-anchor="middle" class="axis">TTFT / prefill RT (X, ms)</text>',
+        f'<text x="{project(.55,0,0)[0]:.1f}" y="{project(.55,0,0)[1]+78:.1f}" text-anchor="middle" class="axis">Server first-token latency (X, ms)</text>',
         f'<text x="{project(0,.55,0)[0]-80:.1f}" y="{project(0,.55,0)[1]+78:.1f}" text-anchor="middle" class="axis">cached tokens (Y)</text>',
         f'<text x="{project(0,0,.58)[0]-70:.1f}" y="{project(0,0,.58)[1]:.1f}" text-anchor="middle" transform="rotate(-90 {project(0,0,.58)[0]-70:.1f},{project(0,0,.58)[1]:.1f})" class="axis">compute tokens (Z)</text>',
     ]
@@ -378,7 +350,7 @@ def render(
     )
     for i, value in enumerate(
         [
-            "X right: larger TTFT / prefill RT (slower).",
+            "X right: larger Server first-token latency (slower).",
             "Y up: more KV reuse; cache dimension.",
             "Z up: more compute tokens (uncached work).",
             "Triangular footprint: input = compute + cache.",
@@ -404,9 +376,6 @@ def render(
 
 
 def data_metrics(path: pathlib.Path) -> list[Any]:
-    if path.suffix.lower() == ".csv":
-        with path.open(newline="", encoding="utf-8") as handle:
-            return list(csv.DictReader(handle))
     data = json.loads(path.read_text(encoding="utf-8"))
     return current_metrics(data, str(path))
 
@@ -474,7 +443,7 @@ def render_cold_miss_2d(
 .paneltitle{{font-size:23px;font-weight:700}} .body{{font-size:17px;fill:#334155}}
 .note{{font-size:15px;fill:#64748b}}</style>
 <text x="70" y="55" class="title">{esc_text(model_label)}：Cache miss 的 seq_len–RT 趋势</text>
-<text x="70" y="88" class="sub">BS={batch_size} · observed cache_len=0 · 每个 seq_len 使用三次成功测量的中位 prefill RT / TTFT</text>"""
+<text x="70" y="88" class="sub">BS={batch_size} · observed cache_len=0 · 每个 seq_len 使用三次成功测量的中位 服务端 first_token_cost_time</text>"""
     ]
     out.append(line(x0, y1, x1, y1, "#0f172a", 2))
     out.append(line(x0, y0, x0, y1, "#0f172a", 2))
@@ -511,7 +480,7 @@ def render_cold_miss_2d(
     out.extend(circle(x, y, 2.8) for x, y in points)
     out += [
         f'<text x="{(x0 + x1) / 2:.1f}" y="{y1 + 78:.1f}" text-anchor="middle" class="axis">seq_len（tokens，线性轴）</text>',
-        f'<text x="42" y="{(y0 + y1) / 2:.1f}" text-anchor="middle" transform="rotate(-90 42 {(y0 + y1) / 2:.1f})" class="axis">中位 prefill RT / TTFT（ms）</text>',
+        f'<text x="42" y="{(y0 + y1) / 2:.1f}" text-anchor="middle" transform="rotate(-90 42 {(y0 + y1) / 2:.1f})" class="axis">中位 服务端 first_token_cost_time（ms）</text>',
     ]
 
     # Inset for the short-sequence region, where a full 1M linear axis hides
@@ -681,7 +650,7 @@ def render_clean(
 .paneltitle{{font-size:23px;font-weight:700}} .body{{font-size:17px;fill:#334155}}
 .note{{font-size:15px;fill:#64748b}} .legend{{font-size:16px;fill:#334155}}</style>
 <text x="1100" y="52" text-anchor="middle" class="title">{esc(title)}</text>
-<text x="1100" y="85" text-anchor="middle" class="sub">X = compute tokens · Y = observed cached tokens · Z = TTFT / prefill RT (ms) · all {len(rows):,} geometries shown</text>"""
+<text x="1100" y="85" text-anchor="middle" class="sub">X = compute tokens · Y = observed cached tokens · Z = Server first-token latency (ms) · all {len(rows):,} geometries shown</text>"""
     ]
 
     # Ground plane and a sparse grid keep the perspective legible.
@@ -827,7 +796,7 @@ def render_clean(
     out += [
         f'<text x="{project(.55,0,0)[0]:.1f}" y="{project(.55,0,0)[1]+70:.1f}" text-anchor="middle" class="axis">compute tokens (X)</text>',
         f'<text x="{project(0,.55,0)[0]-75:.1f}" y="{project(0,.55,0)[1]+70:.1f}" text-anchor="middle" class="axis">cached tokens (Y)</text>',
-        f'<text x="{project(0,0,.57)[0]-62:.1f}" y="{project(0,0,.57)[1]:.1f}" text-anchor="middle" transform="rotate(-90 {project(0,0,.57)[0]-62:.1f},{project(0,0,.57)[1]:.1f})" class="axis">TTFT / prefill RT (Z, ms)</text>',
+        f'<text x="{project(0,0,.57)[0]-62:.1f}" y="{project(0,0,.57)[1]:.1f}" text-anchor="middle" transform="rotate(-90 {project(0,0,.57)[0]-62:.1f},{project(0,0,.57)[1]:.1f})" class="axis">Server first-token latency (Z, ms)</text>',
     ]
 
     one_m = next(

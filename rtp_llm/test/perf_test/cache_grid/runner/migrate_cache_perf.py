@@ -18,7 +18,10 @@ from rtp_llm.test.perf_test.cache_grid.runner.cache_perf import (
     replace_args,
     sha,
 )
-from rtp_llm.test.perf_test.cache_grid.runner.result_schema import current_metrics
+from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    SERVER_LATENCY_CONTRACT,
+    current_metrics,
+)
 
 
 def read_json(path):
@@ -77,16 +80,8 @@ def migrate_metric(source):
                 raise ValueError(
                     "request success must be explicit; remeasure incomplete records"
                 )
-            if request["success"] and "ttft_ms" not in request:
-                if "client_wall_time_ms" not in request:
-                    raise ValueError(
-                        "missing client TTFT: server prefill_time_ms cannot be converted to ttft_ms; remeasure"
-                    )
-                if request.get("output_len") != 1:
-                    raise ValueError(
-                        "client wall time is TTFT only with a recorded output_len=1"
-                    )
-                request["ttft_ms"] = request["client_wall_time_ms"]
+            if request["success"]:
+                canonical_field(request, "prefill_time_ms", ("first_token_cost_time",))
     if item["status"] is None:
         raise ValueError("metric status is missing; cannot infer measurement validity")
     if "measure_runs" not in item:
@@ -123,6 +118,7 @@ def migrate_results(source):
         raise ValueError("expected metrics/results list or a bare metric list")
     result.update(
         schema_version=2,
+        measurement_contract=SERVER_LATENCY_CONTRACT,
         mode="prefix_cache_grid",
         metrics=[migrate_metric(item) for item in metrics],
         resume_compatible=False,
@@ -154,21 +150,28 @@ def migrate_result_file(source, destination):
         if not rows:
             raise ValueError("empty CSV")
         for row in rows:
-            if (
-                not any(key in row for key in ("target_ms", "ttft_ms", "avg_ttft_ms"))
-                and "client_wall_time_ms" in row
-                and row.get("output_len") not in ("1", "1.0")
-            ):
-                raise ValueError("CSV client wall time requires recorded output_len=1")
             canonical_field(row, "input_len", ("seq_len",))
             canonical_field(
                 row,
                 "cache_len",
                 ("cache_len_observed", "reuse_len", "cache_len_requested"),
             )
-            canonical_field(
-                row, "target_ms", ("ttft_ms", "avg_ttft_ms", "client_wall_time_ms")
+            server_keys = (
+                "first_token_cost_time",
+                "prefill_time_ms",
+                "avg_prefill_time_ms",
             )
+            if any(key in row for key in server_keys):
+                row.pop("target_ms", None)
+                canonical_field(row, "target_ms", server_keys)
+            elif (
+                row.get("measurement_contract") != SERVER_LATENCY_CONTRACT
+                or "target_ms" not in row
+            ):
+                raise ValueError(
+                    "CSV requires recorded server first_token_cost_time; client times cannot be converted"
+                )
+            row["measurement_contract"] = SERVER_LATENCY_CONTRACT
             row.setdefault("batch_size", "1")
             row["migration_source_path"] = str(source.resolve())
             row["migration_source_sha256"] = source_hash

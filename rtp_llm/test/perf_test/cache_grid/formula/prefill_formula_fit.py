@@ -8,7 +8,7 @@ reused.  This tool accepts a row only when the runner marks it successful and
 all measured reuse lengths exactly match the requested cache length.
 
 * every requested measurement run succeeded;
-* every run has output length one and finite end-to-end TTFT;
+* every run has output length one and finite positive server first_token_cost_time;
 * observed reuse is constant and exactly matches the request; and
 * the selected batch size is fixed.
 
@@ -19,9 +19,9 @@ such as ``tokens``.  The default fit selects batch size one;
 ``sum()`` keeps the per-request terms well-defined if the same expression is
 evaluated through FlexLB's batch path.
 
-New runner output uses client HTTP wall time with ``max_new_tokens=1`` as
-TTFT.  The server's ``first_token_cost_time`` is retained only for diagnostics;
-historical input formats must be migrated before fitting.
+All fit targets use the server's first_token_cost_time, stored in
+runs[].prefill_time_ms (milliseconds, including engine wait). Client wall time
+is diagnostic only; no client/server timing fallback is permitted.
 
 The report keeps the fit and the production gate separate: a formula can be
 useful for analysis while still failing a tail-error gate.
@@ -40,7 +40,7 @@ import random
 import re
 import statistics
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Sequence
 
 from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     fingerprint as profile_fingerprint,
@@ -61,6 +61,7 @@ from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
     fit_restricted_symbolic,
 )
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
+    SERVER_LATENCY_CONTRACT,
     MetricFormatError,
     current_metrics,
 )
@@ -70,7 +71,6 @@ from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import integer as _integer
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
     observed_reuse_values,
-    request_runs,
     single_request_metric,
 )
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
@@ -149,7 +149,7 @@ def _median_run_time(
         run_input = _integer(run.get("input_len"))
         output_len = _integer(run.get("output_len"))
         reuse_len = _integer(run.get("reuse_len"))
-        latency = _finite(run.get("ttft_ms"))
+        latency = _finite(run.get("prefill_time_ms"))
         if run_input != input_len or output_len != 1:
             return None, None, "request_shape_mismatch"
         if reuse_len != cache_len:
@@ -171,76 +171,9 @@ def load_observations(
     input_files: list[dict[str, Any]] = []
     measurement_contracts: set[str] = set()
     for path in paths:
-        if path.suffix.lower() == ".csv":
-            with path.open(newline="", encoding="utf-8") as stream:
-                reader = csv.DictReader(stream)
-                if not {"batch_size", "input_len", "cache_len", "target_ms"} <= set(
-                    reader.fieldnames or []
-                ):
-                    raise ValueError(
-                        f"{path}: expected current observation CSV columns; migrate legacy CSV first"
-                    )
-                rows = list(reader)
-            source_count = len(rows)
-            for index, item in enumerate(rows, 2):
-                batch = _integer(item.get("batch_size"))
-                if batch != batch_size:
-                    rejected["batch_size"] = rejected.get("batch_size", 0) + 1
-                    continue
-                input_len = _integer(item.get("input_len"))
-                cache_len = _integer(item.get("cache_len"))
-                target = _finite(item.get("target_ms"))
-                if (
-                    input_len is None
-                    or cache_len is None
-                    or cache_len < 0
-                    or cache_len >= input_len
-                    or target is None
-                    or target <= 0
-                ):
-                    rejected["invalid_geometry_or_latency"] = (
-                        rejected.get("invalid_geometry_or_latency", 0) + 1
-                    )
-                    continue
-                observations.append(
-                    Observation(
-                        batch,
-                        input_len,
-                        cache_len,
-                        target,
-                        f"{path.name}:{index}",
-                        cache_len,
-                    )
-                )
-            input_files.append(
-                {"path": str(path), "rows": source_count, "format": "csv"}
-            )
-            continue
-
         json_payload = json.loads(path.read_text(encoding="utf-8"))
         metrics = current_metrics(json_payload, str(path))
-        file_sources = {
-            str(run.get("ttft_source"))
-            for item in metrics
-            if isinstance(item, dict)
-            for run in request_runs(item)
-            if isinstance(run, dict) and run.get("ttft_source")
-        }
-        if len(file_sources) > 1:
-            raise ValueError(
-                f"{path}: mixed ttft_source values are not fit-compatible: "
-                f"{sorted(file_sources)}"
-            )
-        transport = (
-            json_payload.get("request_transport")
-            if isinstance(json_payload, dict)
-            else None
-        )
-        contract = next(iter(file_sources), None) or (
-            f"transport:{transport}" if transport else None
-        )
-        if contract:
-            measurement_contracts.add(contract)
+        measurement_contracts.add(SERVER_LATENCY_CONTRACT)
         source_count = 0
         for index, item in enumerate(metrics):
             source_count += 1
@@ -285,12 +218,6 @@ def load_observations(
                 )
             )
         input_files.append({"path": str(path), "rows": source_count, "format": "json"})
-
-    if len(measurement_contracts) > 1:
-        raise ValueError(
-            "input files mix incompatible request transports/TTFT sources: "
-            f"{sorted(measurement_contracts)}"
-        )
 
     observations.sort(
         key=lambda row: (row.batch_size, row.input_len, row.cache_len, row.source)
@@ -1009,6 +936,7 @@ def run_fit(args: argparse.Namespace) -> int:
                 "cache_len": row.cache_len,
                 "compute_len": row.compute_len,
                 "target_ms": row.target_ms,
+                "measurement_contract": SERVER_LATENCY_CONTRACT,
                 "predicted_ms": predicted,
                 "signed_error_ms": predicted - row.target_ms,
                 "abs_error_ms": abs(predicted - row.target_ms),
@@ -1032,7 +960,10 @@ def run_fit(args: argparse.Namespace) -> int:
         "model_family": model_family,
         "backend": backend,
         "objective": objective_name,
-        "target": (f"{args.estimator} of successful per-request client ttft_ms"),
+        "measurement_contract": SERVER_LATENCY_CONTRACT,
+        "target": (
+            f"{args.estimator} of successful server first_token_cost_time (runs[].prefill_time_ms), including engine wait"
+        ),
         "formula": formula,
         "token_unit": token_unit,
         "formula_compatibility": formula_compatibility,
@@ -1196,6 +1127,7 @@ def run_analyze_anomalies(args: argparse.Namespace) -> int:
                         "cache_len": row.cache_len,
                         "compute_len": row.compute_len,
                         "target_ms": row.target_ms,
+                        "measurement_contract": SERVER_LATENCY_CONTRACT,
                         "predicted_ms": predicted,
                         "ape_pct": round(ape, 2),
                         "detail": f"APE={ape:.1f}% (target={row.target_ms:.1f}ms, predicted={predicted:.1f}ms)",

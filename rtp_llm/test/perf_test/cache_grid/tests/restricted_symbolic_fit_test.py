@@ -108,6 +108,7 @@ class RestrictedSymbolicCliTest(unittest.TestCase):
             target_ms = 25.0 + 0.002 * input_len
             runs = [
                 {
+                    "prefill_time_ms": target_ms,
                     "success": True,
                     "input_len": input_len,
                     "output_len": 1,

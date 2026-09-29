@@ -9,7 +9,7 @@
   cold/cache-hit 路径和 GPU trace。
 - `dsv4_pro_prefill_batch_smoke.json`：3 个固定组批 case，覆盖 batch=2/4、独立前缀、
   组内共享前缀和混合 cold/cache-hit。默认 3 轮，共 30 条正式请求、7 条 seed 请求。
-- `dsv4_pro_prefill_full_template.json`：紧凑型全量模板。runner 加载时自动展开为
+- `dsv4_pro_prefill_full_template.json`：预先展开的显式全量 grid，包含
   1,024 个输入长度、44,505 个 geometry。默认每个 geometry 测 3 次，共 133,515 次
   正式请求；其中 43,481 个 geometry 需要先执行 seed。
 
@@ -22,12 +22,12 @@
 
 | 字段 | 是否参与执行 | 说明 |
 |---|---|---|
-| `schema_version` | 记录 | 配置格式版本 |
+| `schema_version` | 是 | 必填，必须为 2 |
 | `kind` | 记录 | workload 类型 |
 | `description` | 否 | 人工说明 |
 | `generator.name/version` | 记录 | 配置来源和版本 |
-| `generator.cache_alignment` | 是 | `--expected_cache_block_size=0` 时，runner 从这里读取预期复用粒度 |
-| `summary` | 否 | 预估规模，用于启动前检查成本；runner 仍以实际展开结果为准 |
+| `generator.cache_alignment` | 是 | 必填正整数；运行时缓存对齐的唯一配置位置 |
+| `summary` | 否 | 预估规模，用于启动前检查成本；runner 仍以显式 cases 为准 |
 
 当前 DSV4-Pro 配置中：
 
@@ -38,9 +38,8 @@ CP-visible cache block     = 512 × 8 = 4096
 kernel block               = 128
 ```
 
-因此 `generator.cache_alignment`、`cache_block_size` 和 runner 实际探测到的
-`reuse_len` 粒度都必须是 4096。`seq_block_size=256` 同时控制紧凑模板的最小输入和输入
-长度采样对齐，不表示 cache 可以按 256 token 复用。
+因此 grid 的 `generator.cache_alignment` 必须是 4096，并与服务实际探测到的
+`reuse_len` 粒度一致。生成器的输入长度采样对齐是独立维度。
 
 ### Smoke 配置
 
@@ -61,7 +60,7 @@ cache_len % 4096 == 0
 cache_len + cache_commit_tail_tokens <= input_len
 ```
 
-需要测试 batch>1 时，可在显式 case 中增加 `request_groups`，各 group 的 `count` 总和必须
+需要测试 batch>1 时，必须在显式 case 中填写 `request_groups` 和 `prefix_policy`，各 group 的 `count` 总和必须
 等于 `batch_size`；`prefix_policy` 可取 `independent` 或 `shared_by_group`。当前 cache
 profiler 只支持未分组的 batch=1 case，因此 grouped batch 不得加入
 `--cache_profile_case_ids`。
@@ -72,7 +71,7 @@ profiler 只支持未分组的 batch=1 case，因此 grouped batch 不得加入
 
 | case_id | 正式 batch | 请求构成（input_len / cache_len × 数量） | 前缀策略 | seed batch |
 |---|---:|---|---|---:|
-| 0 | 2 | 8192 / 4096 × 2 | 默认 `independent` | 2 |
+| 0 | 2 | 8192 / 4096 × 2 | `independent` | 2 |
 | 1 | 4 | 8192 / 4096 × 2，8192 / 0 × 1，16384 / 12288 × 1 | `independent` | 3 |
 | 2 | 4 | 与 case 1 相同 | `shared_by_group` | 2 |
 
@@ -82,8 +81,8 @@ profiler 只支持未分组的 batch=1 case，因此 grouped batch 不得加入
 - `prefix_policy=independent`：每条请求使用独立前缀。
 - `prefix_policy=shared_by_group`：同组共享前缀，不同组独立；每个共享前缀只 seed 一次。
 
-case 0 展示兼容写法：省略 `request_groups`，runner 将顶层长度复制 `batch_size` 次。
-case 1/2 使用显式分组，不必填写顶层 `input_len/cache_len`。cold 请求不需要 seed。
+所有 batch case 必须使用显式分组，不必填写顶层 `input_len/cache_len`。
+每组 `count/input_len/cache_len` 均必填，cold 请求显式写 `cache_len: 0`，不需要 seed。
 
 执行时先将专用 `BatchDecodeScheduler` 设为 seed 数量 S，并发发送 S 条 seed；
 等全部完成后切换为正式 batch B，再逐轮发送完整的 B 条请求。S=0 时跳过 seed。
@@ -97,28 +96,18 @@ case 结束恢复 batch=1。该模式要求 **DP=1 且测试服务没有其他�
 case 1/2 每轮预期缓存命中均为 `[4096, 4096, 0, 12288]`。
 更多细节见 [批量模式说明](../docs/cache_grid_batches.md)。
 
-### 全量模板
+### 全量 grid
 
-全量文件不展开 `cases`，而是使用 runner 原生支持的紧凑参数：
+全量文件已预先展开为 44,505 个显式 case，保留原 case ID 和测试几何。
+runner 不再接受 `seq_lens`、`seq_generation`、`seq_block_size`、
+`cache_block_size`、`cache_ratios` 或 `cache_ratio_interval`。
+修改采样方案应使用独立生成器重新生成显式 `cases`，然后运行下文预检命令。
 
-| 字段 | 当前值 | 修改效果 |
-|---|---:|---|
-| `seq_generation.kind` | `linear_with_dense_prefix` | 必须保持该值，这是当前支持的自动展开方式 |
-| `seq_generation.count` | 1024 | 输入长度采样数量；减小可缩短测试时间 |
-| `seq_generation.max_seq_len` | 1048575 | 最大输入；加上 1 个输出 token 后严格等于 1M |
-| `seq_block_size` | 256 | 最小输入和普通输入长度的采样对齐 |
-| `cache_block_size` | 4096 | cache 请求对齐及每个 case 至少保留的新计算尾部 |
-| `cache_ratio_interval` | 0.02 | 自动生成 0、0.02、...、0.98；runner 还会加入 near-full case |
-
-`cache_ratio_interval` 必须是 `(0, 1)` 内的有限数值。runner 按
-`0, interval, 2 * interval, ... < 1` 生成均匀比例，最多生成 10,000 个比例；对每个输入长度，
-比例仍会按 `cache_block_size` 向下对齐、去重，并自动补一个 near-full case。若需要非均匀
-采样，也可以删掉 `cache_ratio_interval`，改用显式 `cache_ratios` 数组；两个字段不能同时配置。
-
-修改 `count`、`max_seq_len`、`seq_block_size`、`cache_block_size`、
-`cache_ratio_interval` 或 `cache_ratios` 后，
-必须重新运行下文的预检命令，并同步更新 `summary`。`summary` 写错不会改变实际 case，
-但会误导请求量和运行时间评估。
+`case_id/batch_size` 均必填；单请求还必须填写 `input_len/cache_len`。
+所有数值字段必须使用 JSON 整数，不接受字符串、浮点数或布尔值。
+缓存对齐只允许放在 `generator.cache_alignment`；旧的
+`generator.cache_sampling.alignment`、CLI `--expected_cache_block_size`
+和 profile `cache_grid.expected_block_size` 均会被拒绝。
 
 ## Runner 已有默认值
 
@@ -131,7 +120,6 @@ case 1/2 每轮预期缓存命中均为 `[4096, 4096, 0, 12288]`。
 | `--cache_commit_tail_tokens` | 4096 |
 | `--cache_request_transport` | `dashsc_input_ids` |
 | `--cache_grpc_port` | 0，即 HTTP port + 8 |
-| `--expected_cache_block_size` | 0，然后从 JSON 的 `generator.cache_alignment` 读取 4096 |
 | `--cache_checkpoint_every` | 100 |
 | `--cache_profile_runs` | 0，默认不采 cache trace |
 | `--cache_profile_trace_timeout` | 120 秒 |
@@ -176,7 +164,7 @@ path = Path(
 )
 payload = json.loads(path.read_text(encoding="utf-8"))
 cases = _load_cache_grid_cases(str(path))
-block = _resolve_cache_block_size(payload, 0)
+block = _resolve_cache_block_size(payload)
 groups = [
     case.get("request_groups", [{"count": case["batch_size"],
                                  "input_len": case["input_len"],

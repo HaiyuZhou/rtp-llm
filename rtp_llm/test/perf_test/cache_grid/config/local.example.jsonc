@@ -20,7 +20,6 @@
   "cache_grid": {
     // Match the engine's logical reuse block size, including any CP sharding.
     "cache_alignment": 64,
-    "expected_block_size": 64,
     "commit_tail_tokens": 64,
     "measure_runs": 3
   },

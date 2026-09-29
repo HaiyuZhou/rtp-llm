@@ -1,6 +1,7 @@
 """Archived inputs need explicit migration; normal consumers stay current-only."""
 
 import copy
+import csv
 import json
 import tempfile
 import unittest
@@ -71,7 +72,7 @@ class MigrationTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 
-    def test_old_containers_are_rejected_then_migrate_to_same_client_observation(self):
+    def test_old_containers_are_rejected_then_migrate_to_same_server_observation(self):
         metric = old_metric()
         for payload in (
             [metric],
@@ -86,20 +87,20 @@ class MigrationTest(unittest.TestCase):
                 self.assertEqual(payload, original)
                 path = self.root / "result.json"
                 path.write_text(json.dumps(result))
-                self.assertEqual(load_observations([path])[0][0].target_ms, 12)
-                self.assertEqual(static_rows(path, 1)[0]["rt"], 12)
-                self.assertEqual(interactive_rows(path, 1)[0]["prefill_rt"], 12)
+                self.assertEqual(load_observations([path])[0][0].target_ms, 3)
+                self.assertEqual(static_rows(path, 1)[0]["rt"], 3)
+                self.assertEqual(interactive_rows(path, 1)[0]["prefill_rt"], 3)
                 self.assertEqual(result["metrics"][0]["runs"][0]["prefill_time_ms"], 3)
                 self.assertFalse(result["resume_compatible"])
 
-    def test_server_only_and_multitoken_wall_time_cannot_become_ttft(self):
+    def test_server_only_migrates_and_client_only_cannot_become_server_time(self):
         metric = old_metric()
         del metric["runs"][0]["client_wall_time_ms"]
-        with self.assertRaisesRegex(ValueError, "server prefill_time_ms cannot"):
-            migrate_results([metric])
+        result = migrate_results([metric])
+        self.assertEqual(result["metrics"][0]["runs"][0]["prefill_time_ms"], 3)
         metric = old_metric()
-        metric["runs"][0]["output_len"] = 2
-        with self.assertRaisesRegex(ValueError, "output_len=1"):
+        del metric["runs"][0]["prefill_time_ms"]
+        with self.assertRaisesRegex(ValueError, "prefill_time_ms"):
             migrate_results([metric])
 
     def test_no_aggregate_or_missing_validity_is_invented(self):
@@ -137,30 +138,31 @@ class MigrationTest(unittest.TestCase):
             migrate_result_file(source, output)
         self.assertEqual(source.read_bytes(), original)
 
-    def test_observation_csv_needs_explicit_migration(self):
+    def test_csv_migration_records_server_contract(self):
         source, output = self.root / "old.csv", self.root / "current.csv"
-        source.write_text("seq_len,reuse_len,ttft_ms\n16,8,12\n")
+        source.write_text("seq_len,reuse_len,first_token_cost_time\n16,8,12\n")
         for reader in (lambda p: load_observations([p]), lambda p: static_rows(p, 1)):
-            with self.assertRaisesRegex(ValueError, "CSV"):
+            with self.assertRaises(ValueError):
                 reader(source)
         migrate_result_file(source, output)
-        self.assertEqual(load_observations([output])[0][0].target_ms, 12)
-        self.assertEqual(static_rows(output, 1)[0]["rt"], 12)
+        with output.open() as stream:
+            row = next(csv.DictReader(stream))
+        self.assertEqual(row["target_ms"], "12")
+        self.assertEqual(row["measurement_contract"], "server_first_token_cost_time_ms")
 
-    def test_csv_wall_time_requires_single_token_and_matching_output_format(self):
+    def test_csv_rejects_client_time_and_requires_matching_output_format(self):
         source, output = self.root / "old.csv", self.root / "current.csv"
         source.write_text(
             "seq_len,reuse_len,client_wall_time_ms,output_len\n16,8,12,2\n"
         )
-        with self.assertRaisesRegex(ValueError, "output_len=1"):
+        with self.assertRaisesRegex(ValueError, "recorded server"):
             migrate_result_file(source, output)
-        source.write_text(
-            "seq_len,reuse_len,client_wall_time_ms,output_len\n16,8,12,1\n"
-        )
+        source.write_text("seq_len,reuse_len,first_token_cost_time\n16,8,12\n")
         with self.assertRaisesRegex(ValueError, "preserve the file format"):
             migrate_result_file(source, self.root / "current.json")
         migrate_result_file(source, output)
-        self.assertEqual(load_observations([output])[0][0].target_ms, 12)
+        with output.open() as stream:
+            self.assertEqual(next(csv.DictReader(stream))["target_ms"], "12")
 
     def test_grouped_requests_keep_round_boundaries_and_individual_times(self):
         source = {
@@ -178,7 +180,11 @@ class MigrationTest(unittest.TestCase):
                             batch_wall_time_ms=21,
                             requests=[
                                 old_metric()["runs"][0],
-                                dict(old_metric()["runs"][0], client_wall_time_ms=20),
+                                dict(
+                                    old_metric()["runs"][0],
+                                    prefill_time_ms=5,
+                                    client_wall_time_ms=20,
+                                ),
                             ],
                         )
                     ],
@@ -187,7 +193,7 @@ class MigrationTest(unittest.TestCase):
         }
         result = migrate_results(source)
         run = result["metrics"][0]["runs"][0]
-        self.assertEqual([r["ttft_ms"] for r in run["requests"]], [12, 20])
+        self.assertEqual([r["prefill_time_ms"] for r in run["requests"]], [3, 5])
         self.assertEqual(run["batch_wall_time_ms"], 21)
         self.assertNotIn("ttft_ms", run)
 
@@ -197,7 +203,11 @@ class MigrationTest(unittest.TestCase):
         grid = source / "grid.json"
         grid.write_text(
             json.dumps(
-                {"cases": [dict(case_id=7, batch_size=1, input_len=16, cache_len=8)]}
+                {
+                    "schema_version": 2,
+                    "generator": {"cache_alignment": 8},
+                    "cases": [dict(case_id=7, batch_size=1, input_len=16, cache_len=8)],
+                }
             )
         )
         info = dict(
@@ -244,12 +254,12 @@ class MigrationTest(unittest.TestCase):
         source = self.make_old_run()
         journal = source / "cache_grid_results.journal.jsonl"
         latest = old_metric()
-        latest["runs"][0]["client_wall_time_ms"] = 19
+        latest["runs"][0]["prefill_time_ms"] = 19
         journal.write_text(json.dumps(latest) + "\n")
         output = self.root / "new-run"
         migrate_run(source, output)
         result = json.loads((output / "cache_grid_results.json").read_text())
-        self.assertEqual(result["metrics"][0]["runs"][0]["ttft_ms"], 19)
+        self.assertEqual(result["metrics"][0]["runs"][0]["prefill_time_ms"], 19)
         journal.write_text(journal.read_text() + "{partial")
         with self.assertRaises(ValueError):
             migrate_run(source, self.root / "failed")
@@ -335,8 +345,8 @@ class MigrationTest(unittest.TestCase):
                 ValueError, "Migrate"
             ):
                 current_metrics(broken)
-        del metric["runs"][0]["ttft_ms"]
-        with self.assertRaisesRegex(ValueError, "requires per-request ttft_ms"):
+        del metric["runs"][0]["prefill_time_ms"]
+        with self.assertRaisesRegex(ValueError, "requires per-request prefill_time_ms"):
             current_metrics(result)
 
 

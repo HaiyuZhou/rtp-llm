@@ -33,7 +33,6 @@
   },
   "cache_grid": {
     "cache_alignment": 512,
-    "expected_block_size": 512,
     "measure_runs": 3
   }
 }

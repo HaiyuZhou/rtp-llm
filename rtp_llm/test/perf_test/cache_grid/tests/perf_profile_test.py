@@ -118,6 +118,12 @@ class ResolveTest(unittest.TestCase):
             4,
         )
 
+    def test_removed_runtime_alignment_profile_field_is_rejected(self):
+        with self.assertRaisesRegex(ProfileError, "generator.cache_alignment"):
+            validate_profile(
+                {"schema_version": 1, "cache_grid": {"expected_block_size": 4096}}
+            )
+
     def test_profile_wins_over_default(self):
         self.assertEqual(
             resolve_int(
@@ -139,9 +145,9 @@ class ResolveTest(unittest.TestCase):
     def test_explicit_zero_wins(self):
         self.assertEqual(
             resolve_int(
-                {"schema_version": 1, "cache_grid": {"expected_block_size": 512}},
+                {"schema_version": 1, "cache_grid": {"cache_alignment": 512}},
                 "cache_grid",
-                "expected_block_size",
+                "cache_alignment",
                 0,
                 256,
             ),

@@ -18,9 +18,9 @@ from rtp_llm.test.perf_test.batch_decode_test import (
 )
 from rtp_llm.test.perf_test.cache_grid.runner import cache_perf
 from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
-    fixed_workspace_grid,
     grid_token_budget,
-    validate_fixed_workspace,
+    grid_workspace_tokens,
+    validate_token_budget,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
@@ -32,10 +32,12 @@ def inspect_grid(path):
     batches = {case["batch_size"] for case in cases}
     if len(batches) != 1:
         raise ValueError(f"{path}: split mixed batch sizes into separate files")
-    if fixed_workspace_grid(grid):
+    workspace = grid_workspace_tokens(grid)
+    if workspace is not None:
         metadata = grid.get("generator", {})
-        validate_fixed_workspace(
+        validate_token_budget(
             cases,
+            workspace_tokens=workspace,
             block=_resolve_cache_block_size(grid),
             commit_tail=int(
                 metadata.get("parameters", {}).get("commit_tail_tokens", 4096)

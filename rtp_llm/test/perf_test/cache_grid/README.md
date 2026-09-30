@@ -289,7 +289,8 @@ python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_cache_grid \
 key `PREFILL_TIME_FORMULA`、token 单位 1024，cold 标注阈值默认 1048575。
 当前 profile 的可选 `chart` 字段和工具 CLI 可覆盖图表默认值。
 DSV4 配置保留在 `config/dsv4_*.json*`，作为显式选用的模型 preset。
-随机 batch 启动器现在要求 `--profile`，固定 CP8 workspace 需显式选择，详见
+随机 batch 启动器要求 `--profile`；可通过 `--workspace-tokens` 固定整批 token 容量，
+请求长度按剩余预算依次采样，不再按 batch 平分上限，详见
 [随机 batch 文档](docs/generate_random_batch_grid.md)。
 
 ## Pipeline：测试、拟合与绘图

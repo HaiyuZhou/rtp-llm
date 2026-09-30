@@ -14,9 +14,11 @@ python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_random_batch_grid \
   --cache-alignment 64 --commit-tail-tokens 64 --seed 20260917
 ```
 
-每个 batch size 生成一个文件。默认 `workspace_policy="none"`，不强制 CP8、1M workspace、
-256K 单请求上限或 block4096。默认数值只是可覆盖的采样参数，不代表模型容量。
-单请求采样上限取 `max_input_tokens` 与 `max_batch_tokens // batch_size` 的较小值；
+每个 batch size 生成一个文件。默认不启用固定 workspace；默认数值只是可覆盖的采样参数，不代表模型容量。
+不再把总预算按 batch 平均分配。设对齐后的最小长度为 m、总输入预算为 T，
+第 i 个请求的采样上限为 `min(max_input_tokens, T - 已采样长度之和 - 剩余请求数 × m)`。
+这样允许一个长请求搭配多个短请求，同时保证后续请求至少能取最小长度。
+最后打乱请求槽位，因此 JSON 中的第一个请求不一定是最先采样的长请求。
 `--batch-input-limit B:TOKENS` 可对目录模式中的指定 batch 进一步设限。
 `--output /path/grid.json --batch-sizes 2 4 8` 可生成混合 batch 文件，交给 `tools/cache_perf` 运行。
 
@@ -50,17 +52,40 @@ python3 -m rtp_llm.test.perf_test.cache_grid.runner.run_random_batch_grids \
 旧启动参数 `--model-dir`、`--mega-moe-se`、`--reserve-runtime-mem-mb` 和 `--jit-cache-dir`
 迁移到 profile 的 `engine`、`engine_args`、`engine_env`、`runtime_env`；不再隐式选择 DSV4。
 
-## DSV4 CP8/1M 专用 preset
+## 固定 token workspace
 
-原固定 workspace 实验可继续使用 `config/dsv4_local.example.jsonc`，生成时显式增加：
+用 `--workspace-tokens` 显式指定整批固定容量，不绑定某个 TP/CP，也没有固定 1M 上限：
 
-```text
---workspace-policy fixed_cp8_1m_v1 --cache-alignment 4096 --commit-tail-tokens 4096
+```bash
+python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_random_batch_grid \
+  --output-dir /tmp/flash_fixed_tokens_grids --num-cases 100 --batch-sizes 1 2 4 \
+  --workspace-tokens 65536 --max-batch-tokens 65536 \
+  --min-input-tokens 2048 --max-input-tokens 49152 \
+  --input-alignment 256 --cache-alignment 1024 --commit-tail-tokens 1024
 ```
 
-该策略保留 TP8、DP1、CP ALL_GATHER、sharded KV、decode=1 的要求，
-固定 `max_seq_len=1048576` 和 `max_context_batch_size=1`，要求
-`batch_size × align_up(最长 input + 1, 16) <= 1048576`，并校验 seed 和探针容量。
-模型专用开关和硬件配置仍由 profile 显式提供。
-旧 grid 的策略标记继续生效；未带标记的 grid 使用通用路径。
-已有实验续测必须复用原 grid 和冻结配置，不要用新默认值重新生成后接续旧结果。
+上述 cache 参数适用于已确认可见复用粒度为 1024 的配置，并非任意模型的默认推荐值。
+`max-batch-tokens` 约束原始输入总量，`workspace-tokens` 约束逐请求补齐后总量：
+
+```text
+sum(input_len) <= max_batch_tokens
+sum(align_up(input_len + 1, cache_alignment)) <= workspace_tokens
+```
+
+其中 `+1` 为当前 prefill-only 测试的输出预留。cache block 对齐是保守上界，
+启动时还会检查它是当前 CP 执行对齐 (`2 × TP`，CP 禁用时为 1) 的倍数。
+采样会为后续请求预留最小 padding 容量；KV budget 若启用，也独立计入剩余预算。
+不再使用 `batch × 最长请求` 的矩形限制。
+
+grid 在 `generator.workspace_tokens` 保存预算。启动器及直接调用 runner 都会检查正式测量、
+并发 seed 和缓存探针，固定 `max_context_batch_size=1`，
+`max_seq_len=floor(workspace_tokens / cache_alignment) × cache_alignment`，
+`max_batch_tokens_size=min(workspace_tokens, max_batch_tokens)`；实际调度 batch 仍由 case 决定。
+超限拒绝，不自动扩容、不拆 batch。当前固定 batch 测试仍要求 DP=1、decode=1，
+不支持全局 `cache_shared_seed` 模式（case 内 `shared_by_group` 支持）。
+这是 packed prefill token 容量限制，不是 workspace 字节或总显存保证；权重、KV pool、
+通信、JIT 等仍需单独评估。模型必须支持此 packed batch 执行方式。
+
+旧的 `--workspace-policy` preset 及布尔固定 workspace 参数已移除。
+带旧策略标记的 grid 会明确报错，需要重新生成并使用新结果目录，不得接续旧 checkpoint。
+新实验恢复时必须复用冻结 grid/profile，不要修改预算后接续原结果。

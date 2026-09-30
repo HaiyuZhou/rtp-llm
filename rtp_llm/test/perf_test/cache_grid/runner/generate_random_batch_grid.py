@@ -14,10 +14,8 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
-    FIXED_POLICY,
-    WORKSPACE_TOKENS,
-    input_limit,
-    validate_fixed_workspace,
+    validate_token_budget,
+    workspace_capacity,
 )
 
 MAX_REQUEST_TOKENS = 256 * 1024
@@ -25,12 +23,6 @@ MAX_REQUEST_TOKENS = 256 * 1024
 
 def round_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
-
-
-def _input_limit(args, batch):
-    if args.workspace_policy == FIXED_POLICY:
-        return input_limit(batch)
-    return args.max_batch_tokens // batch
 
 
 def generate_grid(args: argparse.Namespace) -> dict:
@@ -50,11 +42,16 @@ def generate_grid(args: argparse.Namespace) -> dict:
         args.kv_budget_tokens is not None and args.kv_budget_tokens <= 0
     ):
         raise ValueError("token budgets must be positive")
-    if (
-        args.workspace_policy == FIXED_POLICY
-        and args.max_batch_tokens > WORKSPACE_TOKENS
-    ):
-        raise ValueError("max-batch-tokens cannot exceed fixed workspace 1048576")
+    workspace = None
+    if args.workspace_tokens is not None:
+        workspace = workspace_capacity(args.workspace_tokens, args.cache_alignment)
+        validate_token_budget(
+            [],
+            workspace_tokens=workspace,
+            commit_tail=args.commit_tail_tokens,
+            block=args.cache_alignment,
+            token_budget=args.max_batch_tokens,
+        )
     minimum = round_up(args.min_input_tokens, args.input_alignment)
     maximum = args.max_input_tokens // args.input_alignment * args.input_alignment
     block = args.cache_alignment
@@ -62,9 +59,9 @@ def generate_grid(args: argparse.Namespace) -> dict:
     if minimum > maximum:
         raise ValueError("input range contains no aligned length")
     for batch in args.batch_sizes:
-        if minimum > _input_limit(args, batch):
+        if workspace is not None and batch * round_up(minimum + 1, block) > workspace:
             raise ValueError(
-                f"batch={batch} cannot fit minimum inputs in the configured token capacity"
+                f"batch={batch} cannot fit minimum inputs in workspace_tokens"
             )
         if batch * minimum > args.max_batch_tokens:
             raise ValueError(
@@ -87,14 +84,20 @@ def generate_grid(args: argparse.Namespace) -> dict:
             break
         batch = rng.choice(args.batch_sizes)
         groups = []
-        input_sum = peak_kv = 0
+        input_sum = peak_kv = workspace_used = 0
         for index in range(batch):
             remaining = batch - index - 1
             upper = min(
                 maximum,
-                _input_limit(args, batch),
                 args.max_batch_tokens - input_sum - remaining * minimum,
             )
+            if workspace is not None:
+                available = (
+                    workspace
+                    - workspace_used
+                    - remaining * round_up(minimum + 1, block)
+                )
+                upper = min(upper, available // block * block - 1)
             if args.kv_budget_tokens is not None:
                 available = args.kv_budget_tokens - peak_kv - remaining * minimum_kv
                 upper = min(upper, available // block * block)
@@ -121,6 +124,7 @@ def generate_grid(args: argparse.Namespace) -> dict:
                 cache_len = rng.randint(1, max_cache_blocks) * cache_step
             groups.append({"count": 1, "input_len": input_len, "cache_len": cache_len})
             input_sum += input_len
+            workspace_used += round_up(input_len + 1, block)
             # Independent prefixes: include one divergent seed tail per hit request.
             peak_kv += rounded_input + (args.commit_tail_tokens if cache_len else 0)
         rng.shuffle(groups)
@@ -145,9 +149,10 @@ def generate_grid(args: argparse.Namespace) -> dict:
         raise ValueError(
             "not enough distinct batches; reduce num-cases or widen input bounds"
         )
-    if args.workspace_policy == FIXED_POLICY:
-        validate_fixed_workspace(
+    if workspace is not None:
+        validate_token_budget(
             cases,
+            workspace_tokens=workspace,
             commit_tail=args.commit_tail_tokens,
             block=block,
             token_budget=args.max_batch_tokens,
@@ -157,8 +162,8 @@ def generate_grid(args: argparse.Namespace) -> dict:
         "kind": "random_independent_cache_batch",
         "generator": {
             "name": "generate_random_batch_grid",
-            "version": 3,
-            "workspace_policy": args.workspace_policy,
+            "version": 4,
+            "workspace_tokens": args.workspace_tokens,
             "seed": args.seed,
             "alignment": args.input_alignment,
             "cache_alignment": block,
@@ -184,10 +189,9 @@ def parse_args(argv=None):
         "--batch-input-limit", action="append", default=[], metavar="B:TOKENS"
     )
     parser.add_argument(
-        "--workspace-policy",
-        choices=("none", FIXED_POLICY),
-        default="none",
-        help="Optional legacy CP8/1M workspace preset; ordinary grids use token budgets",
+        "--workspace-tokens",
+        type=int,
+        help="Optional fixed packed-token capacity including per-request padding/output reserve",
     )
     parser.add_argument("--num-cases", type=int, default=100)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[2, 4, 8])
@@ -234,11 +238,12 @@ def build_plans(args):
     for batch in sorted(set(args.batch_sizes)):
         local = argparse.Namespace(**vars(args))
         local.batch_sizes = [batch]
-        # Also constrain B * max_input: the engine sizes workspace by config.
-        local.max_input_tokens = limits.get(
-            batch, min(args.max_input_tokens, args.max_batch_tokens // batch)
+        # Do not divide the budget equally: later slots use the remaining budget.
+        minimum = round_up(args.min_input_tokens, args.input_alignment)
+        local.max_input_tokens = min(
+            limits.get(batch, args.max_input_tokens),
+            args.max_batch_tokens - (batch - 1) * minimum,
         )
-        local.max_input_tokens = min(local.max_input_tokens, _input_limit(args, batch))
         local.max_input_tokens = (
             local.max_input_tokens // args.input_alignment * args.input_alignment
         )

@@ -91,7 +91,7 @@ class RandomBatchGridTest(unittest.TestCase):
                 )
             )
 
-    def test_directory_plans_shrink_large_batch_lengths(self):
+    def test_directory_plans_do_not_divide_length_by_batch(self):
         args = parse_args(
             [
                 "--output-dir",
@@ -112,7 +112,10 @@ class RandomBatchGridTest(unittest.TestCase):
             batch = batches.pop()
             limit = grid["summary"]["max_request_tokens"]
             self.assertLessEqual(limit, 262144)
-            self.assertLessEqual(batch * limit, 1048576)
+            self.assertEqual(limit, 262144)
+            self.assertTrue(
+                all(c["input_tokens_sum"] <= 1048576 for c in grid["cases"])
+            )
 
     def test_batch_limit_override(self):
         args = parse_args(
@@ -128,7 +131,7 @@ class RandomBatchGridTest(unittest.TestCase):
             ]
         )
         self.assertEqual(
-            build_plans(args)[0][1]["summary"]["max_request_tokens"], 33792
+            build_plans(args)[0][1]["summary"]["max_request_tokens"], 65536
         )
         args.batch_input_limit = ["31:262145"]
         with self.assertRaises(ValueError):
@@ -139,6 +142,63 @@ class RandomBatchGridTest(unittest.TestCase):
         for case in grid["cases"]:
             for group in case["request_groups"]:
                 self.assertEqual(group["cache_len"] % 8192, 0)
+
+    def test_long_requests_are_sampled_in_both_output_modes(self):
+        options = [
+            "--batch-sizes",
+            "8",
+            "--num-cases",
+            "100",
+            "--min-input-tokens",
+            "2048",
+            "--max-input-tokens",
+            "49152",
+            "--max-batch-tokens",
+            "65536",
+            "--cache-alignment",
+            "1024",
+            "--commit-tail-tokens",
+            "1024",
+        ]
+        for workspace in ([], ["--workspace-tokens", "65536"]):
+            for output in ("--output", "--output-dir"):
+                args = parse_args([output, "/tmp/not-written", *options, *workspace])
+                grid = build_plans(args)[0][1]
+                lengths = [
+                    g["input_len"] for c in grid["cases"] for g in c["request_groups"]
+                ]
+                self.assertGreater(max(lengths), 32768)
+                self.assertTrue(
+                    all(2048 <= n <= 49152 and n % 256 == 0 for n in lengths)
+                )
+                for c in grid["cases"]:
+                    self.assertLessEqual(c["input_tokens_sum"], 65536)
+                    if workspace:
+                        self.assertLessEqual(
+                            sum(
+                                round_up(g["input_len"] + 1, 1024)
+                                for g in c["request_groups"]
+                            ),
+                            65536,
+                        )
+
+    def test_fixed_workspace_rejects_unusable_probe_or_minimum(self):
+        for extra in (
+            ("--workspace-tokens", "0"),
+            ("--workspace-tokens", "8192"),
+            ("--workspace-tokens", "16384", "--batch-sizes", "4"),
+        ):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                generate_grid(self.args(*extra))
+
+    def test_fixed_workspace_and_kv_budget_are_independent(self):
+        args = self.args("--workspace-tokens", "131072", "--kv-budget-tokens", "100000")
+        for c in generate_grid(args)["cases"]:
+            self.assertLessEqual(c["estimated_peak_kv_tokens"], 100000)
+            self.assertLessEqual(
+                sum(round_up(g["input_len"] + 1, 4096) for g in c["request_groups"]),
+                131072,
+            )
 
     def profile(self, root, model_type="qwen_2", engine_env=None):
         path = root / "profile.json"
@@ -185,7 +245,7 @@ class RandomBatchGridTest(unittest.TestCase):
                 "64",
             )
         )
-        self.assertEqual(grid["generator"]["workspace_policy"], "none")
+        self.assertIsNone(grid["generator"]["workspace_tokens"])
         for case in grid["cases"]:
             for group in case["request_groups"]:
                 self.assertGreater(group["input_len"], 262144)
@@ -231,7 +291,9 @@ class RandomBatchGridTest(unittest.TestCase):
                     self.assertIn("--config=cuda12", command)
                     self.assertNotIn("--config=sm10x", command)
                     self.assertIn("--test_arg=--cache_skip_reuse_validation", command)
-                    self.assertNotIn("--test_arg=--cache_fixed_workspace", command)
+                    self.assertFalse(
+                        any("--cache_workspace_tokens=" in arg for arg in command)
+                    )
                     self.assertNotIn("DSV4", " ".join(command))
                     self.assertNotIn("deepseek", " ".join(command))
             manifest = json.loads((root / "results" / "batch_runs.json").read_text())

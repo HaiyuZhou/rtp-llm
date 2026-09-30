@@ -344,7 +344,7 @@ class CachePerfTest(unittest.TestCase):
     def test_fixed_workspace_capacities_are_frozen_and_replayed(self):
         payload = json.loads(self.grid.read_text())
         payload["generator"] = {
-            "workspace_policy": "fixed_cp8_1m_v1",
+            "workspace_tokens": 1048576,
             "cache_alignment": 4096,
             "parameters": {"max_batch_tokens": 65536},
         }
@@ -372,17 +372,17 @@ class CachePerfTest(unittest.TestCase):
                 "--max_context_batch_size=1",
                 "--max_batch_tokens_size=65536",
                 "--concurrency_limit=4",
-                "--cache_fixed_workspace",
+                "--cache_workspace_tokens=1048576",
             ):
                 self.assertIn("--test_arg=" + arg, plan["command"])
 
-    def test_fixed_workspace_rejects_oversized_rectangle_before_launch(self):
+    def test_fixed_workspace_accepts_packed_long_short_batch_before_launch(self):
         self.grid.write_text(
             json.dumps(
                 {
                     "schema_version": 2,
                     "generator": {
-                        "workspace_policy": "fixed_cp8_1m_v1",
+                        "workspace_tokens": 1048576,
                         "cache_alignment": 4096,
                     },
                     "cases": [
@@ -399,14 +399,14 @@ class CachePerfTest(unittest.TestCase):
                 }
             )
         )
-        with self.assertRaisesRegex(ValueError, "rectangle"):
-            cli.build_plan(self.args(), {})
+        plan = cli.build_plan(self.args(), {})
+        self.assertIn("--test_arg=--cache_workspace_tokens=1048576", plan["command"])
         self.assertFalse(self.result.exists())
 
     def test_fixed_workspace_batch_one_profile_keeps_capacity(self):
         payload = json.loads(self.grid.read_text())
         payload["generator"] = {
-            "workspace_policy": "fixed_cp8_1m_v1",
+            "workspace_tokens": 1048576,
             "cache_alignment": 4096,
         }
         self.grid.write_text(json.dumps(payload))
@@ -414,7 +414,7 @@ class CachePerfTest(unittest.TestCase):
         plan = cli.build_plan(
             self.args("profile", extra=["--cases", "7"], explicit=False), {}
         )
-        self.assertIn("--test_arg=--cache_fixed_workspace", plan["command"])
+        self.assertIn("--test_arg=--cache_workspace_tokens=1048576", plan["command"])
         self.assertIn("--test_arg=--max_context_batch_size=1", plan["command"])
         self.assertIn("--test_arg=--max_seq_len=1048576", plan["command"])
 

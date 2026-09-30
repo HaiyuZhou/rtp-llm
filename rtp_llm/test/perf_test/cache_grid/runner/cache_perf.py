@@ -16,10 +16,10 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     profile_environment,
 )
 from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
-    WORKSPACE_TOKENS,
-    fixed_workspace_grid,
     grid_token_budget,
-    validate_fixed_workspace,
+    grid_workspace_tokens,
+    validate_token_budget,
+    workspace_capacity,
 )
 
 TARGET = "//rtp_llm/test/perf_test:cache_grid_perf_test"
@@ -267,15 +267,16 @@ def build_plan(args, inherited=None):
             updates["cache_commit_tail_tokens"] = profile.get("cache_grid", {}).get(
                 "commit_tail_tokens", 4096
             )
-        fixed_workspace = (
-            fixed_workspace_grid(payload) or "--cache_fixed_workspace" in baseline
-        )
-        if fixed_workspace:
+        workspace = grid_workspace_tokens(payload)
+        if workspace is not None:
             # Freeze effective capacities in argv, not just in mutable grid metadata.
             updates.update(
-                max_seq_len=WORKSPACE_TOKENS,
+                cache_workspace_tokens=workspace,
+                max_seq_len=workspace_capacity(
+                    workspace, payload["generator"]["cache_alignment"]
+                ),
                 max_context_batch_size=1,
-                max_batch_tokens_size=grid_token_budget(payload),
+                max_batch_tokens_size=min(workspace, grid_token_budget(payload)),
                 concurrency_limit=max(c["batch_size"] for c in cases),
             )
         runner = replace_args(
@@ -290,9 +291,7 @@ def build_plan(args, inherited=None):
         )
         if args.skip_reuse_validation and "--cache_skip_reuse_validation" not in runner:
             runner.append("--cache_skip_reuse_validation")
-        if fixed_workspace:
-            if "--cache_fixed_workspace" not in runner:
-                runner.append("--cache_fixed_workspace")
+        if workspace is not None:
             tail = next(
                 (
                     int(a.split("=", 1)[1])
@@ -301,8 +300,9 @@ def build_plan(args, inherited=None):
                 ),
                 4096,
             )
-            validate_fixed_workspace(
+            validate_token_budget(
                 cases,
+                workspace_tokens=workspace,
                 block=payload["generator"]["cache_alignment"],
                 commit_tail=tail,
                 token_budget=grid_token_budget(payload),

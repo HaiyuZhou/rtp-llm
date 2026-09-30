@@ -1,93 +1,98 @@
-"""CPU-only admission checks for the opt-in legacy CP8/1M workspace preset."""
+"""CPU-only admission checks for an explicit, topology-independent token budget.
 
-FIXED_POLICY = "fixed_cp8_1m_v1"
-WORKSPACE_TOKENS = 1048576
-CP_ALIGNMENT = 16
+Cache-block padding is conservative for packed CP execution when the block is
+a multiple of the execution alignment. This bounds token capacity, not total
+GPU memory (weights, KV pools, communication and JIT have separate budgets).
+"""
 
 
-def aligned(value, alignment=CP_ALIGNMENT):
+def aligned(value, alignment):
     return (value + alignment - 1) // alignment * alignment
 
 
-def fixed_workspace_grid(payload):
-    policy = payload.get("generator", {}).get("workspace_policy")
-    if policy not in (None, "none", FIXED_POLICY):
-        raise ValueError(f"unsupported cache-grid workspace policy: {policy}")
-    return policy == FIXED_POLICY
+def positive_tokens(value, name):
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
-def input_limit(batch_size, output_tokens=1):
-    """Conservative per-request limit including output and CP padding."""
-    if batch_size <= 0 or output_tokens <= 0:
-        raise ValueError("batch size and output reserve must be positive")
-    return WORKSPACE_TOKENS // batch_size // CP_ALIGNMENT * CP_ALIGNMENT - output_tokens
+def grid_workspace_tokens(payload):
+    metadata = payload.get("generator", {})
+    if metadata.get("workspace_policy") not in (None, "none"):
+        raise ValueError(
+            "workspace_policy is no longer supported; regenerate with --workspace-tokens"
+        )
+    value = metadata.get("workspace_tokens")
+    return None if value is None else positive_tokens(value, "workspace_tokens")
 
 
 def grid_token_budget(payload):
-    budget = int(
+    workspace = grid_workspace_tokens(payload)
+    value = (
         payload.get("generator", {})
         .get("parameters", {})
-        .get("max_batch_tokens", WORKSPACE_TOKENS)
+        .get("max_batch_tokens", workspace)
     )
-    if not 0 < budget <= WORKSPACE_TOKENS:
-        raise ValueError("fixed workspace token budget must be in [1, 1048576]")
-    return budget
+    return positive_tokens(value, "max_batch_tokens")
 
 
-def validate_fixed_workspace(
-    cases,
-    *,
-    commit_tail=4096,
-    block=4096,
-    output_tokens=1,
-    token_budget=WORKSPACE_TOKENS,
+def workspace_capacity(tokens, block):
+    positive_tokens(tokens, "workspace_tokens")
+    positive_tokens(block, "cache_alignment")
+    capacity = tokens // block * block
+    if not capacity:
+        raise ValueError("workspace_tokens cannot hold one cache block")
+    return capacity
+
+
+def validate_token_budget(
+    cases, *, workspace_tokens, commit_tail, block, output_tokens=1, token_budget=None
 ):
-    """Validate raw or normalized cases; do not trust summary/estimated fields.
+    """Validate packed sums for measurements, concurrent seeds and the probe.
 
-    Input sums include cached prefixes. Rectangle checks reserve output tokens
-    before CP alignment, deliberately conservative for prefill-only measurements.
-    Independent seeds are concurrent; shared-by-group seeds count once per group.
+    Reserve output before rounding each request to a cache block. Unlike a
+    batch-times-longest rectangle, this admits a long request with short peers.
+    Summary fields are never trusted.
     """
-    if output_tokens != 1 or block != 4096 or commit_tail <= 0 or commit_tail % block:
-        raise ValueError(
-            "fixed workspace requires CP8/block4096, aligned seed tail and decode=1"
-        )
-    if not 0 < token_budget <= WORKSPACE_TOKENS:
-        raise ValueError("fixed workspace token budget must be in [1, 1048576]")
+    capacity = workspace_capacity(workspace_tokens, block)
+    if output_tokens != 1 or commit_tail <= 0 or commit_tail % block:
+        raise ValueError("token budget requires aligned seed tail and decode=1")
+    token_budget = (
+        workspace_tokens
+        if token_budget is None
+        else positive_tokens(token_budget, "token_budget")
+    )
     stats = []
 
     def phase(case_id, name, lengths):
         count = sum(n for n, _ in lengths)
         total = sum(n * length for n, length in lengths)
-        rectangle = (
-            count
-            * aligned(max((length for _, length in lengths), default=0) + output_tokens)
-            if count
-            else 0
+        padded = sum(
+            n * aligned(length + output_tokens, block) for n, length in lengths
         )
-        if total > token_budget or rectangle > WORKSPACE_TOKENS:
+        if total > token_budget or padded > capacity:
             raise ValueError(
                 f"case {case_id} {name}: input sum={total} (budget={token_budget}), "
-                f"CP-padded rectangle with output reserve={rectangle} "
-                f"(workspace={WORKSPACE_TOKENS}); shorten requests or reduce batch"
+                f"padded token sum with output reserve={padded} "
+                f"(workspace={capacity}); shorten requests or reduce batch"
             )
         stats.append(
-            {
-                "case_id": case_id,
-                "phase": name,
-                "requests": count,
-                "input_tokens": total,
-                "workspace_tokens": rectangle,
-            }
+            dict(
+                case_id=case_id,
+                phase=name,
+                requests=count,
+                input_tokens=total,
+                workspace_tokens=padded,
+            )
         )
 
     phase("probe", "probe", [(1, max(2 * block, block + commit_tail))])
     for index, case in enumerate(cases):
         case_id = case.get("case_id", index)
-        batch = int(case.get("batch_size", 1))
+        batch = positive_tokens(case.get("batch_size", 1), "batch_size")
         policy = case.get("prefix_policy", "independent")
-        if batch <= 0 or policy not in ("independent", "shared_by_group"):
-            raise ValueError(f"case {case_id}: invalid batch/prefix policy")
+        if policy not in ("independent", "shared_by_group"):
+            raise ValueError(f"case {case_id}: invalid prefix policy")
         groups = case.get("request_groups")
         if groups is None:
             groups = [
@@ -99,16 +104,14 @@ def validate_fixed_workspace(
             ]
         measure, seeds = [], []
         for group in groups:
-            count, length, cached = (
-                int(group["count"]),
-                int(group["input_len"]),
-                int(group.get("cache_len", 0)),
-            )
-            if count <= 0 or not 0 <= cached < length:
+            count = positive_tokens(group["count"], "count")
+            length = positive_tokens(group["input_len"], "input_len")
+            cached = group.get("cache_len", 0)
+            if type(cached) is not int or not 0 <= cached < length:
                 raise ValueError(f"case {case_id}: invalid request group")
             measure.append((count, length))
             if cached:
-                if cached % block or cached + commit_tail > length:
+                if cached % commit_tail or cached + commit_tail > length:
                     raise ValueError(
                         f"case {case_id}: cache alignment/seed tail exceeds input"
                     )

@@ -35,9 +35,10 @@ from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
     validate_cache_grid_resume,
 )
 from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
-    WORKSPACE_TOKENS,
-    fixed_workspace_grid,
-    validate_fixed_workspace,
+    grid_token_budget,
+    grid_workspace_tokens,
+    validate_token_budget,
+    workspace_capacity,
 )
 from rtp_llm.test.perf_test.dataset import KNOWN_DATASETS, extract_arg
 from rtp_llm.test.perf_test.distribution_runner import DistributionRunner
@@ -201,9 +202,9 @@ def parse_args(argv: Optional[List[str]] = None):
         help="Override PERF_PROFILE_RUNS for every case.",
     )
     perf.add_argument(
-        "--cache_fixed_workspace",
-        action="store_true",
-        help="Opt-in legacy CP8 workspace: max_seq_len=1048576, max_context_batch_size=1; reject oversized batches.",
+        "--cache_workspace_tokens",
+        type=int,
+        help="Fixed packed-token capacity; includes per-request padding and output reserve.",
     )
     perf.add_argument(
         "--cache_profile_runs",
@@ -579,6 +580,11 @@ def _build_cache_resume_config(
             "cache_commit_tail_tokens": args.cache_commit_tail_tokens,
             "expected_cache_block_size": expected_cache_block_size,
             "cache_request_transport": args.cache_request_transport,
+            **(
+                {"workspace_tokens": args.cache_workspace_tokens}
+                if getattr(args, "cache_workspace_tokens", None) is not None
+                else {}
+            ),
         },
     }
 
@@ -661,32 +667,39 @@ def _load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
 def _configure_cache_batch_limits(args, remaining, cases, *, cache_alignment=None):
     """Ensure admission and context limits can accommodate every fixed batch."""
     batch_size = max(c["batch_size"] for c in cases)
-    if getattr(args, "cache_fixed_workspace", False):
+    workspace = getattr(args, "cache_workspace_tokens", None)
+    if workspace is not None:
         if type(cache_alignment) is not int or cache_alignment <= 0:
             raise ValueError("fixed workspace requires grid.generator.cache_alignment")
-        if args.dp_size != 1 or extract_arg(remaining, "tp_size") != "8":
-            raise ValueError("fixed workspace requires dp_size=1 and tp_size=8")
-        if (
-            extract_arg(remaining, "cp_rotate_method") != "ALL_GATHER"
-            or extract_arg(remaining, "prefill_cp_kv_cache_sharded") != "1"
+        if args.dp_size != 1:
+            raise ValueError("fixed token workspace requires dp_size=1")
+        tp = int(extract_arg(remaining, "tp_size") or 1)
+        cp_method = extract_arg(remaining, "cp_rotate_method") or "DISABLED"
+        if cp_method not in (
+            "DISABLED",
+            "ALL_GATHER",
+            "ALL_GATHER_WITH_OVERLAP",
+            "ALLTOALL",
         ):
+            raise ValueError("unsupported CP method for fixed token workspace")
+        cp_alignment = 2 * tp if cp_method != "DISABLED" and tp > 1 else 1
+        if tp <= 0 or cache_alignment % cp_alignment:
             raise ValueError(
-                "fixed workspace requires CP8 ALL_GATHER with sharded KV cache"
+                "cache_alignment must be a multiple of the CP execution alignment"
             )
         if args.cache_shared_seed:
             raise ValueError("fixed workspace does not support cache_shared_seed mode")
-        budget = int(
-            extract_arg(remaining, "max_batch_tokens_size") or WORKSPACE_TOKENS
-        )
-        budget = budget or WORKSPACE_TOKENS
-        stats = validate_fixed_workspace(
+        budget = int(extract_arg(remaining, "max_batch_tokens_size") or workspace)
+        budget = min(budget or workspace, workspace)
+        stats = validate_token_budget(
             cases,
+            workspace_tokens=workspace,
             commit_tail=args.cache_commit_tail_tokens,
             block=cache_alignment,
             output_tokens=args.decode_test_length,
             token_budget=budget,
         )
-        args.max_seq_len = WORKSPACE_TOKENS
+        args.max_seq_len = workspace_capacity(workspace, cache_alignment)
         args.concurrency_limit = max(args.concurrency_limit, batch_size)
         limits = {
             "max_context_batch_size": 1,
@@ -703,8 +716,8 @@ def _configure_cache_batch_limits(args, remaining, cases, *, cache_alignment=Non
                 index += 1
         remaining[:] = cleaned + [f"--{key}={value}" for key, value in limits.items()]
         logging.info(
-            "cache fixed workspace: max_seq_len=%d max_context_batch_size=1 capacity=%s",
-            WORKSPACE_TOKENS,
+            "cache fixed token workspace: max_seq_len=%d max_context_batch_size=1 capacity=%s",
+            args.max_seq_len,
             stats,
         )
         return
@@ -1105,9 +1118,16 @@ def main() -> str:
         with open(args.cache_grid_json, "rb") as stream:
             grid_bytes = stream.read()
         grid_payload = json.loads(grid_bytes)
-        args.cache_fixed_workspace = args.cache_fixed_workspace or fixed_workspace_grid(
-            grid_payload
-        )
+        workspace = grid_workspace_tokens(grid_payload)
+        if workspace is not None:
+            if args.cache_workspace_tokens not in (None, workspace):
+                raise ValueError("CLI/grid workspace_tokens mismatch")
+            args.cache_workspace_tokens = workspace
+            budget = str(min(workspace, grid_token_budget(grid_payload)))
+            if extract_arg(remaining, "max_batch_tokens_size") is None:
+                remaining.append("--max_batch_tokens_size=" + budget)
+            else:
+                _replace_cli_value(remaining, "max_batch_tokens_size", budget)
         expected_block_size = _resolve_cache_block_size(grid_payload)
         _configure_cache_batch_limits(
             args, remaining, cases, cache_alignment=expected_block_size

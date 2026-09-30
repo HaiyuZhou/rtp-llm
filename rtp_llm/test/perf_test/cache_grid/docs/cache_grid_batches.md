@@ -65,10 +65,12 @@ Batch 图直接读取 `cache_grid_results.json`，不读取旧客户端耗时的
 
 此模式要求独占的 `BatchDecodeScheduler` 测试服务及 DP=1；调度器等齐指定数量后
 统一调度，不能用于混入其他流量的共享服务。CLI 会确保 `concurrency_limit` 不小于 B。
-对于新随机 grid 的 `fixed_cp8_1m_v1` 策略（或底层显式 `--cache_fixed_workspace`），
-固定 `max_context_batch_size=1`、`max_seq_len=1048576`，启动前校验正式 batch、seed 和探针的
-总 input 预算及 CP 对齐矩形；超限拒绝，不自动拆批。见[固定容量策略](generate_random_batch_grid.md)。
-未启用该策略的 grid：提升 `max_context_batch_size` 至少为 B，
+设置 `generator.workspace_tokens`（生成器 `--workspace-tokens`，底层 runner `--cache_workspace_tokens`）时，
+固定 `max_context_batch_size=1`，`max_seq_len` 为预算向下按 cache block 对齐后的值。
+启动前校验正式 batch、seed 和探针的原始 input 总量及逐请求补齐后的 token 总量；
+不再固定 TP/CP 大小，也不使用 batch 乘最长请求的矩形预算。
+超限拒绝，不自动拆批或扩容。见[固定容量说明](generate_random_batch_grid.md)。
+未指定 workspace token 预算的 grid：提升 `max_context_batch_size` 至少为 B，
 并提升 `max_batch_tokens_size` 容纳完整 batch。
 直接调用 runner 时需要调用方保证相同的服务配置。DP>1 的 CLI 配置会在启动前拒绝。
 请求发送失败可能让固定 batch 等不齐，因此即使关闭 fail_fast，也会停止后续测量，

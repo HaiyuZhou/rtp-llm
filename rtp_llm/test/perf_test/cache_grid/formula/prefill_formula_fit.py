@@ -12,12 +12,12 @@ all measured reuse lengths exactly match the requested cache length.
 * observed reuse is constant and exactly matches the request; and
 * the selected batch size is fixed.
 
-The exported expression uses the names and aggregate syntax implemented by
-``PrefillTimeFormula``: ``computeTokens``, ``hitCacheTokens``, ``sum()``,
-numbers, arithmetic operators, and parentheses.  It does not invent an alias
-such as ``tokens``.  The default fit selects batch size one;
-``sum()`` keeps the per-request terms well-defined if the same expression is
-evaluated through FlexLB's batch path.
+Fitting uses restricted-library symbolic regression with greedy forward
+selection and relative squared error. Candidates use the variables, functions,
+and aggregate syntax supported by FlexLB's PrefillTimeFormula parser.
+Input lengths are deterministically split into train/validation/test sets
+(70/15/15 hash buckets). Selection uses train and validation; final coefficients
+are refit on those two sets, keeping the test set held out.
 
 All fit targets use the server's first_token_cost_time, stored in
 runs[].prefill_time_ms (milliseconds, including engine wait). Client wall time
@@ -36,7 +36,6 @@ import html
 import json
 import math
 import pathlib
-import random
 import re
 import statistics
 from dataclasses import dataclass
@@ -78,21 +77,6 @@ from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
 )
 
 DEFAULT_TOKEN_UNIT = 1024
-
-
-def build_feature_names(token_unit: int = DEFAULT_TOKEN_UNIT) -> tuple[str, ...]:
-    u = str(token_unit)
-    return (
-        "1",
-        f"sum(computeTokens / {u}.0)",
-        f"sum(hitCacheTokens / {u}.0)",
-        f"sum((computeTokens / {u}.0) * (computeTokens / {u}.0))",
-        f"sum((computeTokens / {u}.0) * (hitCacheTokens / {u}.0))",
-        f"sum((hitCacheTokens / {u}.0) * (hitCacheTokens / {u}.0))",
-    )
-
-
-FEATURE_NAMES = build_feature_names()
 
 
 @dataclass(frozen=True)
@@ -263,240 +247,6 @@ def load_observations(
     return observations, audit
 
 
-def feature_values(
-    row: Observation, token_unit: int = DEFAULT_TOKEN_UNIT
-) -> list[float]:
-    tokens = row.compute_len / float(token_unit)
-    hit = row.cache_len / float(token_unit)
-    return [1.0, tokens, hit, tokens * tokens, tokens * hit, hit * hit]
-
-
-def _solve_linear_system(matrix: list[list[float]], vector: list[float]) -> list[float]:
-    n = len(vector)
-    aug = [list(matrix[index]) + [vector[index]] for index in range(n)]
-    for column in range(n):
-        pivot = max(range(column, n), key=lambda row: abs(aug[row][column]))
-        if abs(aug[pivot][column]) < 1e-12:
-            raise ValueError(
-                "singular regression matrix; collect more varied geometries"
-            )
-        aug[column], aug[pivot] = aug[pivot], aug[column]
-        scale = aug[column][column]
-        aug[column] = [value / scale for value in aug[column]]
-        for row in range(n):
-            if row == column:
-                continue
-            factor = aug[row][column]
-            if factor:
-                aug[row] = [a - factor * b for a, b in zip(aug[row], aug[column])]
-    return [aug[index][-1] for index in range(n)]
-
-
-def _weighted_median(values: Sequence[tuple[float, float]]) -> float:
-    """Return a deterministic weighted median of (value, nonnegative weight)."""
-    ordered = sorted(
-        (value, weight)
-        for value, weight in values
-        if weight > 0 and math.isfinite(value)
-    )
-    if not ordered:
-        return 0.0
-    total = sum(weight for _, weight in ordered)
-    threshold = total * 0.5
-    cumulative = 0.0
-    for value, weight in ordered:
-        cumulative += weight
-        if cumulative >= threshold:
-            return value
-    return ordered[-1][0]
-
-
-def fit_lad_coefficients(
-    rows: Sequence[Observation],
-    *,
-    max_iter: int = 2000,
-    tol: float = 1e-10,
-    token_unit: int = DEFAULT_TOKEN_UNIT,
-) -> list[float]:
-    """Coordinate-descent least-absolute-deviation (L1/MAE) regression.
-
-    For one coordinate, the exact minimizer is a weighted median.  Columns
-    are scaled during optimization to avoid the large dynamic range of the
-    quadratic token features, then converted back to formula coefficients.
-    """
-    matrix = [feature_values(row, token_unit) for row in rows]
-    targets = [row.target_ms for row in rows]
-    width = len(FEATURE_NAMES)
-    scales = [1.0] * width
-    for column in range(1, width):
-        scales[column] = max(max(abs(values[column]) for values in matrix), 1.0)
-    scaled = [
-        [values[column] / scales[column] for column in range(width)]
-        for values in matrix
-    ]
-    coefficients = [0.0] * width
-    residual = list(targets)  # target - scaled_matrix @ coefficients
-    for _ in range(max_iter):
-        largest_delta = 0.0
-        for column in range(width):
-            candidates: list[tuple[float, float]] = []
-            for row, x in zip(scaled, residual):
-                value = row[column]
-                if abs(value) > 1e-15:
-                    # residual currently includes -value * old coefficient.
-                    excluding = x + value * coefficients[column]
-                    candidates.append((excluding / value, abs(value)))
-            updated = _weighted_median(candidates)
-            delta = abs(updated - coefficients[column])
-            largest_delta = max(largest_delta, delta)
-            if delta:
-                for index, row in enumerate(scaled):
-                    residual[index] -= row[column] * (updated - coefficients[column])
-                coefficients[column] = updated
-        if largest_delta <= tol:
-            break
-    return [coefficient / scale for coefficient, scale in zip(coefficients, scales)]
-
-
-def fit_hybrid_coefficients(
-    rows: Sequence[Observation],
-    *,
-    seed: int,
-    token_unit: int = DEFAULT_TOKEN_UNIT,
-    steps: int = 8000,
-    learning_rate: float = 0.03,
-) -> list[float]:
-    """Fit with torch autograd against absolute and relative error together.
-
-    MAE is divided by the median training latency so the millisecond term and
-    the relative-error term have comparable scale.  The optimized loss is::
-
-        0.5 * mean(abs(pred-target)) / median(target)
-      + 0.5 * mean(abs(pred-target) / target)
-
-    Feature columns are scaled only while optimizing; exported coefficients
-    are converted back to the original FlexLB-compatible expressions.
-    """
-    try:
-        import torch  # type: ignore
-    except ImportError as error:
-        raise RuntimeError("hybrid objective requires CPU PyTorch") from error
-
-    torch.manual_seed(seed)
-    x = torch.tensor(
-        [feature_values(row, token_unit) for row in rows],
-        dtype=torch.float64,
-        device="cpu",
-    )
-    y = torch.tensor([row.target_ms for row in rows], dtype=torch.float64, device="cpu")
-    scales = torch.amax(torch.abs(x), dim=0).clamp_min(1.0)
-    scaled_x = x / scales
-    # Start from the exact coordinate-descent MAE fit.  It is a materially
-    # better starting point than least squares for the long TTFT tail, and we
-    # retain it unless autograd lowers the requested combined loss.
-    lad = fit_lad_coefficients(rows, token_unit=token_unit)
-    beta = torch.nn.Parameter(
-        torch.tensor(lad, dtype=torch.float64, device="cpu") * scales
-    )
-    optimizer = torch.optim.Adam([beta], lr=learning_rate)
-    latency_scale = torch.median(y).clamp_min(1e-9)
-    with torch.no_grad():
-        initial_error = torch.abs(scaled_x.mv(beta) - y)
-        best_loss = float(
-            0.5 * initial_error.mean() / latency_scale
-            + 0.5 * (initial_error / y.clamp_min(1e-9)).mean()
-        )
-    best_beta = beta.detach().clone()
-    stale_steps = 0
-    for _ in range(steps):
-        optimizer.zero_grad(set_to_none=True)
-        with torch.enable_grad():
-            absolute_error = torch.abs(scaled_x.mv(beta) - y)
-            loss = (
-                0.5 * absolute_error.mean() / latency_scale
-                + 0.5 * (absolute_error / y.clamp_min(1e-9)).mean()
-            )
-            loss.backward()
-        optimizer.step()
-        value = float(loss.detach())
-        if value + 1e-12 < best_loss:
-            best_loss = value
-            best_beta = beta.detach().clone()
-            stale_steps = 0
-        else:
-            stale_steps += 1
-        if stale_steps >= 1200:
-            break
-    return [float(value) for value in (best_beta / scales).tolist()]
-
-
-def fit_coefficients(
-    rows: Sequence[Observation],
-    *,
-    objective: str = "mae",
-    ridge: float = 1e-8,
-    seed: int = 20260904,
-    token_unit: int = DEFAULT_TOKEN_UNIT,
-) -> tuple[list[float], str]:
-    names = build_feature_names(token_unit)
-    if len(rows) < len(names):
-        raise ValueError(f"need at least {len(names)} valid rows, got {len(rows)}")
-    if objective == "mae":
-        return (
-            fit_lad_coefficients(rows, token_unit=token_unit),
-            "python_coordinate_descent_lad",
-        )
-    if objective == "hybrid":
-        return (
-            fit_hybrid_coefficients(rows, seed=seed, token_unit=token_unit),
-            "torch_cpu_autograd_hybrid_absolute_relative",
-        )
-    if objective != "mse":
-        raise ValueError(f"unsupported objective: {objective}")
-    # Prefer CPU torch when available, but keep the tool runnable in the
-    # source container where torch may not be installed.
-    try:
-        import torch  # type: ignore
-
-        torch.set_grad_enabled(False)
-        x = torch.tensor(
-            [feature_values(row, token_unit) for row in rows],
-            dtype=torch.float64,
-            device="cpu",
-        )
-        y = torch.tensor(
-            [row.target_ms for row in rows], dtype=torch.float64, device="cpu"
-        )
-        solution = torch.linalg.lstsq(x, y).solution
-        return [float(value) for value in solution.tolist()], "torch_cpu_lstsq"
-    except (ImportError, RuntimeError, ValueError):
-        pass
-
-    width = len(names)
-    gram = [[0.0] * width for _ in range(width)]
-    rhs = [0.0] * width
-    for row in rows:
-        values = feature_values(row, token_unit)
-        for i in range(width):
-            rhs[i] += values[i] * row.target_ms
-            for j in range(width):
-                gram[i][j] += values[i] * values[j]
-    for index in range(1, width):
-        gram[index][index] += ridge
-    return _solve_linear_system(gram, rhs), "python_ridge_normal_equation"
-
-
-def predict(
-    coefficients: Sequence[float],
-    row: Observation,
-    token_unit: int = DEFAULT_TOKEN_UNIT,
-) -> float:
-    return sum(
-        coefficient * value
-        for coefficient, value in zip(coefficients, feature_values(row, token_unit))
-    )
-
-
 def _quantile(values: Sequence[float], q: float) -> float:
     if not values:
         return float("nan")
@@ -507,16 +257,6 @@ def _quantile(values: Sequence[float], q: float) -> float:
     if lower == upper:
         return ordered[lower]
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
-
-
-def error_metrics(
-    rows: Sequence[Observation],
-    coefficients: Sequence[float],
-    token_unit: int = DEFAULT_TOKEN_UNIT,
-) -> dict[str, Any]:
-    return error_metrics_with_predictor(
-        rows, lambda row: predict(coefficients, row, token_unit)
-    )
 
 
 def error_metrics_with_predictor(
@@ -536,23 +276,8 @@ def error_metrics_with_predictor(
     }
 
 
-def split_rows(
-    rows: Sequence[Observation],
-    *,
-    mode: str = "seq-hash-70-15-15",
-    seed: int = 20260904,
-) -> dict[str, list[Observation]]:
-    if mode == "random-50-50":
-        shuffled = list(rows)
-        random.Random(seed).shuffle(shuffled)
-        midpoint = len(shuffled) // 2
-        return {
-            "train": shuffled[:midpoint],
-            "validation": [],
-            "test": shuffled[midpoint:],
-        }
-    if mode != "seq-hash-70-15-15":
-        raise ValueError(f"unsupported split mode: {mode}")
+def split_rows(rows: Sequence[Observation]) -> dict[str, list[Observation]]:
+    """Keep each input length in one deterministic train/validation/test split."""
     groups: dict[int, list[Observation]] = {}
     for row in rows:
         groups.setdefault(row.input_len, []).append(row)
@@ -566,24 +291,6 @@ def split_rows(
             "train" if bucket < 0.70 else "validation" if bucket < 0.85 else "test"
         ].extend(group)
     return result
-
-
-def formula_text(
-    coefficients: Sequence[float], token_unit: int = DEFAULT_TOKEN_UNIT
-) -> str:
-    names = build_feature_names(token_unit)
-    terms: list[str] = []
-    for index, coefficient in enumerate(coefficients):
-        if abs(coefficient) < 1e-14:
-            continue
-        magnitude = f"{abs(coefficient):.15g}"
-        expression = names[index]
-        term = magnitude if expression == "1" else f"{magnitude} * {expression}"
-        if not terms:
-            terms.append(("-" if coefficient < 0 else "") + term)
-        else:
-            terms.append((" - " if coefficient < 0 else " + ") + term)
-    return "".join(terms) if terms else "0"
 
 
 def write_fit_gap_svg(
@@ -793,7 +500,6 @@ def run_fit(args: argparse.Namespace) -> int:
         getattr(args, "token_unit", None),
         DEFAULT_TOKEN_UNIT,
     )
-    names = build_feature_names(token_unit)
     model_label = resolve_label(profile, getattr(args, "model_label", None), "Model")
     filename_label = re.sub(r"[^\w.-]+", "_", model_label).strip("._") or "Model"
     formula_filename = resolve_str(
@@ -836,85 +542,54 @@ def run_fit(args: argparse.Namespace) -> int:
         print(json.dumps(report, ensure_ascii=False))
         return 2
 
-    split_mode = getattr(args, "split_mode", "seq-hash-70-15-15")
-    split_seed = getattr(args, "split_seed", 20260904)
-    splits = split_rows(rows, mode=split_mode, seed=split_seed)
-    model_family = getattr(args, "model_family", "quadratic")
-    symbolic_report = None
-    if model_family == "restricted-symbolic":
-        if not splits["validation"]:
-            raise ValueError(
-                "restricted-symbolic requires a non-empty validation split; "
-                "use --split-mode=seq-hash-70-15-15"
-            )
-        hinge_tokens = (
-            tuple(
-                int(value)
-                for value in getattr(args, "symbolic_hinge_tokens", "").split(",")
-                if value.strip()
-            )
-            or DEFAULT_HINGE_TOKENS
+    splits = split_rows(rows)
+    if not splits["validation"]:
+        raise ValueError(
+            "restricted-symbolic requires a non-empty validation split; "
+            "add measurements with more distinct input lengths"
         )
-        exp_decay_tokens = (
-            tuple(
-                int(value)
-                for value in getattr(args, "symbolic_exp_decay_tokens", "").split(",")
-                if value.strip()
-            )
-            or DEFAULT_EXP_DECAY_TOKENS
+    hinge_tokens = (
+        tuple(
+            int(value)
+            for value in getattr(args, "symbolic_hinge_tokens", "").split(",")
+            if value.strip()
         )
-        symbolic_model = fit_restricted_symbolic(
-            splits["train"],
-            splits["validation"],
-            [*splits["train"], *splits["validation"]],
-            token_unit=token_unit,
-            hinge_tokens=hinge_tokens,
-            exp_decay_tokens=exp_decay_tokens,
-            max_terms=getattr(args, "symbolic_max_terms", 15),
-            complexity_tolerance_pct=getattr(
-                args, "symbolic_complexity_tolerance_pct", 5.0
-            ),
+        or DEFAULT_HINGE_TOKENS
+    )
+    exp_decay_tokens = (
+        tuple(
+            int(value)
+            for value in getattr(args, "symbolic_exp_decay_tokens", "").split(",")
+            if value.strip()
         )
-        coefficients = list(symbolic_model.coefficients)
-        backend = symbolic_model.backend
-        formula = symbolic_model.formula
-        predictor = symbolic_model.predict
-        coefficient_names = [term.expression for term in symbolic_model.terms]
-        symbolic_report = symbolic_model.search_report
-        formula_compatibility = {
-            "parser": "org.flexlb.balance.prediction.PrefillTimeFormula",
-            "variables": list(PARSER_PER_REQUEST_VARIABLES),
-            "functions": [*PARSER_AGGREGATES, *PARSER_FUNCTIONS],
-            "operators": [*PARSER_OPERATORS, "(", ")"],
-            "unsupported_constructs_used": [],
-        }
-        objective_name = "mean_squared_relative_error"
-    else:
-        fit_rows = splits["train"] if len(splits["train"]) >= len(names) else rows
-        coefficients, backend = fit_coefficients(
-            fit_rows,
-            objective=args.objective,
-            seed=split_seed,
-            token_unit=token_unit,
-        )
-        formula = formula_text(coefficients, token_unit)
-        predictor = lambda row: predict(coefficients, row, token_unit)
-        coefficient_names = list(names)
-        formula_compatibility = {
-            "parser": "org.flexlb.balance.prediction.PrefillTimeFormula",
-            "variables": ["computeTokens", "hitCacheTokens"],
-            "functions": ["sum"],
-            "operators": ["+", "-", "*", "/", "(", ")"],
-            "unsupported_constructs_used": [],
-        }
-        objective_name = {
-            "mae": "mean_absolute_error",
-            "mse": "mean_squared_error",
-            "hybrid": (
-                "0.5*MAE/median(train_target_ms) + "
-                "0.5*mean_absolute_percentage_error"
-            ),
-        }[args.objective]
+        or DEFAULT_EXP_DECAY_TOKENS
+    )
+    symbolic_model = fit_restricted_symbolic(
+        splits["train"],
+        splits["validation"],
+        [*splits["train"], *splits["validation"]],
+        token_unit=token_unit,
+        hinge_tokens=hinge_tokens,
+        exp_decay_tokens=exp_decay_tokens,
+        max_terms=getattr(args, "symbolic_max_terms", 15),
+        complexity_tolerance_pct=getattr(
+            args, "symbolic_complexity_tolerance_pct", 5.0
+        ),
+    )
+    coefficients = list(symbolic_model.coefficients)
+    backend = symbolic_model.backend
+    formula = symbolic_model.formula
+    predictor = symbolic_model.predict
+    coefficient_names = [term.expression for term in symbolic_model.terms]
+    symbolic_report = symbolic_model.search_report
+    formula_compatibility = {
+        "parser": "org.flexlb.balance.prediction.PrefillTimeFormula",
+        "variables": list(PARSER_PER_REQUEST_VARIABLES),
+        "functions": [*PARSER_AGGREGATES, *PARSER_FUNCTIONS],
+        "operators": [*PARSER_OPERATORS, "(", ")"],
+        "unsupported_constructs_used": [],
+    }
+    objective_name = "mean_squared_relative_error"
     metrics = {
         name: error_metrics_with_predictor(group, predictor)
         for name, group in splits.items()
@@ -957,7 +632,7 @@ def run_fit(args: argparse.Namespace) -> int:
     report = {
         "schema_version": 1,
         "model": model_label,
-        "model_family": model_family,
+        "model_family": "restricted-symbolic",
         "backend": backend,
         "objective": objective_name,
         "measurement_contract": SERVER_LATENCY_CONTRACT,
@@ -974,10 +649,10 @@ def run_fit(args: argparse.Namespace) -> int:
         "symbolic_search": symbolic_report,
         "audit": audit,
         "split": {
-            "mode": split_mode,
-            "seed": split_seed,
-            "train_fraction": 0.5 if split_mode == "random-50-50" else 0.70,
-            "test_fraction": 0.5 if split_mode == "random-50-50" else 0.15,
+            "mode": "seq-hash-70-15-15",
+            "train_fraction": 0.70,
+            "validation_fraction": 0.15,
+            "test_fraction": 0.15,
         },
         "split_counts": {name: len(group) for name, group in splits.items()},
         "metrics": metrics,
@@ -1104,19 +779,23 @@ def run_analyze_anomalies(args: argparse.Namespace) -> int:
     # This check applies to the raw result JSON items, not aggregated observations.
 
     # (c) Residual outliers: fit formula and find high-APE cases
-    if len(rows) >= len(build_feature_names(token_unit)):
-        splits = split_rows(rows)
-        fit_rows = (
-            splits["train"]
-            if len(splits["train"]) >= len(build_feature_names(token_unit))
-            else rows
+    splits = split_rows(rows)
+    residual_check = {
+        "model_family": "restricted-symbolic",
+        "status": "skipped",
+        "reason": "empty_train_or_validation_split",
+    }
+    if splits["train"] and splits["validation"]:
+        model = fit_restricted_symbolic(
+            splits["train"],
+            splits["validation"],
+            [*splits["train"], *splits["validation"]],
+            token_unit=token_unit,
         )
-        coefficients, _ = fit_coefficients(
-            fit_rows, objective="mae", token_unit=token_unit
-        )
+        residual_check = {"model_family": "restricted-symbolic", "status": "completed"}
         max_ape_pct = float(getattr(args, "max_anomaly_ape_pct", 25.0))
         for row in rows:
-            predicted = predict(coefficients, row, token_unit)
+            predicted = model.predict(row)
             ape = 100.0 * abs(predicted - row.target_ms) / row.target_ms
             if ape > max_ape_pct and row.target_ms > min_rt_ms:
                 anomalies.append(
@@ -1188,6 +867,7 @@ def run_analyze_anomalies(args: argparse.Namespace) -> int:
         "anomalies": anomalies,
         "audit": audit,
         "valid_observations": len(rows),
+        "residual_check": residual_check,
         "floors": {"min_rt_ms": min_rt_ms, "min_compute_tokens": min_compute_tokens},
         "profile": profile,
         "profile_sha256": profile_fingerprint(profile) if profile else None,
@@ -1215,18 +895,6 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--max-p95-ape-pct", type=float, default=10.0)
     fit.add_argument("--max-max-ape-pct", type=float, default=40.0)
     fit.add_argument(
-        "--model-family",
-        choices=("quadratic", "restricted-symbolic"),
-        default="quadratic",
-        help="Formula family; restricted-symbolic performs train-only forward selection.",
-    )
-    fit.add_argument(
-        "--objective",
-        choices=("mae", "mse", "hybrid"),
-        default="hybrid",
-        help="fit objective; hybrid balances normalized absolute and relative error",
-    )
-    fit.add_argument(
         "--estimator",
         choices=("median", "min", "trimmed"),
         default="median",
@@ -1235,12 +903,6 @@ def build_parser() -> argparse.ArgumentParser:
             "external GPU contention, 'trimmed' drops the slowest run"
         ),
     )
-    fit.add_argument(
-        "--split-mode",
-        choices=("random-50-50", "seq-hash-70-15-15"),
-        default="seq-hash-70-15-15",
-    )
-    fit.add_argument("--split-seed", type=int, default=20260904)
     fit.add_argument("--symbolic-max-terms", type=int, default=15)
     fit.add_argument("--symbolic-complexity-tolerance-pct", type=float, default=5.0)
     fit.add_argument(

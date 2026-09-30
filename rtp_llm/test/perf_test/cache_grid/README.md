@@ -274,6 +274,14 @@ python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_cache_grid \
 
 ## 通用化迁移
 
+公式拟合与异常分析的残差检查统一使用 **restricted-symbolic**，需要 CPU PyTorch。
+算法从受限候选库中选择数学项，以相对平方误差拟合；输入长度按哈希划分为
+训练/验证/测试集（70%/15%/15% 桶），测试集不参与选式或系数重拟合。
+不再提供算法选择、独立目标函数选择和 50/50 划分参数；可用
+`--symbolic-max-terms`、`--symbolic-complexity-tolerance-pct` 等控制搜索。
+常规拟合要求训练集和验证集非空；异常分析在缺少这些数据时跳过残差检查，并在
+`anomaly_report.json` 的 `residual_check` 中记录原因，其余检查继续执行。
+
 公式入口统一为 `formula.prefill_formula_fit`，Bazel target 为 `prefill_formula_fit`，
 默认输出 `<model_label>_prefill_formula.txt`；专用 profile 可以继续指定旧产物名。
 新 profile 只在顶层设置一次 `model_label`，缺省时取 `engine.model_type`，再缺省为 `Model`。

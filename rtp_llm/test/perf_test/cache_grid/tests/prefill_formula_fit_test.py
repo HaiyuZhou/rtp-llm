@@ -2,69 +2,19 @@
 
 import argparse
 import json
-import re
 import tempfile
 import unittest
 from pathlib import Path
 
 from rtp_llm.test.perf_test.cache_grid.formula.prefill_formula_fit import (
     DEFAULT_TOKEN_UNIT,
-    FEATURE_NAMES,
     Observation,
-    build_feature_names,
     build_parser,
-    error_metrics,
-    feature_values,
-    fit_coefficients,
-    formula_text,
     load_observations,
-    predict,
     run_analyze_anomalies,
     run_fit,
     split_rows,
 )
-
-
-class PrefillFormulaFitTest(unittest.TestCase):
-
-    def test_features_use_compute_and_hit_tokens(self) -> None:
-        row = Observation(
-            batch_size=1,
-            input_len=4096,
-            cache_len=1024,
-            target_ms=10.0,
-            source="synthetic",
-        )
-        self.assertEqual(feature_values(row), [1.0, 3.0, 1.0, 9.0, 3.0, 1.0])
-
-    def test_exported_formula_uses_only_prefill_time_formula_names(self) -> None:
-        expression = formula_text([1.0, 2.0, -3.0, 4.0, -5.0, 6.0])
-        identifiers = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression))
-        self.assertEqual(identifiers, {"sum", "computeTokens", "hitCacheTokens"})
-        self.assertNotIn("tokens", identifiers)
-
-    def test_feature_expressions_match_flexlb_aggregate_grammar(self) -> None:
-        self.assertEqual(len(FEATURE_NAMES), 6)
-        for expression in FEATURE_NAMES[1:]:
-            self.assertTrue(expression.startswith("sum("), expression)
-            self.assertTrue(expression.endswith(")"), expression)
-
-    def test_random_half_split_is_exact_and_reproducible(self) -> None:
-        rows = [
-            Observation(1, 1024 + index, index, 10.0 + index, f"row-{index}")
-            for index in range(11)
-        ]
-        first = split_rows(rows, mode="random-50-50", seed=17)
-        second = split_rows(rows, mode="random-50-50", seed=17)
-        self.assertEqual(len(first["train"]), 5)
-        self.assertEqual(len(first["validation"]), 0)
-        self.assertEqual(len(first["test"]), 6)
-        self.assertEqual(first, second)
-        self.assertEqual(
-            set(first["train"]) | set(first["test"]),
-            set(rows),
-        )
-        self.assertFalse(set(first["train"]) & set(first["test"]))
 
 
 def _make_observations(count: int = 20) -> list[Observation]:
@@ -155,92 +105,6 @@ class MeasurementContractTest(unittest.TestCase):
             )
 
 
-class BuildFeatureNamesTest(unittest.TestCase):
-    def test_default_token_unit(self):
-        names = build_feature_names()
-        self.assertEqual(len(names), 6)
-        self.assertEqual(names[0], "1")
-        self.assertIn("1024", names[1])
-        self.assertEqual(names, build_feature_names(DEFAULT_TOKEN_UNIT))
-
-    def test_custom_token_unit(self):
-        names = build_feature_names(2048)
-        self.assertEqual(len(names), 6)
-        self.assertIn("2048", names[1])
-        self.assertIn("2048", names[2])
-        self.assertNotEqual(names, build_feature_names())
-
-
-class FeatureValuesTest(unittest.TestCase):
-    def test_default_unit(self):
-        row = Observation(1, 2048, 1024, 10.0, "test", 1024)
-        values = feature_values(row)
-        self.assertAlmostEqual(values[0], 1.0)
-        self.assertAlmostEqual(values[1], (2048 - 1024) / 1024.0)
-        self.assertAlmostEqual(values[2], 1024 / 1024.0)
-
-    def test_custom_unit(self):
-        row = Observation(1, 2048, 1024, 10.0, "test", 1024)
-        values_default = feature_values(row)
-        values_custom = feature_values(row, 2048)
-        self.assertAlmostEqual(values_default[0], values_custom[0])
-        self.assertNotAlmostEqual(values_default[1], values_custom[1])
-        self.assertAlmostEqual(values_custom[1], (2048 - 1024) / 2048.0)
-
-
-class FitAndPredictTest(unittest.TestCase):
-    def test_fit_with_default_token_unit(self):
-        rows = _make_observations(20)
-        coefficients, backend = fit_coefficients(rows, objective="mae")
-        self.assertEqual(len(coefficients), 6)
-        self.assertTrue(backend)
-
-    def test_fit_with_custom_token_unit(self):
-        rows = _make_observations(20)
-        coefficients, backend = fit_coefficients(rows, objective="mae", token_unit=2048)
-        self.assertEqual(len(coefficients), 6)
-
-    def test_predict_roundtrip(self):
-        rows = _make_observations(20)
-        coefficients, _ = fit_coefficients(rows, objective="mae")
-        predicted = predict(coefficients, rows[0])
-        self.assertIsInstance(predicted, float)
-
-    def test_predict_with_custom_token_unit(self):
-        rows = _make_observations(20)
-        coefficients, _ = fit_coefficients(rows, objective="mae", token_unit=2048)
-        predicted = predict(coefficients, rows[0], token_unit=2048)
-        self.assertIsInstance(predicted, float)
-
-    def test_error_metrics_with_token_unit(self):
-        rows = _make_observations(20)
-        coefficients, _ = fit_coefficients(rows, objective="mae")
-        metrics = error_metrics(rows, coefficients)
-        self.assertIn("mape_pct", metrics)
-        self.assertIn("p95_ape_pct", metrics)
-        metrics_custom = error_metrics(rows, coefficients, token_unit=2048)
-        self.assertIn("mape_pct", metrics_custom)
-
-
-class FormulaTextTest(unittest.TestCase):
-    def test_default_token_unit(self):
-        names = build_feature_names()
-        coefficients = [1.0, 2.0, 0.0, 0.0, 0.0, 0.0]
-        text = formula_text(coefficients)
-        self.assertIn("1024", text)
-        self.assertIn(names[1], text)
-
-    def test_custom_token_unit(self):
-        coefficients = [1.0, 2.0, 0.0, 0.0, 0.0, 0.0]
-        text = formula_text(coefficients, token_unit=2048)
-        self.assertIn("2048", text)
-        self.assertNotIn("1024", text)
-
-    def test_zero_coefficients(self):
-        text = formula_text([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        self.assertEqual(text, "0")
-
-
 class RunFitTest(unittest.TestCase):
     def test_fit_without_profile(self):
         rows = _make_observations(40)
@@ -256,7 +120,6 @@ class RunFitTest(unittest.TestCase):
                 max_mape_pct=100.0,
                 max_p95_ape_pct=100.0,
                 max_max_ape_pct=100.0,
-                objective="mae",
                 estimator="median",
                 allow_insufficient_data=False,
                 profile=None,
@@ -271,6 +134,9 @@ class RunFitTest(unittest.TestCase):
             self.assertIsNone(report["profile"])
             self.assertIsNone(report["profile_sha256"])
             self.assertEqual(report["token_unit"], DEFAULT_TOKEN_UNIT)
+            self.assertEqual(report["model_family"], "restricted-symbolic")
+            self.assertEqual(report["objective"], "mean_squared_relative_error")
+            self.assertIsNotNone(report["symbolic_search"])
             self.assertTrue((output_dir / "Model_prefill_formula.txt").exists())
             formula_content = (output_dir / "Model_prefill_formula.txt").read_text()
             self.assertTrue(formula_content.startswith("PREFILL_TIME_FORMULA="))
@@ -332,7 +198,6 @@ class RunFitTest(unittest.TestCase):
                 max_mape_pct=100.0,
                 max_p95_ape_pct=100.0,
                 max_max_ape_pct=100.0,
-                objective="mae",
                 estimator="median",
                 allow_insufficient_data=False,
                 profile=str(profile_path),
@@ -380,7 +245,6 @@ class RunFitTest(unittest.TestCase):
                 max_mape_pct=100.0,
                 max_p95_ape_pct=100.0,
                 max_max_ape_pct=100.0,
-                objective="mae",
                 estimator="median",
                 allow_insufficient_data=False,
                 profile=str(profile_path),
@@ -401,6 +265,27 @@ class RunFitTest(unittest.TestCase):
 
 
 class AnalyzeAnomaliesTest(unittest.TestCase):
+    def test_empty_validation_skips_residual_fit_explicitly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "results.json"
+            _write_cache_grid_result(source, _make_observations(1))
+            output = Path(tmp) / "out"
+            args = build_parser().parse_args(
+                [
+                    "analyze-anomalies",
+                    "--inputs",
+                    str(source),
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(run_analyze_anomalies(args), 0)
+            report = json.loads((output / "anomaly_report.json").read_text())
+            self.assertEqual(report["residual_check"]["status"], "skipped")
+            self.assertEqual(
+                report["residual_check"]["model_family"], "restricted-symbolic"
+            )
+
     def test_basic_analysis(self):
         rows = _make_observations(40)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -490,7 +375,51 @@ class AnalyzeAnomaliesTest(unittest.TestCase):
             self.assertTrue(len(cache_anomalies) > 0)
 
 
+class SplitTest(unittest.TestCase):
+    def test_splits_preserve_geometry_and_hold_out_test_rows(self):
+        rows = _make_observations(100)
+        splits = split_rows(rows)
+        self.assertEqual(splits, split_rows(list(reversed(rows))))
+        self.assertTrue(all(splits.values()))
+        self.assertEqual(
+            set(rows), set().union(*(set(group) for group in splits.values()))
+        )
+        input_sets = [set(row.input_len for row in group) for group in splits.values()]
+        self.assertTrue(
+            all(
+                not left & right
+                for i, left in enumerate(input_sets)
+                for right in input_sets[i + 1 :]
+            )
+        )
+
+
 class ParserTest(unittest.TestCase):
+    def test_removed_algorithm_options_are_rejected(self):
+        import contextlib
+        import io
+
+        for option, value in (
+            ("--model-family", "quadratic"),
+            ("--objective", "mae"),
+            ("--split-mode", "random-50-50"),
+            ("--split-seed", "17"),
+        ):
+            with self.subTest(option=option), contextlib.redirect_stderr(
+                io.StringIO()
+            ), self.assertRaises(SystemExit):
+                build_parser().parse_args(
+                    [
+                        "fit",
+                        "--inputs",
+                        "a.json",
+                        "--output-dir",
+                        "/tmp/out",
+                        option,
+                        value,
+                    ]
+                )
+
     def test_fit_has_profile_flags(self):
         parser = build_parser()
         args = parser.parse_args(

@@ -153,8 +153,6 @@ class RestrictedSymbolicCliTest(unittest.TestCase):
                     str(result_path),
                     "--output-dir",
                     str(output_dir),
-                    "--model-family",
-                    "restricted-symbolic",
                     "--symbolic-max-terms",
                     "3",
                 ]

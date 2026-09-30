@@ -10,12 +10,12 @@ all measured reuse lengths exactly match the requested cache length.
 * every requested measurement run succeeded;
 * every run has output length one and finite positive server first_token_cost_time;
 * observed reuse is constant and exactly matches the request; and
-* the selected batch size is fixed.
+* request lists are preserved for all batch sizes (an optional filter is available).
 
 Fitting uses restricted-library symbolic regression with greedy forward
 selection and relative squared error. Candidates use the variables, functions,
 and aggregate syntax supported by FlexLB's PrefillTimeFormula parser.
-Input lengths are deterministically split into train/validation/test sets
+Request distributions are deterministically split into train/validation/test sets
 (70/15/15 hash buckets). Selection uses train and validation; final coefficients
 are refit on those two sets, keeping the test set held out.
 
@@ -54,26 +54,11 @@ from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
     DEFAULT_EXP_DECAY_TOKENS,
     DEFAULT_HINGE_TOKENS,
     PARSER_AGGREGATES,
+    PARSER_BATCH_VARIABLES,
     PARSER_FUNCTIONS,
     PARSER_OPERATORS,
     PARSER_PER_REQUEST_VARIABLES,
     fit_restricted_symbolic,
-)
-from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
-    SERVER_LATENCY_CONTRACT,
-    MetricFormatError,
-    current_metrics,
-)
-from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
-    finite_number as _finite,
-)
-from rtp_llm.test.perf_test.cache_grid.runner.result_schema import integer as _integer
-from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
-    observed_reuse_values,
-    single_request_metric,
-)
-from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
-    status_ok as _status_ok,
 )
 
 DEFAULT_TOKEN_UNIT = 1024
@@ -87,164 +72,51 @@ class Observation:
     target_ms: float
     source: str
     requested_cache_len: int | None = None
+    requests: tuple[tuple[int, int], ...] = ()
+    geometry_key: str = ""
 
     @property
     def compute_len(self) -> int:
         return self.input_len - self.cache_len
 
 
-def _run_time_statistic(values: Sequence[float], estimator: str) -> float:
-    if estimator == "min":
-        return min(values)
-    if estimator == "trimmed":
-        ordered = sorted(values)
-        return statistics.median(ordered[:-1]) if len(ordered) > 1 else ordered[0]
-    return statistics.median(values)
+def load_observations(paths, *, batch_size=None, estimator="median"):
+    from rtp_llm.test.perf_test.cache_grid.runner.observations import collect
 
-
-def _median_run_time(
-    item: dict[str, Any], estimator: str = "median"
-) -> tuple[float | None, int | None, str | None]:
-    runs = item.get("runs")
-    if not isinstance(runs, list) or not runs:
-        return None, None, "missing_runs"
-    expected_runs = _integer(item.get("measure_runs"))
-    success_runs = _integer(item.get("success_runs"))
-    if success_runs != expected_runs or len(runs) != expected_runs:
-        return None, None, "incomplete_runs"
-    values: list[float] = []
-    input_len = _integer(item.get("input_len"))
-    requested_cache_len = _integer(item.get("cache_len_requested"))
-    if item.get("reuse_exact") is False and not item.get(
-        "reuse_validation_skipped", False
-    ):
-        return None, None, "reuse_not_exact"
-    observed_values = observed_reuse_values(item, parse=_integer)
-    if len(observed_values) != expected_runs or len(set(observed_values)) != 1:
-        return None, None, "observed_reuse_not_constant"
-    cache_len = observed_values[0]
-    if cache_len < 0 or input_len is None or cache_len >= input_len:
-        return None, None, "invalid_observed_geometry"
-    if cache_len != requested_cache_len:
-        return None, None, "requested_reuse_mismatch"
-    for run in runs:
-        if not isinstance(run, dict) or run.get("success") is not True:
-            return None, None, "run_failed"
-        run_input = _integer(run.get("input_len"))
-        output_len = _integer(run.get("output_len"))
-        reuse_len = _integer(run.get("reuse_len"))
-        latency = _finite(run.get("prefill_time_ms"))
-        if run_input != input_len or output_len != 1:
-            return None, None, "request_shape_mismatch"
-        if reuse_len != cache_len:
-            return None, None, "reuse_mismatch"
-        if latency is None or latency <= 0:
-            return None, None, "invalid_latency"
-        values.append(latency)
-    return _run_time_statistic(values, estimator), cache_len, None
-
-
-def load_observations(
-    paths: Sequence[pathlib.Path],
-    *,
-    batch_size: int = 1,
-    estimator: str = "median",
-) -> tuple[list[Observation], dict[str, Any]]:
-    observations: list[Observation] = []
-    rejected: dict[str, int] = {}
-    input_files: list[dict[str, Any]] = []
-    measurement_contracts: set[str] = set()
-    for path in paths:
-        json_payload = json.loads(path.read_text(encoding="utf-8"))
-        metrics = current_metrics(json_payload, str(path))
-        measurement_contracts.add(SERVER_LATENCY_CONTRACT)
-        source_count = 0
-        for index, item in enumerate(metrics):
-            source_count += 1
-            if not _status_ok(item):
-                rejected["status"] = rejected.get("status", 0) + 1
-                continue
-            batch = _integer(item.get("batch_size"))
-            if batch != batch_size:
-                rejected["batch_size"] = rejected.get("batch_size", 0) + 1
-                continue
-            try:
-                item = single_request_metric(item)
-            except MetricFormatError as error:
-                reason = str(error)
-                rejected[reason] = rejected.get(reason, 0) + 1
-                continue
-            input_len = _integer(item.get("input_len"))
-            cache_len = _integer(item.get("cache_len_requested"))
-            if (
-                input_len is None
-                or cache_len is None
-                or cache_len < 0
-                or cache_len >= input_len
-            ):
-                rejected["invalid_geometry"] = rejected.get("invalid_geometry", 0) + 1
-                continue
-            target, observed_cache_len, reason = _median_run_time(item, estimator)
-            if target is None:
-                rejected[reason or "invalid_run"] = (
-                    rejected.get(reason or "invalid_run", 0) + 1
-                )
-                continue
-            assert observed_cache_len is not None
-            observations.append(
-                Observation(
-                    batch,
-                    input_len,
-                    cache_len,
-                    target,
-                    f"{path.name}:metrics[{index}]",
-                    cache_len,
-                )
-            )
-        input_files.append({"path": str(path), "rows": source_count, "format": "json"})
-
-    observations.sort(
-        key=lambda row: (row.batch_size, row.input_len, row.cache_len, row.source)
+    records, audit = collect(
+        paths, batch_size=batch_size, estimator=estimator, partial=True
     )
-    raw_observation_count = len(observations)
-    grouped: dict[tuple[int, int, int], list[Observation]] = {}
-    for row in observations:
-        grouped.setdefault((row.batch_size, row.input_len, row.cache_len), []).append(
-            row
-        )
-    observations = [
+    rows = [
         Observation(
-            key[0],
-            key[1],
-            key[2],
-            statistics.median(item.target_ms for item in values),
-            values[0].source,
-            values[0].requested_cache_len,
+            r["batch_size"],
+            r["input_len"],
+            r["cache_len"],
+            r["target_ms"],
+            f'{r["source_run"]}:metrics[{r["metric_index"]}]',
+            r["cache_len"],
+            tuple((v[0], v[1]) for v in r["request_distribution"]),
+            r["geometry_key"],
         )
-        for key, values in sorted(grouped.items())
+        for r in records
     ]
-    unique = {(row.batch_size, row.input_len, row.cache_len) for row in observations}
-    audit = {
-        "input_files": input_files,
-        "estimator": estimator,
-        "raw_metric_count": sum(int(item["rows"]) for item in input_files),
-        "raw_valid_observation_count": raw_observation_count,
-        "valid_observation_count": len(observations),
-        "collapsed_duplicate_geometry_count": raw_observation_count - len(observations),
-        "unique_geometry_count": len(unique),
-        "rejected_counts": rejected,
-        "selected_batch_size": batch_size,
-        "measurement_contracts": sorted(measurement_contracts),
-        "seq_len_range": [
-            min((x.input_len for x in observations), default=None),
-            max((x.input_len for x in observations), default=None),
+    audit.update(
+        input_files=audit["sources"],
+        selected_batch_size=batch_size,
+        raw_metric_count=sum(s["rows"] for s in audit["sources"]),
+        raw_valid_observation_count=len(rows),
+        collapsed_duplicate_geometry_count=0,
+        unique_geometry_count=len({r.geometry_key for r in rows}),
+        measurement_contracts=[audit["measurement_contract"]],
+        seq_len_range=[
+            min((r.input_len for r in rows), default=None),
+            max((r.input_len for r in rows), default=None),
         ],
-        "cache_len_range": [
-            min((x.cache_len for x in observations), default=None),
-            max((x.cache_len for x in observations), default=None),
+        cache_len_range=[
+            min((r.cache_len for r in rows), default=None),
+            max((r.cache_len for r in rows), default=None),
         ],
-    }
-    return observations, audit
+    )
+    return rows, audit
 
 
 def _quantile(values: Sequence[float], q: float) -> float:
@@ -277,10 +149,10 @@ def error_metrics_with_predictor(
 
 
 def split_rows(rows: Sequence[Observation]) -> dict[str, list[Observation]]:
-    """Keep each input length in one deterministic train/validation/test split."""
-    groups: dict[int, list[Observation]] = {}
+    """Keep duplicate/permuted request distributions in the same held-out split."""
+    groups: dict[str, list[Observation]] = {}
     for row in rows:
-        groups.setdefault(row.input_len, []).append(row)
+        groups.setdefault(row.geometry_key or str(row.input_len), []).append(row)
     result: dict[str, list[Observation]] = {"train": [], "validation": [], "test": []}
     for seq_len, group in sorted(groups.items()):
         bucket = (
@@ -518,11 +390,30 @@ def run_fit(args: argparse.Namespace) -> int:
     )
 
     paths = [pathlib.Path(value) for value in args.inputs]
+    if len(paths) > 1:
+        from rtp_llm.test.perf_test.cache_grid.runner.unified_pipeline import (
+            compatibility,
+        )
+
+        compatibility(paths)
     rows, audit = load_observations(
         paths, batch_size=args.batch_size, estimator=args.estimator
     )
     output = pathlib.Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    # A rejected rerun must not leave an old model marked deployable.
+    (output / "model.json").write_text(
+        json.dumps(
+            dict(
+                schema_version=2,
+                production_acceptance=False,
+                formula=None,
+                reason="fit_not_accepted",
+                measurement_contract=audit["measurement_contract"],
+            ),
+            indent=2,
+        )
+    )
     (output / "input_audit.json").write_text(
         json.dumps(audit, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
@@ -540,14 +431,23 @@ def run_fit(args: argparse.Namespace) -> int:
             json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
         print(json.dumps(report, ensure_ascii=False))
-        return 2
+        return 3
 
     splits = split_rows(rows)
-    if not splits["validation"]:
-        raise ValueError(
-            "restricted-symbolic requires a non-empty validation split; "
-            "add measurements with more distinct input lengths"
+    if any(not splits[name] for name in ("train", "validation", "test")):
+        (output / "fit_report.json").write_text(
+            json.dumps(
+                dict(
+                    production_acceptance=False,
+                    formula=None,
+                    reason="insufficient_geometry_splits",
+                    audit=audit,
+                    split_counts={k: len(v) for k, v in splits.items()},
+                ),
+                indent=2,
+            )
         )
+        return 3
     hinge_tokens = (
         tuple(
             int(value)
@@ -584,7 +484,7 @@ def run_fit(args: argparse.Namespace) -> int:
     symbolic_report = symbolic_model.search_report
     formula_compatibility = {
         "parser": "org.flexlb.balance.prediction.PrefillTimeFormula",
-        "variables": list(PARSER_PER_REQUEST_VARIABLES),
+        "variables": [*PARSER_PER_REQUEST_VARIABLES, *PARSER_BATCH_VARIABLES],
         "functions": [*PARSER_AGGREGATES, *PARSER_FUNCTIONS],
         "operators": [*PARSER_OPERATORS, "(", ")"],
         "unsupported_constructs_used": [],
@@ -595,10 +495,17 @@ def run_fit(args: argparse.Namespace) -> int:
         for name, group in splits.items()
     }
     metrics["all"] = error_metrics_with_predictor(rows, predictor)
+    metrics["by_batch"] = {
+        str(batch): {
+            name: error_metrics_with_predictor(
+                [r for r in group if r.batch_size == batch], predictor
+            )
+            for name, group in {**splits, "all": rows}.items()
+        }
+        for batch in sorted({r.batch_size for r in rows})
+    }
     split_by_geometry = {
-        (row.batch_size, row.input_len, row.cache_len): name
-        for name, group in splits.items()
-        for row in group
+        row.geometry_key: name for name, group in splits.items() for row in group
     }
     predictions = []
     for row in rows:
@@ -611,14 +518,14 @@ def run_fit(args: argparse.Namespace) -> int:
                 "cache_len": row.cache_len,
                 "compute_len": row.compute_len,
                 "target_ms": row.target_ms,
-                "measurement_contract": SERVER_LATENCY_CONTRACT,
+                "measurement_contract": audit["measurement_contract"],
                 "predicted_ms": predicted,
                 "signed_error_ms": predicted - row.target_ms,
                 "abs_error_ms": abs(predicted - row.target_ms),
                 "ape_pct": 100.0 * abs(predicted - row.target_ms) / row.target_ms,
-                "split": split_by_geometry[
-                    (row.batch_size, row.input_len, row.cache_len)
-                ],
+                "split": split_by_geometry[row.geometry_key],
+                "request_distribution": json.dumps(row.requests),
+                "geometry_key": row.geometry_key,
                 "source": row.source,
             }
         )
@@ -635,7 +542,7 @@ def run_fit(args: argparse.Namespace) -> int:
         "model_family": "restricted-symbolic",
         "backend": backend,
         "objective": objective_name,
-        "measurement_contract": SERVER_LATENCY_CONTRACT,
+        "measurement_contract": audit["measurement_contract"],
         "target": (
             f"{args.estimator} of successful server first_token_cost_time (runs[].prefill_time_ms), including engine wait"
         ),
@@ -649,7 +556,7 @@ def run_fit(args: argparse.Namespace) -> int:
         "symbolic_search": symbolic_report,
         "audit": audit,
         "split": {
-            "mode": "seq-hash-70-15-15",
+            "mode": "request-distribution-hash-70-15-15",
             "train_fraction": 0.70,
             "validation_fraction": 0.15,
             "test_fraction": 0.15,
@@ -657,7 +564,7 @@ def run_fit(args: argparse.Namespace) -> int:
         "split_counts": {name: len(group) for name, group in splits.items()},
         "metrics": metrics,
         "production_acceptance": bool(
-            len(rows) >= args.min_valid_rows
+            audit["unique_geometry_count"] >= args.min_valid_rows
             and len(splits["test"]) > 0
             and metrics["test"]["mape_pct"] is not None
             and metrics["test"]["mape_pct"] <= args.max_mape_pct
@@ -676,6 +583,37 @@ def run_fit(args: argparse.Namespace) -> int:
         "profile": profile,
         "profile_sha256": profile_sha256,
     }
+    report["production_acceptance"] = (
+        not audit["partial"]
+        and report["production_acceptance"]
+        and all(
+            all(group[split]["n"] > 0 for split in ("train", "validation", "test"))
+            and group["test"]["mape_pct"] <= args.max_mape_pct
+            and group["test"]["p95_ape_pct"] <= args.max_p95_ape_pct
+            and group["test"]["max_ape_pct"] <= args.max_max_ape_pct
+            for group in metrics["by_batch"].values()
+        )
+    )
+    report["measurement_contract"] = audit["measurement_contract"]
+    report["target"] = f"{args.estimator} of per-round max server first_token_cost_time"
+    report["production_note"] = (
+        "Strict exact-reuse request lists; per-batch held-out gates apply. "
+        "Deployment requires validation against the target FlexLB parser/runtime."
+    )
+    (output / "model.json").write_text(
+        json.dumps(
+            dict(
+                schema_version=2,
+                formula=formula,
+                token_unit=token_unit,
+                terms=report["coefficients"],
+                library=symbolic_report["library_version"],
+                production_acceptance=report["production_acceptance"],
+                measurement_contract=report["measurement_contract"],
+            ),
+            indent=2,
+        )
+    )
     (output / "fit_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
@@ -806,7 +744,7 @@ def run_analyze_anomalies(args: argparse.Namespace) -> int:
                         "cache_len": row.cache_len,
                         "compute_len": row.compute_len,
                         "target_ms": row.target_ms,
-                        "measurement_contract": SERVER_LATENCY_CONTRACT,
+                        "measurement_contract": audit["measurement_contract"],
                         "predicted_ms": predicted,
                         "ape_pct": round(ape, 2),
                         "detail": f"APE={ape:.1f}% (target={row.target_ms:.1f}ms, predicted={predicted:.1f}ms)",
@@ -889,7 +827,9 @@ def build_parser() -> argparse.ArgumentParser:
     fit = sub.add_parser("fit", help="fit from successful measurements")
     fit.add_argument("--inputs", nargs="+", required=True)
     fit.add_argument("--output-dir", required=True)
-    fit.add_argument("--batch-size", type=int, default=1)
+    fit.add_argument(
+        "--batch-size", type=int, default=None, help="Optional batch filter"
+    )
     fit.add_argument("--min-valid-rows", type=int, default=30)
     fit.add_argument("--max-mape-pct", type=float, default=5.0)
     fit.add_argument("--max-p95-ape-pct", type=float, default=10.0)
@@ -933,7 +873,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate = sub.add_parser("validate-inputs", help="audit valid/invalid rows")
     validate.add_argument("--inputs", nargs="+", required=True)
-    validate.add_argument("--batch-size", type=int, default=1)
+    validate.add_argument("--batch-size", type=int, default=None)
     validate.add_argument(
         "--estimator",
         choices=("median", "min", "trimmed"),
@@ -946,7 +886,7 @@ def build_parser() -> argparse.ArgumentParser:
     anom = sub.add_parser("analyze-anomalies", help="detect anomalous measurements")
     anom.add_argument("--inputs", nargs="+", required=True)
     anom.add_argument("--output-dir", required=True)
-    anom.add_argument("--batch-size", type=int, default=1)
+    anom.add_argument("--batch-size", type=int, default=None)
     anom.add_argument(
         "--estimator",
         choices=("median", "min", "trimmed"),

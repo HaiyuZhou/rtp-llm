@@ -88,7 +88,7 @@ class GroupedSingleRequestTest(unittest.TestCase):
                 self.assertEqual(audit["valid_observation_count"], 1)
                 self.assertEqual(
                     audit["measurement_contracts"],
-                    ["server_first_token_cost_time_ms"],
+                    ["batch_max_server_first_token_cost_time_ms"],
                 )
                 self.assertEqual(observations[0].target_ms, median(LATENCIES))
                 self.assertEqual(observations[0].cache_len, cached)
@@ -162,7 +162,7 @@ class GroupedSingleRequestTest(unittest.TestCase):
             )
             observations, audit = load_observations([path], batch_size=2)
             self.assertEqual(observations, [])
-            self.assertEqual(audit["rejected_counts"], {"unsupported_grouped_batch": 1})
+            self.assertEqual(audit["rejected_counts"], {"invalid_round": 1})
             self.assertEqual(interactive_rows(path, 2, all_runs=True), [])
 
     def test_scalar_rows_are_unchanged(self):
@@ -186,7 +186,8 @@ class GroupedSingleRequestTest(unittest.TestCase):
             observations, audit = load_observations([path])
             self.assertEqual(len(observations), 1)
             self.assertEqual(
-                audit["measurement_contracts"], ["server_first_token_cost_time_ms"]
+                audit["measurement_contracts"],
+                ["batch_max_server_first_token_cost_time_ms"],
             )
 
 

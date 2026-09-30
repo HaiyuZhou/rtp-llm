@@ -164,7 +164,10 @@ py_binary(
 py_test(
     name = "cache_perf_pipeline_test",
     main = "cache_grid/tests/cache_perf_pipeline_test.py",
-    srcs = ["cache_grid/tests/cache_perf_pipeline_test.py"],
+    srcs = [
+        "cache_grid/tests/cache_perf_pipeline_test.py",
+        "cache_grid/tests/result_schema_test.py",
+    ],
     deps = [":perf_test_lib"],
 )
 

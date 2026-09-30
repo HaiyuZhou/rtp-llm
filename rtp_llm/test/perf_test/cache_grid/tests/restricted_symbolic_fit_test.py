@@ -23,10 +23,39 @@ from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
 
 
 class RestrictedSymbolicLibraryTest(unittest.TestCase):
+    def test_unified_batch_fit_recovers_request_sum_and_batch_cost(self):
+        rows = []
+        for batch in (1, 2, 4):
+            for index in range(1, 41):
+                requests = tuple(
+                    (
+                        1024 * (index + j * 3 + (index * 7 + j) % 10),
+                        1024 * ((index * 7 + j) % 10),
+                    )
+                    for j in range(batch)
+                )
+                total_compute = sum(i - c for i, c in requests)
+                rows.append(
+                    Observation(
+                        batch,
+                        sum(i for i, _ in requests),
+                        sum(c for _, c in requests),
+                        10 + 7 * batch + 0.002 * total_compute,
+                        f"{batch}:{index}",
+                        requests=requests,
+                        geometry_key=f"{batch}:{index}",
+                    )
+                )
+        train = [r for i, r in enumerate(rows) if i % 5 != 0]
+        validation = [r for i, r in enumerate(rows) if i % 5 == 0]
+        model = fit_restricted_symbolic(train, validation, rows, token_unit=1024)
+        for row in rows:
+            self.assertAlmostEqual(model.predict(row), row.target_ms, places=6)
+
     def test_library_is_versioned_and_flexlb_compatible(self):
         terms = build_candidate_library(65536)
-        self.assertEqual(LIBRARY_VERSION, "prefill-restricted-v2")
-        self.assertEqual(len(terms), 67)
+        self.assertEqual(LIBRARY_VERSION, "prefill-request-list-v3")
+        self.assertEqual(len(terms), 70)
         expressions = " ".join(term.expression for term in terms)
         self.assertNotIn("log1p", expressions)
         self.assertNotIn("**", expressions)
@@ -140,6 +169,7 @@ class RestrictedSymbolicCliTest(unittest.TestCase):
                     {
                         "schema_version": 2,
                         "mode": "prefix_cache_grid",
+                        "complete": True,
                         "metrics": metrics,
                     }
                 ),

@@ -304,6 +304,19 @@ DSV4 配置保留在 `config/dsv4_*.json*`，作为显式选用的模型 preset�
 
 # 已有完整结果：只重新拟合、绘图，不启动 Bazel 或模型服务。
 ./tools/cache_perf pipeline --skip-test --result-dir /path/results
+
+# 随机 batch 生成器输出的多个 JSON：逐个启动测试，全部完成后统一拟合和绘图。
+./tools/cache_perf pipeline --profile /path/local.jsonc --grid-dir /path/grids \
+  --result-root /path/new-batch-results --runs 3
+
+# 多 grid 中断恢复：完成的跳过，有 checkpoint 的续测，尚未开始的按冻结配置启动。
+./tools/cache_perf pipeline --test-mode resume --result-root /path/batch-results
+
+# 也支持原 run_random_batch_grids 生成的 batch_runs.json 及各运行目录。
+./tools/cache_perf pipeline --skip-test --result-root /path/batch-results
+
+# 部分结果只能显式预览，不拟合、不声明可发布；只看图也可使用 --skip-fit。
+./tools/cache_perf pipeline --skip-test --partial --result-root /path/batch-results
 ```
 
 测试阶段与 `run/resume` 共用 Bazel 启动、环境和快照接口；后处理优先读取
@@ -311,7 +324,8 @@ DSV4 配置保留在 `config/dsv4_*.json*`，作为显式选用的模型 preset�
 `--skip-test` 不接受 profile/grid/runs/env 等启动覆盖项。
 引擎参数写入 profile，环境覆盖使用 `--env NAME=VALUE`，不再用末尾 `--` 转发 runner 参数。
 
-保留 `--batch-size`（选择后处理 batch）、`--estimator median|min|trimmed`、
+默认处理所有 batch，包括 batch=1，不需要单独选择 batch 模式。
+保留 `--batch-size`（可选后处理过滤器）、`--estimator median|min|trimmed`、
 `--formula-output-dir`、`--svg-output`、`--cold-svg-output`、`--html-output`。
 `pipeline_summary.json` 记录各阶段退出码和产物位置。
 测试失败或结果不完整时不进行后处理；拟合质量门禁返回 3 时仍绘图，最终返回 3；
@@ -320,12 +334,33 @@ DSV4 配置保留在 `config/dsv4_*.json*`，作为显式选用的模型 preset�
 例如顶层 `model_label: "DeepSeek-V4-Pro"` 输出 `DeepSeek-V4-Pro_prefill_formula.txt`。
 文件名保留模型名称的大小写和连字符；空格、路径分隔符等转换为下划线。
 
-Pipeline 的 `prefill_3d.interactive.html` 默认使用 `--all-runs`，展示每次成功测量的原始散点，
-不再将重复测量折叠为中位数点；静态图和公式拟合的聚合方式不受影响。
+统一观测数据要求所有测量轮次成功、每个请求实际 reuse 与请求 cache 精确一致。
+每轮延迟取批内请求 `prefill_time_ms` 最大值，再按 estimator 聚合；客户端 wall time 仅保留诊断。
+即使测试使用 `--skip-reuse-validation`，reuse 不匹配的数据也不会进入公式和正式图表。
+不同运行先检查模型、拓扑、精度、缓存及引擎配置的一致性；容量设置差异保留在来源审计中。
+多 grid 汇总要求各运行有 profile 快照或内嵌 profile，不猜测不同模型可以混合。
 
-Pipeline 还会生成 `prefill_tpm_per_card.interactive.html`，只生成总输入长度口径的 TPM 图，
-不自动生成 computed-length TPM 图。每个成功测量单独计算：
-`单卡 TPM = input_len × 60000 / RT(ms) / cards`，其中 `input_len` 包含缓存命中部分。
+公式统一使用请求列表：`sum(f(computeTokens, hitCacheTokens))` 加上 batchSize、
+maxComputeTokens 等候选特征，二次项是逐请求平方后求和，不是总长度平方。
+同一请求分布及其排列、跨文件重复数据进入同一 train/validation/test 分区；
+训练按 batch 等权、同 batch 内几何等权，跳过线性相关候选项。
+各 batch 都必须有训练、验证和测试样本且通过测试误差门禁；不完整来源不能通过生产验收。
+导出语法遵循 FlexLB PrefillTimeFormula，但上线前仍需目标 Java 运行时验证及适用范围验证。
+
+产物位置：
+
+- `report/sources.json`：来源、冻结配置及容量差异。
+- `report/observations.json`：保留 source、case_id、每请求长度、逐轮延迟的统一数据。
+- `report/audit.json`：输入摘要、排除原因及各 batch 数量。
+- 单 grid `formula/`、多 grid `report/formula/`：model.json、fit_report.json、predictions.csv、fit_gap.svg 和公式文本；数据不足时只输出审计及拒绝报告。
+- `report/latency.interactive.html`、`report/tpm.interactive.html`：离线交互图，根目录保留旧 HTML 文件名。
+- 根目录 `prefill_3d.svg`：compute/cache/服务端延迟三维投影散点，按 batch 着色；`prefill_cold_miss.svg` 为零 cache 数据的二维切片。
+
+交互图可切换全部/指定 batch、整批总长度/每请求均值、case 聚合/逐轮数据、延迟/总输入 TPM/计算 TPM。
+全部 batch 视图 X=compute、Y=cache、Z=batch、颜色=所选指标；固定 batch 时 Z=所选指标。
+点击点查看请求分布和来源。TPM 使用整批 token 数：
+`单卡 TPM = sum(input_len) × 60000 / RT(ms) / cards`，计算 TPM 则以 sum(compute_len) 为分子。
+它不是客户端端到端吞吐。
 卡数优先读取冻结 profile 的 `engine.world_size`；未提供时取 `tp_size × dp_size × pp_size`
-（缺省维度为 1），EP/CP 不再额外相乘。旧结果无 profile 拓扑时回退到 run_config，
-仍无卡数信息时按 1 卡处理。独立绘图 CLI 可用 `--cards` 显式覆盖。
+（缺省维度为 1），EP/CP 不再额外相乘。无 profile 时按 1 卡处理，pipeline 可用 `--cards` 显式覆盖。
+独立旧绘图 CLI 保留原有行为；上述统一能力通过 pipeline 使用。

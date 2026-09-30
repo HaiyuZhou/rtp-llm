@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rtp_llm.test.perf_test.cache_grid.runner import cache_perf as cli
+from rtp_llm.test.perf_test.cache_grid.tests.result_schema_test import grouped_metric
 
 
 class CachePerfPipelineTest(unittest.TestCase):
@@ -61,7 +62,7 @@ class CachePerfPipelineTest(unittest.TestCase):
                 {
                     "schema_version": 2,
                     "mode": "prefix_cache_grid",
-                    "metrics": [],
+                    "metrics": [grouped_metric()],
                     "complete": complete,
                     "completed_cases": 1,
                     "total_cases": 1,
@@ -95,9 +96,11 @@ class CachePerfPipelineTest(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0)
 
         with patch.object(cli.subprocess, "run", side_effect=run):
-            self.assertEqual(cli.main(self.argv("--runs", "4")), 0)
-        self.assertEqual(
-            [c[2] for c in calls[1:]], list(cli.POSTPROCESS_MODULES.values())
+            self.assertEqual(cli.main(self.argv("--runs", "4", "--skip-fit")), 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn(
+            "Original Model",
+            (self.result / "report/latency.interactive.html").read_text(),
         )
         self.assertEqual(self.manifest()["status"], "completed")
 
@@ -113,8 +116,7 @@ class CachePerfPipelineTest(unittest.TestCase):
 
         def run(command, **kwargs):
             calls.append(command)
-            code = 3 if command[2] == cli.POSTPROCESS_MODULES["fit"] else 0
-            return subprocess.CompletedProcess(command, code)
+            return subprocess.CompletedProcess(command, 0)
 
         with patch.object(cli.subprocess, "run", side_effect=run):
             code = cli.main(
@@ -122,23 +124,16 @@ class CachePerfPipelineTest(unittest.TestCase):
                     "--skip-test",
                     "--estimator",
                     "min",
-                    "--batch-size",
-                    "2",
                     "--svg-output",
                     str(self.root / "custom.svg"),
                     launch=False,
                 )
             )
         self.assertEqual(code, 3)
-        self.assertEqual(len(calls), 4)
-        self.assertIn("min", calls[0])
-        self.assertIn(str(self.root / "custom.svg"), calls[1])
-        self.assertIn("--all-runs", calls[2])
-        self.assertIn("--all-runs", calls[3])
-        self.assertIn("tpm-effective", calls[3])
-        self.assertNotIn("tpm-compute", " ".join(arg for call in calls for arg in call))
+        self.assertEqual(len(calls), 0)
+        self.assertTrue((self.root / "custom.svg").exists())
         self.assertEqual(self.manifest()["status"], "fit_rejected")
-        self.assertEqual(self.manifest()["stages"]["test"], {"skipped": True})
+        self.assertTrue(self.manifest()["stages"]["test"]["skipped"])
 
     def test_test_failure_stops_postprocessing_and_preserves_code(self):
         with patch.object(
@@ -147,39 +142,42 @@ class CachePerfPipelineTest(unittest.TestCase):
             self.assertEqual(cli.main(self.argv()), 7)
             self.assertEqual(run.call_count, 1)
         self.assertEqual(self.manifest()["status"], "failed")
-        self.assertEqual(self.manifest()["stages"], {"test": {"returncode": 7}})
+        self.assertEqual(self.manifest()["stages"]["test"]["returncode"], 7)
 
     def test_incomplete_results_are_rejected_without_postprocessing(self):
         self.result_file(complete=False)
         args = cli.parser().parse_args(self.argv("--skip-test", launch=False))
         with patch.object(cli.subprocess, "run") as run:
-            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            with self.assertRaisesRegex(ValueError, "incomplete"):
                 cli.run_pipeline(args)
             run.assert_not_called()
-        self.assertFalse((self.result / "pipeline_summary.json").exists())
+        self.assertEqual(self.manifest()["status"], "failed")
+        args.partial = True
+        self.assertEqual(cli.run_pipeline(args), 0)
+        self.assertEqual(self.manifest()["status"], "partial")
 
     def test_postprocessing_failure_is_not_a_quality_gate(self):
         self.result_file()
-        with patch.object(
-            cli.subprocess, "run", return_value=subprocess.CompletedProcess([], 2)
-        ) as run:
+        with patch(
+            "rtp_llm.test.perf_test.cache_grid.formula.prefill_formula_fit.run_fit",
+            return_value=2,
+        ):
             self.assertEqual(cli.main(self.argv("--skip-test", launch=False)), 2)
-            self.assertEqual(run.call_count, 1)
         self.assertEqual(self.manifest()["status"], "failed")
 
     def test_chart_failure_is_recorded(self):
         self.result_file()
-        with patch.object(
-            cli.subprocess,
-            "run",
-            side_effect=[
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 9),
-            ],
-        ) as run:
-            self.assertEqual(cli.main(self.argv("--skip-test", launch=False)), 9)
-            self.assertEqual(run.call_count, 2)
-        self.assertEqual(self.manifest()["stages"]["svg"]["returncode"], 9)
+        with patch(
+            "rtp_llm.test.perf_test.cache_grid.plot.unified_report.write_charts",
+            side_effect=RuntimeError("chart failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "chart failed"):
+                cli.run_pipeline(
+                    cli.parser().parse_args(
+                        self.argv("--skip-test", "--skip-fit", launch=False)
+                    )
+                )
+        self.assertEqual(self.manifest()["status"], "failed")
 
     def test_resume_uses_existing_launch_configuration(self):
         args = cli.parser().parse_args(self.argv())
@@ -201,7 +199,10 @@ class CachePerfPipelineTest(unittest.TestCase):
 
         with patch.object(cli.subprocess, "run", side_effect=run):
             self.assertEqual(
-                cli.main(self.argv("--test-mode", "resume", launch=False)), 0
+                cli.main(
+                    self.argv("--test-mode", "resume", "--skip-fit", launch=False)
+                ),
+                0,
             )
         self.assertEqual((self.result / "profile.snapshot.json").read_bytes(), frozen)
 
@@ -209,6 +210,200 @@ class CachePerfPipelineTest(unittest.TestCase):
         args = cli.parser().parse_args(self.argv("--skip-test"))
         with self.assertRaisesRegex(ValueError, "launch overrides"):
             cli.run_pipeline(args)
+
+    def test_multi_grid_merge_and_completed_resume(self):
+        grids = self.root / "grids"
+        grids.mkdir()
+        for name in ("b1", "b2"):
+            (grids / f"{name}.json").write_bytes(self.grid.read_bytes())
+        argv = ["pipeline", "--result-root", str(self.result), "--skip-fit"]
+        original = cli.execute_plan
+
+        def execute(plan):
+            with patch.object(
+                cli.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)
+            ):
+                code = original(plan)
+            destination = plan["destination"]
+            (destination / "cache_grid_results.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mode": "prefix_cache_grid",
+                        "complete": True,
+                        "metrics": [grouped_metric()],
+                    }
+                )
+            )
+            return code
+
+        with patch.object(cli, "execute_plan", side_effect=execute) as launch:
+            self.assertEqual(
+                cli.main(
+                    argv + ["--profile", str(self.profile), "--grid-dir", str(grids)]
+                ),
+                0,
+            )
+            self.assertEqual(launch.call_count, 2)
+        rows = json.loads((self.result / "report/observations.json").read_text())
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[0]["source_run"], rows[1]["source_run"])
+        self.assertEqual(rows[0]["geometry_key"], rows[1]["geometry_key"])
+        with patch.object(cli, "execute_plan") as launch:
+            self.assertEqual(cli.main(argv + ["--test-mode", "resume"]), 0)
+            launch.assert_not_called()
+
+    def test_heterogeneous_requests_features_and_split(self):
+        from rtp_llm.test.perf_test.cache_grid.formula.prefill_formula_fit import (
+            load_observations,
+            split_rows,
+        )
+        from rtp_llm.test.perf_test.cache_grid.formula.restricted_symbolic_fit import (
+            build_candidate_library,
+        )
+        from rtp_llm.test.perf_test.cache_grid.runner.observations import (
+            normalize_metric,
+        )
+
+        item = grouped_metric(input_len=8192, cache_len=4096)
+        item["batch_size"] = 2
+        item["request_groups"].append(dict(count=1, input_len=16384, cache_len=4096))
+        for run in item["runs"]:
+            run["requests"].append(
+                dict(run["requests"][0], input_len=16384, prefill_time_ms=2000)
+            )
+        normalized = normalize_metric(item, "source", 0)
+        self.assertEqual(normalized["target_ms"], 2000)
+        self.assertEqual(normalized["compute_len"], 16384)
+        self.assertEqual(
+            normalized["request_distribution"],
+            [[8192, 4096, 4096], [16384, 4096, 12288]],
+        )
+        reverse = json.loads(json.dumps(item))
+        reverse["request_groups"].reverse()
+        for run in reverse["runs"]:
+            run["requests"].reverse()
+        self.assertEqual(
+            normalize_metric(reverse, "other", 0)["geometry_key"],
+            normalized["geometry_key"],
+        )
+        self.result_file()
+        path = self.result / "cache_grid_results.json"
+        data = json.loads(path.read_text())
+        data["metrics"] = [item, reverse]
+        path.write_text(json.dumps(data))
+        rows, audit = load_observations([path])
+        self.assertEqual(audit["unique_geometry_count"], 1)
+        self.assertEqual(sorted(map(len, split_rows(rows).values())), [0, 0, 2])
+        terms = {t.name: t for t in build_candidate_library(1024)}
+        self.assertEqual(terms["u**2"].evaluate(rows[0]), 4**2 + 12**2)
+        self.assertEqual(terms["batchSize"].evaluate(rows[0]), 2)
+        self.assertEqual(terms["maxComputeTokens"].evaluate(rows[0]), 12)
+
+    def test_multi_grid_dry_run_has_no_side_effects(self):
+        grids = self.root / "grids"
+        grids.mkdir()
+        (grids / "b1.json").write_bytes(self.grid.read_bytes())
+        argv = [
+            "pipeline",
+            "--result-root",
+            str(self.result),
+            "--grid-dir",
+            str(grids),
+            "--profile",
+            str(self.profile),
+            "--dry-run",
+        ]
+        with patch.object(cli, "execute_plan") as launch:
+            self.assertEqual(cli.main(argv), 0)
+            launch.assert_not_called()
+        self.assertFalse(self.result.exists())
+
+    def test_multi_grid_pending_resume_freezes_inputs(self):
+        grids = self.root / "grids"
+        grids.mkdir()
+        for name in ("a", "b"):
+            (grids / f"{name}.json").write_bytes(self.grid.read_bytes())
+        argv = ["pipeline", "--result-root", str(self.result), "--skip-fit"]
+        original = cli.execute_plan
+
+        def interrupted(plan):
+            with patch.object(
+                cli.subprocess, "run", return_value=subprocess.CompletedProcess([], 7)
+            ):
+                code = original(plan)
+            dest = plan["destination"]
+            (dest / "cache_grid_results.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mode": "prefix_cache_grid",
+                        "complete": False,
+                        "metrics": [grouped_metric()],
+                    }
+                )
+            )
+            return code
+
+        with patch.object(cli, "execute_plan", side_effect=interrupted):
+            self.assertEqual(
+                cli.main(
+                    argv
+                    + [
+                        "--profile",
+                        str(self.profile),
+                        "--grid-dir",
+                        str(grids),
+                        "--runs",
+                        "4",
+                    ]
+                ),
+                7,
+            )
+        self.profile.unlink()
+        for path in grids.glob("*.json"):
+            path.write_text("invalid modified input")
+        commands = []
+
+        def resumed(plan):
+            commands.append(plan["command"])
+            with patch.object(
+                cli.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)
+            ):
+                code = original(plan)
+            (plan["destination"] / "cache_grid_results.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mode": "prefix_cache_grid",
+                        "complete": True,
+                        "metrics": [grouped_metric()],
+                    }
+                )
+            )
+            return code
+
+        with patch.object(cli, "execute_plan", side_effect=resumed):
+            self.assertEqual(cli.main(argv + ["--test-mode", "resume"]), 0)
+        self.assertEqual(len(commands), 2)
+        self.assertIn("--test_arg=--require_cache_resume", commands[0])
+        self.assertNotIn("--test_arg=--require_cache_resume", commands[1])
+        self.assertIn("--test_arg=--cache_measure_runs=4", commands[1])
+
+    def test_incompatible_models_cannot_be_merged(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.unified_pipeline import (
+            compatibility,
+        )
+
+        paths = []
+        for name, model in (("a", "qwen_2"), ("b", "other")):
+            dest = self.root / name
+            dest.mkdir()
+            path = dest / "cache_grid_results.json"
+            path.write_text(json.dumps({"profile": {"engine": {"model_type": model}}}))
+            paths.append(path)
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            compatibility(paths)
 
     def test_pipeline_does_not_accept_profiler_mode(self):
         args = cli.parser().parse_args(self.argv("--profile-backend", "nsys"))

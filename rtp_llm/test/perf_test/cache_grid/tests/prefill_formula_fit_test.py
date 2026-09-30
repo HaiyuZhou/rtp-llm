@@ -101,7 +101,8 @@ class MeasurementContractTest(unittest.TestCase):
             observations, audit = load_observations(paths)
             self.assertTrue(observations)
             self.assertEqual(
-                audit["measurement_contracts"], ["server_first_token_cost_time_ms"]
+                audit["measurement_contracts"],
+                ["batch_max_server_first_token_cost_time_ms"],
             )
 
 

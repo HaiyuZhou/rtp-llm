@@ -81,7 +81,8 @@ class ServerLatencyTest(unittest.TestCase):
         rows, audit = load_observations([self.path])
         self.assertEqual(rows[0].target_ms, 20)
         self.assertEqual(
-            audit["measurement_contracts"], ["server_first_token_cost_time_ms"]
+            audit["measurement_contracts"],
+            ["batch_max_server_first_token_cost_time_ms"],
         )
         self.assertEqual(static_rows(self.path, 1)[0]["rt"], 20)
         points = interactive_rows(self.path, 1, all_runs=True)

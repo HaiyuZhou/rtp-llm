@@ -9,10 +9,12 @@ expression-tree search.
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Callable, Sequence, TypeVar
 
-LIBRARY_VERSION = "prefill-restricted-v2"
+LIBRARY_VERSION = "prefill-request-list-v3"
 DEFAULT_HINGE_TOKENS = (16384, 32768, 65536, 131072, 262144, 524288)
 DEFAULT_EXP_DECAY_TOKENS = (16384, 65536, 262144)
 PARSER_OPERATORS = ("+", "-", "*", "/", "^")
@@ -71,6 +73,17 @@ def _variables(row: object, token_unit: int) -> tuple[float, float, float, float
     )
 
 
+def _requests(row):
+    return getattr(row, "requests", ()) or ((row.input_len, row.cache_len),)
+
+
+def _sum_term(row, token_unit, fn):
+    return sum(
+        fn(_variables(SimpleNamespace(input_len=i, cache_len=c), token_unit))
+        for i, c in _requests(row)
+    )
+
+
 def build_candidate_library(
     token_unit: int,
     hinge_tokens: Sequence[int] = DEFAULT_HINGE_TOKENS,
@@ -98,7 +111,7 @@ def build_candidate_library(
             CandidateTerm(
                 name,
                 f"sum({expression})",
-                lambda row, fn=fn: fn(_variables(row, token_unit)),
+                lambda row, fn=fn: _sum_term(row, token_unit, fn),
             )
         )
 
@@ -173,6 +186,21 @@ def build_candidate_library(
             f"max({s} - {label}, 0)",
             lambda values, threshold=threshold: max(values[2] - threshold, 0.0),
         )
+    terms.extend(
+        [
+            CandidateTerm("batchSize", "batchSize", lambda row: float(row.batch_size)),
+            CandidateTerm(
+                "maxComputeTokens",
+                f"(maxComputeTokens / {token_unit}.0)",
+                lambda row: max(i - c for i, c in _requests(row)) / token_unit,
+            ),
+            CandidateTerm(
+                "maxInputTokens",
+                f"(maxInputTokens / {token_unit}.0)",
+                lambda row: max(i for i, c in _requests(row)) / token_unit,
+            ),
+        ]
+    )
     return tuple(terms)
 
 
@@ -250,14 +278,36 @@ def fit_restricted_symbolic(
     z_train = x_train / scales
     z_validation = x_validation / scales
     relative_train = z_train / y_train[:, None].clamp_min(1e-12)
-    gram = relative_train.T @ relative_train
-    rhs = relative_train.T @ torch.ones(len(y_train), dtype=torch.float64)
 
-    def solve(z, y, indices: Sequence[int]):
+    def weights(rows):
+        counts = Counter(getattr(row, "batch_size", 1) for row in rows)
+        geometry_counts = Counter(
+            getattr(row, "geometry_key", "") or str(i) for i, row in enumerate(rows)
+        )
+        raw = [
+            1.0 / geometry_counts[getattr(row, "geometry_key", "") or str(i)]
+            for i, row in enumerate(rows)
+        ]
+        totals = {
+            b: sum(w for w, row in zip(raw, rows) if getattr(row, "batch_size", 1) == b)
+            for b in counts
+        }
+        return torch.tensor(
+            [w / totals[getattr(row, "batch_size", 1)] for w, row in zip(raw, rows)],
+            dtype=torch.float64,
+        )
+
+    train_weights = weights(train_rows)
+    validation_weights = weights(validation_rows)
+    relative_train = relative_train * train_weights.sqrt()[:, None]
+    gram = relative_train.T @ relative_train
+    rhs = relative_train.T @ train_weights.sqrt()
+
+    def solve(z, y, indices: Sequence[int], row_weights):
         relative_design = z[:, indices] / y[:, None].clamp_min(1e-12)
         return torch.linalg.lstsq(
-            relative_design,
-            torch.ones(len(y), dtype=torch.float64),
+            relative_design * row_weights.sqrt()[:, None],
+            row_weights.sqrt(),
             rcond=1e-10,
         ).solution
 
@@ -273,13 +323,21 @@ def fit_restricted_symbolic(
     for _ in range(max_terms):
         beta = solve_train(selected)
         train_relative_mse = float(
-            torch.mean(((z_train[:, selected].mv(beta) - y_train) / y_train) ** 2)
+            torch.sum(
+                train_weights
+                * ((z_train[:, selected].mv(beta) - y_train) / y_train) ** 2
+            )
+            / train_weights.sum()
         )
         validation_relative_mse = float(
-            torch.mean(
-                ((z_validation[:, selected].mv(beta) - y_validation) / y_validation)
-                ** 2
+            torch.sum(
+                validation_weights
+                * (
+                    ((z_validation[:, selected].mv(beta) - y_validation) / y_validation)
+                    ** 2
+                )
             )
+            / validation_weights.sum()
         )
         history.append(
             {
@@ -296,6 +354,10 @@ def fit_restricted_symbolic(
             if index in selected:
                 continue
             candidate = [*selected, index]
+            if torch.linalg.matrix_rank(z_train[:, candidate], tol=1e-8) < len(
+                candidate
+            ):
+                continue
             candidate_beta = solve_train(candidate)
             candidate_gram = gram[candidate][:, candidate]
             candidate_rhs = rhs[candidate]
@@ -303,11 +365,13 @@ def fit_restricted_symbolic(
                 (
                     candidate_beta @ candidate_gram @ candidate_beta
                     - 2 * candidate_beta @ candidate_rhs
-                    + len(y_train)
+                    + train_weights.sum()
                 )
-                / len(y_train)
+                / train_weights.sum()
             )
             choices.append((loss, index))
+        if not choices:
+            break
         selected.append(min(choices, key=lambda item: (item[0], item[1]))[1])
 
     best_validation = min(float(item["validation_relative_mse"]) for item in history)
@@ -324,7 +388,7 @@ def fit_restricted_symbolic(
     y_refit = torch.tensor(
         [float(getattr(row, "target_ms")) for row in refit_rows], dtype=torch.float64
     )
-    beta = solve(x_refit, y_refit, chosen_indices)
+    beta = solve(x_refit, y_refit, chosen_indices, weights(refit_rows))
     coefficients = tuple(
         float(value) for value in (beta / scales[chosen_indices]).tolist()
     )
@@ -341,17 +405,15 @@ def fit_restricted_symbolic(
             "functions": list(PARSER_FUNCTIONS),
             "aggregates": list(PARSER_AGGREGATES),
             "per_request_variables": list(PARSER_PER_REQUEST_VARIABLES),
-            "excluded_batch_variables": list(PARSER_BATCH_VARIABLES),
-            "excluded_batch_variables_reason": (
-                "the fit observations contain one aggregate input/cache geometry, "
-                "not the per-request lists required to distinguish batch aggregates"
-            ),
+            "batch_variables": list(PARSER_BATCH_VARIABLES),
         },
         "max_terms": max_terms,
         "complexity_tolerance_pct": complexity_tolerance_pct,
         "selection_rule": "smallest expression within tolerance of best validation relative MSE",
         "objective": "mean_squared_relative_error",
         "feature_scaling": "train RMS, clamped to a minimum of 1",
+        "weighting": "equal batch-size weight; equal geometry weight within batch",
+        "rank_policy": "skip linearly dependent candidate columns on training data",
         "refit_policy": "selected terms refit on train+validation",
         "test_usage": "test rows are excluded from selection and refit",
         "history": history,

@@ -51,6 +51,7 @@ from rtp_llm.dash_sc.codec import (
     DashScInputIdsError,
     DashScParameterError,
     OtherParams,
+    ParsedInputIds,
     SamplingParams,
     _token_ids_list_from_generate_output,
     build_dash_error_response,
@@ -851,6 +852,7 @@ def _apply_request_overrides(
     environment. DashScope-serving still sends per-request thinking, timeout,
     and priority controls; those explicit controls must win before enqueue.
     """
+    generate_config.force_sp_accept = bool(other.force_sp_accept)
     request_max_think = sampling.max_new_think_tokens
     if request_max_think is None:
         request_max_think = other.max_new_think_tokens
@@ -909,7 +911,7 @@ def _apply_request_overrides(
 
 async def iter_real_model_stream_infer(
     request,
-    input_ids_list: list[int],
+    input_ids: ParsedInputIds | list[int],
     sampling: SamplingParams,
     other: OtherParams,
     backend_visitor: Any,
@@ -933,7 +935,7 @@ async def iter_real_model_stream_infer(
     the HTTP path). ``request.id`` (string) is preserved as the trace id.
 
     ``echo_prefix_ids`` is the auto-derived "thinking prefill" token id sequence. When
-    non-empty and ``input_ids_list`` ends with it, the first non-empty ``generated_ids``
+    non-empty and the input sequence ends with it, the first non-empty ``generated_ids``
     chunk gets ``echo_prefix_ids`` prepended so downstream consumers that rely on the
     prefill-echo contract (dashllm-style) see the expected first token.
 
@@ -954,6 +956,9 @@ async def iter_real_model_stream_infer(
     + tuple hashing entirely. The slow branch only fires when a caller explicitly
     sets ``stop_words_list`` on the request.
     """
+    input_ids_list = (
+        input_ids.sequence if isinstance(input_ids, ParsedInputIds) else input_ids
+    )
     trace_str = str(request.id)
     tag = stream_log_tag(request_id_numeric=rtp_llm_request_id, trace_id=trace_str)
     runtime = think_runtime if think_runtime is not None else _ThinkRuntime()
@@ -1999,10 +2004,8 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     request.model_name,
                 )
                 try:
-                    input_ids_list, sampling, other = parse_dash_sc_grpc_request(
-                        request
-                    )
-                except DashScParameterError as e:
+                    input_ids, sampling, other = parse_dash_sc_grpc_request(request)
+                except (DashScParameterError, DashScInputIdsError) as e:
                     if first_request:
                         record.record_request_frame(request)
                         record.mark_request_done("eof")
@@ -2023,7 +2026,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     )
                     yield resp
                     return
-                if input_ids_list is None:
+                if input_ids is None:
                     if first_request:
                         record.record_request_frame(request)
                         record.mark_request_done("eof")
@@ -2041,6 +2044,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     )
                     yield resp
                     return
+                input_ids_list = input_ids.sequence
                 if first_request:
                     # Hand the record the payload we just parsed so it does not
                     # decode the same request proto again (the input_ids tensor
@@ -2130,7 +2134,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                 else:
                     async for resp, stats in iter_real_model_stream_infer(
                         request,
-                        input_ids_list,
+                        input_ids,
                         sampling,
                         other,
                         self._backend_visitor,

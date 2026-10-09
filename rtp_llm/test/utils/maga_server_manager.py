@@ -7,6 +7,7 @@ import signal as signal_mod
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -37,6 +38,7 @@ class MagaServerManager(object):
         process_file_name: str = "process.log",
         smoke_args_str: str = "",
         health_check_path: str = "/health",
+        env_file: Optional[str] = None,
     ):
         self._username = os.getenv("USER")
         self._env_args = env_args
@@ -49,6 +51,7 @@ class MagaServerManager(object):
         self._port = port
         self._smoke_args_str = smoke_args_str
         self._health_check_path = health_check_path
+        self._env_file = os.path.abspath(env_file) if env_file is not None else None
         self._exit_code: Optional[int] = None
         self._state_lock = threading.Lock()
         self._stop_requested = False
@@ -227,6 +230,9 @@ class MagaServerManager(object):
             self._role_name,
             current_env.get("CUDA_VISIBLE_DEVICES", "<not set>"),
         )
+        if self._env_file is not None:
+            current_env["ENV_FILE"] = self._env_file
+            self._write_environment(current_env)
         p = subprocess.Popen(
             ["/opt/conda310/bin/python", "-m", "rtp_llm.start_server"] + parsed_args,
             env=current_env,
@@ -247,6 +253,23 @@ class MagaServerManager(object):
             return False
 
         return self.wait_sever_done(timeout)
+
+    def _write_environment(self, environment: Dict[str, str]) -> None:
+        """Atomically capture the exact launch environment, like printenv."""
+        assert self._env_file is not None
+        directory = os.path.dirname(self._env_file)
+        os.makedirs(directory, exist_ok=True)
+        # A full environment can contain credentials. Keep the snapshot private.
+        fd, temporary = tempfile.mkstemp(prefix=".env-", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                for name, value in sorted(environment.items()):
+                    stream.write(f"{name}={value}\n")
+            os.replace(temporary, self._env_file)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        logging.info("Server launch environment: %s", self._env_file)
 
     def stop_server(self):
         with self._state_lock:

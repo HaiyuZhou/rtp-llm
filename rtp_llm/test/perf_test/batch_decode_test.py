@@ -1,12 +1,45 @@
 import argparse
 import glob
+import hashlib
 import json
 import logging
 import os
 import shutil
+import sys
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
+    cache_grid_section,
+    engine_section,
+    extract_embedded_profile,
+)
+from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
+    fingerprint as profile_fingerprint,
+)
+from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
+    load_profile,
+    merge_engine_args,
+    profile_environment,
+    resolve_int,
+)
+from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+    CacheGridRunner,
+    MaterializedCaseStore,
+    PrefixPromptFactory,
+    is_grouped_case,
+    normalize_cache_case,
+    resume_config_fingerprint,
+    validate_cache_grid_resume,
+)
+from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
+    grid_token_budget,
+    grid_workspace_tokens,
+    validate_token_budget,
+    workspace_capacity,
+)
 from rtp_llm.test.perf_test.dataset import KNOWN_DATASETS, extract_arg
 from rtp_llm.test.perf_test.distribution_runner import DistributionRunner
 from rtp_llm.test.perf_test.grid_runner import GridRunner
@@ -16,7 +49,7 @@ from rtp_llm.test.perf_test.hub_download import (
 )
 from rtp_llm.test.perf_test.sampling import prepare_distribution_config
 from rtp_llm.test.perf_test.server import EngineServer
-from rtp_llm.test.perf_test.test_util import create_query, create_reuse_cache_queries
+from rtp_llm.test.perf_test.test_util import create_query
 
 
 def run_single(
@@ -46,7 +79,7 @@ def run_single(
     ).run()
 
 
-def parse_args():
+def parse_args(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(
         description="RTP-LLM batch decode performance test runner. "
         "Unrecognized arguments are forwarded to the engine server.",
@@ -64,15 +97,6 @@ def parse_args():
         type=str,
         default="1024,4096",
         help="Comma-separated input lengths for grid mode",
-    )
-    perf.add_argument(
-        "--grid_cases",
-        type=str,
-        default="",
-        help=(
-            "Optional comma-separated batch:input_len pairs for grid mode. "
-            "When set, only these cases are run while the output remains grid-shaped."
-        ),
     )
     dataset_group = perf.add_mutually_exclusive_group()
     dataset_group.add_argument(
@@ -116,18 +140,198 @@ def parse_args():
     )
     perf.add_argument("--decode_test_length", type=int, default=10)
     perf.add_argument(
-        "--num_measures",
-        type=int,
-        default=1,
-        help="Number of measurement rounds requested by BUILD configs. Currently recorded only.",
+        "--cache_grid_json",
+        type=str,
+        default="",
+        help=(
+            "JSON describing an explicit total-seq x prefix-cache grid. "
+            "Each case inserts a prefix, then verifies aux_info.reuse_len."
+        ),
     )
     perf.add_argument(
-        "--prefill_reuse_cache_hit_rate",
-        type=float,
-        default=0.0,
+        "--cache_shared_seed",
+        action="store_true",
+        help="Seed one shared prefix for batch=1 input_ids cache cases",
+    )
+    perf.add_argument(
+        "--cache_measure_runs",
+        type=int,
+        default=3,
+        help="Measured requests per cache-grid case (default: 3)",
+    )
+    perf.add_argument(
+        "--cache_skip_reuse_validation",
+        action="store_true",
         help=(
-            "When >0, prefill grid mode seeds a shared prefix before each run and "
-            "measures prompts whose target prefix-cache hit rate is this value."
+            "Record observed cache reuse but do not fail a case when reuse_len "
+            "differs from the requested cache_len. Shape, timing, and request "
+            "failures remain strict."
+        ),
+    )
+    perf.add_argument(
+        "--cache_request_timeout",
+        type=int,
+        default=int(os.environ.get("PERF_REQUEST_TIMEOUT", "7200")),
+        help="Per-request timeout in seconds for cache-grid mode (default: 7200)",
+    )
+    perf.add_argument(
+        "--cache_commit_tail_tokens",
+        type=int,
+        default=int(os.environ.get("CACHE_COMMIT_TAIL_TOKENS", "4096")),
+        help=(
+            "Extra seed tokens used to commit the requested cache prefix "
+            "before measurement (default: 4096)"
+        ),
+    )
+    perf.add_argument(
+        "--warmup_runs",
+        type=int,
+        default=None,
+        help="Override PERF_FORMAL_WARMUP_RUNS for every case.",
+    )
+    perf.add_argument(
+        "--measure_runs",
+        type=int,
+        default=None,
+        help="Override PERF_MEASURE_RUNS for every case.",
+    )
+    perf.add_argument(
+        "--profile_runs",
+        type=int,
+        default=None,
+        help="Override PERF_PROFILE_RUNS for every case.",
+    )
+    perf.add_argument(
+        "--cache_workspace_tokens",
+        type=int,
+        help="Fixed packed-token capacity; includes per-request padding and output reserve.",
+    )
+    perf.add_argument(
+        "--cache_profile_runs",
+        type=int,
+        default=0,
+        help=(
+            "Diagnostic replays per selected cache-grid case (default: disabled). "
+            "Independent of --profile_runs."
+        ),
+    )
+    perf.add_argument(
+        "--cache_profile_case_ids",
+        type=int,
+        nargs="+",
+        default=[],
+        help="Explicit case IDs from the cache grid/report to profile.",
+    )
+    perf.add_argument(
+        "--cache_profile_only",
+        action="store_true",
+        help=(
+            "Skip formal measurements; write a new isolated replay directory "
+            "below result_dir."
+        ),
+    )
+    perf.add_argument(
+        "--cache_profile_flat_output",
+        action="store_true",
+        help="Use an already isolated profile-only result directory (cache_perf internal).",
+    )
+    perf.add_argument(
+        "--cache_profile_trace_timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for complete trace JSON from every TP rank.",
+    )
+    perf.add_argument(
+        "--cache_profile_backend", choices=("kineto", "nsys"), default="kineto"
+    )
+    perf.add_argument("--cache_nsys_path", default="nsys")
+    perf.add_argument("--cache_nsys_session", default="")
+    perf.add_argument("--cache_nsys_tail_seconds", type=float, default=0.1)
+    perf.add_argument(
+        "--engine_arg",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Repeatable engine argument shorthand, e.g. tp_size=8.",
+    )
+    perf.add_argument(
+        "--engine_env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Repeatable engine environment default; --test_env wins.",
+    )
+    perf.add_argument(
+        "--materialize_cache_cases",
+        type=str,
+        default="",
+        help=(
+            "Cache-grid mode: build every case's prompts once with the "
+            "tokenizer, store them compactly in this directory, and exit "
+            "without starting the engine.  Later runs with "
+            "--cache_case_files reuse the store and skip per-case prompt "
+            "construction entirely."
+        ),
+    )
+    perf.add_argument(
+        "--cache_request_transport",
+        choices=("http_prompt", "dashsc_input_ids"),
+        default="dashsc_input_ids",
+        help=(
+            "Cache-grid request transport. dashsc_input_ids sends the already "
+            "verified token IDs as binary INT32 and skips server tokenization "
+            "(default: dashsc_input_ids)."
+        ),
+    )
+    perf.add_argument(
+        "--cache_grpc_port",
+        type=int,
+        default=0,
+        help="Dash-SC gRPC port for input_ids mode; 0 uses HTTP port + 8.",
+    )
+    perf.add_argument(
+        "--cache_case_files",
+        type=str,
+        default="",
+        help=(
+            "Cache-grid mode: read prompts from a store directory created "
+            "by --materialize_cache_cases instead of constructing them with "
+            "the tokenizer at run time.  Requires the same --cache_grid_json."
+        ),
+    )
+    perf.add_argument(
+        "--profile",
+        type=str,
+        default="",
+        help=(
+            "JSON profile for parameter defaults and engine arg injection. "
+            "Priority: CLI explicit > profile > legacy default."
+        ),
+    )
+    perf.add_argument(
+        "--cache_checkpoint_every",
+        type=int,
+        default=100,
+        help=(
+            "Compact the append-only per-case journal into the full result "
+            "JSON after this many cases (default: 100)."
+        ),
+    )
+    perf.add_argument(
+        "--require_cache_resume",
+        action="store_true",
+        help=(
+            "Require cache_grid_results.json in --result_dir. Use this on a "
+            "restart to prevent an accidental fresh run from a mistyped path."
+        ),
+    )
+    perf.add_argument(
+        "--allow_resume_mismatch",
+        action="store_true",
+        help=(
+            "When resuming from existing results, warn instead of aborting "
+            "on grid/profile, model/engine config, measure runs, transport, "
+            "commit-tail, or block-size mismatches."
         ),
     )
 
@@ -138,8 +342,251 @@ def parse_args():
     engine.add_argument("--max_seq_len", type=int, default=8192)
     engine.add_argument("--concurrency_limit", type=int, default=64)
 
-    args, remaining = parser.parse_known_args()
+    args, remaining = parser.parse_known_args(argv)
+    if any(arg.split("=", 1)[0] == "--expected_cache_block_size" for arg in remaining):
+        parser.error(
+            "--expected_cache_block_size was removed; set grid.generator.cache_alignment"
+        )
+    explicit_options = {
+        item.split("=", 1)[0] for item in (argv if argv is not None else sys.argv[1:])
+    }
+    if args.cache_profile_runs < 0 or args.cache_profile_trace_timeout <= 0:
+        parser.error(
+            "cache profile runs must be non-negative and trace timeout positive"
+        )
+    if bool(args.cache_profile_runs) != bool(args.cache_profile_case_ids):
+        parser.error(
+            "--cache_profile_runs and --cache_profile_case_ids must be supplied together"
+        )
+    if args.cache_profile_backend == "nsys" and (
+        not args.cache_profile_only or not args.cache_nsys_session
+    ):
+        parser.error("nsys requires --cache_profile_only and --cache_nsys_session")
+    if not 0 <= args.cache_nsys_tail_seconds <= 60:
+        parser.error("cache_nsys_tail_seconds must be between 0 and 60")
+    if args.cache_profile_flat_output and not args.cache_profile_only:
+        parser.error("--cache_profile_flat_output requires --cache_profile_only")
+    if args.cache_profile_only and args.require_cache_resume:
+        parser.error(
+            "--cache_profile_only creates a fresh replay directory; "
+            "omit --require_cache_resume"
+        )
+    if args.cache_profile_only and not args.cache_profile_runs:
+        parser.error("--cache_profile_only requires --cache_profile_runs and case IDs")
+    if args.cache_profile_runs and (not args.cache_grid_json or args.partial != 2):
+        parser.error("cache profiling requires --cache_grid_json and --partial=2")
+
+    profile = None
+    profile_sha256 = None
+    if args.profile:
+        profile = load_profile(args.profile)
+        profile_sha256 = profile_fingerprint(profile)
+        cache_grid = cache_grid_section(profile)
+        engine = engine_section(profile)
+        args.cache_measure_runs = resolve_int(
+            profile,
+            "cache_grid",
+            "measure_runs",
+            (
+                args.cache_measure_runs
+                if "--cache_measure_runs" in explicit_options
+                else None
+            ),
+            3,
+        )
+        if "dp_size" in engine:
+            args.dp_size = resolve_int(
+                profile,
+                "engine",
+                "dp_size",
+                args.dp_size if "--dp_size" in explicit_options else None,
+                1,
+            )
+        if "max_seq_len" in engine:
+            args.max_seq_len = resolve_int(
+                profile,
+                "engine",
+                "max_seq_len",
+                args.max_seq_len if "--max_seq_len" in explicit_options else None,
+                8192,
+            )
+        if "concurrency_limit" in engine:
+            args.concurrency_limit = resolve_int(
+                profile,
+                "engine",
+                "concurrency_limit",
+                (
+                    args.concurrency_limit
+                    if "--concurrency_limit" in explicit_options
+                    else None
+                ),
+                64,
+            )
+        remaining = merge_engine_args(profile, remaining)
+
+    args._profile = profile
+    args._profile_sha256 = profile_sha256
     return args, remaining
+
+
+def _parse_name_value(value: str, option: str) -> Tuple[str, str]:
+    """Parse NAME=VALUE options used by the generic Bazel entrypoint."""
+    if "=" not in value:
+        raise ValueError(f"{option} expects NAME=VALUE, got {value!r}")
+    name, parsed = value.split("=", 1)
+    name = name.strip().lstrip("-")
+    if not name or any(ch.isspace() for ch in name):
+        raise ValueError(f"{option} has invalid name in {value!r}")
+    return name, parsed
+
+
+def _engine_arg_argv(engine_args: List[str]) -> List[str]:
+    """Convert repeatable ``--engine_arg NAME=VALUE`` options to engine argv."""
+    result: List[str] = []
+    for item in engine_args:
+        name, value = _parse_name_value(item, "--engine_arg")
+        result.extend([f"--{name}", value])
+    return result
+
+
+def _apply_engine_env(engine_env: List[str]) -> List[str]:
+    """Apply engine env defaults without overriding Bazel ``--test_env`` values."""
+    names: List[str] = []
+    for item in engine_env:
+        name, value = _parse_name_value(item, "--engine_env")
+        if name not in os.environ:
+            os.environ[name] = value
+        names.append(name)
+    return sorted(set(names))
+
+
+def _apply_run_overrides(args: argparse.Namespace) -> None:
+    """Map explicit perf run controls to the legacy environment contract."""
+    for option, env_name in (
+        ("warmup_runs", "PERF_FORMAL_WARMUP_RUNS"),
+        ("measure_runs", "PERF_MEASURE_RUNS"),
+        ("profile_runs", "PERF_PROFILE_RUNS"),
+    ):
+        value = getattr(args, option)
+        if value is None:
+            continue
+        if value < 0:
+            raise ValueError(f"--{option} must be >= 0, got {value}")
+        os.environ[env_name] = str(value)
+
+
+def _is_sensitive_name(name: str) -> bool:
+    normalized = name.strip().lstrip("-").lower()
+    return (
+        any(token in normalized for token in ("password", "secret", "access_key"))
+        or normalized == "token"
+        or normalized.endswith("_token")
+    )
+
+
+def _redact_argv(argv: List[str]) -> List[str]:
+    """Redact likely credentials before persisting invocation metadata."""
+    redacted: List[str] = []
+    redact_next = False
+    for item in argv:
+        if redact_next:
+            redacted.append("***")
+            redact_next = False
+            continue
+        key = item.split("=", 1)[0].lstrip("-").lower()
+        embedded_key = ""
+        if key in ("engine_arg", "engine_env") and "=" in item:
+            embedded_key = item.split("=", 1)[1].split("=", 1)[0].lower()
+        sensitive = _is_sensitive_name(key) or (
+            bool(embedded_key) and _is_sensitive_name(embedded_key)
+        )
+        if sensitive:
+            if "=" in item:
+                redacted.append(item.split("=", 1)[0] + "=***")
+            else:
+                redacted.append(item)
+                redact_next = True
+        else:
+            redacted.append(item)
+    return redacted
+
+
+_REPRODUCTION_ENV_NAMES = {
+    "CUDA_VISIBLE_DEVICES",
+    "LOCAL_WORLD_SIZE",
+    "START_PORT",
+    "TOKENIZERS_PARALLELISM",
+    "WORLD_SIZE",
+}
+_REPRODUCTION_ENV_PREFIXES = (
+    "CACHE_",
+    "DG_JIT_",
+    "DSV4_",
+    "PERF_",
+    "PREFILL_",
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "TILELANG_",
+    "TRITON_",
+)
+
+
+def _capture_reproduction_env(
+    engine_env_names: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    """Capture performance-relevant environment values with credential redaction."""
+    requested = set(engine_env_names or [])
+    requested.update(
+        name
+        for name in os.environ
+        if name in _REPRODUCTION_ENV_NAMES
+        or name.startswith(_REPRODUCTION_ENV_PREFIXES)
+    )
+    captured = {}
+    for name in sorted(requested):
+        if name not in os.environ:
+            continue
+        lowered = name.lower()
+        sensitive = _is_sensitive_name(lowered)
+        captured[name] = "***" if sensitive else os.environ[name]
+    return captured
+
+
+def _build_cache_resume_config(
+    args: argparse.Namespace,
+    remaining_args: List[str],
+    engine_env_names: Optional[List[str]],
+    expected_cache_block_size: int,
+) -> Dict[str, Any]:
+    """Build the stable model/workload config guarded across resumed attempts."""
+    return {
+        "schema_version": 1,
+        "model": {
+            "model_type": extract_arg(remaining_args, "model_type"),
+            "checkpoint_path": extract_arg(remaining_args, "checkpoint_path"),
+            "tokenizer_path": extract_arg(remaining_args, "tokenizer_path"),
+        },
+        "engine": {
+            "args": _redact_argv(remaining_args),
+            "environment": _capture_reproduction_env(engine_env_names),
+            "dp_size": args.dp_size,
+            "max_seq_len": args.max_seq_len,
+            "concurrency_limit": args.concurrency_limit,
+        },
+        "workload": {
+            "partial": args.partial,
+            "decode_test_length": args.decode_test_length,
+            "cache_measure_runs": args.cache_measure_runs,
+            "cache_skip_reuse_validation": args.cache_skip_reuse_validation,
+            "cache_commit_tail_tokens": args.cache_commit_tail_tokens,
+            "expected_cache_block_size": expected_cache_block_size,
+            "cache_request_transport": args.cache_request_transport,
+            **(
+                {"workspace_tokens": args.cache_workspace_tokens}
+                if getattr(args, "cache_workspace_tokens", None) is not None
+                else {}
+            ),
+        },
+    }
 
 
 def _replace_cli_value(argv: List[str], key: str, new_value: str) -> None:
@@ -173,6 +620,237 @@ def resolve_perf_engine_paths(remaining: List[str]) -> List[str]:
     return out
 
 
+def _load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
+    """Load current explicit grids without generating or filling case fields."""
+    with open(path, encoding="utf-8") as stream:
+        config = json.load(stream)
+    _resolve_cache_block_size(config)
+    if type(config.get("schema_version")) is not int or config["schema_version"] != 2:
+        raise ValueError("cache grid requires schema_version=2")
+    legacy = {
+        "seq_lens",
+        "seq_generation",
+        "seq_block_size",
+        "cache_block_size",
+        "cache_ratios",
+        "cache_ratio_interval",
+    } & config.keys()
+    if legacy:
+        raise ValueError(
+            f"compact grid fields are unsupported: {sorted(legacy)}; generate explicit cases"
+        )
+    if "cases" not in config:
+        raise ValueError("cache grid requires explicit cases")
+    raw_cases = config["cases"]
+    if not isinstance(raw_cases, list):
+        raise ValueError("cache grid cases must be a list")
+    cases: List[Dict[str, int]] = []
+    seen = set()
+    seen_ids = set()
+    for index, raw in enumerate(raw_cases):
+        if not isinstance(raw, dict):
+            raise ValueError(f"cache grid case {index} must be an object")
+        case = normalize_cache_case(raw)
+        key = CacheGridRunner.case_key(case)
+        if key in seen:
+            raise ValueError(f"duplicate cache grid case: {case}")
+        seen.add(key)
+        if case["case_id"] in seen_ids:
+            raise ValueError(f"duplicate cache grid case_id: {case['case_id']}")
+        seen_ids.add(case["case_id"])
+        cases.append(case)
+    if not cases:
+        raise ValueError(f"cache grid {path} contains no cases")
+    return cases
+
+
+def _configure_cache_batch_limits(args, remaining, cases, *, cache_alignment=None):
+    """Configure token capacity without changing profile admission or context limits."""
+    batch_size = max(c["batch_size"] for c in cases)
+    workspace = getattr(args, "cache_workspace_tokens", None)
+    if workspace is not None:
+        if type(cache_alignment) is not int or cache_alignment <= 0:
+            raise ValueError("fixed workspace requires grid.generator.cache_alignment")
+        if args.dp_size != 1:
+            raise ValueError("fixed token workspace requires dp_size=1")
+        tp = int(extract_arg(remaining, "tp_size") or 1)
+        cp_method = extract_arg(remaining, "cp_rotate_method") or "DISABLED"
+        if cp_method not in (
+            "DISABLED",
+            "ALL_GATHER",
+            "ALL_GATHER_WITH_OVERLAP",
+            "ALLTOALL",
+        ):
+            raise ValueError("unsupported CP method for fixed token workspace")
+        cp_alignment = 2 * tp if cp_method != "DISABLED" and tp > 1 else 1
+        if tp <= 0 or cache_alignment % cp_alignment:
+            raise ValueError(
+                "cache_alignment must be a multiple of the CP execution alignment"
+            )
+        if args.cache_shared_seed:
+            raise ValueError("fixed workspace does not support cache_shared_seed mode")
+        budget = int(extract_arg(remaining, "max_batch_tokens_size") or workspace)
+        budget = min(budget or workspace, workspace)
+        stats = validate_token_budget(
+            cases,
+            workspace_tokens=workspace,
+            commit_tail=args.cache_commit_tail_tokens,
+            block=cache_alignment,
+            output_tokens=args.decode_test_length,
+            token_budget=budget,
+        )
+        args.max_seq_len = workspace_capacity(workspace, cache_alignment)
+        limits = {
+            "max_batch_tokens_size": budget,
+        }
+        index, cleaned = 0, []
+        while index < len(remaining):
+            item = remaining[index]
+            name = item.split("=", 1)[0].lstrip("-")
+            if name in limits:
+                index += 1 if "=" in item else 2
+            else:
+                cleaned.append(item)
+                index += 1
+        remaining[:] = cleaned + [f"--{key}={value}" for key, value in limits.items()]
+        logging.info(
+            "cache fixed token workspace: max_seq_len=%d capacity=%s",
+            args.max_seq_len,
+            stats,
+        )
+        return
+    if batch_size <= 1:
+        return
+    if args.dp_size != 1:
+        raise ValueError("fixed cache batches currently require dp_size=1")
+    total_tokens = max(
+        sum(
+            g["count"] * g["input_len"]
+            for g in c.get(
+                "request_groups",
+                [{"count": c["batch_size"], "input_len": c["input_len"]}],
+            )
+        )
+        for c in cases
+    )
+    for name, required in (("max_batch_tokens_size", total_tokens),):
+        current = int(extract_arg(remaining, name) or 0)
+        if current >= required:
+            continue
+        flag = "--" + name
+        cleaned = []
+        index = 0
+        while index < len(remaining):
+            value = remaining[index]
+            if value == flag:
+                index += 2
+            elif value.startswith(flag + "="):
+                index += 1
+            else:
+                cleaned.append(value)
+                index += 1
+        remaining[:] = cleaned + [flag, str(required)]
+        logging.info(
+            "cache fixed batch: raised %s from %d to %d", name, current, required
+        )
+
+
+def _resolve_cache_block_size(grid_payload: Any) -> int:
+    """Read the single authoritative cache alignment in the grid."""
+    if not isinstance(grid_payload, dict):
+        raise ValueError("cache grid must be a JSON object")
+    generator = grid_payload.get("generator")
+    if not isinstance(generator, dict):
+        raise ValueError("grid requires generator.cache_alignment")
+    sampling = generator.get("cache_sampling")
+    if "cache_block_size" in grid_payload or (
+        isinstance(sampling, dict) and "alignment" in sampling
+    ):
+        raise ValueError(
+            "cache alignment must only be configured at generator.cache_alignment"
+        )
+    value = generator.get("cache_alignment")
+    if type(value) is not int or value <= 0:
+        raise ValueError("generator.cache_alignment must be a positive integer")
+    return value
+
+
+def _dedupe_cache_grid_cases(
+    cases: List[Dict[str, int]], block_size: int
+) -> List[Dict[str, int]]:
+    """Collapse cases whose requested cache lengths share one physical bucket.
+
+    The engine reuses prefix KV only in whole block_size chunks, so requests
+    whose cache_len floors to the same block count measure the identical
+    geometry.  Keep one representative per bucket: prefer the aligned request
+    (its observed reuse then equals what it asked for), otherwise the largest
+    request in the bucket, which stays closest to the next boundary if the
+    block-size assumption is slightly off.
+    """
+    buckets: Dict[tuple, Dict[str, int]] = {}
+    order: List[tuple] = []
+    for case in cases:
+        if is_grouped_case(case):
+            key = (CacheGridRunner.case_key(case),)
+            if key not in buckets:
+                buckets[key] = case
+                order.append(key)
+            continue
+        key = (case["batch_size"], case["input_len"], case["cache_len"] // block_size)
+        kept = buckets.get(key)
+        if kept is None:
+            buckets[key] = case
+            order.append(key)
+        elif kept["cache_len"] % block_size and not case["cache_len"] % block_size:
+            buckets[key] = case
+        elif (
+            kept["cache_len"] % block_size
+            and case["cache_len"] % block_size
+            and case["cache_len"] > kept["cache_len"]
+        ):
+            buckets[key] = case
+    return [buckets[key] for key in order]
+
+
+def _load_materialized_case_store(
+    root: str,
+    cases: List[Dict[str, int]],
+    measure_runs: int,
+    grid_sha256: str,
+) -> MaterializedCaseStore:
+    """Load a precomputed prompt store and prove it matches this grid."""
+    store = MaterializedCaseStore(root)
+    stored = store.load_cases()
+    if store.run_count != measure_runs:
+        raise ValueError(
+            f"case store {root} was materialized with run_count="
+            f"{store.run_count}, but --cache_measure_runs={measure_runs}"
+        )
+    if store.grid_sha256 and store.grid_sha256 != grid_sha256:
+        raise ValueError(
+            f"case store {root} was materialized from a different grid JSON "
+            f"(sha256 {store.grid_sha256[:12]} != {grid_sha256[:12]}); "
+            "rerun --materialize_cache_cases"
+        )
+
+    def geometry(case: Dict[str, int]) -> tuple:
+        return (
+            case["case_id"],
+            CacheGridRunner.case_key(case),
+            case["batch_size"],
+            case["input_len"],
+            case["cache_len"],
+        )
+
+    if [geometry(c) for c in stored] != [geometry(c) for c in cases]:
+        raise ValueError(
+            f"case store {root} holds {len(stored)} cases but this run plans "
+            f"{len(cases)}; the grid JSON or block-size dedup changed since "
+            "materialization. Rerun --materialize_cache_cases."
+        )
+    return store
+
+
 def _collect_timeline_files(result_dir: str) -> None:
     """Wait for async profiler saves and collect timeline JSON files into a timelines/ subdirectory."""
     # C++ engine's ProfilerSaveWorker writes timeline JSONs asynchronously in a
@@ -196,26 +874,137 @@ def _collect_timeline_files(result_dir: str) -> None:
         logging.info("No timeline files found in %s", result_dir)
 
 
-def _write_test_info(args: argparse.Namespace, remaining_args: List[str]) -> None:
-    """Persist test configuration to result_dir for downstream consumers."""
+def _write_test_info(
+    args: argparse.Namespace,
+    remaining_args: List[str],
+    engine_env_names: Optional[List[str]] = None,
+    status: str = "completed",
+    expected_cache_block_size: int = 0,
+    resume_config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist a reproducible, credential-safe test configuration."""
+    model_type = extract_arg(remaining_args, "model_type") or os.environ.get(
+        "MODEL_TYPE"
+    )
+    checkpoint_path = extract_arg(remaining_args, "checkpoint_path") or os.environ.get(
+        "CHECKPOINT_PATH"
+    )
+    profile = getattr(args, "_profile", None)
+    profile_sha256 = getattr(args, "_profile_sha256", None)
+    path = os.path.join(args.result_dir, "test_info.json")
+    previous: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as stream:
+                previous = json.load(stream)
+        except (OSError, ValueError):
+            logging.warning("Ignoring unreadable previous test info at %s", path)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    attempt_count = int(previous.get("attempt_count", 0))
+    if status == "running":
+        attempt_count += 1
     info = {
-        "model_type": os.environ.get("MODEL_TYPE"),
-        "checkpoint_path": os.environ.get("CHECKPOINT_PATH"),
-        "tokenizer_path": os.environ.get("TOKENIZER_PATH"),
+        "status": status,
+        "started_at": previous.get("started_at", now),
+        "updated_at": now,
+        "last_attempt_started_at": (
+            now if status == "running" else previous.get("last_attempt_started_at", now)
+        ),
+        "attempt_count": attempt_count,
+        "model_type": model_type,
+        "checkpoint_path": checkpoint_path,
         "tp_size": extract_arg(remaining_args, "tp_size", "1"),
         "dp_size": args.dp_size,
-        "max_seq_len": args.max_seq_len,
-        "concurrency_limit": args.concurrency_limit,
-        "decode_test_length": args.decode_test_length,
-        "num_measures": args.num_measures,
-        "prefill_reuse_cache_hit_rate": args.prefill_reuse_cache_hit_rate,
-        "dataset_name": args.dataset_name or None,
-        "dataset_path": args.dataset_path or args.dataset or None,
+        "cache_grid_json": args.cache_grid_json or None,
+        "resume_config_sha256": resume_config_fingerprint(resume_config),
+        "profile_sha256": profile_sha256,
     }
-    path = os.path.join(args.result_dir, "test_info.json")
-    with open(path, "w") as f:
-        json.dump(info, f, indent=2)
-    logging.info(f"Wrote test info to {path}")
+    launch_path = os.path.join(args.result_dir, "cache_perf_launch.json")
+    if args.cache_grid_json and os.path.isfile(launch_path):
+        # The unified launcher already owns the reproducible configuration.
+        # Keep results' run_config as the authoritative effective config used
+        # by the resume guard; do not repeat it or the raw argv in test_info.
+        with open(launch_path, encoding="utf-8") as stream:
+            launch = json.load(stream)
+        if launch.get("schema_version") != 2:
+            raise ValueError("unsupported launch manifest")
+        info.update(
+            schema_version=4,
+            config_files={
+                "launch": "cache_perf_launch.json",
+                "profile": launch.get("profile_file", "profile.snapshot.json"),
+                "grid": "grid.snapshot.json",
+            },
+            config_file_sha256={
+                "cache_perf_launch.json": hashlib.sha256(
+                    Path(launch_path).read_bytes()
+                ).hexdigest(),
+                **launch.get("snapshots", {}),
+            },
+        )
+    else:
+        tokenizer_path = extract_arg(
+            remaining_args, "tokenizer_path"
+        ) or os.environ.get("TOKENIZER_PATH")
+        info.update(
+            {
+                "schema_version": 3,
+                "tokenizer_path": tokenizer_path,
+                "max_seq_len": args.max_seq_len,
+                "concurrency_limit": args.concurrency_limit,
+                "decode_test_length": args.decode_test_length,
+                "seq_size_per_block": extract_arg(
+                    remaining_args, "seq_size_per_block", None
+                ),
+                "cache_measure_runs": (
+                    args.cache_measure_runs if args.cache_grid_json else None
+                ),
+                "cache_skip_reuse_validation": (
+                    args.cache_skip_reuse_validation if args.cache_grid_json else None
+                ),
+                "cache_request_timeout": (
+                    args.cache_request_timeout if args.cache_grid_json else None
+                ),
+                "cache_commit_tail_tokens": (
+                    args.cache_commit_tail_tokens if args.cache_grid_json else None
+                ),
+                "partial": args.partial,
+                "warmup_runs": int(os.environ.get("PERF_FORMAL_WARMUP_RUNS", "1")),
+                "measure_runs": int(os.environ.get("PERF_MEASURE_RUNS", "1")),
+                "profile_runs": int(os.environ.get("PERF_PROFILE_RUNS", "1")),
+                "expected_cache_block_size": (
+                    expected_cache_block_size if args.cache_grid_json else None
+                ),
+                "cache_case_store": args.cache_case_files or None,
+                "cache_profile_runs": args.cache_profile_runs,
+                "cache_profile_case_ids": args.cache_profile_case_ids,
+                "cache_profile_only": args.cache_profile_only,
+                "cache_profile_trace_timeout": args.cache_profile_trace_timeout,
+                "cache_profile_backend": args.cache_profile_backend,
+                "cache_nsys_session": args.cache_nsys_session,
+                "cache_nsys_path": args.cache_nsys_path,
+                "cache_nsys_tail_seconds": args.cache_nsys_tail_seconds,
+                "cache_request_transport": (
+                    args.cache_request_transport if args.cache_grid_json else None
+                ),
+                "cache_grpc_port": (
+                    args.cache_grpc_port or None if args.cache_grid_json else None
+                ),
+                "dataset_name": args.dataset_name or None,
+                "dataset_path": args.dataset_path or args.dataset or None,
+                "engine_args": _redact_argv(remaining_args),
+                "engine_env_names": sorted(engine_env_names or []),
+                "engine_environment": _capture_reproduction_env(engine_env_names),
+                "argv": _redact_argv(sys.argv),
+                "resume_config": resume_config,
+                "profile": profile,
+            }
+        )
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as stream:
+        json.dump(info, stream, indent=2)
+    os.replace(tmp_path, path)
+    logging.info("Wrote test info to %s", path)
 
 
 def _effective_grid_max_seq_len(
@@ -225,75 +1014,371 @@ def _effective_grid_max_seq_len(
     return max(needed_seq_len, args.max_seq_len)
 
 
-def _parse_grid_cases(grid_cases: str) -> Optional[List[Tuple[int, int]]]:
-    if not grid_cases.strip():
-        return None
+def _ensure_xgrammar_lib_path() -> None:
+    import sys
 
-    cases: List[Tuple[int, int]] = []
-    seen = set()
-    for raw_case in grid_cases.split(","):
-        case = raw_case.strip()
-        if not case:
-            continue
-        parts = case.split(":")
-        if len(parts) != 2:
-            raise ValueError(
-                f"Invalid --grid_cases item {case!r}; expected batch:input_len"
-            )
-        try:
-            batch_size = int(parts[0])
-            input_len = int(parts[1])
-        except ValueError as e:
-            raise ValueError(
-                f"Invalid --grid_cases item {case!r}; batch and input_len must be integers"
-            ) from e
-        if batch_size <= 0 or input_len <= 0:
-            raise ValueError(
-                f"Invalid --grid_cases item {case!r}; values must be positive"
-            )
-        parsed_case = (batch_size, input_len)
-        if parsed_case not in seen:
-            seen.add(parsed_case)
-            cases.append(parsed_case)
-
-    if not cases:
-        raise ValueError("--grid_cases did not contain any valid cases")
-    return cases
+    so_name = "libxgrammar_bindings.so"
+    for p in sys.path:
+        xgrammar_dir = os.path.join(p, "xgrammar")
+        if os.path.isfile(os.path.join(xgrammar_dir, so_name)):
+            current = os.environ.get("LD_LIBRARY_PATH", "")
+            if xgrammar_dir not in current.split(":"):
+                os.environ["LD_LIBRARY_PATH"] = (
+                    f"{xgrammar_dir}:{current}" if current else xgrammar_dir
+                )
+                logging.info(f"Added {xgrammar_dir} to LD_LIBRARY_PATH")
+            return
 
 
-def _positive_int_arg(argv: List[str], key: str, default: int) -> int:
-    value = extract_arg(argv, key)
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-    except ValueError as e:
-        raise ValueError(f"Invalid --{key} value {value!r}; expected integer") from e
-    if parsed <= 0:
-        raise ValueError(f"Invalid --{key} value {value!r}; expected positive integer")
-    return parsed
-
-
-def _reuse_query_variant_count(profile: bool = True) -> int:
-    warmup_runs = int(os.environ.get("PERF_FORMAL_WARMUP_RUNS", "1"))
-    measure_runs = int(os.environ.get("PERF_MEASURE_RUNS", "1"))
-    profile_runs = int(os.environ.get("PERF_PROFILE_RUNS", "1" if profile else "0"))
-    return max(1, warmup_runs + measure_runs + profile_runs)
+def _prepare_cache_profile_result_dir(args):
+    if not args.cache_profile_only:
+        return
+    if not args.cache_profile_flat_output:
+        args.result_dir = str(
+            Path(args.result_dir) / "cache_profile_replays" / uuid.uuid4().hex
+        )
+        return
+    directory = Path(args.result_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    allowed = {"cache_perf_launch.json", "profile.snapshot.json", "grid.snapshot.json"}
+    if any(p.name not in allowed or not p.is_file() for p in directory.iterdir()):
+        raise ValueError("flat profile output requires a fresh isolated directory")
+    # Exclusive claim prevents concurrent/repeated invocations from overwriting results.
+    with (directory / ".cache_profile_started").open("x") as stream:
+        stream.write("profile-only isolated output\n")
 
 
 def main() -> str:
     from rtp_llm.config.log_config import setup_logging
 
     setup_logging()
+    _ensure_xgrammar_lib_path()
 
     args, remaining = parse_args()
+    # Direct Bazel --test_env and --engine_env remain explicit overrides.
+    engine_env_names = _apply_engine_env(args.engine_env)
+    engine_env_names = sorted(
+        set(
+            engine_env_names
+            + _apply_engine_env(
+                [
+                    f"{key}={value}"
+                    for key, value in profile_environment(args._profile or {}).items()
+                ]
+            )
+        )
+    )
+    _apply_run_overrides(args)
+    # Model/parallelism-specific flags are intentionally not hard-coded in
+    # this runner.  The generic target can forward any engine flag through
+    # repeatable --engine_arg=NAME=VALUE options; raw unknown args remain
+    # supported for backwards compatibility.
+    remaining.extend(_engine_arg_argv(args.engine_arg))
     remaining = resolve_perf_engine_paths(remaining)
     generate_config = json.loads(args.generate_config)
+    if args.cache_profile_runs and args.dp_size != 1:
+        raise ValueError(
+            "cache-grid profiling currently requires DP=1; all TP ranks are captured"
+        )
+    _prepare_cache_profile_result_dir(args)
     os.makedirs(args.result_dir, exist_ok=True)
+    # Cache-grid mode writes its manifest after resolving the grid and resume
+    # fingerprint, but still before tokenizer/model initialization.
+    if not args.cache_grid_json:
+        _write_test_info(args, remaining, engine_env_names, status="running")
     EngineServer.propagate_engine_env(remaining)
 
     logging.info(f"Result directory: {args.result_dir}")
     logging.info(f"Engine args forwarded to server: {remaining}")
+
+    if args.cache_grid_json:
+        if args.partial != 2:
+            raise ValueError("--cache_grid_json is prefill-only; use --partial=2")
+        if args.cache_measure_runs <= 0:
+            raise ValueError("--cache_measure_runs must be positive")
+        if args.cache_request_timeout <= 0:
+            raise ValueError("--cache_request_timeout must be positive")
+        if args.cache_commit_tail_tokens <= 0:
+            raise ValueError("--cache_commit_tail_tokens must be positive")
+        if args.cache_checkpoint_every <= 0:
+            raise ValueError("--cache_checkpoint_every must be positive")
+        if args.materialize_cache_cases and args.cache_case_files:
+            raise ValueError(
+                "--materialize_cache_cases and --cache_case_files are mutually "
+                "exclusive"
+            )
+
+        cases = _load_cache_grid_cases(args.cache_grid_json)
+        with open(args.cache_grid_json, "rb") as stream:
+            grid_bytes = stream.read()
+        grid_payload = json.loads(grid_bytes)
+        workspace = grid_workspace_tokens(grid_payload)
+        if workspace is not None:
+            if args.cache_workspace_tokens not in (None, workspace):
+                raise ValueError("CLI/grid workspace_tokens mismatch")
+            args.cache_workspace_tokens = workspace
+            budget = str(min(workspace, grid_token_budget(grid_payload)))
+            if extract_arg(remaining, "max_batch_tokens_size") is None:
+                remaining.append("--max_batch_tokens_size=" + budget)
+            else:
+                _replace_cli_value(remaining, "max_batch_tokens_size", budget)
+        expected_block_size = _resolve_cache_block_size(grid_payload)
+        _configure_cache_batch_limits(
+            args, remaining, cases, cache_alignment=expected_block_size
+        )
+        grid_metadata = {
+            key: grid_payload.get(key)
+            for key in ("schema_version", "kind", "generator", "summary")
+            if key in grid_payload
+        }
+        grid_sha256 = hashlib.sha256(grid_bytes).hexdigest()
+        if expected_block_size > 0:
+            deduped = _dedupe_cache_grid_cases(cases, expected_block_size)
+            if len(deduped) < len(cases):
+                logging.warning(
+                    "cache grid: dropped %d of %d cases that collapse onto the same "
+                    "%d-token physical block bucket",
+                    len(cases) - len(deduped),
+                    len(cases),
+                    expected_block_size,
+                )
+                cases = deduped
+        logging.info(
+            "cache grid plan: cases=%d sha256=%s expected_block_size=%d metadata=%s",
+            len(cases),
+            grid_sha256,
+            expected_block_size,
+            grid_metadata,
+        )
+        if args.cache_shared_seed:
+            if args.cache_request_transport != "dashsc_input_ids":
+                raise ValueError("--cache_shared_seed requires dashsc_input_ids")
+            if any(is_grouped_case(c) or c["batch_size"] != 1 for c in cases):
+                raise ValueError(
+                    "--cache_shared_seed supports only ungrouped batch_size=1"
+                )
+            if (
+                args.cache_profile_runs
+                or args.cache_profile_only
+                or args.cache_case_files
+                or args.materialize_cache_cases
+            ):
+                raise ValueError(
+                    "--cache_shared_seed does not support profiling or materialized cases"
+                )
+            if (
+                expected_block_size <= 0
+                or args.cache_commit_tail_tokens < expected_block_size
+            ):
+                raise ValueError(
+                    "--cache_shared_seed requires a known block size and full commit tail"
+                )
+        unknown_profile_ids = set(args.cache_profile_case_ids) - {
+            int(c["case_id"]) for c in cases
+        }
+        if unknown_profile_ids:
+            raise ValueError(
+                f"unknown/deduplicated cache profile case IDs: {sorted(unknown_profile_ids)}"
+            )
+        if any(
+            is_grouped_case(c) and c["case_id"] in args.cache_profile_case_ids
+            for c in cases
+        ):
+            raise ValueError(
+                "cache profiling currently supports only ungrouped batch_size=1 cases"
+            )
+        if args.cache_profile_runs and args.materialize_cache_cases:
+            raise ValueError(
+                "cache profiling cannot be combined with --materialize_cache_cases"
+            )
+        resume_config = _build_cache_resume_config(
+            args, remaining, engine_env_names, expected_block_size
+        )
+        if args.cache_shared_seed:
+            resume_config["cache_seed_mode"] = "shared_prefix_v1"
+        checkpoint = validate_cache_grid_resume(
+            args.result_dir,
+            grid_sha256=grid_sha256,
+            profile_sha256=getattr(args, "_profile_sha256", None),
+            measure_runs=args.cache_measure_runs,
+            cache_commit_tail_tokens=args.cache_commit_tail_tokens,
+            expected_block_size=expected_block_size,
+            request_transport=args.cache_request_transport,
+            run_config=resume_config,
+            shared_seed=args.cache_shared_seed,
+            allow_resume_mismatch=args.allow_resume_mismatch,
+            require_resume=args.require_cache_resume,
+        )
+        if checkpoint is not None:
+            logging.info(
+                "cache grid: preflight resume accepted progress=%s",
+                checkpoint.get("progress"),
+            )
+        _write_test_info(
+            args,
+            remaining,
+            engine_env_names,
+            status="running",
+            expected_cache_block_size=expected_block_size,
+            resume_config=resume_config,
+        )
+        checkpoint_ok_keys = (
+            {
+                str(row.get("case_key"))
+                for row in checkpoint.get("metrics", [])
+                if isinstance(row, dict) and row.get("status") == "ok"
+            }
+            if checkpoint is not None
+            else set()
+        )
+        planned_case_keys = {CacheGridRunner.case_key(case) for case in cases}
+        if (
+            checkpoint is not None
+            and checkpoint_ok_keys == planned_case_keys
+            and not args.cache_profile_runs
+        ):
+            logging.info(
+                "cache grid: checkpoint already contains all %d successful cases; "
+                "skipping tokenizer and model startup",
+                len(cases),
+            )
+            _write_test_info(
+                args,
+                remaining,
+                engine_env_names,
+                status="completed",
+                expected_cache_block_size=expected_block_size,
+                resume_config=resume_config,
+            )
+            return args.result_dir
+        for case in [group for c in cases for group in c.get("request_groups", [c])]:
+            cache_len = int(case["cache_len"])
+            input_len = int(case["input_len"])
+            if (
+                "count" in case
+                and expected_block_size
+                and cache_len % expected_block_size
+            ):
+                raise ValueError(
+                    f"cache-grid cache_len must align to block size {expected_block_size}: {case}"
+                )
+            if cache_len and cache_len % args.cache_commit_tail_tokens:
+                raise ValueError(
+                    "cache-grid cache_len must align to "
+                    f"--cache_commit_tail_tokens={args.cache_commit_tail_tokens}: "
+                    f"{case}"
+                )
+            if cache_len and cache_len + args.cache_commit_tail_tokens > input_len:
+                raise ValueError(
+                    "cache-grid cache_len must leave one commit tail before "
+                    f"server startup: {case}"
+                )
+        max_input_len = max(int(case["input_len"]) for case in cases)
+        tokenizer_path = (
+            extract_arg(remaining, "tokenizer_path")
+            or extract_arg(remaining, "checkpoint_path")
+            or os.environ.get("TOKENIZER_PATH", "")
+        )
+        if not tokenizer_path:
+            raise ValueError(
+                "cache-grid mode requires --tokenizer_path or --checkpoint_path"
+            )
+
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path, trust_remote_code=True
+        )
+
+        if args.materialize_cache_cases:
+            store = MaterializedCaseStore(args.materialize_cache_cases)
+            stats = store.materialize(
+                cases,
+                PrefixPromptFactory(tokenizer),
+                args.cache_measure_runs,
+                grid_metadata=grid_metadata,
+                grid_sha256=grid_sha256,
+                profile_sha256=getattr(args, "_profile_sha256", "") or "",
+            )
+            logging.info(
+                "materialized %d cache-grid cases (%d cached) to %s: %s",
+                stats["cases"],
+                stats["cached_cases"],
+                args.materialize_cache_cases,
+                stats,
+            )
+            return args.result_dir
+
+        case_store = None
+        if args.cache_case_files:
+            case_store = _load_materialized_case_store(
+                args.cache_case_files,
+                cases,
+                args.cache_measure_runs,
+                grid_sha256,
+            )
+            logging.info(
+                "cache grid: using materialized case store %s", args.cache_case_files
+            )
+
+        server = EngineServer(args, remaining)
+        server.start(
+            max_seq_len=max(max_input_len + args.decode_test_length, args.max_seq_len),
+            # Admission must allow the complete fixed batch to reach the scheduler.
+            max_concurrency=args.concurrency_limit,
+        )
+        try:
+            # CacheGridRunner bypasses GridRunner/BatchPerfImpl, whose run() normally
+            # switches BatchDecodeScheduler to prefill. Configure it explicitly before
+            # the block-size probe, cache seeds, or measurement requests are issued.
+            server.set_scheduler_mode(batch_size=1, mode="prefill")
+            CacheGridRunner(
+                server.port,
+                tokenizer,
+                cases,
+                args.result_dir,
+                request_timeout=args.cache_request_timeout,
+                shared_seed=args.cache_shared_seed,
+                measure_runs=args.cache_measure_runs,
+                checkpoint_every=args.cache_checkpoint_every,
+                cache_commit_tail_tokens=args.cache_commit_tail_tokens,
+                skip_reuse_validation=args.cache_skip_reuse_validation,
+                grid_metadata=grid_metadata,
+                grid_sha256=grid_sha256,
+                expected_block_size=expected_block_size,
+                case_store=case_store,
+                profile=getattr(args, "_profile", None),
+                profile_sha256=getattr(args, "_profile_sha256", None),
+                allow_resume_mismatch=args.allow_resume_mismatch,
+                require_resume=args.require_cache_resume,
+                request_transport=args.cache_request_transport,
+                grpc_port=args.cache_grpc_port or None,
+                run_config=resume_config,
+                profile_runs=args.cache_profile_runs,
+                profile_case_ids=args.cache_profile_case_ids,
+                profile_only=args.cache_profile_only,
+                profile_flat_output=args.cache_profile_flat_output,
+                profile_tp_size=int(
+                    extract_arg(remaining, "tp_size") or os.environ.get("TP_SIZE", "1")
+                ),
+                profile_trace_timeout=args.cache_profile_trace_timeout,
+                profile_backend=args.cache_profile_backend,
+                nsys_path=args.cache_nsys_path,
+                nsys_session=args.cache_nsys_session,
+                nsys_tail_seconds=args.cache_nsys_tail_seconds,
+            ).run()
+            _collect_timeline_files(args.result_dir)
+        finally:
+            server.stop()
+        _write_test_info(
+            args,
+            remaining,
+            engine_env_names,
+            status="completed",
+            expected_cache_block_size=expected_block_size,
+            resume_config=resume_config,
+        )
+        return args.result_dir
 
     distribution_mode = (
         args.dataset_name or args.dataset_path or args.dataset or args.test_json
@@ -344,10 +1429,8 @@ def main() -> str:
     else:
         batch_size_list = [int(x) for x in args.batch_size.split(",")]
         input_len_list = [int(x) for x in args.input_len.split(",")]
-        grid_cases = _parse_grid_cases(args.grid_cases)
-        if grid_cases:
-            batch_size_list = sorted({batch_size for batch_size, _ in grid_cases})
-            input_len_list = sorted({input_len for _, input_len in grid_cases})
+        needed_seq_len = max(input_len_list) + args.decode_test_length
+        effective_max_seq_len = max(needed_seq_len, args.max_seq_len)
 
         server = EngineServer(args, remaining)
         server.start(
@@ -356,28 +1439,6 @@ def main() -> str:
         )
 
         input_query_dict = create_query(input_len_list=input_len_list)
-        reuse_cache_query_dict = None
-        if args.prefill_reuse_cache_hit_rate > 0.0 and args.partial in (0, 2):
-            tokenizer_path = (
-                extract_arg(remaining, "tokenizer_path")
-                or extract_arg(remaining, "checkpoint_path")
-                or os.environ.get("TOKENIZER_PATH", "")
-            )
-            reuse_cache_query_dict = create_reuse_cache_queries(
-                tokenizer_path=tokenizer_path,
-                input_len_list=input_len_list,
-                hit_rate=args.prefill_reuse_cache_hit_rate,
-                seq_size_per_block=_positive_int_arg(
-                    remaining, "seq_size_per_block", 1
-                ),
-                # Concurrent reuse-cache requests must share only the seeded
-                # prefix. Give every request in the largest grid batch a
-                # distinct suffix; otherwise identical requests can reuse one
-                # another and invalidate the requested hit-rate measurement.
-                num_variants=max(
-                    _reuse_query_variant_count(), max(batch_size_list) * args.dp_size
-                ),
-            )
 
         if args.partial in (0, 1):
             GridRunner(
@@ -390,7 +1451,6 @@ def main() -> str:
                 dump_json_path=args.result_dir,
                 decode_test_length=args.decode_test_length,
                 generate_config=generate_config,
-                grid_cases=grid_cases,
             ).run()
         if args.partial in (0, 2):
             GridRunner(
@@ -403,13 +1463,11 @@ def main() -> str:
                 dump_json_path=args.result_dir,
                 decode_test_length=args.decode_test_length,
                 generate_config=generate_config,
-                grid_cases=grid_cases,
-                reuse_cache_query_dict=reuse_cache_query_dict,
             ).run()
         _collect_timeline_files(args.result_dir)
         server.stop()
 
-    _write_test_info(args, remaining)
+    _write_test_info(args, remaining, engine_env_names, status="completed")
     return args.result_dir
 
 

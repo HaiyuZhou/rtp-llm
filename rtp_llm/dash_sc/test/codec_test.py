@@ -19,9 +19,11 @@ from rtp_llm.dash_sc.codec import (
     DASH_ERROR_CAPACITY,
     DASH_ERROR_TIMEOUT,
     DashErrorSpec,
+    DashScInputIdsError,
     DashScParameterError,
     LLMFinishReason,
     OtherParams,
+    ParsedInputIds,
     SamplingParams,
     build_dash_error_response,
     build_error_response,
@@ -640,6 +642,7 @@ class DashScGrpcRequestTest(TestCase):
                 json_format=True,
             ),
             enable_thinking=False,
+            force_sp_accept=True,
         )
 
         sp = parse_sampling_params(req)
@@ -648,6 +651,7 @@ class DashScGrpcRequestTest(TestCase):
         self.assertEqual(json.loads(sp.response_format), {"type": "json_object"})
         self.assertTrue(sp.json_format)
         self.assertIs(op.enable_thinking, False)
+        self.assertTrue(op.force_sp_accept)
 
     def test_parse_sampling_tool_call_structural_tag_parameter(self) -> None:
         tag = _tool_call_structural_tag()
@@ -979,7 +983,9 @@ class DashScGrpcRequestTest(TestCase):
 
         ids, sp, op = parse_dash_sc_grpc_request(req)
 
-        self.assertEqual(ids, [1, 2])
+        self.assertIsInstance(ids, ParsedInputIds)
+        assert ids is not None
+        self.assertEqual(ids.values, [1, 2])
         self.assertIsNotNone(sp)
         self.assertIsNotNone(op)
         self.assertEqual(sp.max_new_think_tokens, 7)
@@ -1110,7 +1116,10 @@ class DashScGrpcRequestTest(TestCase):
         _add_tensor(req, "top_k", "INT32", [1], struct.pack("<i", 10))
         _add_tensor(req, "return_input_ids", "BOOL", [1], b"\x01")
         ids, sp, op = parse_dash_sc_grpc_request(req)
-        self.assertEqual(ids, [1, 2])
+        self.assertIsInstance(ids, ParsedInputIds)
+        assert ids is not None
+        self.assertEqual(ids.values, [1, 2])
+        self.assertEqual(ids.tensor.tolist(), [1, 2])
         self.assertIsNotNone(sp)
         self.assertIsNotNone(op)
         assert sp is not None and op is not None
@@ -1123,6 +1132,65 @@ class DashScGrpcRequestTest(TestCase):
         self.assertIsNone(ids)
         self.assertIsNone(sp)
         self.assertIsNone(op)
+
+    def test_inference_input_ids_from_int32_wire_buffer(self) -> None:
+        req = predict_v2_pb2.ModelInferRequest()
+        _add_tensor(req, "input_ids", "INT32", [3], struct.pack("<3i", 7, 8, 9))
+
+        parsed, _, _ = parse_dash_sc_grpc_request(req)
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.tensor.dtype, torch.int32)
+        self.assertEqual(parsed.tensor.tolist(), [7, 8, 9])
+        self.assertIsNone(parsed._values)
+        self.assertEqual(list(parsed.sequence), [7, 8, 9])
+        parsed.tensor[0] = 99
+        self.assertEqual(parsed.values, [7, 8, 9])
+        self.assertEqual(parse_input_ids_from_request(req), [7, 8, 9])
+
+    def test_inference_input_ids_from_int64_converts_to_engine_dtype(self) -> None:
+        req = predict_v2_pb2.ModelInferRequest()
+        _add_tensor(req, "input_ids", "INT64", [2], struct.pack("<2q", 10, 11))
+
+        parsed, _, _ = parse_dash_sc_grpc_request(req)
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.tensor.dtype, torch.int32)
+        self.assertEqual(parsed.tensor.tolist(), [10, 11])
+
+    def test_inference_input_ids_from_int64_accepts_int32_boundaries(self) -> None:
+        req = predict_v2_pb2.ModelInferRequest()
+        _add_tensor(
+            req,
+            "input_ids",
+            "INT64",
+            [2],
+            struct.pack("<2q", -(2**31), 2**31 - 1),
+        )
+
+        parsed, _, _ = parse_dash_sc_grpc_request(req)
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.tensor.tolist(), [-(2**31), 2**31 - 1])
+
+    def test_inference_input_ids_from_int64_rejects_int32_overflow(self) -> None:
+        for value in (-(2**40), 2**40):
+            with self.subTest(value=value):
+                req = predict_v2_pb2.ModelInferRequest()
+                _add_tensor(req, "input_ids", "INT64", [1], struct.pack("<q", value))
+                with self.assertRaisesRegex(
+                    DashScInputIdsError, "outside the INT32 range"
+                ):
+                    parse_dash_sc_grpc_request(req)
+
+    def test_inference_input_ids_rejects_misaligned_wire_buffer(self) -> None:
+        req = predict_v2_pb2.ModelInferRequest()
+        _add_tensor(req, "input_ids", "INT32", [1], b"\x01\x02\x03")
+        parsed, _, _ = parse_dash_sc_grpc_request(req)
+        self.assertIsNone(parsed)
 
     def test_sampling_to_generate_config(self) -> None:
         sp = SamplingParams(
@@ -1177,7 +1245,13 @@ class BuildStreamResponseFromGenerateOutputsTest(TestCase):
         out = GenerateOutput(
             output_ids=torch.tensor([7, 8, 9], dtype=torch.int32),
             finished=True,
-            aux_info=AuxInfo(input_len=10, reuse_len=4),
+            aux_info=AuxInfo(
+                input_len=10,
+                reuse_len=4,
+                cost_time=12.5,
+                first_token_cost_time=3.5,
+                wait_time=1.25,
+            ),
         )
         go = GenerateOutputs(generate_outputs=[out])
         resp = build_stream_response_from_generate_outputs(
@@ -1211,6 +1285,11 @@ class BuildStreamResponseFromGenerateOutputsTest(TestCase):
             4,
         )
         self.assertEqual(infer.parameters["prompt_token_num"].int64_param, 10)
+        self.assertEqual(infer.parameters["engine_cost_time_us"].int64_param, 12500)
+        self.assertEqual(
+            infer.parameters["engine_first_token_cost_time_us"].int64_param, 3500
+        )
+        self.assertEqual(infer.parameters["engine_wait_time_us"].int64_param, 1250)
 
     def test_serializes_compact_logprob_tensors(self) -> None:
         out = GenerateOutput(

@@ -1284,11 +1284,28 @@ def main() -> str:
                 "cache-grid mode requires --tokenizer_path or --checkpoint_path"
             )
 
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path, trust_remote_code=True
+        model_type = extract_arg(remaining, "model_type") or os.environ.get(
+            "MODEL_TYPE", ""
         )
+        checkpoint_path = extract_arg(remaining, "checkpoint_path") or tokenizer_path
+        if model_type:
+            # Keep prompt materialization on the same tokenizer path as the
+            # engine.  Some models (notably GLM-5) need RTP-LLM's registered
+            # tokenizer adapter because their tokenizer_config.json names a
+            # class that older pinned transformers releases do not export.
+            from rtp_llm.frontend.tokenizer_factory.tokenizer_factory import (
+                TokenizerFactory,
+            )
+
+            tokenizer = TokenizerFactory.create(
+                checkpoint_path, tokenizer_path, model_type
+            )
+        else:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_path, trust_remote_code=True
+            )
 
         if args.materialize_cache_cases:
             store = MaterializedCaseStore(args.materialize_cache_cases)

@@ -31,6 +31,11 @@ profile 必须有 `schema_version: 1`。`.jsonc` 支持行注释和块注释，�
 环境优先级为 `--env KEY=VALUE > profile engine_env/runtime_env > 允许继承的外部环境`。
 两个 profile 环境段不能重复定义同一变量。`runtime_env` 在启动 Bazel 前生效，
 两类环境都通过 `--test_env` 传给测试进程；最终环境写入快照。
+模型服务启动前还会将实际传给子进程的完整环境保存到对应 `result-dir/env.txt`，
+并将服务的 `ENV_FILE` 指向该文件。文件采用 `KEY=VALUE` 格式，包含服务启动时补充的
+`MODEL_TYPE`、`CHECKPOINT_PATH`、`START_PORT` 和调度器变量等，权限为 `0600`。
+续测重新启动服务时更新为本次启动环境；仅出图或已完成而跳过启动时不更新。
+这是启动环境快照，不包含各 worker 启动后自行修改的变量；CLI 参数仍保存在启动清单中。
 例如临时覆盖编译器：
 
 ```bash

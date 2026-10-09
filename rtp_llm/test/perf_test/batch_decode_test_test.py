@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import struct
 import subprocess
 import tempfile
@@ -36,6 +37,7 @@ from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
     validate_cache_grid_resume,
 )
 from rtp_llm.test.perf_test.server import EngineServer
+from rtp_llm.test.utils.maga_server_manager import MagaServerManager
 
 
 class CacheGridBatchTest(unittest.TestCase):
@@ -964,6 +966,47 @@ class BatchDecodeTest(unittest.TestCase):
 
 
 class EngineServerSchedulerModeTest(unittest.TestCase):
+    @patch.object(MagaServerManager, "stop_server")
+    @patch.object(MagaServerManager, "wait_sever_done", return_value=False)
+    @patch("rtp_llm.test.utils.maga_server_manager.subprocess.Popen")
+    def test_launch_environment_matches_subprocess_even_when_startup_fails(
+        self, popen, wait, stop
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / "result" / "env.txt"
+            with patch.dict(
+                os.environ,
+                {
+                    "TEST_UNDECLARED_OUTPUTS_DIR": directory,
+                    "MODEL_TYPE": "example_model",
+                    "CHECKPOINT_PATH": "/models/example",
+                    "CUSTOM_MODEL_OPTION": "inherited",
+                    "ENV_FILE": str(Path(directory) / "unrelated.txt"),
+                },
+                clear=True,
+            ):
+                manager = MagaServerManager(
+                    port="12345",
+                    env_args={"CUSTOM_MODEL_OPTION": "override=a b"},
+                    device_ids=[2, 3],
+                    env_file=str(env_file),
+                )
+                for option in ("first", "resumed"):
+                    manager._env_args["RUN_OPTION"] = option
+                    self.assertFalse(manager.start_server(log_to_file=False))
+                    captured = dict(
+                        line.split("=", 1) for line in env_file.read_text().splitlines()
+                    )
+                    self.assertEqual(captured, popen.call_args.kwargs["env"])
+                    self.assertEqual(captured["RUN_OPTION"], option)
+                    self.assertEqual(captured["CUSTOM_MODEL_OPTION"], "override=a b")
+                    self.assertEqual(captured["START_PORT"], "12345")
+                    self.assertEqual(captured["CUDA_VISIBLE_DEVICES"], "2,3")
+                    self.assertEqual(captured["TOKENIZER_PATH"], "/models/example")
+                    self.assertEqual(captured["ENV_FILE"], str(env_file))
+                    self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
+                self.assertFalse((Path(directory) / "unrelated.txt").exists())
+
     @patch("rtp_llm.test.perf_test.server.MagaServerManager")
     def test_nsys_disables_environment_and_cli_timeline(self, manager):
         server = self._server()
@@ -972,6 +1015,7 @@ class EngineServerSchedulerModeTest(unittest.TestCase):
         manager.return_value.start_server.return_value = True
         server.start(8192, 1)
         options = manager.call_args.kwargs
+        self.assertEqual(options["env_file"], "/tmp/result/env.txt")
         self.assertEqual(options["env_args"]["GEN_TIMELINE_SYNC"], "0")
         self.assertTrue(options["smoke_args_str"].endswith("--gen_timeline_sync=False"))
 

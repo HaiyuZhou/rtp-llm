@@ -41,6 +41,7 @@ class EngineServer:
             env_args=env,
             process_file_name="process.log",
             smoke_args_str=engine_cli,
+            env_file=os.path.join(self._args.result_dir, "env.txt"),
         )
         if not self._server.start_server():
             self._server.print_process_log()

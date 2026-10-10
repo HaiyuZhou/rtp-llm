@@ -737,6 +737,7 @@ def _apply_dash_sc_controls_to_generate_config(
     default_thinking_mode: ThinkingMode,
 ) -> None:
     """Apply DashSC request controls over the deployment THINK_MODE default."""
+    generate_config.force_sp_accept = bool(request_controls.force_sp_accept)
     request_max_think = sampling.max_new_think_tokens
     if request_max_think is None:
         request_max_think = request_controls.max_new_think_tokens
@@ -1735,7 +1736,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     )
                     yield resp
                     return
-                input_ids_list = parsed_input_ids.values
+                input_ids_list = parsed_input_ids.sequence
                 if first_request:
                     # Hand the record the payload we just parsed so it does not
                     # decode the same request proto again (the input_ids tensor

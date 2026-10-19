@@ -84,13 +84,23 @@ cold 请求使用独立 token ID。
 
 压力发送器是有界 open-loop：任务队列只保存几何和计划时间，完整 token IDs 只在工作线程内构造，
 内存随 `cache_pressure_client_concurrency` 而不是总请求数增长。request rate 为 0 时立即填满
-客户端并发；正数时支持 `constant` 和 `poisson` 到达。BatchDecodeScheduler 只在攒满
+客户端并发；正数时支持 `constant` 和 `poisson` 到达。
+
+`cache_pressure_scheduler=batch_decode` 是默认模式。BatchDecodeScheduler 只在攒满
 `cache_pressure_batch_size` 后执行，因此正式请求数不是整批时，runner 自动增加不计入 metric 的
 padding 请求，防止尾批永久等待。padding 失败会使本次测试失败。
 
-若要观察服务端排队，配置 `client_concurrency > batch_size`；两者相等只保证连续组批，
-不保证 scheduler 内存在等待请求。`engine.concurrency_limit` 必须至少覆盖 client concurrency
-和 seed count。该模式目前要求 DP=1、未分组 batch=1、`dashsc_input_ids`、明确 block size 和
+`cache_pressure_scheduler=fifo` 以 `USE_BATCH_DECODE_SCHEDULER=0` 启动服务，不调用运行时
+scheduler 控制接口。FIFO 不等待固定 batch，也不增加 padding；空闲时首个请求可立即运行，执行中
+到达的请求在下一个 prefill 边界按并发、token budget 和 KV 资源动态组批。
+`cache_pressure_batch_size` 在 FIFO 下不适用，必须保持默认值 1。未显式配置 client concurrency 时，
+FIFO 使用 `engine.concurrency_limit`。结果的 `pressure_scheduler` 和
+`continuous_pressure.scheduler` 区分两种口径；FIFO 的 `scheduler_batch_size` 为 null。
+
+固定批模式若要观察服务端排队，配置 `client_concurrency > batch_size`；两者相等只保证连续组批，
+不保证 scheduler 内存在等待请求。FIFO 模式通过提高 client concurrency 或 request rate 制造积压。
+`engine.concurrency_limit` 必须至少覆盖 client concurrency 和 seed count。该模式目前要求
+DP=1、未分组 batch=1、`dashsc_input_ids`、明确 block size 和
 完整 commit tail；不支持 fixed workspace、物化输入、profiling 或额外的 `cache_shared_seed`。
 
 结果使用 `seed_mode=continuous_shared_prefix_v1`。每个 run 记录 seed family、全局发送序号、

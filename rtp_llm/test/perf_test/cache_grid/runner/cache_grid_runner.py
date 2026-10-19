@@ -977,6 +977,7 @@ class CacheGridRunner:
         request_timeout: int = 7200,
         shared_seed: bool = False,
         pressure_mode: str = "case",
+        pressure_scheduler: str = "batch_decode",
         pressure_batch_size: int = 1,
         pressure_client_concurrency: int = 2,
         pressure_seed_count: int = 4,
@@ -1041,6 +1042,7 @@ class CacheGridRunner:
         self._shared_seed_record = None
         self._shared_seed_refreshes = []
         self.pressure_mode = pressure_mode
+        self.pressure_scheduler = pressure_scheduler
         self.pressure_batch_size = pressure_batch_size
         self.pressure_client_concurrency = pressure_client_concurrency
         self.pressure_seed_count = pressure_seed_count
@@ -1053,6 +1055,12 @@ class CacheGridRunner:
         self._continuous_prompt_lock = threading.Lock()
         if pressure_mode not in {"case", "continuous"}:
             raise ValueError(f"unsupported cache pressure mode: {pressure_mode}")
+        if pressure_scheduler not in {"batch_decode", "fifo"}:
+            raise ValueError(
+                f"unsupported continuous pressure scheduler: {pressure_scheduler}"
+            )
+        if pressure_mode != "continuous" and pressure_scheduler != "batch_decode":
+            raise ValueError("FIFO cache pressure requires continuous mode")
         if pressure_mode == "continuous":
             if pressure_batch_size <= 0 or pressure_client_concurrency <= 0:
                 raise ValueError(
@@ -1068,9 +1076,17 @@ class CacheGridRunner:
                 raise ValueError(
                     "continuous pressure arrival must be constant or poisson"
                 )
-            if pressure_client_concurrency < pressure_batch_size:
+            if (
+                pressure_scheduler == "batch_decode"
+                and pressure_client_concurrency < pressure_batch_size
+            ):
                 raise ValueError(
                     "continuous pressure client concurrency must be at least batch size"
+                )
+            if pressure_scheduler == "fifo" and pressure_batch_size != 1:
+                raise ValueError(
+                    "continuous FIFO pressure does not use pressure_batch_size; "
+                    "leave it at 1"
                 )
             if shared_seed:
                 raise ValueError(
@@ -1098,6 +1114,8 @@ class CacheGridRunner:
                 )
             run_config = dict(run_config or {})
             run_config["cache_seed_mode"] = "continuous_shared_prefix_v1"
+            if pressure_scheduler == "fifo":
+                run_config["cache_pressure_scheduler"] = "fifo"
         if shared_seed:
             if request_transport != "dashsc_input_ids":
                 raise ValueError("shared seed requires dashsc_input_ids transport")
@@ -1405,6 +1423,7 @@ class CacheGridRunner:
             payload["shared_seed"] = self._shared_seed_record
             payload["shared_seed_refreshes"] = self._shared_seed_refreshes
         if self.pressure_mode == "continuous":
+            payload["pressure_scheduler"] = self.pressure_scheduler
             payload["continuous_seeds"] = self._continuous_seed_records
             payload["continuous_pressure"] = self._continuous_summary
         if asynchronous:
@@ -1643,7 +1662,8 @@ class CacheGridRunner:
                 seed_len, f"continuous_seed_{family}_{seed_id}_"
             )
             seeds.append((family, seed_id, ids))
-        self._set_prefill_batch_size(len(seeds))
+        if self.pressure_scheduler == "batch_decode":
+            self._set_prefill_batch_size(len(seeds))
         barrier = threading.Barrier(len(seeds))
 
         def send(item):
@@ -1773,7 +1793,12 @@ class CacheGridRunner:
             "seed": {},
             "seed_mode": "continuous_shared_prefix_v1",
             "execution_mode": "continuous_pressure_v1",
-            "pressure_batch_size": self.pressure_batch_size,
+            "pressure_scheduler": self.pressure_scheduler,
+            "pressure_batch_size": (
+                self.pressure_batch_size
+                if self.pressure_scheduler == "batch_decode"
+                else None
+            ),
             "pressure_client_concurrency": self.pressure_client_concurrency,
             "runs": runs,
             "reuse_exact": reuse_exact,
@@ -1807,7 +1832,11 @@ class CacheGridRunner:
                         }
                     )
             rng.shuffle(jobs)
-            padding_count = (-len(jobs)) % self.pressure_batch_size
+            padding_count = (
+                (-len(jobs)) % self.pressure_batch_size
+                if self.pressure_scheduler == "batch_decode"
+                else 0
+            )
             for index in range(padding_count):
                 padding = dict(jobs[index % len(jobs)])
                 padding["padding"] = True
@@ -1830,7 +1859,8 @@ class CacheGridRunner:
                         offset += 1.0 / self.pressure_request_rate
                 offsets.append(offset)
 
-            self._set_prefill_batch_size(self.pressure_batch_size)
+            if self.pressure_scheduler == "batch_decode":
+                self._set_prefill_batch_size(self.pressure_batch_size)
             pressure_started_wall = time.time()
             pressure_started = time.perf_counter()
 
@@ -1889,7 +1919,8 @@ class CacheGridRunner:
                 ]
                 results = [future.result() for future in futures]
         finally:
-            self._set_prefill_batch_size(1)
+            if self.pressure_scheduler == "batch_decode":
+                self._set_prefill_batch_size(1)
 
         by_key = {self.case_key(case): [] for case in pending}
         for job, result in zip(jobs, results):
@@ -1917,10 +1948,15 @@ class CacheGridRunner:
             "schema_version": 1,
             "started_at_epoch_s": pressure_started_wall,
             "execution_mode": "continuous_pressure_v1",
+            "scheduler": self.pressure_scheduler,
             "arrival": self.pressure_arrival,
             "request_rate": self.pressure_request_rate,
             "random_seed": self.pressure_random_seed,
-            "scheduler_batch_size": self.pressure_batch_size,
+            "scheduler_batch_size": (
+                self.pressure_batch_size
+                if self.pressure_scheduler == "batch_decode"
+                else None
+            ),
             "client_concurrency": self.pressure_client_concurrency,
             "configured_seed_count": self.pressure_seed_count,
             "effective_seed_count": len(self._continuous_seed_ids),

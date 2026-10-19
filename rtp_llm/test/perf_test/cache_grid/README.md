@@ -108,6 +108,12 @@ python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_random_batch_grid \
   --pressure-seed-count 4 --pressure-batch-size 4 \
   --pressure-client-concurrency 12 --pressure-request-rate 0
 
+# FIFO 连续压力：不固定服务端 batch，按到达流量动态组批。
+./tools/cache_perf run --profile /path/local.jsonc --grid /path/grid.json \
+  --result-dir /path/continuous-fifo --runs 20 --pressure-mode continuous \
+  --pressure-scheduler fifo --pressure-seed-count 4 \
+  --pressure-client-concurrency 12 --pressure-request-rate 20
+
 # 单 grid 续测；多 grid 则用 --result-root。
 ./tools/cache_perf pipeline --test-mode resume --result-dir /path/new-results
 ./tools/cache_perf pipeline --test-mode resume --result-root /path/new-batch-results
@@ -137,6 +143,10 @@ fixed workspace、materialized cases、profiling 或 `cache_shared_seed` 混用�
 正数配合 `constant` 或 `poisson` 到达模型。要制造服务端排队，应让
 `pressure-client-concurrency > pressure-batch-size`，同时保证 `engine.concurrency_limit`
 不小于 client concurrency 和 seed count。详细执行与结果字段见参考文档。
+默认 `--pressure-scheduler batch_decode` 使用固定批；`--pressure-scheduler fifo` 使用线上动态
+组批语义，不接受 `--pressure-batch-size`，也不会为了凑批增加 padding。FIFO 下实际 batch 由
+到达速率、客户端并发、token budget 和 KV 资源共同决定；未指定客户端并发时使用
+`engine.concurrency_limit`。
 `--skip-test` 不接受 profile/grid/runs/env 等启动覆盖项。
 
 后处理默认包含所有 batch；`--batch-size` 是可选过滤器。

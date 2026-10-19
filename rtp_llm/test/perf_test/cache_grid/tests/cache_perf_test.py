@@ -227,6 +227,7 @@ class CachePerfTest(unittest.TestCase):
             self.args(
                 extra=[
                     "--pressure-mode=continuous",
+                    "--pressure-scheduler=batch_decode",
                     "--pressure-batch-size=4",
                     "--pressure-client-concurrency=8",
                     "--pressure-seed-count=3",
@@ -240,6 +241,7 @@ class CachePerfTest(unittest.TestCase):
         command = plan["command"]
         for argument in (
             "--cache_pressure_mode=continuous",
+            "--cache_pressure_scheduler=batch_decode",
             "--cache_pressure_batch_size=4",
             "--cache_pressure_client_concurrency=8",
             "--cache_pressure_seed_count=3",
@@ -254,6 +256,31 @@ class CachePerfTest(unittest.TestCase):
         ]
         self.assertIn("--test_arg=--cache_pressure_batch_size=1", defaults)
         self.assertIn("--test_arg=--cache_pressure_client_concurrency=0", defaults)
+
+        fifo = cli.build_plan(
+            self.args(
+                extra=[
+                    "--pressure-mode=continuous",
+                    "--pressure-scheduler=fifo",
+                    "--pressure-client-concurrency=8",
+                ]
+            ),
+            {},
+        )["command"]
+        self.assertIn("--test_arg=--cache_pressure_scheduler=fifo", fifo)
+
+    def test_fifo_pressure_rejects_fixed_batch_size(self):
+        with self.assertRaisesRegex(ValueError, "does not apply to FIFO"):
+            cli.build_plan(
+                self.args(
+                    extra=[
+                        "--pressure-mode=continuous",
+                        "--pressure-scheduler=fifo",
+                        "--pressure-batch-size=4",
+                    ]
+                ),
+                {},
+            )
 
     def test_resume_rejects_pressure_overrides(self):
         self.save_run()

@@ -184,7 +184,16 @@ def _build_cache_resume_config(
             **(
                 {
                     "cache_pressure_mode": args.cache_pressure_mode,
-                    "cache_pressure_batch_size": args.cache_pressure_batch_size,
+                    **(
+                        {"cache_pressure_scheduler": "fifo"}
+                        if args.cache_pressure_scheduler == "fifo"
+                        else {}
+                    ),
+                    **(
+                        {"cache_pressure_batch_size": (args.cache_pressure_batch_size)}
+                        if args.cache_pressure_scheduler == "batch_decode"
+                        else {}
+                    ),
                     "cache_pressure_client_concurrency": (
                         args.cache_pressure_client_concurrency
                     ),
@@ -568,15 +577,22 @@ def _ensure_xgrammar_lib_path() -> None:
             return
 
 
-def _ensure_batch_decode_scheduler(remaining: List[str]) -> None:
-    """Require the scheduler used by fixed-batch cache-grid measurements."""
+def _ensure_batch_decode_scheduler(
+    remaining: List[str], *, enabled: bool = True
+) -> None:
+    """Make the engine scheduler match the cache-grid execution contract."""
     value = extract_arg(remaining, "use_batch_decode_scheduler")
     if value is None:
-        remaining.extend(["--use_batch_decode_scheduler", "1"])
+        remaining.extend(["--use_batch_decode_scheduler", "1" if enabled else "0"])
         return
-    if str(value).lower() not in ("1", "true"):
+    normalized = str(value).lower()
+    if normalized not in ("0", "false", "1", "true"):
+        raise ValueError("--use_batch_decode_scheduler must be a boolean")
+    actual = normalized in ("1", "true")
+    if actual != enabled:
         raise ValueError(
-            "cache-grid measurements require --use_batch_decode_scheduler=1"
+            "cache-grid scheduler mismatch: "
+            f"--use_batch_decode_scheduler must be {int(enabled)}"
         )
 
 
@@ -914,7 +930,15 @@ def main() -> str:
     _ensure_xgrammar_lib_path()
     _apply_run_overrides(args)
     remaining = resolve_perf_engine_paths(remaining)
-    _ensure_batch_decode_scheduler(remaining)
+    if args.cache_pressure_scheduler == "fifo":
+        if not args.cache_grid_json:
+            raise ValueError("FIFO scheduler is only supported by cache-grid pressure")
+        if args.cache_pressure_mode != "continuous":
+            raise ValueError(
+                "FIFO cache pressure requires --cache_pressure_mode=continuous"
+            )
+    use_batch_decode_scheduler = args.cache_pressure_scheduler != "fifo"
+    _ensure_batch_decode_scheduler(remaining, enabled=use_batch_decode_scheduler)
     generate_config = json.loads(args.generate_config)
     if args.cache_profile_runs and args.dp_size != 1:
         raise ValueError(
@@ -938,8 +962,18 @@ def main() -> str:
             raise ValueError("--cache_commit_tail_tokens must be positive")
         if args.cache_checkpoint_every <= 0:
             raise ValueError("--cache_checkpoint_every must be positive")
-        if args.cache_pressure_batch_size <= 0:
+        if (
+            args.cache_pressure_scheduler == "batch_decode"
+            and args.cache_pressure_batch_size <= 0
+        ):
             raise ValueError("--cache_pressure_batch_size must be positive")
+        if (
+            args.cache_pressure_scheduler == "fifo"
+            and args.cache_pressure_batch_size != 1
+        ):
+            raise ValueError(
+                "--cache_pressure_batch_size does not apply to FIFO; leave it at 1"
+            )
         if args.cache_pressure_seed_count <= 0:
             raise ValueError("--cache_pressure_seed_count must be positive")
         if args.cache_pressure_request_rate < 0:
@@ -950,10 +984,13 @@ def main() -> str:
             args.cache_pressure_mode == "continuous"
             and args.cache_pressure_client_concurrency == 0
         ):
-            args.cache_pressure_client_concurrency = min(
-                args.concurrency_limit,
-                max(2, 2 * args.cache_pressure_batch_size),
-            )
+            if args.cache_pressure_scheduler == "fifo":
+                args.cache_pressure_client_concurrency = args.concurrency_limit
+            else:
+                args.cache_pressure_client_concurrency = min(
+                    args.concurrency_limit,
+                    max(2, 2 * args.cache_pressure_batch_size),
+                )
         if args.materialize_cache_cases and args.cache_case_files:
             raise ValueError(
                 "--materialize_cache_cases and --cache_case_files are mutually "
@@ -1058,7 +1095,11 @@ def main() -> str:
                     "continuous cache pressure requires a known block size and "
                     "full commit tail"
                 )
-            if args.cache_pressure_client_concurrency < args.cache_pressure_batch_size:
+            if (
+                args.cache_pressure_scheduler == "batch_decode"
+                and args.cache_pressure_client_concurrency
+                < args.cache_pressure_batch_size
+            ):
                 raise ValueError(
                     "continuous pressure client concurrency must be at least "
                     "the scheduler batch size"
@@ -1246,15 +1287,17 @@ def main() -> str:
                 max_seq_len=max(
                     max_input_len + args.decode_test_length, args.max_seq_len
                 ),
-                # Admission must allow the complete fixed batch to reach the scheduler.
+                # The frontend rejects requests above this admission limit.
                 max_concurrency=args.concurrency_limit,
+                use_batch_decode_scheduler=use_batch_decode_scheduler,
             )
             if args.cache_request_transport == "dashsc_input_ids":
                 effective_cache_grpc_port = args.cache_grpc_port or server.port + 8
-            # CacheGridRunner bypasses GridRunner/BatchPerfImpl, whose run() normally
-            # switches BatchDecodeScheduler to prefill. Configure it explicitly before
-            # the block-size probe, cache seeds, or measurement requests are issued.
-            server.set_scheduler_mode(batch_size=1, mode="prefill")
+            if use_batch_decode_scheduler:
+                # CacheGridRunner bypasses GridRunner/BatchPerfImpl, whose run() normally
+                # switches BatchDecodeScheduler to prefill. Configure it explicitly before
+                # the block-size probe, cache seeds, or measurement requests are issued.
+                server.set_scheduler_mode(batch_size=1, mode="prefill")
             metrics = CacheGridRunner(
                 server.port,
                 tokenizer,
@@ -1263,6 +1306,7 @@ def main() -> str:
                 request_timeout=args.cache_request_timeout,
                 shared_seed=args.cache_shared_seed,
                 pressure_mode=args.cache_pressure_mode,
+                pressure_scheduler=args.cache_pressure_scheduler,
                 pressure_batch_size=args.cache_pressure_batch_size,
                 pressure_client_concurrency=args.cache_pressure_client_concurrency,
                 pressure_seed_count=args.cache_pressure_seed_count,

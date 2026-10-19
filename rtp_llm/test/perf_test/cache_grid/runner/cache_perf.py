@@ -160,6 +160,7 @@ def build_plan(args, inherited=None):
     pressure_tuning = any(
         value is not None
         for value in (
+            args.pressure_scheduler,
             args.pressure_batch_size,
             args.pressure_client_concurrency,
             args.pressure_seed_count,
@@ -200,6 +201,10 @@ def build_plan(args, inherited=None):
         )
     if pressure_tuning and args.pressure_mode is None:
         raise ValueError("pressure tuning requires --pressure-mode")
+    if args.pressure_scheduler == "fifo" and args.pressure_mode != "continuous":
+        raise ValueError("FIFO pressure scheduler requires --pressure-mode=continuous")
+    if args.pressure_scheduler == "fifo" and args.pressure_batch_size not in (None, 1):
+        raise ValueError("--pressure-batch-size does not apply to FIFO")
     if args.mode == "profile" and args.pressure_mode == "continuous":
         raise ValueError("profile mode does not support continuous pressure")
     if replay != bool(args.cases):
@@ -301,6 +306,7 @@ def build_plan(args, inherited=None):
         if args.pressure_mode is not None:
             updates.update(
                 cache_pressure_mode=args.pressure_mode,
+                cache_pressure_scheduler=(args.pressure_scheduler or "batch_decode"),
                 cache_pressure_batch_size=(
                     1 if args.pressure_batch_size is None else args.pressure_batch_size
                 ),
@@ -538,6 +544,7 @@ def parser():
     p.add_argument("--cases", help="comma-separated original case IDs")
     p.add_argument("--runs", type=int)
     p.add_argument("--pressure-mode", choices=("case", "continuous"))
+    p.add_argument("--pressure-scheduler", choices=("batch_decode", "fifo"))
     p.add_argument("--pressure-batch-size", type=int)
     p.add_argument("--pressure-client-concurrency", type=int)
     p.add_argument("--pressure-seed-count", type=int)

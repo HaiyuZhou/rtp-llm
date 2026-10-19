@@ -107,10 +107,22 @@ def parse_args(
         help="case-by-case measurement or an interleaved continuous request stream",
     )
     perf.add_argument(
+        "--cache_pressure_scheduler",
+        choices=("batch_decode", "fifo"),
+        default="batch_decode",
+        help=(
+            "Scheduler used by continuous pressure: fixed-size BatchDecodeScheduler "
+            "or production-style dynamic FIFO batching"
+        ),
+    )
+    perf.add_argument(
         "--cache_pressure_batch_size",
         type=int,
         default=1,
-        help="BatchDecodeScheduler prefill batch size in continuous mode",
+        help=(
+            "BatchDecodeScheduler prefill batch size in continuous mode; "
+            "must remain 1 and is ignored with FIFO"
+        ),
     )
     perf.add_argument(
         "--cache_pressure_client_concurrency",

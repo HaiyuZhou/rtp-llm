@@ -526,6 +526,7 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertEqual(args.cache_request_transport, "dashsc_input_ids")
         self.assertEqual(args.cache_grpc_port, 0)
         self.assertEqual(args.cache_pressure_mode, "case")
+        self.assertEqual(args.cache_pressure_scheduler, "batch_decode")
         self.assertEqual(args.cache_pressure_batch_size, 1)
         self.assertEqual(args.cache_pressure_client_concurrency, 0)
         self.assertEqual(args.cache_pressure_seed_count, 4)
@@ -951,15 +952,25 @@ class BatchDecodeTest(unittest.TestCase):
             with self.subTest(option=option), self.assertRaises(SystemExit):
                 parse_args([option])
 
-    def test_cache_grid_requires_batch_decode_scheduler(self):
+    def test_cache_grid_selects_requested_scheduler(self):
         remaining = []
         _ensure_batch_decode_scheduler(remaining)
         self.assertEqual(remaining, ["--use_batch_decode_scheduler", "1"])
+        remaining = []
+        _ensure_batch_decode_scheduler(remaining, enabled=False)
+        self.assertEqual(remaining, ["--use_batch_decode_scheduler", "0"])
         for value in ("0", "false"):
             with self.subTest(value=value), self.assertRaisesRegex(
-                ValueError, "require --use_batch_decode_scheduler=1"
+                ValueError, "must be 1"
             ):
                 _ensure_batch_decode_scheduler(["--use_batch_decode_scheduler", value])
+        for value in ("1", "true"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "must be 0"
+            ):
+                _ensure_batch_decode_scheduler(
+                    ["--use_batch_decode_scheduler", value], enabled=False
+                )
 
     def test_dsv4_example_injects_model_identity_paths_and_launch_config(self):
         profile = (
@@ -2805,6 +2816,60 @@ class ContinuousPressureTest(unittest.TestCase):
                 )
             with self.assertRaisesRegex(ValueError, "at least batch size"):
                 self.runner(directory, pressure_client_concurrency=2)
+
+    def test_fifo_uses_dynamic_batching_without_padding_or_scheduler_control(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.runner(
+                directory,
+                pressure_scheduler="fifo",
+                pressure_batch_size=1,
+                pressure_client_concurrency=3,
+            )
+            self.addCleanup(runner._close_resources)
+            measured = []
+
+            def post(prompt, ids, request_id):
+                if request_id.startswith("continuous_seed:"):
+                    return {
+                        "prefill_time_ms": 1,
+                        "success": True,
+                        "input_len": len(ids),
+                        "output_len": 1,
+                        "reuse_len": 0,
+                    }
+                key = request_id.split(":", 1)[0]
+                cache_len = int(key.rsplit("cache", 1)[1])
+                measured.append(request_id)
+                return {
+                    "prefill_time_ms": 2,
+                    "success": True,
+                    "input_len": len(ids),
+                    "output_len": 1,
+                    "reuse_len": cache_len,
+                    "wait_time_ms": 1,
+                }
+
+            with patch.object(runner, "_post_request", side_effect=post), patch.object(
+                runner, "_probe_reuse_granularity"
+            ), patch.object(runner, "_set_prefill_batch_size") as scheduler:
+                metrics = runner.run()
+
+            scheduler.assert_not_called()
+            self.assertEqual(len(measured), 6)
+            self.assertTrue(all(metric["status"] == "ok" for metric in metrics))
+            self.assertTrue(
+                all(metric["pressure_scheduler"] == "fifo" for metric in metrics)
+            )
+            saved = json.loads(
+                (Path(directory) / "cache_grid_results.json").read_text()
+            )
+            self.assertEqual(saved["pressure_scheduler"], "fifo")
+            self.assertEqual(saved["run_config"]["cache_pressure_scheduler"], "fifo")
+            summary = saved["continuous_pressure"]
+            self.assertEqual(summary["scheduler"], "fifo")
+            self.assertIsNone(summary["scheduler_batch_size"])
+            self.assertEqual(summary["measured_requests"], 6)
+            self.assertEqual(summary["padding_requests"], 0)
 
     def test_case_mode_ignores_auto_pressure_concurrency_sentinel(self):
         with tempfile.TemporaryDirectory() as directory:

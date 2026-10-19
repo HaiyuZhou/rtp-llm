@@ -157,6 +157,17 @@ def load_cases(path):
 
 def build_plan(args, inherited=None):
     inherited = dict(os.environ if inherited is None else inherited)
+    pressure_tuning = any(
+        value is not None
+        for value in (
+            args.pressure_batch_size,
+            args.pressure_client_concurrency,
+            args.pressure_seed_count,
+            args.pressure_request_rate,
+            args.pressure_arrival,
+            args.pressure_random_seed,
+        )
+    )
     if args.profile_backend == "nsys" and args.mode != "profile":
         raise ValueError("--profile-backend=nsys requires profile mode")
     if not 0 <= args.nsys_tail_seconds <= 60:
@@ -181,10 +192,16 @@ def build_plan(args, inherited=None):
         or args.output_base
         or args.bazel
         or args.skip_reuse_validation
+        or args.pressure_mode is not None
+        or pressure_tuning
     ):
         raise ValueError(
             "resume uses frozen configuration; launch overrides are forbidden"
         )
+    if pressure_tuning and args.pressure_mode is None:
+        raise ValueError("pressure tuning requires --pressure-mode")
+    if args.mode == "profile" and args.pressure_mode == "continuous":
+        raise ValueError("profile mode does not support continuous pressure")
     if replay != bool(args.cases):
         raise ValueError("--cases is required only for retest/profile")
     if (args.profile is None) != (args.grid is None):
@@ -280,6 +297,32 @@ def build_plan(args, inherited=None):
         if not saved:
             updates["cache_commit_tail_tokens"] = profile.get("cache_grid", {}).get(
                 "commit_tail_tokens", 4096
+            )
+        if args.pressure_mode is not None:
+            updates.update(
+                cache_pressure_mode=args.pressure_mode,
+                cache_pressure_batch_size=(
+                    1 if args.pressure_batch_size is None else args.pressure_batch_size
+                ),
+                cache_pressure_client_concurrency=(
+                    0
+                    if args.pressure_client_concurrency is None
+                    else args.pressure_client_concurrency
+                ),
+                cache_pressure_seed_count=(
+                    4 if args.pressure_seed_count is None else args.pressure_seed_count
+                ),
+                cache_pressure_request_rate=(
+                    0.0
+                    if args.pressure_request_rate is None
+                    else args.pressure_request_rate
+                ),
+                cache_pressure_arrival=args.pressure_arrival or "constant",
+                cache_pressure_random_seed=(
+                    0
+                    if args.pressure_random_seed is None
+                    else args.pressure_random_seed
+                ),
             )
         workspace = grid_workspace_tokens(payload)
         if workspace is not None:
@@ -494,6 +537,13 @@ def parser():
     p.add_argument("--result-dir", type=Path)
     p.add_argument("--cases", help="comma-separated original case IDs")
     p.add_argument("--runs", type=int)
+    p.add_argument("--pressure-mode", choices=("case", "continuous"))
+    p.add_argument("--pressure-batch-size", type=int)
+    p.add_argument("--pressure-client-concurrency", type=int)
+    p.add_argument("--pressure-seed-count", type=int)
+    p.add_argument("--pressure-request-rate", type=float)
+    p.add_argument("--pressure-arrival", choices=("constant", "poisson"))
+    p.add_argument("--pressure-random-seed", type=int)
     p.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
     p.add_argument("--config", action="append", help="repeatable Bazel configuration")
     p.add_argument("--output-base")

@@ -182,6 +182,21 @@ def _build_cache_resume_config(
             "expected_cache_block_size": expected_cache_block_size,
             "cache_request_transport": args.cache_request_transport,
             **(
+                {
+                    "cache_pressure_mode": args.cache_pressure_mode,
+                    "cache_pressure_batch_size": args.cache_pressure_batch_size,
+                    "cache_pressure_client_concurrency": (
+                        args.cache_pressure_client_concurrency
+                    ),
+                    "cache_pressure_seed_count": args.cache_pressure_seed_count,
+                    "cache_pressure_request_rate": args.cache_pressure_request_rate,
+                    "cache_pressure_arrival": args.cache_pressure_arrival,
+                    "cache_pressure_random_seed": args.cache_pressure_random_seed,
+                }
+                if args.cache_pressure_mode == "continuous"
+                else {}
+            ),
+            **(
                 {"workspace_tokens": args.cache_workspace_tokens}
                 if getattr(args, "cache_workspace_tokens", None) is not None
                 else {}
@@ -218,8 +233,13 @@ def _configure_cache_batch_limits(args, remaining, cases, *, cache_alignment=Non
             raise ValueError(
                 "cache_alignment must be a multiple of the CP execution alignment"
             )
-        if args.cache_shared_seed:
-            raise ValueError("fixed workspace does not support cache_shared_seed mode")
+        if (
+            getattr(args, "cache_shared_seed", False)
+            or getattr(args, "cache_pressure_mode", "case") == "continuous"
+        ):
+            raise ValueError(
+                "fixed workspace does not support shared-seed or continuous pressure mode"
+            )
         budget = int(extract_arg(remaining, "max_batch_tokens_size") or workspace)
         budget = min(budget or workspace, workspace)
         stats = validate_token_budget(
@@ -918,6 +938,22 @@ def main() -> str:
             raise ValueError("--cache_commit_tail_tokens must be positive")
         if args.cache_checkpoint_every <= 0:
             raise ValueError("--cache_checkpoint_every must be positive")
+        if args.cache_pressure_batch_size <= 0:
+            raise ValueError("--cache_pressure_batch_size must be positive")
+        if args.cache_pressure_seed_count <= 0:
+            raise ValueError("--cache_pressure_seed_count must be positive")
+        if args.cache_pressure_request_rate < 0:
+            raise ValueError("--cache_pressure_request_rate must be non-negative")
+        if args.cache_pressure_client_concurrency < 0:
+            raise ValueError("--cache_pressure_client_concurrency must be non-negative")
+        if (
+            args.cache_pressure_mode == "continuous"
+            and args.cache_pressure_client_concurrency == 0
+        ):
+            args.cache_pressure_client_concurrency = min(
+                args.concurrency_limit,
+                max(2, 2 * args.cache_pressure_batch_size),
+            )
         if args.materialize_cache_cases and args.cache_case_files:
             raise ValueError(
                 "--materialize_cache_cases and --cache_case_files are mutually "
@@ -989,6 +1025,57 @@ def main() -> str:
                 raise ValueError(
                     "--cache_shared_seed requires a known block size and full commit tail"
                 )
+        if args.cache_pressure_mode == "continuous":
+            if args.cache_shared_seed:
+                raise ValueError(
+                    "--cache_pressure_mode=continuous cannot use --cache_shared_seed"
+                )
+            if args.cache_request_transport != "dashsc_input_ids":
+                raise ValueError(
+                    "continuous cache pressure requires dashsc_input_ids transport"
+                )
+            if args.dp_size != 1:
+                raise ValueError("continuous cache pressure currently requires DP=1")
+            if any(is_grouped_case(c) or c["batch_size"] != 1 for c in cases):
+                raise ValueError(
+                    "continuous cache pressure supports only ungrouped batch_size=1"
+                )
+            if (
+                args.cache_profile_runs
+                or args.cache_profile_only
+                or args.cache_case_files
+                or args.materialize_cache_cases
+            ):
+                raise ValueError(
+                    "continuous cache pressure does not support profiling or "
+                    "materialized cases"
+                )
+            if (
+                expected_block_size <= 0
+                or args.cache_commit_tail_tokens < expected_block_size
+            ):
+                raise ValueError(
+                    "continuous cache pressure requires a known block size and "
+                    "full commit tail"
+                )
+            if args.cache_pressure_client_concurrency < args.cache_pressure_batch_size:
+                raise ValueError(
+                    "continuous pressure client concurrency must be at least "
+                    "the scheduler batch size"
+                )
+            required_admission = max(
+                args.cache_pressure_client_concurrency,
+                (
+                    args.cache_pressure_seed_count
+                    if any(int(case["cache_len"]) for case in cases)
+                    else 0
+                ),
+            )
+            if args.concurrency_limit < required_admission:
+                raise ValueError(
+                    f"--concurrency_limit={args.concurrency_limit} cannot admit "
+                    f"continuous pressure concurrency={required_admission}"
+                )
         unknown_profile_ids = set(args.cache_profile_case_ids) - {
             int(c["case_id"]) for c in cases
         }
@@ -1012,6 +1099,8 @@ def main() -> str:
         )
         if args.cache_shared_seed:
             resume_config["cache_seed_mode"] = "shared_prefix_v1"
+        elif args.cache_pressure_mode == "continuous":
+            resume_config["cache_seed_mode"] = "continuous_shared_prefix_v1"
         checkpoint = validate_cache_grid_resume(
             args.result_dir,
             grid_sha256=grid_sha256,
@@ -1022,6 +1111,7 @@ def main() -> str:
             request_transport=args.cache_request_transport,
             run_config=resume_config,
             shared_seed=args.cache_shared_seed,
+            pressure_mode=args.cache_pressure_mode,
             allow_resume_mismatch=args.allow_resume_mismatch,
             require_resume=args.require_cache_resume,
         )
@@ -1172,6 +1262,13 @@ def main() -> str:
                 args.result_dir,
                 request_timeout=args.cache_request_timeout,
                 shared_seed=args.cache_shared_seed,
+                pressure_mode=args.cache_pressure_mode,
+                pressure_batch_size=args.cache_pressure_batch_size,
+                pressure_client_concurrency=args.cache_pressure_client_concurrency,
+                pressure_seed_count=args.cache_pressure_seed_count,
+                pressure_request_rate=args.cache_pressure_request_rate,
+                pressure_arrival=args.cache_pressure_arrival,
+                pressure_random_seed=args.cache_pressure_random_seed,
                 measure_runs=args.cache_measure_runs,
                 checkpoint_every=args.cache_checkpoint_every,
                 cache_commit_tail_tokens=args.cache_commit_tail_tokens,

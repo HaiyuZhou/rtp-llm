@@ -102,6 +102,12 @@ python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_random_batch_grid \
 ./tools/cache_perf run --profile /path/local.jsonc --grid /path/grid.json \
   --result-dir /path/test-only --runs 3
 
+# 连续压力：4 个长 seed family，scheduler 每批 4 请求，最多 12 个请求在途。
+./tools/cache_perf run --profile /path/local.jsonc --grid /path/grid.json \
+  --result-dir /path/continuous --runs 20 --pressure-mode continuous \
+  --pressure-seed-count 4 --pressure-batch-size 4 \
+  --pressure-client-concurrency 12 --pressure-request-rate 0
+
 # 单 grid 续测；多 grid 则用 --result-root。
 ./tools/cache_perf pipeline --test-mode resume --result-dir /path/new-results
 ./tools/cache_perf pipeline --test-mode resume --result-root /path/new-batch-results
@@ -123,6 +129,14 @@ python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_random_batch_grid \
 恢复读取冻结的 profile/grid/环境，不接受这些启动配置的覆盖。
 多 grid 恢复会跳过已完成运行，有 checkpoint 的续测，未开始的按冻结配置启动。
 运行失败但没有 checkpoint 时，应使用新目录重试。
+
+连续压力模式只接受未分组的 `batch_size=1` grid 和 `dashsc_input_ids`，且不与
+fixed workspace、materialized cases、profiling 或 `cache_shared_seed` 混用。
+它先并发 seed 若干条 `max(cache_len)+commit_tail` 长前缀，再将各 case/run 打乱，
+从不同 seed 截断到目标 cache_len 后持续提交。`--pressure-request-rate=0` 表示 burst；
+正数配合 `constant` 或 `poisson` 到达模型。要制造服务端排队，应让
+`pressure-client-concurrency > pressure-batch-size`，同时保证 `engine.concurrency_limit`
+不小于 client concurrency 和 seed count。详细执行与结果字段见参考文档。
 `--skip-test` 不接受 profile/grid/runs/env 等启动覆盖项。
 
 后处理默认包含所有 batch；`--batch-size` 是可选过滤器。

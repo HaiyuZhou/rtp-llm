@@ -222,6 +222,51 @@ class CachePerfTest(unittest.TestCase):
                 {},
             )
 
+    def test_run_forwards_continuous_pressure_configuration(self):
+        plan = cli.build_plan(
+            self.args(
+                extra=[
+                    "--pressure-mode=continuous",
+                    "--pressure-batch-size=4",
+                    "--pressure-client-concurrency=8",
+                    "--pressure-seed-count=3",
+                    "--pressure-request-rate=12.5",
+                    "--pressure-arrival=poisson",
+                    "--pressure-random-seed=17",
+                ]
+            ),
+            {},
+        )
+        command = plan["command"]
+        for argument in (
+            "--cache_pressure_mode=continuous",
+            "--cache_pressure_batch_size=4",
+            "--cache_pressure_client_concurrency=8",
+            "--cache_pressure_seed_count=3",
+            "--cache_pressure_request_rate=12.5",
+            "--cache_pressure_arrival=poisson",
+            "--cache_pressure_random_seed=17",
+        ):
+            self.assertIn("--test_arg=" + argument, command)
+
+        defaults = cli.build_plan(self.args(extra=["--pressure-mode=continuous"]), {})[
+            "command"
+        ]
+        self.assertIn("--test_arg=--cache_pressure_batch_size=1", defaults)
+        self.assertIn("--test_arg=--cache_pressure_client_concurrency=0", defaults)
+
+    def test_resume_rejects_pressure_overrides(self):
+        self.save_run()
+        with self.assertRaisesRegex(ValueError, "overrides"):
+            cli.build_plan(
+                self.args(
+                    "resume",
+                    extra=["--pressure-mode=continuous"],
+                    explicit=False,
+                ),
+                {},
+            )
+
     def test_resume_rejects_bazel_launch_overrides(self):
         self.save_run()
         for option in (

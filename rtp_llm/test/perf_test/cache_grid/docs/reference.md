@@ -73,6 +73,30 @@ S=0 时跳过 seed。HTTP 每个槽使用独立 session，input_ids/gRPC 也支�
 请求失败可能导致 batch 等不齐，因此即使关闭 fail_fast，也会停止后续测量并恢复调度器。
 可通过引擎 `BatchDecodeScheduler::schedule` 日志和 forward trace 验证实际组批。
 
+### 连续压力模式
+
+`--cache_pressure_mode=continuous`（统一入口为 `--pressure-mode continuous`）不再按
+case 执行“seed → 测量 → 下一个 case”。runner 一次并发插入
+`cache_pressure_seed_count` 条长度为 `max(cache_len)+commit_tail` 的独立长前缀，
+然后打乱全部 case/run。每个命中请求选择一个 seed family，截断到目标 cache_len，
+并在第一个未缓存 block 内加入唯一后缀，因此共享所需缓存状态但不会复用其他测量请求的尾部。
+cold 请求使用独立 token ID。
+
+压力发送器是有界 open-loop：任务队列只保存几何和计划时间，完整 token IDs 只在工作线程内构造，
+内存随 `cache_pressure_client_concurrency` 而不是总请求数增长。request rate 为 0 时立即填满
+客户端并发；正数时支持 `constant` 和 `poisson` 到达。BatchDecodeScheduler 只在攒满
+`cache_pressure_batch_size` 后执行，因此正式请求数不是整批时，runner 自动增加不计入 metric 的
+padding 请求，防止尾批永久等待。padding 失败会使本次测试失败。
+
+若要观察服务端排队，配置 `client_concurrency > batch_size`；两者相等只保证连续组批，
+不保证 scheduler 内存在等待请求。`engine.concurrency_limit` 必须至少覆盖 client concurrency
+和 seed count。该模式目前要求 DP=1、未分组 batch=1、`dashsc_input_ids`、明确 block size 和
+完整 commit tail；不支持 fixed workspace、物化输入、profiling 或额外的 `cache_shared_seed`。
+
+结果使用 `seed_mode=continuous_shared_prefix_v1`。每个 run 记录 seed family、全局发送序号、
+计划/实际发送 offset、客户端 schedule lag；顶层 `continuous_pressure` 记录实际吞吐、padding、
+schedule lag 以及来自服务端 `engine_wait_time` 的排队请求数和 wait time 聚合。
+
 `--skip-reuse-validation` 允许测试保留实测 reuse 不匹配的结果，仍记录期望值及校验状态；
 输入/输出形状、请求成功和有效时间仍严格检查，启动前缓存块探针也不跳过。
 这些 reuse 不匹配的结果不会进入统一 pipeline 的正式图表或公式。

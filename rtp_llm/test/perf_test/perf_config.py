@@ -101,6 +101,48 @@ def parse_args(
         help="Seed one shared prefix for batch=1 input_ids cache cases",
     )
     perf.add_argument(
+        "--cache_pressure_mode",
+        choices=("case", "continuous"),
+        default="case",
+        help="case-by-case measurement or an interleaved continuous request stream",
+    )
+    perf.add_argument(
+        "--cache_pressure_batch_size",
+        type=int,
+        default=1,
+        help="BatchDecodeScheduler prefill batch size in continuous mode",
+    )
+    perf.add_argument(
+        "--cache_pressure_client_concurrency",
+        type=int,
+        default=0,
+        help="Maximum in-flight clients in continuous mode (0: auto)",
+    )
+    perf.add_argument(
+        "--cache_pressure_seed_count",
+        type=int,
+        default=4,
+        help="Number of long shared-prefix families seeded before continuous pressure",
+    )
+    perf.add_argument(
+        "--cache_pressure_request_rate",
+        type=float,
+        default=0.0,
+        help="Open-loop requests per second in continuous mode (0: burst)",
+    )
+    perf.add_argument(
+        "--cache_pressure_arrival",
+        choices=("constant", "poisson"),
+        default="constant",
+        help="Open-loop arrival process in continuous mode",
+    )
+    perf.add_argument(
+        "--cache_pressure_random_seed",
+        type=int,
+        default=0,
+        help="Deterministic shuffle/arrival seed for continuous mode",
+    )
+    perf.add_argument(
         "--cache_measure_runs",
         type=int,
         default=3,

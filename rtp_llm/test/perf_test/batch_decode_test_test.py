@@ -525,6 +525,12 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertEqual(args.cache_case_files, "")
         self.assertEqual(args.cache_request_transport, "dashsc_input_ids")
         self.assertEqual(args.cache_grpc_port, 0)
+        self.assertEqual(args.cache_pressure_mode, "case")
+        self.assertEqual(args.cache_pressure_batch_size, 1)
+        self.assertEqual(args.cache_pressure_client_concurrency, 0)
+        self.assertEqual(args.cache_pressure_seed_count, 4)
+        self.assertEqual(args.cache_pressure_request_rate, 0)
+        self.assertEqual(args.cache_pressure_arrival, "constant")
         self.assertEqual(args.cache_checkpoint_every, 100)
         self.assertFalse(args.require_cache_resume)
         self.assertIsInstance(remaining, list)
@@ -2682,6 +2688,134 @@ class SharedSeedTest(unittest.TestCase):
                     expected_block_size=8,
                     cache_commit_tail_tokens=8,
                 )
+
+
+class ContinuousPressureTest(unittest.TestCase):
+    def runner(self, directory, **kwargs):
+        options = {
+            "request_transport": "dashsc_input_ids",
+            "pressure_mode": "continuous",
+            "pressure_batch_size": 4,
+            "pressure_client_concurrency": 4,
+            "pressure_seed_count": 2,
+            "pressure_random_seed": 7,
+            "expected_block_size": 8,
+            "cache_commit_tail_tokens": 8,
+            "measure_runs": 2,
+        }
+        options.update(kwargs)
+        return CacheGridRunner(
+            8000,
+            _WordTokenizer(),
+            [
+                {"case_id": 0, "batch_size": 1, "input_len": 64, "cache_len": 16},
+                {"case_id": 1, "batch_size": 1, "input_len": 64, "cache_len": 32},
+                {"case_id": 2, "batch_size": 1, "input_len": 64, "cache_len": 0},
+            ],
+            directory,
+            **options,
+        )
+
+    def test_interleaves_cases_reuses_seed_families_and_pads_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.runner(directory)
+            self.addCleanup(runner._close_resources)
+            seeds = {}
+            measured = []
+            active = 0
+            max_active = 0
+            lock = threading.Lock()
+
+            def post(prompt, ids, request_id):
+                nonlocal active, max_active
+                if request_id.startswith("continuous_seed:"):
+                    family = int(request_id.split(":")[1])
+                    seeds[family] = list(ids)
+                    return {
+                        "prefill_time_ms": 1,
+                        "success": True,
+                        "input_len": len(ids),
+                        "output_len": 1,
+                        "reuse_len": 0,
+                    }
+                key = request_id.split(":", 1)[0]
+                cache_len = int(key.rsplit("cache", 1)[1])
+                family_text = request_id.rsplit("family", 1)[1]
+                family = None if family_text == "None" else int(family_text)
+                if cache_len:
+                    self.assertEqual(ids[:cache_len], seeds[family][:cache_len])
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                    wait_time = float(max(0, active - 1))
+                    measured.append((key, list(ids), request_id))
+                time.sleep(0.01)
+                with lock:
+                    active -= 1
+                return {
+                    "prefill_time_ms": 2,
+                    "success": True,
+                    "input_len": len(ids),
+                    "output_len": 1,
+                    "reuse_len": cache_len,
+                    "wait_time_ms": wait_time,
+                }
+
+            with patch.object(runner, "_post_request", side_effect=post), patch.object(
+                runner, "_probe_reuse_granularity"
+            ), patch.object(runner, "_set_prefill_batch_size") as scheduler:
+                metrics = runner.run()
+
+            self.assertTrue(all(metric["status"] == "ok" for metric in metrics))
+            self.assertEqual(
+                [call.args[0] for call in scheduler.call_args_list], [2, 4, 1]
+            )
+            self.assertEqual(max_active, 4)
+            self.assertEqual(len(measured), 8)
+            saved = json.loads(
+                (Path(directory) / "cache_grid_results.json").read_text()
+            )
+            self.assertEqual(saved["seed_mode"], "continuous_shared_prefix_v1")
+            self.assertEqual(saved["continuous_pressure"]["measured_requests"], 6)
+            self.assertEqual(saved["continuous_pressure"]["padding_requests"], 2)
+            self.assertGreater(saved["continuous_pressure"]["queued_requests"], 0)
+            sequence = [
+                run["pressure_sequence"] for metric in metrics for run in metric["runs"]
+            ]
+            self.assertEqual(len(sequence), len(set(sequence)))
+            self.assertTrue(
+                all(
+                    run["pressure_schedule_lag_ms"] >= 0
+                    for metric in metrics
+                    for run in metric["runs"]
+                )
+            )
+
+    def test_requires_input_ids_and_enough_client_concurrency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "dashsc_input_ids"):
+                CacheGridRunner(
+                    8000,
+                    _WordTokenizer(),
+                    [],
+                    directory,
+                    pressure_mode="continuous",
+                    expected_block_size=8,
+                    cache_commit_tail_tokens=8,
+                )
+            with self.assertRaisesRegex(ValueError, "at least batch size"):
+                self.runner(directory, pressure_client_concurrency=2)
+
+    def test_case_mode_ignores_auto_pressure_concurrency_sentinel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = CacheGridRunner(
+                8000,
+                _WordTokenizer(),
+                [],
+                directory,
+                pressure_client_concurrency=0,
+            )
+            runner._close_resources()
 
 
 if __name__ == "__main__":

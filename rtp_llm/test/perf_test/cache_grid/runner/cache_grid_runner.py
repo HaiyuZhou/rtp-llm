@@ -36,6 +36,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import statistics
 import struct
 import subprocess
@@ -188,6 +189,7 @@ def validate_cache_grid_resume(
     request_transport: str,
     run_config: Dict[str, Any] | None = None,
     shared_seed: bool = False,
+    pressure_mode: str = "case",
     allow_resume_mismatch: bool = False,
     require_resume: bool = False,
 ) -> Dict[str, Any] | None:
@@ -220,7 +222,11 @@ def validate_cache_grid_resume(
         raise ValueError(
             "checkpoint measurement_contract differs; retest with server first_token_cost_time"
         )
-    expected_seed_mode = "shared_prefix_v1" if shared_seed else "independent"
+    expected_seed_mode = (
+        "continuous_shared_prefix_v1"
+        if pressure_mode == "continuous"
+        else ("shared_prefix_v1" if shared_seed else "independent")
+    )
     if payload["seed_mode"] != expected_seed_mode:
         raise ValueError("cache seed mode mismatch; use a new result directory")
     mismatches = []
@@ -970,6 +976,13 @@ class CacheGridRunner:
         *,
         request_timeout: int = 7200,
         shared_seed: bool = False,
+        pressure_mode: str = "case",
+        pressure_batch_size: int = 1,
+        pressure_client_concurrency: int = 2,
+        pressure_seed_count: int = 4,
+        pressure_request_rate: float = 0.0,
+        pressure_arrival: str = "constant",
+        pressure_random_seed: int = 0,
         measure_runs: int = 3,
         checkpoint_every: int = 100,
         cache_commit_tail_tokens: int = 4096,
@@ -1027,6 +1040,64 @@ class CacheGridRunner:
         self._shared_seed_ids = []
         self._shared_seed_record = None
         self._shared_seed_refreshes = []
+        self.pressure_mode = pressure_mode
+        self.pressure_batch_size = pressure_batch_size
+        self.pressure_client_concurrency = pressure_client_concurrency
+        self.pressure_seed_count = pressure_seed_count
+        self.pressure_request_rate = pressure_request_rate
+        self.pressure_arrival = pressure_arrival
+        self.pressure_random_seed = pressure_random_seed
+        self._continuous_seed_ids: List[List[int]] = []
+        self._continuous_seed_records: List[Dict[str, Any]] = []
+        self._continuous_summary: Dict[str, Any] | None = None
+        self._continuous_prompt_lock = threading.Lock()
+        if pressure_mode not in {"case", "continuous"}:
+            raise ValueError(f"unsupported cache pressure mode: {pressure_mode}")
+        if pressure_mode == "continuous":
+            if pressure_batch_size <= 0 or pressure_client_concurrency <= 0:
+                raise ValueError(
+                    "continuous pressure batch size and concurrency must be positive"
+                )
+            if pressure_seed_count <= 0:
+                raise ValueError("continuous pressure seed count must be positive")
+            if pressure_request_rate < 0:
+                raise ValueError(
+                    "continuous pressure request rate must be non-negative"
+                )
+            if pressure_arrival not in {"constant", "poisson"}:
+                raise ValueError(
+                    "continuous pressure arrival must be constant or poisson"
+                )
+            if pressure_client_concurrency < pressure_batch_size:
+                raise ValueError(
+                    "continuous pressure client concurrency must be at least batch size"
+                )
+            if shared_seed:
+                raise ValueError(
+                    "continuous pressure cannot be combined with shared seed"
+                )
+            if request_transport != "dashsc_input_ids":
+                raise ValueError(
+                    "continuous pressure requires dashsc_input_ids transport"
+                )
+            if any(is_grouped_case(c) or c["batch_size"] != 1 for c in self.cases):
+                raise ValueError(
+                    "continuous pressure supports only ungrouped batch_size=1"
+                )
+            if case_store is not None or profile_runs or profile_only:
+                raise ValueError(
+                    "continuous pressure does not support materialized cases or profiling"
+                )
+            if (
+                not expected_block_size
+                or cache_commit_tail_tokens < expected_block_size
+            ):
+                raise ValueError(
+                    "continuous pressure requires a known block size and at least "
+                    "one block commit tail"
+                )
+            run_config = dict(run_config or {})
+            run_config["cache_seed_mode"] = "continuous_shared_prefix_v1"
         if shared_seed:
             if request_transport != "dashsc_input_ids":
                 raise ValueError("shared seed requires dashsc_input_ids transport")
@@ -1127,6 +1198,7 @@ class CacheGridRunner:
             request_transport=self.request_transport,
             run_config=self.run_config,
             shared_seed=self.shared_seed,
+            pressure_mode=self.pressure_mode,
             allow_resume_mismatch=allow_resume_mismatch,
             require_resume=require_resume,
         )
@@ -1147,6 +1219,9 @@ class CacheGridRunner:
             if self.shared_seed:
                 self._shared_seed_record = payload.get("shared_seed")
                 self._shared_seed_refreshes = payload.get("shared_seed_refreshes", [])
+            if self.pressure_mode == "continuous":
+                self._continuous_seed_records = payload.get("continuous_seeds", [])
+                self._continuous_summary = payload.get("continuous_pressure")
             self._resume_count = int(payload.get("resume_count", 0)) + 1
             self._started_at = payload.get("started_at", self._started_at)
             progress = payload.get("progress") or {}
@@ -1299,7 +1374,11 @@ class CacheGridRunner:
             "schema_version": 2,
             "measurement_contract": SERVER_LATENCY_CONTRACT,
             "mode": "prefix_cache_grid",
-            "seed_mode": "shared_prefix_v1" if self.shared_seed else "independent",
+            "seed_mode": (
+                "continuous_shared_prefix_v1"
+                if self.pressure_mode == "continuous"
+                else ("shared_prefix_v1" if self.shared_seed else "independent")
+            ),
             "complete": complete,
             "status": "completed" if complete else "in_progress",
             "started_at": self._started_at,
@@ -1325,6 +1404,9 @@ class CacheGridRunner:
         if self.shared_seed:
             payload["shared_seed"] = self._shared_seed_record
             payload["shared_seed_refreshes"] = self._shared_seed_refreshes
+        if self.pressure_mode == "continuous":
+            payload["continuous_seeds"] = self._continuous_seed_records
+            payload["continuous_pressure"] = self._continuous_summary
         if asynchronous:
             if self._checkpoint_future is not None:
                 self._checkpoint_future.result()
@@ -1546,6 +1628,342 @@ class CacheGridRunner:
             int(case["input_len"]),
             int(case["case_id"]),
         )
+
+    def _initialize_continuous_seeds(self, pending) -> None:
+        max_cache = max((int(case["cache_len"]) for case in pending), default=0)
+        self._continuous_seed_ids = []
+        self._continuous_seed_records = []
+        if max_cache == 0:
+            return
+        seed_len = max_cache + self.cache_commit_tail_tokens
+        seeds = []
+        for family in range(self.pressure_seed_count):
+            seed_id = uuid.uuid4().hex
+            _, ids = self.factory._exact_text_and_ids(
+                seed_len, f"continuous_seed_{family}_{seed_id}_"
+            )
+            seeds.append((family, seed_id, ids))
+        self._set_prefill_batch_size(len(seeds))
+        barrier = threading.Barrier(len(seeds))
+
+        def send(item):
+            family, seed_id, ids = item
+            started = time.perf_counter()
+            try:
+                barrier.wait(timeout=self.request_timeout)
+                result = self._post_request(
+                    "", ids, f"continuous_seed:{family}:{seed_id}"
+                )
+            except Exception as exc:
+                result = {"success": False, "error": repr(exc)}
+            return {
+                "family": family,
+                "seed_id": seed_id,
+                "input_len": seed_len,
+                "max_cache_len": max_cache,
+                "elapsed_s": time.perf_counter() - started,
+                "result": result,
+                "ids": ids,
+            }
+
+        with ThreadPoolExecutor(
+            max_workers=len(seeds), thread_name_prefix="continuous-seed"
+        ) as pool:
+            futures = [pool.submit(send, seed) for seed in seeds]
+            records = [future.result() for future in futures]
+        records.sort(key=lambda record: record["family"])
+        for record in records:
+            result = record["result"]
+            if not (
+                result.get("success")
+                and result.get("input_len") == seed_len
+                and result.get("output_len") == 1
+                and result.get("reuse_len") == 0
+            ):
+                raise RuntimeError(
+                    "continuous pressure seed failed shape/reuse validation: "
+                    f"{result}"
+                )
+        self._continuous_seed_ids = [record.pop("ids") for record in records]
+        self._continuous_seed_records = records
+        logging.info(
+            "[CACHE_CONTINUOUS] seeded families=%d length=%d",
+            len(records),
+            seed_len,
+        )
+
+    def _continuous_request_ids(self, case, family, nonce):
+        total_len = int(case["input_len"])
+        cache_len = int(case["cache_len"])
+        if cache_len == 0:
+            with self._continuous_prompt_lock:
+                _, ids = self.factory._exact_text_and_ids(
+                    total_len, f"continuous_cold_{nonce}_"
+                )
+            return ids
+        seed_ids = self._continuous_seed_ids[family]
+        prefix = seed_ids[:cache_len]
+        with self._continuous_prompt_lock:
+            nonce_ids = _encode(self.factory.tokenizer, f"pressure_branch_{nonce}_")
+        different = next(
+            (token for token in nonce_ids if token != seed_ids[cache_len]), None
+        )
+        suffix_len = total_len - cache_len
+        if (
+            different is None
+            or len(nonce_ids) + 1 >= self.expected_block_size
+            or len(nonce_ids) + 1 > suffix_len
+        ):
+            raise ValueError("cannot construct an isolated continuous-pressure suffix")
+        suffix = [different] + nonce_ids
+        suffix += (self.factory._filler_ids * suffix_len)[: suffix_len - len(suffix)]
+        return prefix + suffix
+
+    def _continuous_metric(self, case, runs):
+        total_len = int(case["input_len"])
+        cache_len = int(case["cache_len"])
+        successful = [result for result in runs if result.get("success")]
+        reuse_values = [int(result.get("reuse_len", -1)) for result in successful]
+        reuse_exact = bool(
+            len(successful) == self.measure_runs
+            and all(value == cache_len for value in reuse_values)
+        )
+        shape_exact = bool(
+            len(successful) == self.measure_runs
+            and all(
+                int(result.get("input_len", -1)) == total_len for result in successful
+            )
+            and all(int(result.get("output_len", -1)) == 1 for result in successful)
+        )
+        prefill_values = [
+            float(result["prefill_time_ms"])
+            for result in successful
+            if run_prefill_rt(result) is not None
+        ]
+        timing_valid = len(prefill_values) == self.measure_runs
+        validation_status = measurement_status(
+            len(successful) == self.measure_runs,
+            shape_exact,
+            reuse_exact,
+            timing_valid,
+        )
+        status = measurement_status(
+            len(successful) == self.measure_runs,
+            shape_exact,
+            reuse_exact,
+            timing_valid,
+            skip_reuse=self.skip_reuse_validation,
+        )
+        offsets = [float(result["pressure_completed_offset_ms"]) for result in runs]
+        return {
+            "case_key": self.case_key(case),
+            "case_id": int(case["case_id"]),
+            "batch_size": 1,
+            "input_len": total_len,
+            "input_len_built": total_len,
+            "cache_len_requested": cache_len,
+            "cache_len_observed": reuse_values,
+            "input_len_observed": [
+                int(result.get("input_len", 0)) for result in successful
+            ],
+            "expected_reuse_len": cache_len,
+            "success_runs": len(successful),
+            "measure_runs": self.measure_runs,
+            "cache_commit_tail_tokens": self.cache_commit_tail_tokens,
+            "seed": {},
+            "seed_mode": "continuous_shared_prefix_v1",
+            "execution_mode": "continuous_pressure_v1",
+            "pressure_batch_size": self.pressure_batch_size,
+            "pressure_client_concurrency": self.pressure_client_concurrency,
+            "runs": runs,
+            "reuse_exact": reuse_exact,
+            "reuse_validation_skipped": self.skip_reuse_validation,
+            "validation_status": validation_status,
+            "shape_exact": shape_exact,
+            "timing_valid": timing_valid,
+            "prefill_time_ms": prefill_values,
+            "median_prefill_time_ms": (
+                statistics.median(prefill_values) if timing_valid else None
+            ),
+            "avg_prefill_time_ms": (
+                statistics.fmean(prefill_values) if timing_valid else None
+            ),
+            "elapsed_s": (max(offsets) - min(offsets)) / 1000.0 if offsets else 0.0,
+            "status": status,
+        }
+
+    def _run_continuous(self, pending) -> List[Dict[str, Any]]:
+        rng = random.Random(self.pressure_random_seed)
+        try:
+            self._initialize_continuous_seeds(pending)
+            jobs = []
+            for case in pending:
+                for run_index in range(self.measure_runs):
+                    jobs.append(
+                        {
+                            "case": case,
+                            "run_index": run_index,
+                            "padding": False,
+                        }
+                    )
+            rng.shuffle(jobs)
+            padding_count = (-len(jobs)) % self.pressure_batch_size
+            for index in range(padding_count):
+                padding = dict(jobs[index % len(jobs)])
+                padding["padding"] = True
+                jobs.append(padding)
+            for sequence, job in enumerate(jobs):
+                job["sequence"] = sequence
+                job["nonce"] = uuid.uuid4().hex
+                if int(job["case"]["cache_len"]):
+                    job["family"] = sequence % len(self._continuous_seed_ids)
+                else:
+                    job["family"] = None
+
+            offsets = []
+            offset = 0.0
+            for index in range(len(jobs)):
+                if index and self.pressure_request_rate:
+                    if self.pressure_arrival == "poisson":
+                        offset += rng.expovariate(self.pressure_request_rate)
+                    else:
+                        offset += 1.0 / self.pressure_request_rate
+                offsets.append(offset)
+
+            self._set_prefill_batch_size(self.pressure_batch_size)
+            pressure_started_wall = time.time()
+            pressure_started = time.perf_counter()
+
+            def send(job, scheduled_offset):
+                case = job["case"]
+                key = self.case_key(case)
+                request_id = (
+                    f"{key}:run{job['run_index']}:pressure{job['sequence']}:"
+                    f"family{job['family']}"
+                )
+                try:
+                    ids = self._continuous_request_ids(
+                        case, job["family"], job["nonce"]
+                    )
+                    due = pressure_started + scheduled_offset
+                    remaining = due - time.perf_counter()
+                    if remaining > 0:
+                        time.sleep(remaining)
+                    dispatched = time.perf_counter()
+                    result = self._post_request("", ids, request_id)
+                except Exception as exc:
+                    dispatched = time.perf_counter()
+                    result = {
+                        "success": False,
+                        "error": repr(exc),
+                        "request_id": request_id,
+                    }
+                completed = time.perf_counter()
+                result = dict(result)
+                result.update(
+                    {
+                        "run_index": job["run_index"],
+                        "seed_family": job["family"],
+                        "pressure_sequence": job["sequence"],
+                        "pressure_padding": job["padding"],
+                        "pressure_scheduled_offset_ms": scheduled_offset * 1000.0,
+                        "pressure_dispatch_offset_ms": (dispatched - pressure_started)
+                        * 1000.0,
+                        "pressure_schedule_lag_ms": max(
+                            0.0,
+                            (dispatched - pressure_started - scheduled_offset) * 1000.0,
+                        ),
+                        "pressure_completed_offset_ms": (completed - pressure_started)
+                        * 1000.0,
+                    }
+                )
+                return result
+
+            with ThreadPoolExecutor(
+                max_workers=self.pressure_client_concurrency,
+                thread_name_prefix="continuous-pressure",
+            ) as pool:
+                futures = [
+                    pool.submit(send, job, offsets[index])
+                    for index, job in enumerate(jobs)
+                ]
+                results = [future.result() for future in futures]
+        finally:
+            self._set_prefill_batch_size(1)
+
+        by_key = {self.case_key(case): [] for case in pending}
+        for job, result in zip(jobs, results):
+            if not job["padding"]:
+                by_key[self.case_key(job["case"])].append(result)
+        elapsed = time.perf_counter() - pressure_started
+        schedule_lags = [
+            float(result["pressure_schedule_lag_ms"])
+            for job, result in zip(jobs, results)
+            if not job["padding"]
+        ]
+        server_waits = [
+            float(result["wait_time_ms"])
+            for job, result in zip(jobs, results)
+            if not job["padding"]
+            and result.get("success")
+            and isinstance(result.get("wait_time_ms"), (int, float))
+        ]
+        padding_failures = sum(
+            not result.get("success")
+            for job, result in zip(jobs, results)
+            if job["padding"]
+        )
+        self._continuous_summary = {
+            "schema_version": 1,
+            "started_at_epoch_s": pressure_started_wall,
+            "execution_mode": "continuous_pressure_v1",
+            "arrival": self.pressure_arrival,
+            "request_rate": self.pressure_request_rate,
+            "random_seed": self.pressure_random_seed,
+            "scheduler_batch_size": self.pressure_batch_size,
+            "client_concurrency": self.pressure_client_concurrency,
+            "configured_seed_count": self.pressure_seed_count,
+            "effective_seed_count": len(self._continuous_seed_ids),
+            "measured_requests": len(jobs) - padding_count,
+            "padding_requests": padding_count,
+            "padding_failures": padding_failures,
+            "elapsed_s": elapsed,
+            "achieved_request_rate": (len(jobs) / elapsed if elapsed else None),
+            "median_schedule_lag_ms": (
+                statistics.median(schedule_lags) if schedule_lags else None
+            ),
+            "max_schedule_lag_ms": max(schedule_lags) if schedule_lags else None,
+            "queued_requests": sum(wait > 0 for wait in server_waits),
+            "median_server_wait_time_ms": (
+                statistics.median(server_waits) if server_waits else None
+            ),
+            "max_server_wait_time_ms": max(server_waits) if server_waits else None,
+        }
+        metrics = []
+        for case in pending:
+            key = self.case_key(case)
+            runs = sorted(by_key[key], key=lambda result: result["run_index"])
+            metric = self._continuous_metric(case, runs)
+            self._results[key] = metric
+            self._append_journal(metric)
+            self._write_progress_checkpoint()
+            metrics.append(metric)
+        complete = all(
+            self._results.get(self.case_key(case), {}).get("status") == "ok"
+            for case in self.cases
+        )
+        self._save(complete=complete)
+        failures = [metric for metric in metrics if metric["status"] != "ok"]
+        if padding_failures:
+            raise RuntimeError(
+                f"continuous cache pressure had {padding_failures} failed padding requests"
+            )
+        if failures and self.fail_fast:
+            raise RuntimeError(
+                "continuous cache pressure completed with invalid cases: "
+                + ", ".join(metric["case_key"] for metric in failures)
+            )
+        return list(self._results.values())
 
     def _prepare_case_payload(self, case: Dict[str, Any]) -> Dict[str, Any]:
         """Build prompts for one case without issuing a model request."""
@@ -2107,6 +2525,20 @@ class CacheGridRunner:
             try:
                 self._run_profiles()
                 return list(self._results.values())
+            finally:
+                self._close_resources()
+
+        if self.pressure_mode == "continuous":
+            try:
+                return self._run_continuous(pending)
+            except BaseException:
+                try:
+                    self._save(complete=False)
+                except Exception:
+                    logging.exception(
+                        "cache grid: failed to flush continuous-pressure checkpoint"
+                    )
+                raise
             finally:
                 self._close_resources()
 

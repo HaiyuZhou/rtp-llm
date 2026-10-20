@@ -319,6 +319,20 @@ TEST_F(FIFOSchedulerTest, testSimple) {
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
         runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
+    EXPECT_EQ(scheduler.pressureWaitingRequests(), 0u);
+    scheduler.waiting_streams_.resize(2);
+    scheduler.loading_cache_streams_.resize(3);
+    scheduler.running_streams_.resize(4);
+    EXPECT_EQ(scheduler.pressureWaitingRequests(), 5u);
+    scheduler.waiting_group_queue_.resize(1);
+    EXPECT_FALSE(scheduler.pressureWaitingRequests().has_value());
+    scheduler.waiting_group_queue_.clear();
+    scheduler.loading_cache_group_queue_.resize(1);
+    EXPECT_FALSE(scheduler.pressureWaitingRequests().has_value());
+    scheduler.loading_cache_group_queue_.clear();
+    scheduler.waiting_streams_.clear();
+    scheduler.loading_cache_streams_.clear();
+    scheduler.running_streams_.clear();
     std::shared_ptr<GenerateInput> query = make_shared<GenerateInput>();
     query->input_ids                     = torch::tensor({1}, torch::kInt32);
     query->generate_config               = makeTestGenerateConfig();

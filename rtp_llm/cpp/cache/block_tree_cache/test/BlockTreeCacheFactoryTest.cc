@@ -25,6 +25,7 @@
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
 #include "rtp_llm/cpp/config/StaticConfig.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
+#include "rtp_llm/cpp/model_rpc/BroadcastManager.h"
 #include "rtp_llm/models_py/bindings/CrcBlockCopy.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 
@@ -397,7 +398,9 @@ void expectFactoryRejects(const CacheConfig&                              config
     CoreDumpGuard guard;
     try {
         EXPECT_EQ(createBlockTreeCache(config, kv_cache_config, allocator), nullptr);
-    } catch (const std::exception&) { SUCCEED(); }
+    } catch (const std::exception&) {
+        SUCCEED();
+    }
     EXPECT_EQ(allocator->blockTreeCache(), nullptr);
 }
 
@@ -489,7 +492,7 @@ void writeDevicePattern(void* address, size_t bytes, uint8_t pattern) {
 void expectDevicePattern(const void* address, size_t bytes, uint8_t pattern) {
     ASSERT_NE(address, nullptr);
     auto        device = torch::from_blob(const_cast<void*>(address),
-                                   {static_cast<int64_t>(bytes)},
+                                          {static_cast<int64_t>(bytes)},
                                    torch::TensorOptions(torch::kUInt8).device(torch::kCUDA));
     auto        host   = device.cpu();
     const auto* data   = host.data_ptr<uint8_t>();
@@ -639,6 +642,42 @@ TEST_F(BlockTreeCacheFactoryTest, SingleTypeBindsExistingTargetGroupAndPool) {
     expectTargetGroupsBoundByTag(cache, allocator);
 }
 
+TEST_F(BlockTreeCacheFactoryTest, PressureOwnershipRequiresActualRootBroadcastScope) {
+    for (int variant = 0; variant < 4; ++variant) {
+        auto              config    = makeSingleConfig();
+        auto              allocator = initAllocator<CoordinatorCacheManager>(config);
+        ParallelismConfig parallel;
+        parallel.world_rank = variant == 3 ? 5 : 4;
+        parallel.tp_rank    = variant == 3 ? 1 : 0;
+        parallel.tp_size    = variant == 0 ? 1 : 2;
+        std::shared_ptr<BroadcastManager> broadcast;
+        if (variant == 2) {
+            broadcast = std::make_shared<BroadcastManager>(std::vector<std::string>{"localhost:1", "localhost:2"});
+        }
+        auto cache = createBlockTreeCache(config, KVCacheConfig{}, allocator, parallel, nullptr, broadcast);
+        ASSERT_NE(cache, nullptr);
+        const auto snapshot = cache->pressureSnapshot();
+        ASSERT_TRUE(snapshot.ownership.has_value());
+        ASSERT_FALSE(snapshot.groups.empty());
+        const auto& group = cache->groupSets().front();
+        EXPECT_EQ(snapshot.groups.front().block_tokens, group->group(group->groupTags().front()).seqSizePerBlock());
+        EXPECT_EQ(snapshot.groups.front().payload_bytes, group->payloadBytes());
+        EXPECT_EQ(snapshot.groups.front().storage_bytes, group->storageBytes());
+        EXPECT_EQ(snapshot.groups.front().crc_enabled, group->crcEnabled());
+        EXPECT_EQ(snapshot.ownership->owner_world_rank, 4);
+        if (variant == 0) {
+            EXPECT_EQ(snapshot.ownership->mode, CachePressureOwnership::Mode::INDEPENDENT);
+            EXPECT_FALSE(snapshot.ownership->all_participant_publication);
+        } else if (variant == 1) {
+            EXPECT_EQ(snapshot.ownership->mode, CachePressureOwnership::Mode::UNSUPPORTED);
+        } else {
+            EXPECT_EQ(snapshot.ownership->mode, CachePressureOwnership::Mode::SHARED_TP);
+            EXPECT_TRUE(snapshot.ownership->all_participant_publication);
+            EXPECT_EQ(snapshot.ownership->participant_world_ranks, (std::vector<int>{4, 5}));
+        }
+    }
+}
+
 TEST_F(BlockTreeCacheFactoryTest, RemoteResolverMatchesAllocatorForNonContiguousGlobalLayers) {
     {
         const auto    config    = makeHybridConfig();
@@ -726,14 +765,18 @@ TEST_F(BlockTreeCacheFactoryTest, HeterogeneousMtpPreservesExactGeometryAcrossCo
     const auto host_block = group_set->hostPool()->malloc();
     ASSERT_TRUE(host_block.has_value());
     group_set->hostPool()->incTreeRef(*host_block, BlockTreeRefType::STORE);
-    EXPECT_TRUE(cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
-        {TransferDescriptor::deviceToHost(group_set->groupSetId(), {src}, *host_block)})).ok());
+    EXPECT_TRUE(cache
+                    ->executeTransfer(block_transfer_engine_test::makeTransferTask(
+                        {TransferDescriptor::deviceToHost(group_set->groupSetId(), {src}, *host_block)}))
+                    .ok());
     for (int layer = 0; layer < 3; ++layer) {
         writeDevicePattern(
             allocator->convertIndexToAddr(layer, "default", src).kv_addr, bytes[static_cast<size_t>(layer)], 0);
     }
-    EXPECT_TRUE(cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
-        {TransferDescriptor::hostToDevice(group_set->groupSetId(), *host_block, {src})})).ok());
+    EXPECT_TRUE(cache
+                    ->executeTransfer(block_transfer_engine_test::makeTransferTask(
+                        {TransferDescriptor::hostToDevice(group_set->groupSetId(), *host_block, {src})}))
+                    .ok());
     for (int layer = 0; layer < 3; ++layer) {
         expectDevicePattern(allocator->convertIndexToAddr(layer, "default", src).kv_addr,
                             bytes[static_cast<size_t>(layer)],
@@ -1024,12 +1067,16 @@ TEST_F(BlockTreeCacheFactoryTest, PerRankBlockTransferEnginePreservesNonContiguo
     writeDevicePattern(full_group->convertIndexToAddr(/*global_layer=*/0, device_block).kv_addr, layer_bytes, 0x31);
     writeDevicePattern(full_group->convertIndexToAddr(/*global_layer=*/2, device_block).kv_addr, layer_bytes, 0x72);
 
-    EXPECT_TRUE(cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
-        {TransferDescriptor::deviceToHost(group_set->groupSetId(), {device_block}, host_block)})).ok());
+    EXPECT_TRUE(cache
+                    ->executeTransfer(block_transfer_engine_test::makeTransferTask(
+                        {TransferDescriptor::deviceToHost(group_set->groupSetId(), {device_block}, host_block)}))
+                    .ok());
     writeDevicePattern(full_group->convertIndexToAddr(/*global_layer=*/0, device_block).kv_addr, layer_bytes, 0x00);
     writeDevicePattern(full_group->convertIndexToAddr(/*global_layer=*/2, device_block).kv_addr, layer_bytes, 0x00);
-    EXPECT_TRUE(cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
-        {TransferDescriptor::hostToDevice(group_set->groupSetId(), host_block, {device_block})})).ok());
+    EXPECT_TRUE(cache
+                    ->executeTransfer(block_transfer_engine_test::makeTransferTask(
+                        {TransferDescriptor::hostToDevice(group_set->groupSetId(), host_block, {device_block})}))
+                    .ok());
 
     expectDevicePattern(full_group->convertIndexToAddr(/*global_layer=*/0, device_block).kv_addr, layer_bytes, 0x31);
     expectDevicePattern(full_group->convertIndexToAddr(/*global_layer=*/2, device_block).kv_addr, layer_bytes, 0x72);
@@ -1226,8 +1273,10 @@ TEST_F(BlockTreeCacheFactoryTest, SparseMlaIndexerPoolsShareAtomicReuseAndPacked
                 cache_group->convertIndexToAddr(global_layer, device_blocks[0][member]).kv_addr, layer_bytes, pattern);
         }
     }
-    EXPECT_TRUE(cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
-        {TransferDescriptor::deviceToHost(group_set->groupSetId(), device_blocks[0], *host_block)})).ok());
+    EXPECT_TRUE(cache
+                    ->executeTransfer(block_transfer_engine_test::makeTransferTask(
+                        {TransferDescriptor::deviceToHost(group_set->groupSetId(), device_blocks[0], *host_block)}))
+                    .ok());
     for (size_t member = 0; member < cache_groups.size(); ++member) {
         const auto&  cache_group = cache_groups[member];
         const size_t layer_bytes =
@@ -1237,8 +1286,10 @@ TEST_F(BlockTreeCacheFactoryTest, SparseMlaIndexerPoolsShareAtomicReuseAndPacked
                 cache_group->convertIndexToAddr(global_layer, device_blocks[0][member]).kv_addr, layer_bytes, 0);
         }
     }
-    EXPECT_TRUE(cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
-        {TransferDescriptor::hostToDevice(group_set->groupSetId(), *host_block, device_blocks[0])})).ok());
+    EXPECT_TRUE(cache
+                    ->executeTransfer(block_transfer_engine_test::makeTransferTask(
+                        {TransferDescriptor::hostToDevice(group_set->groupSetId(), *host_block, device_blocks[0])}))
+                    .ok());
     for (size_t member = 0; member < cache_groups.size(); ++member) {
         const auto&  cache_group = cache_groups[member];
         const size_t layer_bytes =
@@ -2355,10 +2406,14 @@ TEST_F(BlockTreeCacheFactoryTest, Factory_CreatesExecutableFullSWAConfig) {
         const BlockIdxType host_block = *host_block_result;
         const BlockIdxType disk_block = *disk_block_result;
 
-        EXPECT_TRUE(factory_cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
-            {TransferDescriptor::deviceToHost(group->groupSetId(), device_blocks[0], host_block)})).ok());
-        EXPECT_TRUE(factory_cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
-            {TransferDescriptor::hostToDisk(group->groupSetId(), host_block, disk_block)})).ok());
+        EXPECT_TRUE(factory_cache
+                        ->executeTransfer(block_transfer_engine_test::makeTransferTask(
+                            {TransferDescriptor::deviceToHost(group->groupSetId(), device_blocks[0], host_block)}))
+                        .ok());
+        EXPECT_TRUE(factory_cache
+                        ->executeTransfer(block_transfer_engine_test::makeTransferTask(
+                            {TransferDescriptor::hostToDisk(group->groupSetId(), host_block, disk_block)}))
+                        .ok());
 
         block_tree_cache_test::unreferenceDeviceBlocksForTest(*group, device_blocks);
         group->hostPool()->decTreeRef(host_block, BlockTreeRefType::STORE);
@@ -2448,13 +2503,17 @@ void verifyCrcResidencyRoundTrip(CacheConfig config, const std::vector<bool>& ex
             const auto& group = cache->groupSets()[index];
             disk_blocks.push_back(group->allocateSingleBlock(Tier::DISK, BlockTreeRefType::STORE));
             ASSERT_NE(disk_blocks.back(), NULL_BLOCK_IDX);
-            ASSERT_TRUE(cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
-                {TransferDescriptor::hostToDisk(index, host_blocks[index], disk_blocks.back())})).ok());
+            ASSERT_TRUE(cache
+                            ->executeTransfer(block_transfer_engine_test::makeTransferTask(
+                                {TransferDescriptor::hostToDisk(index, host_blocks[index], disk_blocks.back())}))
+                            .ok());
         }
         ASSERT_NO_FATAL_FAILURE(visit(fill, 0));
         for (size_t index = 0; index < cache->groupSets().size(); ++index) {
-            ASSERT_TRUE(cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
-                {TransferDescriptor::diskToDevice(index, disk_blocks[index], blocks[index].front())})).ok());
+            ASSERT_TRUE(cache
+                            ->executeTransfer(block_transfer_engine_test::makeTransferTask(
+                                {TransferDescriptor::diskToDevice(index, disk_blocks[index], blocks[index].front())}))
+                            .ok());
             cache->groupSets()[index]->releaseSingleBlock(Tier::DISK, disk_blocks[index], BlockTreeRefType::STORE);
         }
         ASSERT_NO_FATAL_FAILURE(visit(expect, -1));
@@ -2540,7 +2599,7 @@ TEST_F(BlockTreeCacheFactoryTest, DefaultCrcAtPageBoundaryUsesEncodedStrideInLoc
         // Two adjacent records catch footer writes that overlap the next compact slot.
         const auto device_blocks = block_tree_cache_test::allocateDeviceBlocksForTest(*group, 2);
         ASSERT_EQ(device_blocks.size(), 2u);
-        std::vector<BlockIdxType> host_blocks, disk_blocks;
+        std::vector<BlockIdxType>       host_blocks, disk_blocks;
         std::vector<TransferDescriptor> stores, loads, disk_stores, disk_loads;
         for (const auto& blocks : device_blocks) {
             ASSERT_EQ(blocks.size(), 1u);
@@ -2565,16 +2624,16 @@ TEST_F(BlockTreeCacheFactoryTest, DefaultCrcAtPageBoundaryUsesEncodedStrideInLoc
             }
         }
         if (host_on) {
-            const auto first = reinterpret_cast<uintptr_t>(group->hostPool()->blockBuffer(host_blocks[0]).addr);
+            const auto first  = reinterpret_cast<uintptr_t>(group->hostPool()->blockBuffer(host_blocks[0]).addr);
             const auto second = reinterpret_cast<uintptr_t>(group->hostPool()->blockBuffer(host_blocks[1]).addr);
             EXPECT_EQ(std::max(first, second) - std::min(first, second), expected_stride);
         }
         const auto target_group = allocator->cacheGroups().front();
-        const auto visit = [&](bool verify, bool clear = false) {
+        const auto visit        = [&](bool verify, bool clear = false) {
             for (size_t index = 0; index < device_blocks.size(); ++index) {
                 for (int layer = 0; layer < 2; ++layer) {
-                    auto* addr = target_group->convertIndexToAddr(layer, device_blocks[index].front()).kv_addr;
-                    const size_t bytes = target_group->config().kvBlockStrideBytes();
+                    auto*         addr  = target_group->convertIndexToAddr(layer, device_blocks[index].front()).kv_addr;
+                    const size_t  bytes = target_group->config().kvBlockStrideBytes();
                     const uint8_t pattern = clear ? 0 : 0x31 + index * 0x20 + layer * 7;
                     if (verify) {
                         expectDevicePattern(addr, bytes, pattern);

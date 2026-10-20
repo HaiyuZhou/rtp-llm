@@ -3,6 +3,7 @@
 #include <chrono>
 #include <list>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 #include "absl/status/status.h"
@@ -36,6 +37,10 @@ public:
     virtual bool         empty()            = 0;
     virtual int64_t      lastScheduleTime() = 0;
     virtual int64_t      onflightStreams()  = 0;
+    // Observed local waiting and cache-loading work, excluding running streams.
+    virtual std::optional<uint64_t> pressureWaitingRequests() {
+        return std::nullopt;
+    }
 
     virtual std::vector<EngineScheduleInfo::TaskInfo> waitingTaskList() {
         return {};

@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 import unittest
 from types import SimpleNamespace as NS
@@ -114,6 +115,148 @@ def wire():
             )
         ],
     )
+
+
+def shared_wire(t=1, baseline=False):
+    message = wire()
+    message.requested_ranks = [0, 1]
+    message.ranks.append(copy.deepcopy(message.ranks[0]))
+    for i, item in enumerate(message.ranks):
+        item.world_rank = i
+        item.service_instance = f"instance-{i}"
+        item.sequence = t + 2
+        item.sampled_monotonic_ns = int((t + i * 100) * 1e9)
+        item.ownership = PB(
+            mode=2,
+            owner_world_rank=PB(value=0),
+            participant_world_ranks=[0, 1],
+            publication_scope=2,
+        )
+        item.groups[0].group_tags = ["gpu-tag"]
+        item.groups[0].block_tokens = 512
+        item.groups[0].payload_bytes = item.groups[0].storage_bytes = 4096
+        item.groups[0].crc_enabled = False
+        for pool in item.pools:
+            pool.pool_name = "gpu-tag" if pool.tier == 1 else "host-tag"
+            pool.block_size_bytes = 4096
+        if baseline or i:
+            item.groups[0].watermark_trigger_count = 0
+            for transfer in item.transfers:
+                transfer.published_blocks = 0
+        if i:
+            for pool in item.pools:
+                pool.used_blocks = pool.published_host_blocks = 0
+    return message
+
+
+class SharedOwnershipTest(unittest.TestCase):
+    def test_first_sparse_transfer_endpoint_is_progress_not_reset(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        initial = shared_wire(0, True)
+        initial.ranks[0].transfers = []
+        initial.ranks[1].transfers = []
+        baseline = decode_pressure_response(initial, 0, 0, (0, 1)).samples
+        evaluator = PressureCoverage(baseline, configured())
+        for t in range(1, 4):
+            current = shared_wire(t)
+            current.ranks[1].transfers = []
+            evaluator.add(decode_pressure_response(current, t, t, (0, 1)).samples, t)
+        self.assertTrue(evaluator.assess(1, 3).valid)
+        vanished = shared_wire(4)
+        vanished.ranks[0].transfers = []
+        vanished.ranks[1].transfers = []
+        evaluator.add(decode_pressure_response(vanished, 4, 4, (0, 1)).samples, 4)
+        self.assertFalse(evaluator.epoch_valid)
+        self.assertIn("counter_reset", evaluator.reasons)
+
+    def test_rejects_missing_scope_owner_and_incompatible_layout(self):
+        mutations = [
+            lambda m: setattr(m.ranks[0].ownership, "owner_world_rank", None),
+            lambda m: setattr(m.ranks[0].ownership, "owner_world_rank", PB(value=9)),
+            lambda m: setattr(m.ranks[0].ownership, "publication_scope", 1),
+            lambda m: setattr(m.ranks[0].ownership, "participant_world_ranks", [0]),
+            lambda m: setattr(m.ranks[1], "ownership", None),
+            lambda m: setattr(m.ranks[1].ownership, "mode", 0),
+            lambda m: setattr(m.ranks[1].groups[0], "group_tags", ["other"]),
+            lambda m: setattr(m.ranks[1].groups[0], "group_type", 2),
+            lambda m: setattr(m.ranks[1].groups[0], "block_tokens", 256),
+            lambda m: setattr(m.ranks[1].groups[0], "payload_bytes", 2048),
+            lambda m: setattr(m.ranks[1].groups[0], "storage_bytes", 8192),
+            lambda m: setattr(m.ranks[1].groups[0], "crc_enabled", True),
+            lambda m: setattr(m.ranks[1].pools[0], "pool_name", "other"),
+            lambda m: setattr(m.ranks[1].pools[0], "block_size_bytes", 8192),
+            lambda m: setattr(m.ranks[1].pools[0], "total_blocks", 101),
+            lambda m: m.ranks.pop(),
+            lambda m: m.ranks.pop(0),
+        ]
+        for mutate in mutations:
+            message = shared_wire()
+            mutate(message)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                decode_pressure_response(message, 1, 1, (0, 1))
+
+    def test_partial_page_does_not_hide_observed_restart_layout_or_counter_reset(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        baseline = decode_pressure_response(shared_wire(0, True), 0, 0, (0, 1)).samples
+        current = decode_pressure_response(shared_wire(1), 1, 1, (0, 1)).samples
+        mutations = [
+            lambda s: dataclasses.replace(s, instance="restarted"),
+            lambda s: dataclasses.replace(
+                s, pools=(dataclasses.replace(s.pools[0], capacity=101), s.pools[1])
+            ),
+            lambda s: dataclasses.replace(
+                s, groups=(dataclasses.replace(s.groups[0], triggers=0),)
+            ),
+            lambda s: dataclasses.replace(s, ownership=None),
+        ]
+        for mutate in mutations:
+            evaluator = PressureCoverage(baseline, configured())
+            evaluator.add(current, 1)
+            observed = mutate(
+                dataclasses.replace(
+                    current[0],
+                    sequence=4,
+                    server_s=2,
+                    client_send_s=2,
+                    client_receive_s=2,
+                )
+            )
+            evaluator.add((observed,), 2)
+            self.assertFalse(evaluator.epoch_valid)
+
+    def test_owner_clock_boundary_and_missing_stale_peer_never_gain_coverage(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        baseline = decode_pressure_response(shared_wire(0, True), 0, 0, (0, 1)).samples
+        for failure in ("missing", "stale", "none"):
+            evaluator = PressureCoverage(baseline, configured())
+            for t in range(1, 5):
+                samples = list(
+                    decode_pressure_response(shared_wire(t), t, t, (0, 1)).samples
+                )
+                samples[0] = dataclasses.replace(samples[0], offset_bounds=(-0.2, 0.2))
+                if t >= 3 and failure == "missing":
+                    samples.pop()
+                if t >= 3 and failure == "stale":
+                    samples[1] = dataclasses.replace(
+                        samples[1], offset_bounds=(-110, -100)
+                    )
+                evaluator.add(samples, t)
+            if failure == "none":
+                self.assertEqual(evaluator.intervals(1, 4), [(1.2, 3.8)])
+            else:
+                self.assertEqual(
+                    evaluator.intervals(1, 4),
+                    [(1.2, 1.8 if failure == "missing" else 2.0)],
+                )
 
 
 class PressurePredicateTest(unittest.TestCase):
@@ -376,6 +519,25 @@ class PressurePredicateTest(unittest.TestCase):
 
 
 class CoverageTest(unittest.TestCase):
+    def test_declared_shared_owner_preserves_raw_peers_and_owner_clock(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        def page(t, baseline=False):
+            message = shared_wire(t, baseline)
+            return decode_pressure_response(message, t, t, (0, 1)).samples
+
+        baseline = page(0, True)
+        evaluator = PressureCoverage(baseline, configured())
+        for t in range(1, 5):
+            samples = page(t)
+            self.assertEqual(samples[1].pools[0].used, 0)
+            self.assertEqual(samples[1].pools[1].host_resident, 0)
+            evaluator.add(samples, t)
+        self.assertTrue(evaluator.assess(1, 4).valid)
+        self.assertEqual(evaluator.intervals(1, 4), [(1, 4)])
+
     def test_interval_contract(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             confirmed_segment,

@@ -1127,6 +1127,31 @@ class RunnerIntegrationTest(unittest.TestCase):
     def test_measurement_loss_recovers_for_cleanup_but_fails_coverage(self):
         self._runner_case("measurement_loss")
 
+    def test_shared_owner_real_protobuf_preserves_raw_peers_and_manifest_provenance(
+        self,
+    ):
+        self._runner_case(shared=True)
+
+    def test_missing_waiting_wrapper_is_unknown_activity(self):
+        self._runner_case("missing_waiting")
+
+    def test_owner_zero_presence_survives_json_and_missing_wrapper_is_rejected(self):
+        from google.protobuf.json_format import MessageToDict, ParseDict
+
+        from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2 as pb
+
+        message = pb.CachePressureRankPB()
+        message.ownership.mode = pb.PressureOwnershipPB.SHARED_TP
+        message.ownership.owner_world_rank.value = 0
+        encoded = MessageToDict(message, preserving_proto_field_name=True)
+        self.assertIn("owner_world_rank", encoded["ownership"])
+        restored = ParseDict(encoded, pb.CachePressureRankPB())
+        self.assertTrue(restored.ownership.HasField("owner_world_rank"))
+        del encoded["ownership"]["owner_world_rank"]
+        restored = ParseDict(encoded, pb.CachePressureRankPB())
+        self.assertFalse(restored.ownership.HasField("owner_world_rank"))
+        self._runner_case("missing_owner", shared=True)
+
     def test_runner_all_rank_control_and_poll_failures_retain_evidence(self):
         for fault in (
             "missing",
@@ -1141,7 +1166,7 @@ class RunnerIntegrationTest(unittest.TestCase):
             with self.subTest(fault=fault):
                 self._runner_case(fault)
 
-    def _runner_case(self, fault=None):
+    def _runner_case(self, fault=None, shared=False):
         from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2 as pb
         from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
             CacheGridRunner,
@@ -1257,6 +1282,28 @@ class RunnerIntegrationTest(unittest.TestCase):
             peer = response.ranks.add()
             peer.CopyFrom(rank)
             peer.world_rank, peer.service_instance = 1, "peer-wire"
+            if shared:
+                for item in (rank, peer):
+                    item.ownership.mode = pb.PressureOwnershipPB.SHARED_TP
+                    item.ownership.owner_world_rank.value = 0
+                    item.ownership.participant_world_ranks.extend([0, 1])
+                    item.ownership.publication_scope = (
+                        pb.PressureOwnershipPB.ALL_PARTICIPANTS
+                    )
+                    item.groups[0].group_tags.append("gpu-tag")
+                    item.groups[0].block_tokens = 512
+                    item.groups[0].payload_bytes = item.groups[0].storage_bytes = 4096
+                    for pool in item.pools:
+                        pool.pool_name = "gpu-tag" if pool.tier == 1 else "host-tag"
+                        pool.block_size_bytes = 4096
+                peer.groups[0].watermark_trigger_count = 0
+                peer.ClearField("transfers")
+                for pool in peer.pools:
+                    pool.used_blocks = pool.published_host_blocks = 0
+            if fault == "missing_waiting":
+                rank.activity.ClearField("waiting_requests")
+            if fault == "missing_owner":
+                rank.ownership.ClearField("owner_world_rank")
             for step in peer.steps:
                 del step.source_request_ids[:]
             if fault == "poll_rank":
@@ -1504,9 +1551,20 @@ class RunnerIntegrationTest(unittest.TestCase):
                 self.assertFalse(any(e["event"] == "error" for e in events))
                 if fault == "measurement_loss":
                     self.assertFalse(result["pressure"]["valid"])
+                    self.assertFalse(
+                        summary["validity"]["pressure_valid"]["measurement"]
+                    )
                     self.assertLess(result["pressure"]["ratio"], 0.95)
                     self.assertGreater(result["pressure"]["longest_invalid_s"], 2)
                     self.assertGreater((1 - result["pressure"]["ratio"]) * 4, 2)
+                    self.assertTrue(
+                        (runner.result_dir / "pressure/cache_samples.jsonl")
+                        .read_text()
+                        .strip()
+                    )
+                    self.assertLessEqual(
+                        clock() - result["measurement_end"], config().drain_timeout_s
+                    )
             first = missing_polls[0]
             self.assertEqual(
                 dict(polls[first].after_step_sequence),
@@ -1540,6 +1598,22 @@ class RunnerIntegrationTest(unittest.TestCase):
                 )
             return
         self.assertIsNone(result["failure"])
+        if shared:
+            manifest = json.loads(
+                (runner.result_dir / "pressure/manifest.json").read_text()
+            )
+            targets = manifest["frozen"]["targets"]
+            self.assertEqual([target["owner_rank"] for target in targets], [0, 0])
+            self.assertEqual(
+                targets[1]["participants"], [[0, "actual-wire"], [1, "peer-wire"]]
+            )
+            self.assertEqual(targets[1]["publication_scope"], 2)
+            self.assertEqual(targets[1]["owner_instance"], "actual-wire")
+            raw = manifest["frozen"]["raw_baseline"]["response"]["ranks"][1]
+            self.assertTrue(
+                all(int(pool.get("used_blocks", 0)) == 0 for pool in raw["pools"])
+            )
+            self.assertTrue(result["pressure"]["valid"])
         self.assertIn("measurement", [r.phase for r in controls])
         evidence = json.loads((runner.result_dir / "pressure/summary.json").read_text())
         self.assertEqual(evidence["metrics"], [])

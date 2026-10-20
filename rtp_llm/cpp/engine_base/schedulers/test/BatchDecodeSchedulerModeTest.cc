@@ -4,6 +4,18 @@
 
 namespace rtp_llm {
 
+TEST(BatchDecodeSchedulerModeTest, PressureWaitingCountsLoadingButExcludesRunning) {
+    BatchDecodeScheduler scheduler(RuntimeConfig{}, nullptr, nullptr);
+    EXPECT_EQ(scheduler.pressureWaitingRequests(), 0u);
+    scheduler.waiting_streams_.resize(2);
+    scheduler.loading_cache_streams_.resize(3);
+    scheduler.running_streams_.resize(4);
+    EXPECT_EQ(scheduler.pressureWaitingRequests(), 5u);
+    scheduler.waiting_streams_.clear();
+    scheduler.loading_cache_streams_.clear();
+    scheduler.running_streams_.clear();
+}
+
 TEST(BatchDecodeSchedulerModeTest, ControlWakeReturnsEmptyWithoutChangingBatchPolicy) {
     RuntimeConfig runtime;
     runtime.batch_decode_scheduler_config.batch_decode_scheduler_batch_size = 16;

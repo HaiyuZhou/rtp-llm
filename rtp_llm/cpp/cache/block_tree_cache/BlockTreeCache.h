@@ -45,6 +45,9 @@ struct CachePressureGroupSnapshot {
     std::optional<std::string> host_pool_id, disk_pool_id;
     TierWatermark              device_watermark, host_watermark, disk_watermark;
     uint64_t                   watermark_trigger_count{0};
+    std::vector<std::string>   group_tags;
+    uint64_t                   block_tokens{0}, payload_bytes{0}, storage_bytes{0};
+    bool                       crc_enabled{false};
 };
 struct CachePressureTransferSnapshot: TransferEvidence {
     size_t                 group_id{0};
@@ -53,14 +56,27 @@ struct CachePressureTransferSnapshot: TransferEvidence {
     CacheTransferOperation operation{CacheTransferOperation::LOAD};
     Tier                   source_tier{Tier::NONE}, target_tier{Tier::NONE};
 };
+struct CachePressureOwnership {
+    enum class Mode {
+        UNSUPPORTED = 0,
+        INDEPENDENT = 1,
+        SHARED_TP   = 2
+    };
+    Mode             mode{Mode::UNSUPPORTED};
+    int              owner_world_rank{0};
+    std::vector<int> participant_world_ranks;
+    bool             all_participant_publication{false};
+};
 struct CachePressureSnapshot {
     std::vector<CachePressurePoolSnapshot>     pools;
     std::vector<CachePressureGroupSnapshot>    groups;
     std::vector<CachePressureTransferSnapshot> transfers;
+    std::optional<CachePressureOwnership>      ownership;
 };
 
 // Unified configuration for BlockTreeCache behavior and pool sizing.
 struct BlockTreeCacheConfig {
+    std::optional<CachePressureOwnership> pressure_ownership;
     // ---- Tier enable flags ----
     bool enable_device_cache{true};
     bool enable_host_cache{false};

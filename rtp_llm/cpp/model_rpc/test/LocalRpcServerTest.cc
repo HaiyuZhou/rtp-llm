@@ -217,10 +217,14 @@ public:
         ++snapshot_calls;
         return CachePressureSnapshot(snapshot);
     }
-    mutable int           snapshot_calls = 0;
-    CachePressureSnapshot snapshot;
-    PressureStepRecorder  recorder{2};
-    PressureStepPage      getPressureSteps(const std::string& session, uint64_t after, size_t limit) const override {
+    mutable int             snapshot_calls = 0;
+    CachePressureSnapshot   snapshot;
+    PressureStepRecorder    recorder{2};
+    std::optional<uint64_t> waiting_requests;
+    std::optional<uint64_t> getPressureWaitingRequests() const override {
+        return waiting_requests;
+    }
+    PressureStepPage getPressureSteps(const std::string& session, uint64_t after, size_t limit) const override {
         return recorder.read(session, after, limit);
     }
     ErrorResult<int64_t> controlPressureDiagnostics(const PressureSessionControl& control,
@@ -1501,6 +1505,70 @@ TEST(PressureRpcTest, ControlWrappersValidateAndKeepActiveProjectionAcrossCursor
     control.set_session_id("s");
     ASSERT_TRUE(service.ControlPressureDiagnostics(&context, &control, &ack).ok());
     ASSERT_TRUE(service.ControlPressureDiagnosticsInternal(&context, &control, &ack).ok());
+}
+
+TEST(PressureRpcTest, ProjectsObservedWaitingRequestsWithoutInventingUnsupportedZero) {
+    TestLocalRpcServer server;
+    server.configurePressure(0);
+    auto engine = std::make_shared<PressureEngine>();
+    engine->recorder.enable("waiting", 8);
+    server.setEngineForTest(engine);
+    grpc::ServerContext    context;
+    CachePressureRequestPB request;
+    request.set_session_id("waiting");
+    CachePressureResponsePB response;
+    for (const auto count : {0u, 3u}) {
+        engine->waiting_requests = count;
+        ASSERT_TRUE(server.GetCachePressureInternal(&context, &request, &response).ok());
+        ASSERT_TRUE(response.ranks(0).activity().has_waiting_requests());
+        EXPECT_EQ(response.ranks(0).activity().waiting_requests().value(), count);
+    }
+    engine->waiting_requests.reset();
+    ASSERT_TRUE(server.GetCachePressureInternal(&context, &request, &response).ok());
+    EXPECT_FALSE(response.ranks(0).activity().has_waiting_requests());
+}
+
+TEST(PressureRpcTest, ExplicitSharedOwnerZeroRoundTripsWithoutChangingLocalCounters) {
+    TestLocalRpcServer server;
+    server.configurePressure(1, 1, 2);
+    auto                   engine = std::make_shared<PressureEngine>();
+    CachePressureOwnership ownership;
+    ownership.mode                        = CachePressureOwnership::Mode::SHARED_TP;
+    ownership.owner_world_rank            = 0;
+    ownership.participant_world_ranks     = {0, 1};
+    ownership.all_participant_publication = true;
+    engine->snapshot.ownership            = ownership;
+    CachePressurePoolSnapshot pool;
+    pool.pool_id      = "peer-local";
+    pool.total_blocks = pool.free_blocks = 127;
+    engine->snapshot.pools.push_back(pool);
+    CachePressureGroupSnapshot group;
+    group.group_tags    = {"full"};
+    group.block_tokens  = 512;
+    group.payload_bytes = 4096;
+    group.storage_bytes = 4112;
+    group.crc_enabled   = true;
+    engine->snapshot.groups.push_back(group);
+    server.setEngineForTest(engine);
+    grpc::ServerContext     context;
+    CachePressureRequestPB  request;
+    CachePressureResponsePB response;
+    ASSERT_TRUE(server.GetCachePressureInternal(&context, &request, &response).ok());
+    CachePressureResponsePB decoded;
+    ASSERT_TRUE(decoded.ParseFromString(response.SerializeAsString()));
+    const auto& rank = decoded.ranks(0);
+    ASSERT_TRUE(rank.has_ownership());
+    ASSERT_TRUE(rank.ownership().has_owner_world_rank());
+    EXPECT_EQ(rank.ownership().owner_world_rank().value(), 0);
+    EXPECT_EQ(rank.ownership().mode(), PressureOwnershipPB::SHARED_TP);
+    EXPECT_EQ(rank.ownership().publication_scope(), PressureOwnershipPB::ALL_PARTICIPANTS);
+    EXPECT_EQ(rank.ownership().participant_world_ranks_size(), 2);
+    EXPECT_EQ(rank.pools(0).used_blocks(), 0);
+    EXPECT_EQ(rank.pools(0).published_host_blocks(), 0);
+    EXPECT_EQ(rank.groups(0).block_tokens(), 512);
+    EXPECT_EQ(rank.groups(0).payload_bytes(), 4096);
+    EXPECT_EQ(rank.groups(0).storage_bytes(), 4112);
+    EXPECT_TRUE(rank.groups(0).crc_enabled());
 }
 
 TEST(PressureRpcTest, ControlDeadlineRetainsSuccessfulRankAndUnsupportedIsExplicit) {

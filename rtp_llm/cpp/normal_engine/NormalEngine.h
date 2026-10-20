@@ -38,6 +38,9 @@ public:
     absl::Status                      stop() override;
 
     ErrorResult<CachePressureSnapshot> getCachePressure() const override;
+    std::optional<uint64_t>            getPressureWaitingRequests() const override {
+        return scheduler_ ? scheduler_->pressureWaitingRequests() : std::nullopt;
+    }
     PressureStepPage
     getPressureSteps(const std::string& session_id, uint64_t after_sequence, size_t limit) const override;
     ErrorResult<int64_t> controlPressureDiagnostics(const PressureSessionControl&         control,

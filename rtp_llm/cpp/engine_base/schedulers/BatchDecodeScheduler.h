@@ -282,6 +282,11 @@ public:
         return waiting_streams_.size() + loading_cache_streams_.size() + running_streams_.size();
     }
 
+    std::optional<uint64_t> pressureWaitingRequests() override {
+        std::lock_guard<std::mutex> lock(lock_);
+        return waiting_streams_.size() + loading_cache_streams_.size();
+    }
+
 private:
     std::mutex                   lock_;
     std::condition_variable      cond_;

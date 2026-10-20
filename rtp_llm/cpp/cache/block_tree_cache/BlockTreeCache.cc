@@ -239,6 +239,7 @@ std::vector<BlockTreePoolMetricsSnapshot> BlockTreeCache::poolMetricsSnapshots()
 
 CachePressureSnapshot BlockTreeCache::pressureSnapshot() const {
     CachePressureSnapshot snapshot;
+    snapshot.ownership = config_.pressure_ownership;
     // Lock order: cache -> individual pool / pending-release / ledger mutex.
     // Each subordinate lock is released before acquiring another. Copy callbacks
     // take only the ledger lock. No serialization or tree walk occurs here.
@@ -269,8 +270,13 @@ CachePressureSnapshot BlockTreeCache::pressureSnapshot() const {
     }
     for (const auto& group : tree_->groupSets()) {
         CachePressureGroupSnapshot record;
-        record.group_id   = group->groupSetId();
-        record.group_type = group->groupType();
+        record.group_id      = group->groupSetId();
+        record.group_type    = group->groupType();
+        record.group_tags    = group->groupTags();
+        record.block_tokens  = group->group(group->groupTags().front()).seqSizePerBlock();
+        record.payload_bytes = group->payloadBytes();
+        record.storage_bytes = group->storageBytes();
+        record.crc_enabled   = group->crcEnabled();
         std::vector<const IBlockPool*> pools;
         for (const auto& pool : group->devicePools()) {
             if (pool) {

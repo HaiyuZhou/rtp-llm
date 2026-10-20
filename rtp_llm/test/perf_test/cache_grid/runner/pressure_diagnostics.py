@@ -6,7 +6,7 @@ message; raw bytes remain separate from the deliberately smaller evaluator view.
 
 import json
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,9 @@ class PoolSample:
     low_ratio: float
     high_ratio: float
     host_resident: int = 0
+    pool_name: str = ""
+    tier: int = 0
+    block_size_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,17 @@ class GroupSample:
     host_pool_id: str
     triggers: int
     gpu_host_published: int
+    group_tags: tuple[str, ...] = ()
+    disk_pool_id: str = ""
+    geometry: tuple[int, int, int, bool] = (0, 0, 0, False)
+
+
+@dataclass(frozen=True)
+class PressureOwnership:
+    mode: int
+    owner_rank: int
+    participants: tuple[int, ...]
+    publication_scope: int
 
 
 @dataclass(frozen=True)
@@ -66,6 +80,7 @@ class RankSample:
     groups: tuple[GroupSample, ...]
     offset_bounds: tuple[float, float] | None = None
     counters: tuple[tuple[tuple, int], ...] = ()
+    ownership: PressureOwnership | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +90,14 @@ class PressureTarget:
     group_id: int
     device_pool_ids: tuple[str, ...]
     host_pool_id: str
+    owner_rank: int | None = None
+    owner_instance: str = ""
+    owner_group_id: int | None = None
+    pool_mapping: tuple[tuple[str, str], ...] = ()
+    participants: tuple[tuple[int, str], ...] = ()
+    publication_scope: int = 1
+    ownership_mode: int = 1
+    layout: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -188,6 +211,75 @@ def _validate_group(group, pools):
                 raise ValueError("FULL device requires 0 < low < high <= 1")
 
 
+def _layout(sample):
+    return (
+        tuple(
+            sorted(
+                (
+                    p.pool_id,
+                    p.pool_name,
+                    p.tier,
+                    p.capacity,
+                    p.block_size_bytes,
+                    p.low_ratio,
+                    p.high_ratio,
+                )
+                for p in sample.pools
+            )
+        ),
+        tuple(
+            sorted(
+                (
+                    g.group_id,
+                    g.group_type,
+                    g.device_pool_ids,
+                    g.host_pool_id,
+                    g.group_tags,
+                    g.disk_pool_id,
+                    g.geometry,
+                )
+                for g in sample.groups
+            )
+        ),
+    )
+
+
+def _shared_layout(sample):
+    pools = {p.pool_id: p for p in sample.pools}
+    result = []
+    tags = set()
+    for group in sample.groups:
+        identity = tuple(sorted(group.group_tags))
+        if not identity or len(set(identity)) != len(identity) or identity in tags:
+            raise ValueError("ambiguous shared group tags")
+        tags.add(identity)
+        tokens, payload, storage, _ = group.geometry
+        if tokens <= 0 or payload <= 0 or storage < payload:
+            raise ValueError("missing shared group geometry")
+        members = []
+        for key in (
+            *group.device_pool_ids,
+            *((group.host_pool_id,) if group.host_pool_id else ()),
+            *((group.disk_pool_id,) if group.disk_pool_id else ()),
+        ):
+            pool = pools[key]
+            if (
+                not pool.pool_name
+                or pool.block_size_bytes <= 0
+                or pool.tier not in (1, 2, 3)
+            ):
+                raise ValueError("missing shared pool geometry")
+            members.append(
+                (pool.tier, pool.pool_name, pool.capacity, pool.block_size_bytes)
+            )
+        if len(set((tier, name) for tier, name, _, _ in members)) != len(members):
+            raise ValueError("ambiguous shared pool tags")
+        result.append(
+            (identity, group.group_type, group.geometry, tuple(sorted(members)))
+        )
+    return tuple(sorted(result))
+
+
 def select_targets(
     samples: tuple[RankSample, ...], ranks: tuple[int, ...]
 ) -> tuple[PressureTarget, ...]:
@@ -227,7 +319,98 @@ def select_targets(
         if not full:
             raise ValueError("rank has no FULL groups")
         result.extend(sorted(full, key=lambda target: target.group_id))
-    return tuple(result)
+    by_rank = {sample.rank: sample for sample in samples}
+    frozen = []
+    for target in result:
+        sample = by_rank[target.rank]
+        declaration = sample.ownership
+        owner = sample
+        participants = (sample,)
+        if declaration is not None:
+            if declaration.mode == 1:
+                if (
+                    declaration.owner_rank != sample.rank
+                    or declaration.participants != (sample.rank,)
+                    or declaration.publication_scope != 1
+                ):
+                    raise ValueError("inconsistent independent ownership")
+            elif declaration.mode == 2:
+                if (
+                    declaration.publication_scope != 2
+                    or len(declaration.participants) < 2
+                    or len(set(declaration.participants))
+                    != len(declaration.participants)
+                    or set(declaration.participants) != set(ranks)
+                    or sample.rank not in declaration.participants
+                    or declaration.owner_rank not in declaration.participants
+                    or any(rank not in by_rank for rank in declaration.participants)
+                ):
+                    raise ValueError("incomplete shared ownership scope")
+                participants = tuple(by_rank[rank] for rank in declaration.participants)
+                if any(peer.ownership != declaration for peer in participants):
+                    raise ValueError("inconsistent shared ownership declaration")
+                owner = by_rank[declaration.owner_rank]
+                layout = _shared_layout(owner)
+                if any(_shared_layout(peer) != layout for peer in participants):
+                    raise ValueError("incompatible shared group/pool layout")
+            else:
+                raise ValueError("unsupported pressure ownership")
+        group = next(g for g in sample.groups if g.group_id == target.group_id)
+        owner_group = group
+        mapping = tuple(
+            (key, key) for key in (*group.device_pool_ids, group.host_pool_id)
+        )
+        if owner is not sample:
+            if not group.group_tags or len(set(group.group_tags)) != len(
+                group.group_tags
+            ):
+                raise ValueError("shared group requires unique tags")
+            matches = [
+                g for g in owner.groups if set(g.group_tags) == set(group.group_tags)
+            ]
+            if len(matches) != 1 or matches[0].group_type != group.group_type:
+                raise ValueError("ambiguous shared group layout")
+            owner_group = matches[0]
+            local_pools = {p.pool_id: p for p in sample.pools}
+            owner_pools = {p.pool_id: p for p in owner.pools}
+            mapped = []
+            for key in (*group.device_pool_ids, group.host_pool_id):
+                pool = local_pools[key]
+                matches = [
+                    owner_pools[k]
+                    for k in (*owner_group.device_pool_ids, owner_group.host_pool_id)
+                    if (owner_pools[k].tier, owner_pools[k].pool_name)
+                    == (pool.tier, pool.pool_name)
+                ]
+                if (
+                    not pool.pool_name
+                    or pool.tier not in (1, 2)
+                    or pool.block_size_bytes <= 0
+                    or len(matches) != 1
+                    or (matches[0].capacity, matches[0].block_size_bytes)
+                    != (pool.capacity, pool.block_size_bytes)
+                ):
+                    raise ValueError("incompatible shared pool geometry/capacity")
+                mapped.append((key, matches[0].pool_id))
+            if len({v for _, v in mapped}) != len(mapped):
+                raise ValueError("ambiguous shared pool mapping")
+            mapping = tuple(mapped)
+        # Freeze all tiers/groups, including observe-only layout, without counters.
+        layout = tuple((peer.rank, *_layout(peer)) for peer in participants)
+        frozen.append(
+            replace(
+                target,
+                owner_rank=owner.rank,
+                owner_instance=owner.instance,
+                owner_group_id=owner_group.group_id,
+                pool_mapping=mapping,
+                participants=tuple((p.rank, p.instance) for p in participants),
+                publication_scope=declaration.publication_scope if declaration else 1,
+                ownership_mode=declaration.mode if declaration else 1,
+                layout=layout,
+            )
+        )
+    return tuple(frozen)
 
 
 def validate_inventory(
@@ -352,6 +535,10 @@ def decode_pressure_response(
         raise ValueError("response requested ranks mismatch")
     samples = []
     for rank in response.ranks:
+        if rank.HasField("ownership") and not rank.ownership.HasField(
+            "owner_world_rank"
+        ):
+            raise ValueError("missing explicit owner rank")
         if rank.error:
             raise ValueError(f"rank {rank.world_rank}: {rank.error}")
         raw_pools = {}
@@ -427,6 +614,17 @@ def decode_pressure_response(
                     host,
                     group.watermark_trigger_count,
                     published,
+                    tuple(getattr(group, "group_tags", ())),
+                    group.disk_pool_id.value if group.HasField("disk_pool_id") else "",
+                    tuple(
+                        getattr(group, field, 0)
+                        for field in (
+                            "block_tokens",
+                            "payload_bytes",
+                            "storage_bytes",
+                            "crc_enabled",
+                        )
+                    ),
                 )
             )
         pools = []
@@ -441,6 +639,9 @@ def decode_pressure_response(
                     pool.pending_release_blocks,
                     *watermarks[key],
                     pool.published_host_blocks,
+                    getattr(pool, "pool_name", ""),
+                    pool.tier,
+                    getattr(pool, "block_size_bytes", 0),
                 )
             )
         _integer(rank.sampled_monotonic_ns, "sampled_monotonic_ns")
@@ -457,6 +658,16 @@ def decode_pressure_response(
                 tuple(groups),
                 _wire_offset_bounds(response, rank, client_send_s, client_receive_s),
                 _wire_counters(rank),
+                (
+                    PressureOwnership(
+                        rank.ownership.mode,
+                        rank.ownership.owner_world_rank.value,
+                        tuple(rank.ownership.participant_world_ranks),
+                        rank.ownership.publication_scope,
+                    )
+                    if rank.HasField("ownership")
+                    else None
+                ),
             )
         )
     result = tuple(samples)
@@ -639,6 +850,45 @@ class PressureCoverage:
         if not self.epoch_valid:
             return
         samples = tuple(samples)
+        # Validate every concrete payload even if another participant is absent.
+        # Missing samples break adjacency; observed resets invalidate the epoch.
+        for sample in samples:
+            baseline = self.baselines.get(sample.rank)
+            reference = self.last_seen.get(sample.rank, baseline)
+            if baseline is None:
+                self.epoch_valid = False
+                self.reasons.add("inventory_discontinuity")
+                continue
+            if (
+                sample.instance != baseline.instance
+                or sample.ownership != baseline.ownership
+                or _layout(sample) != _layout(baseline)
+            ):
+                self.epoch_valid = False
+                self.reasons.add("inventory_discontinuity")
+            counters = dict(sample.counters)
+            old = dict(reference.counters)
+            groups = {g.group_id: g for g in sample.groups}
+            if (
+                old
+                and any(k not in counters or counters[k] < v for k, v in old.items())
+            ) or any(
+                g.group_id in groups
+                and (
+                    groups[g.group_id].triggers < g.triggers
+                    or groups[g.group_id].gpu_host_published < g.gpu_host_published
+                )
+                for g in reference.groups
+            ):
+                self.epoch_valid = False
+                self.reasons.add("counter_reset")
+            if sample.sequence <= reference.sequence:
+                self.epoch_valid = False
+                self.reasons.add("sequence_reset")
+        if not self.epoch_valid:
+            for rank in self.ranks:
+                self._break(rank)
+            return
         try:
             validate_inventory(select_targets(samples, self.ranks), self.targets)
         except ValueError:
@@ -668,8 +918,10 @@ class PressureCoverage:
             reset = (
                 old_counters
                 and (
-                    set(counters) != set(old_counters)
-                    or any(counters[k] < v for k, v in old_counters.items())
+                    any(
+                        k not in counters or counters[k] < v
+                        for k, v in old_counters.items()
+                    )
                 )
             ) or any(
                 g.triggers < old_groups[g.group_id].triggers
@@ -732,13 +984,16 @@ class PressureCoverage:
                     previous = None
             if not self.epoch_valid:
                 continue
-            base = {g.group_id: g for g in self.baselines[rank].groups}
-            pools = {p.pool_id: p for p in sample.pools}
             for target in (t for t in self.targets if t.rank == rank):
                 key = (rank, target.group_id)
-                group = next(g for g in sample.groups if g.group_id == target.group_id)
                 try:
-                    valid = group_valid(group, pools, base[group.group_id], self.config)
+                    # Peer intervals establish freshness only. Every shared target
+                    # predicate is evaluated on its owner's clock and counters.
+                    valid = all(
+                        self._target_valid(t, sample, samples)
+                        for t in self.targets
+                        if t.owner_rank == rank and t.owner_group_id == target.group_id
+                    )
                 except ValueError:
                     valid = False
                 if not valid:
@@ -767,6 +1022,45 @@ class PressureCoverage:
                             self.segments[key].pop(0)
                             self.reasons.add("history_overflow")
             self.previous[rank] = sample, bounds
+
+    def _target_valid(self, target, owner, samples):
+        local = next(s for s in samples if s.rank == target.rank)
+        local_pools = {p.pool_id: p for p in local.pools}
+        owner_pools = {p.pool_id: p for p in owner.pools}
+        pools = {}
+        for local_id, owner_id in target.pool_mapping:
+            source = owner_pools[owner_id]
+            pools[local_id] = replace(
+                local_pools[local_id],
+                used=source.used,
+                pending_release=source.pending_release,
+                host_resident=source.host_resident,
+            )
+        source = next(g for g in owner.groups if g.group_id == target.owner_group_id)
+        base = next(
+            g
+            for g in self.baselines[owner.rank].groups
+            if g.group_id == target.owner_group_id
+        )
+        group = next(g for g in local.groups if g.group_id == target.group_id)
+        return group_valid(
+            replace(
+                group,
+                triggers=source.triggers,
+                gpu_host_published=source.gpu_host_published,
+            ),
+            pools,
+            replace(
+                group,
+                triggers=base.triggers,
+                gpu_host_published=base.gpu_host_published,
+            ),
+            self.config,
+        )
+
+    def target_valid(self, target, samples):
+        owner = next(s for s in samples if s.rank == target.owner_rank)
+        return self._target_valid(target, owner, samples)
 
     def intervals(self, start, end):
         coverage([], start, end)  # validate window

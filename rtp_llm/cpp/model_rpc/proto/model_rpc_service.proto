@@ -1111,6 +1111,19 @@ message PressureGroupPB {
     PressureWatermarkPB host_watermark = 7;
     PressureWatermarkPB disk_watermark = 8;
     uint64 watermark_trigger_count = 9;
+    repeated string group_tags = 10;
+    uint64 block_tokens = 11;
+    uint64 payload_bytes = 12;
+    uint64 storage_bytes = 13;
+    bool crc_enabled = 14;
+}
+message PressureOwnershipPB {
+    enum Mode { UNSUPPORTED = 0; INDEPENDENT = 1; SHARED_TP = 2; }
+    enum PublicationScope { UNKNOWN = 0; LOCAL = 1; ALL_PARTICIPANTS = 2; }
+    Mode mode = 1;
+    google.protobuf.Int32Value owner_world_rank = 2;
+    repeated int32 participant_world_ranks = 3;
+    PublicationScope publication_scope = 4;
 }
 // Each record describes one physical endpoint. Never sum source/target endpoints.
 message PressureTransferPB {
@@ -1199,6 +1212,7 @@ message CachePressureRankPB {
     PressureActivityPB activity = 15;
     bool step_history_available = 16;
     ProfileStatusPB profile = 17;
+    PressureOwnershipPB ownership = 18;
 }
 message CachePressureResponsePB {
     uint32 schema_version = 1;

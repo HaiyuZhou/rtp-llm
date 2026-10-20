@@ -3093,12 +3093,17 @@ class CacheGridRunner:
             decoded = decode_pressure_response(response, sent, received, ranks)
             targets = select_targets(decoded.samples, ranks)
             available = []
+            owner_pools = {
+                (target.owner_rank, owner_id)
+                for target in targets
+                for local_id, owner_id in target.pool_mapping
+                if local_id in target.device_pool_ids
+            }
             for rank in response.ranks:
                 required = {
                     pool_id
-                    for target in targets
-                    if target.rank == rank.world_rank
-                    for pool_id in target.device_pool_ids
+                    for owner_rank, pool_id in owner_pools
+                    if owner_rank == rank.world_rank
                 }
                 for pool in rank.pools:
                     if pool.pool_id in required:

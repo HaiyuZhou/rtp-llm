@@ -722,6 +722,14 @@ absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
     return running_streams_;
 }
 
+std::optional<uint64_t> FIFOScheduler::pressureWaitingRequests() {
+    std::lock_guard<std::mutex> lock(lock_);
+    if (!waiting_group_queue_.empty() || !loading_cache_group_queue_.empty()) {
+        return std::nullopt;
+    }
+    return waiting_streams_.size() + loading_cache_streams_.size();
+}
+
 int64_t FIFOScheduler::waitingStreamsSize() {
     std::lock_guard<mutex> lock(lock_);
     return waiting_streams_.size() + groupQueueStreamsSize(waiting_group_queue_);

@@ -625,19 +625,8 @@ class PressureSession:
                 return
             try:
                 self.ready = all(
-                    group_valid(
-                        g,
-                        {p.pool_id: p for p in s.pools},
-                        next(
-                            b
-                            for b in self.coverage.baselines[s.rank].groups
-                            if b.group_id == g.group_id
-                        ),
-                        self.config,
-                    )
-                    for s in evidence.samples
-                    for g in s.groups
-                    if g.group_type == "FULL"
+                    self.coverage.target_valid(t, evidence.samples)
+                    for t in self.coverage.targets
                 )
                 self.ready = self.ready and all(
                     0

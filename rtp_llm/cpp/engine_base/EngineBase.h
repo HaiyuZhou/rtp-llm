@@ -73,6 +73,9 @@ public:
     virtual PressureStepPage getPressureSteps(const std::string&, uint64_t, size_t) const {
         return {};
     }
+    virtual std::optional<uint64_t> getPressureWaitingRequests() const {
+        return std::nullopt;
+    }
     virtual ErrorResult<int64_t> controlPressureDiagnostics(const PressureSessionControl&,
                                                             std::chrono::system_clock::time_point) {
         return {kPressureDiagnosticsUnsupported, "pressure session diagnostics unsupported"};

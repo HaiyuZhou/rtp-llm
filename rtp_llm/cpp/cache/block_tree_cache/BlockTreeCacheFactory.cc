@@ -31,7 +31,7 @@
 namespace rtp_llm {
 namespace {
 
-constexpr size_t kCopyAlignment = 16;
+constexpr size_t kCopyAlignment     = 16;
 constexpr size_t kDirectIOAlignment = 4096;
 
 std::optional<EvictionPolicy> parseEvictionPolicy(const std::string& value) {
@@ -425,9 +425,9 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
         group_pools[static_cast<size_t>(group_id)] = std::move(pool);
     }
 
-    const bool       host_enabled = kv_cache_config.enable_memory_cache;
-    const bool       disk_enabled = kv_cache_config.enable_disk_cache;
-    const bool       crc_backend_available = CrcBlockCopyBatch::available() && (host_enabled || disk_enabled);
+    const bool host_enabled          = kv_cache_config.enable_memory_cache;
+    const bool disk_enabled          = kv_cache_config.enable_disk_cache;
+    const bool crc_backend_available = CrcBlockCopyBatch::available() && (host_enabled || disk_enabled);
     // HOST buffers are also used directly for disk I/O, so both pools share the disk alignment when needed.
     const size_t pool_alignment =
         disk_enabled && !kv_cache_config.disk_cache_buffered_io ? kDirectIOAlignment : kCopyAlignment;
@@ -636,6 +636,28 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     const bool owns_mutable_block_tree =
         parallelism_config.tp_rank == 0 && !parallelism_config.ffn_disaggregate_config.is_ffn_service();
     config.full_prefix_scan_interval_ms = owns_mutable_block_tree ? configured_scan_interval_ms : 0;
+
+    CachePressureOwnership ownership;
+    const int              base_rank = parallelism_config.world_rank - parallelism_config.tp_rank;
+    ownership.owner_world_rank       = base_rank;
+    if (!parallelism_config.ffn_disaggregate_config.is_ffn_service()) {
+        if (parallelism_config.tp_size == 1) {
+            ownership.mode                    = CachePressureOwnership::Mode::INDEPENDENT;
+            ownership.participant_world_ranks = {parallelism_config.world_rank};
+        } else if (parallelism_config.tp_size > 1
+                   && (parallelism_config.tp_rank > 0
+                       || (broadcast_manager
+                           && broadcast_manager->workerNum() == static_cast<size_t>(parallelism_config.tp_size)))) {
+            // Root settlement waits for every worker's result. Peers declare
+            // shared addressing; the consumer must verify the owner's scope too.
+            ownership.mode                        = CachePressureOwnership::Mode::SHARED_TP;
+            ownership.all_participant_publication = true;
+            for (int rank = 0; rank < parallelism_config.tp_size; ++rank) {
+                ownership.participant_world_ranks.push_back(base_rank + rank);
+            }
+        }
+    }
+    config.pressure_ownership = std::move(ownership);
 
     auto cache_metrics_reporter = std::make_shared<BlockTreeCacheMetricsReporter>(std::move(metrics_reporter));
     auto per_rank_engine        = std::make_shared<PerRankBlockTransferEngine>(group_sets,

@@ -907,6 +907,17 @@ void pressureWatermark(const TierWatermark& value, PressureWatermarkPB* output) 
     output->set_high_ratio(value.high_ratio);
 }
 void pressureSnapshotToProto(const CachePressureSnapshot& snapshot, CachePressureRankPB* output) {
+    if (snapshot.ownership) {
+        const auto& ownership = *snapshot.ownership;
+        auto*       pb        = output->mutable_ownership();
+        pb->set_mode(static_cast<PressureOwnershipPB::Mode>(ownership.mode));
+        pb->mutable_owner_world_rank()->set_value(ownership.owner_world_rank);
+        for (int rank : ownership.participant_world_ranks) {
+            pb->add_participant_world_ranks(rank);
+        }
+        pb->set_publication_scope(ownership.all_participant_publication ? PressureOwnershipPB::ALL_PARTICIPANTS :
+                                                                          PressureOwnershipPB::LOCAL);
+    }
     for (const auto& pool : snapshot.pools) {
         auto* pb = output->add_pools();
         pb->set_pool_id(pool.pool_id);
@@ -932,6 +943,13 @@ void pressureSnapshotToProto(const CachePressureSnapshot& snapshot, CachePressur
         auto* pb = output->add_groups();
         pb->set_group_id(group.group_id);
         pb->set_group_type(pressureGroup(group.group_type));
+        pb->set_block_tokens(group.block_tokens);
+        pb->set_payload_bytes(group.payload_bytes);
+        pb->set_storage_bytes(group.storage_bytes);
+        pb->set_crc_enabled(group.crc_enabled);
+        for (const auto& tag : group.group_tags) {
+            pb->add_group_tags(tag);
+        }
         for (const auto& id : group.device_pool_ids) {
             pb->add_device_pool_ids(id);
         }
@@ -1230,6 +1248,9 @@ grpc::Status LocalRpcServer::GetCachePressureInternal(grpc::ServerContext*      
     if (page.available) {
         record->mutable_activity()->mutable_running_requests()->set_value(
             page.active ? page.active->context_batch + page.active->decode_batch : 0);
+        if (const auto waiting = engine_->getPressureWaitingRequests()) {
+            record->mutable_activity()->mutable_waiting_requests()->set_value(*waiting);
+        }
     }
     if (page.active) {
         add_step(*page.active);

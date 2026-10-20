@@ -302,6 +302,62 @@ class PressurePredicateTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             raw_pressure_record(response, 2.0, 1.0)
 
+    def test_disabled_host_disk_and_observe_only_watermarks_are_preserved(self):
+        message = wire()
+        current = message.ranks[0]
+        full = current.groups[0]
+        full.host_watermark = PB(low_ratio=0.0, high_ratio=0.0)
+        full.disk_pool_id = PB(value="disk")
+        full.disk_watermark = PB(low_ratio=0.0, high_ratio=0.0)
+        current.pools.extend(
+            [
+                PB(
+                    pool_id="disk",
+                    tier=3,
+                    total_blocks=100,
+                    used_blocks=0,
+                    pending_release_blocks=0,
+                    published_host_blocks=0,
+                ),
+                PB(
+                    pool_id="swa",
+                    tier=1,
+                    total_blocks=100,
+                    used_blocks=0,
+                    pending_release_blocks=0,
+                    published_host_blocks=0,
+                ),
+            ]
+        )
+        current.groups.append(
+            PB(
+                group_id=1,
+                group_type=2,
+                device_pool_ids=["swa"],
+                device_watermark=PB(low_ratio=0.0, high_ratio=0.0),
+                watermark_trigger_count=0,
+            )
+        )
+        sample = decode_pressure_response(message, 1.0, 1.1, (0,)).samples[0]
+        pools = {pool.pool_id: pool for pool in sample.pools}
+        for pool_id in ("host", "disk", "swa"):
+            self.assertEqual(
+                (pools[pool_id].low_ratio, pools[pool_id].high_ratio), (0.0, 0.0)
+            )
+        self.assertEqual(len(select_targets((sample,), (0,))), 1)
+        group = sample.groups[0]
+        baseline = dataclasses.replace(group, triggers=0, gpu_host_published=0)
+        self.assertTrue(group_valid(group, pools, baseline, configured()))
+
+    def test_disabled_or_invalid_full_device_watermarks_are_rejected(self):
+        for low, high in ((0.0, 0.0), (0.0, 0.9), (0.9, 0.8), (0.8, 1.1)):
+            message = wire()
+            message.ranks[0].groups[0].device_watermark = PB(
+                low_ratio=low, high_ratio=high
+            )
+            with self.subTest(low=low, high=high), self.assertRaises(ValueError):
+                decode_pressure_response(message, 1.0, 1.1, (0,))
+
     def test_wire_rejects_schema_presence_tier_and_unknown_mapping(self):
         mutations = [
             lambda m: setattr(m, "schema_version", 2),

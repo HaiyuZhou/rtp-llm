@@ -140,10 +140,12 @@ def _pool_map(pools):
         _id(pool.pool_id)
         for name in ("capacity", "used", "pending_release", "host_resident"):
             _integer(getattr(pool, name), name)
-        _number(pool.low_ratio, "low_ratio")
-        _number(pool.high_ratio, "high_ratio")
-        if not 0 < pool.low_ratio < pool.high_ratio <= 1:
-            raise ValueError("require 0 < low < high <= 1")
+        # HOST/DISK and observe-only groups may disable eviction with {0, 0}.
+        # Enabled, ordered thresholds are required only by the FULL GPU gate.
+        _number(pool.low_ratio, "low_ratio", inclusive=True)
+        _number(pool.high_ratio, "high_ratio", inclusive=True)
+        if max(pool.low_ratio, pool.high_ratio) > 1:
+            raise ValueError("watermark ratios must be <= 1")
         if (
             not 0 <= pool.pending_release <= pool.used <= pool.capacity
             or pool.host_resident > pool.used
@@ -177,6 +179,11 @@ def _validate_group(group, pools):
         not group.host_pool_id or pools[group.host_pool_id].capacity <= 0
     ):
         raise ValueError("FULL requires positive host capacity")
+    if group.group_type == "FULL":
+        for key in group.device_pool_ids:
+            pool = pools[key]
+            if not 0 < pool.low_ratio < pool.high_ratio <= 1:
+                raise ValueError("FULL device requires 0 < low < high <= 1")
 
 
 def select_targets(

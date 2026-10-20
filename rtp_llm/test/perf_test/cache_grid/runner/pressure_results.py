@@ -116,6 +116,7 @@ class PressureEvidence:
         self.pending = {}
         self.window = None
         self.duration = None
+        self.execution_failed = False
         self.lock = threading.RLock()
 
     def abort(self, error):
@@ -139,6 +140,15 @@ class PressureEvidence:
         row.update(terminal=terminal, completed_s=event.get("completed_s"))
         row.update(event.get("result", {}))
         row["success"] = terminal == "completion" and row.get("success") is True
+        if not row["success"]:
+            self.execution_failed = True
+        if terminal == "completion" and "input_len" in record:
+            result = event.get("result", {})
+            if (
+                result.get("input_len") != record["input_len"]
+                or result.get("output_len") != 1
+            ):
+                self.execution_failed = True
         if terminal == "cancellation":
             row.update(
                 cancel_requested_s=event.get("at_s"),
@@ -167,6 +177,8 @@ class PressureEvidence:
             elif kind == "dispatch":
                 self.pending[event["job_id"]] = (event, None)
             elif kind == "completion":
+                if event.get("result", {}).get("success") is not True:
+                    self.execution_failed = True
                 entry = self.pending.pop(event["job_id"], None)
                 if entry:
                     self._terminal(entry[0], kind, event)
@@ -174,6 +186,8 @@ class PressureEvidence:
                 entry = self.pending.get(event["job_id"])
                 if entry:
                     self.pending[event["job_id"]] = (entry[0], event)
+            elif kind == "error":
+                self.execution_failed = True
             elif kind == "finished":
                 for record, cancellation in self.pending.values():
                     self._terminal(record, "cancellation", cancellation or {})
@@ -186,7 +200,10 @@ class PressureEvidence:
                     window=self.window.summary() if self.window else None,
                     result=event,
                     validity=dict(
-                        execution_valid=not failure or profile_failure,
+                        execution_valid=(
+                            not self.execution_failed
+                            and (not failure or profile_failure)
+                        ),
                         pressure_valid=dict(
                             measurement=event.get("pressure", {}).get("valid"),
                             # The actual capture window is supplied by Task 13;

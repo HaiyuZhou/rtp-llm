@@ -11,6 +11,56 @@ from rtp_llm.test.perf_test.cache_grid.runner.pressure_results import (
 
 
 class PressureResultsTest(unittest.TestCase):
+    def test_profile_first_failure_does_not_mask_execution_evidence(self):
+        for terminal in (
+            "failed",
+            "cancelled",
+            "unfinished",
+            "clean",
+            "error",
+            "shape",
+        ):
+            with self.subTest(
+                terminal=terminal
+            ), tempfile.TemporaryDirectory() as directory:
+                writer = PressureWriter(Path(directory), {})
+                sink = PressureEvidence(writer, profile_requested=True)
+                request = dict(
+                    event="dispatch",
+                    job_id=1,
+                    request_id="a",
+                    phase="support",
+                    dispatched_s=71,
+                    input_len=16,
+                )
+                sink(request)
+                if terminal in {"failed", "clean", "error", "shape"}:
+                    sink(
+                        dict(
+                            event="completion",
+                            job_id=1,
+                            completed_s=72,
+                            result=dict(
+                                success=terminal != "failed",
+                                input_len=16,
+                                output_len=2 if terminal == "shape" else 1,
+                            ),
+                        )
+                    )
+                elif terminal == "cancelled":
+                    sink(dict(event="cancellation", job_id=1, at_s=72, accepted=True))
+                if terminal == "error":
+                    sink(dict(event="error", reason="padding_failed"))
+                sink(dict(event="finished", failure="profile_timeout"))
+                writer.close()
+                summary = json.loads(
+                    (Path(directory) / "pressure/summary.json").read_text()
+                )
+                self.assertEqual(summary["result"]["failure"], "profile_timeout")
+                self.assertEqual(
+                    summary["validity"]["execution_valid"], terminal == "clean"
+                )
+
     def test_writer_rejects_nonfinite_and_unknown_stream(self):
         with tempfile.TemporaryDirectory() as directory:
             writer = PressureWriter(Path(directory), {})

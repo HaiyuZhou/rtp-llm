@@ -330,7 +330,10 @@ class PressureSession:
 
     def emit(self, event, **values):
         with self.lock:
-            self.sink(dict(event=event, session_id=self.session_id, **values))
+            record = dict(event=event, session_id=self.session_id, **values)
+            self.sink(record)
+            if self.controller and hasattr(self.controller, "consume"):
+                self.controller.consume(record)
             if event == "phase" and self.diagnostics_control:
                 if len(self.control_jobs) >= 16:
                     raise RuntimeError("diagnostic control queue full")
@@ -869,11 +872,23 @@ class PressureSession:
                         self.control_executor.shutdown(wait=False, cancel_futures=True)
                 self.executor.shutdown(wait=False, cancel_futures=True)
                 self.poll_executor.shutdown(wait=False, cancel_futures=True)
+        profile_result = None
+        if self.controller and hasattr(self.controller, "finish"):
+            try:
+                profile_result = self.controller.finish(getattr(self, "coverage", None))
+            except Exception as exc:
+                profile_result = dict(
+                    trace_valid=False, reasons=[repr(exc)], pressure_valid=False
+                )
+            if not profile_result.get("trace_valid"):
+                self.state.fail("profile_invalid")
         result = dict(
             failure=self.state.failure,
             measurement_start=self.state.measurement_start,
             measurement_end=self.state.measurement_end,
         )
+        if profile_result is not None:
+            result["profile"] = profile_result
         if self.state.measurement_end is not None:
             result["pressure"] = asdict(
                 self.coverage.assess(

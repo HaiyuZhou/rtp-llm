@@ -33,7 +33,7 @@ class TorchProfile {
 public:
     TorchProfile(const std::string& prefix, std::string output_dir = "");
     ~TorchProfile();
-    void start();
+    void start(std::function<void()> before_enable = {});
 
     // Stops profiling and returns the result + filename for async saving.
     // Returns {nullptr, ""} if already stopped.

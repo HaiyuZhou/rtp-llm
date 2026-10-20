@@ -114,12 +114,15 @@ TorchProfile::~TorchProfile() {
     }
 }
 
-void TorchProfile::start() {
+void TorchProfile::start(std::function<void()> before_enable) {
     owner_thread_   = std::this_thread::get_id();
     profile_device_ = activities_.count(tpi::ActivityType::CUDA) ? currentProfileDevice() : -1;
     count_ += 1;
     stopped_ = false;
     tap::prepareProfiler(config_, activities_);
+    if (before_enable) {
+        before_enable();
+    }
     tap::enableProfiler(config_, activities_);
 }
 
@@ -328,9 +331,14 @@ void StepWindowProfiler::startStep() {
         prefix += "_";
     }
     prefix += "wr" + std::to_string(world_rank_) + "_";
-    profiler_ = std::make_shared<TorchProfile>(prefix, default_output_dir_);
+    profiler_         = std::make_shared<TorchProfile>(prefix, default_output_dir_);
+    auto monotonic_ns = [] {
+        timespec value{};
+        clock_gettime(CLOCK_MONOTONIC, &value);
+        return int64_t(value.tv_sec) * 1000000000LL + value.tv_nsec;
+    };
     try {
-        profiler_->start();
+        profiler_->start([&] { status_.capture_begin_ns = monotonic_ns(); });
         has_profiler_.store(true, std::memory_order_release);
         status_.state = "active";
     } catch (const std::exception& error) {
@@ -339,6 +347,7 @@ void StepWindowProfiler::startStep() {
         status_.state               = "finished";
         status_.collection_complete = true;
         status_.collection_error    = error.what();
+        status_.capture_end_ns      = status_.capture_begin_ns ? monotonic_ns() : 0;
         last_finished_trace_        = trace_name_;
     }
 }
@@ -387,11 +396,14 @@ void StepWindowProfiler::stopProfiler(const char* reason) {
     // Device drain/finalization can stall. Keep snapshot and requestStop usable
     // so external callers can enforce their own bounded cleanup deadlines.
     auto [result, file_name] = profiler->stopAndCollect();
+    timespec capture_end{};
+    clock_gettime(CLOCK_MONOTONIC, &capture_end);
     {
         std::lock_guard<std::mutex> lock(mu_);
         has_profiler_.store(false, std::memory_order_release);
         status_.collection_complete = true;
         status_.file_name           = file_name;
+        status_.capture_end_ns      = int64_t(capture_end.tv_sec) * 1000000000LL + capture_end.tv_nsec;
         if (!result) {
             status_.collection_error = "profiler collection failed";
             status_.state            = "finished";

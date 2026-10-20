@@ -269,6 +269,8 @@ TEST(LocalRpcServerProfileTest, ForwardedStopIsScopedIdempotentAndVisibleInDiagn
     ASSERT_EQ(response.ranks_size(), 1);
     EXPECT_TRUE(response.ranks(0).accepted());
     EXPECT_TRUE(response.ranks(0).profile().collection_complete());
+    EXPECT_EQ(response.ranks(0).profile().capture_begin_ns(), 0);
+    EXPECT_EQ(response.ranks(0).profile().capture_end_ns(), 0);
     StopProfileInternalRequestPB internal;
     internal.set_trace_name(request.trace_name());
     EXPECT_TRUE(service.StopProfileInternal(&context, &internal, &response).ok());
@@ -331,10 +333,18 @@ TEST(LocalRpcServerProfileTest, AcceptedStopTimeoutDoesNotClaimCollectionOrExpor
         EXPECT_EQ(response.ranks(0).profile().state(), "stopping");
         EXPECT_FALSE(response.ranks(0).profile().collection_complete());
         EXPECT_FALSE(response.ranks(0).profile().export_complete());
+        EXPECT_GT(response.ranks(0).profile().capture_begin_ns(), 0);
+        EXPECT_EQ(response.ranks(0).profile().capture_end_ns(), 0);
     }
     release.set_value();
     worker.join();
     EXPECT_TRUE(engine->getProfileStatus().collection_complete);
+    CachePressureRequestPB  poll;
+    CachePressureResponsePB snapshot;
+    ASSERT_TRUE(server.GetCachePressure(&context, &poll, &snapshot).ok());
+    EXPECT_EQ(snapshot.ranks(0).profile().capture_begin_ns(), engine->getProfileStatus().capture_begin_ns);
+    EXPECT_EQ(snapshot.ranks(0).profile().capture_end_ns(), engine->getProfileStatus().capture_end_ns);
+    EXPECT_GT(snapshot.ranks(0).profile().capture_end_ns(), snapshot.ranks(0).profile().capture_begin_ns());
 }
 
 class RecordingWriter: public LocalRpcServer::WriterInterface {

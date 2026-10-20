@@ -16,6 +16,47 @@ from rtp_llm.test.perf_test.cache_grid.runner import cache_perf as cli
 
 
 class CachePerfTest(unittest.TestCase):
+    def test_continuous_profile_rejects_case_replay_and_multiple_epochs(self):
+        self.pressure_profile()
+        for extra in (["--cases=7"], ["--runs=2"], ["--profile-backend=nsys"]):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                cli.build_plan(
+                    self.args(
+                        "profile",
+                        extra=["--pressure-mode=continuous", "--pressure-preload"]
+                        + extra,
+                    ),
+                    {},
+                )
+
+    def test_continuous_profile_never_overwrites_existing_baseline(self):
+        self.pressure_profile()
+        self.result.mkdir()
+        baseline = self.result / "cache_grid_results.json"
+        baseline.write_text('{"baseline":true}')
+        args = self.args(
+            "profile", extra=["--pressure-mode=continuous", "--pressure-preload"]
+        )
+        args.allow_restart_without_checkpoint = True
+        with self.assertRaises(ValueError):
+            cli.build_plan(args, {})
+        self.assertEqual(baseline.read_text(), '{"baseline":true}')
+
+    def test_continuous_profile_uses_single_epoch_without_case_replay(self):
+        self.pressure_profile()
+        for runs in ([], ["--runs=1"]):
+            plan = cli.build_plan(
+                self.args(
+                    "profile",
+                    extra=["--pressure-mode=continuous", "--pressure-preload"] + runs,
+                ),
+                {},
+            )
+            argv = json.loads(plan["artifacts"][cli.MANIFEST])["runner_args"]
+            self.assertIn("--cache_profile_runs=1", argv)
+            self.assertIn("--cache_profile_only", argv)
+            self.assertNotIn("--cache_profile_case_ids", argv)
+
     def pressure_profile(self):
         profile = load_profile(self.profile)
         profile["engine"]["seq_size_per_block"] = 512

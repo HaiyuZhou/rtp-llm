@@ -84,6 +84,8 @@ TEST_F(StepWindowProfilerConfigureTest, StopIsScopedAndCanDisarmBeforeStart) {
     EXPECT_TRUE(profiler_.requestStop("sessionA_window0"));
     EXPECT_EQ(profiler_.status().state, "finished");
     EXPECT_TRUE(profiler_.status().collection_complete);
+    EXPECT_EQ(profiler_.status().capture_begin_ns, 0);
+    EXPECT_EQ(profiler_.status().capture_end_ns, 0);
     profiler_.configure(true, "sessionA_window0", 0, 20);
     EXPECT_FALSE(profiler_.enabled());
     profiler_.configure(true, "sessionB_window0", 0, 20);

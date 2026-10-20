@@ -1129,6 +1129,13 @@ def main() -> str:
                     "--cache_shared_seed requires a known block size and full commit tail"
                 )
         if args.cache_pressure_mode == "continuous":
+            continuous_profile = (
+                args.cache_pressure_preload
+                and args.cache_profile_only
+                and args.cache_profile_runs == 1
+                and not args.cache_profile_case_ids
+                and args.cache_profile_backend == "kineto"
+            )
             if args.cache_shared_seed:
                 raise ValueError(
                     "--cache_pressure_mode=continuous cannot use --cache_shared_seed"
@@ -1144,8 +1151,10 @@ def main() -> str:
                     "continuous cache pressure supports only ungrouped batch_size=1"
                 )
             if (
-                args.cache_profile_runs
-                or args.cache_profile_only
+                (
+                    (args.cache_profile_runs or args.cache_profile_only)
+                    and not continuous_profile
+                )
                 or args.cache_case_files
                 or args.materialize_cache_cases
             ):

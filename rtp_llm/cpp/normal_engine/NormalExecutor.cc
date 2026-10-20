@@ -339,6 +339,12 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         }
         const bool record_forward = pressure_enabled && model_input.pressure_step_id && model_input.pressure_tokens
                                     && (model_input.pressure_context_batch + model_input.pressure_decode_batch);
+        std::string                     pressure_step_name;
+        std::unique_ptr<ProfilingScope> pressure_step_scope;
+        if (record_forward && at::hasCallbacks()) {
+            pressure_step_name  = "pressure.step/" + std::to_string(model_input.pressure_step_id);
+            pressure_step_scope = std::make_unique<ProfilingScope>(pressure_step_name.c_str());
+        }
         if (record_forward) {
             pressure_record.step_id              = model_input.pressure_step_id;
             pressure_record.context_batch        = model_input.pressure_context_batch;
@@ -350,6 +356,7 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         }
         try {
             model_output = std::move(model_->forward(model_input));
+            pressure_step_scope.reset();
         } catch (...) {
             if (record_forward) {
                 pressure_recorder_->abort();

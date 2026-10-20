@@ -1178,7 +1178,16 @@ class CacheGridRunner:
                 raise ValueError(
                     "continuous pressure supports only ungrouped batch_size=1"
                 )
-            if case_store is not None or profile_runs or profile_only:
+            continuous_profile = (
+                self.pressure_config is not None
+                and profile_only
+                and profile_runs == 1
+                and not tuple(profile_case_ids)
+                and profile_backend == "kineto"
+            )
+            if case_store is not None or (
+                (profile_runs or profile_only) and not continuous_profile
+            ):
                 raise ValueError(
                     "continuous pressure does not support materialized cases or profiling"
                 )
@@ -1239,8 +1248,13 @@ class CacheGridRunner:
             raise ValueError("nsys tail seconds must be between 0 and 60")
         if profile_runs < 0 or profile_trace_timeout <= 0 or profile_tp_size <= 0:
             raise ValueError("invalid cache profile runs, timeout or TP size")
-        if bool(profile_runs) != bool(self.profile_case_ids) or (
-            profile_only and not profile_runs
+        if not (
+            pressure_mode == "continuous"
+            and self.pressure_config is not None
+            and profile_only
+        ) and (
+            bool(profile_runs) != bool(self.profile_case_ids)
+            or (profile_only and not profile_runs)
         ):
             raise ValueError(
                 "cache profiling requires positive runs and explicit case IDs"
@@ -1860,6 +1874,84 @@ class CacheGridRunner:
         ):
             raise ValueError("full pressure requires ungrouped batch_size=1")
         session_id = uuid.uuid4().hex
+        if controller is None and getattr(self, "profile_only", False):
+            from .pressure_profile import KinetoCapture
+
+            trace_name = "pressure_" + session_id
+            instances = {
+                int(rank): instance
+                for rank, instance in (evidence_manifest or {}).get("epoch", {}).items()
+            }
+
+            def start_capture():
+                response = self._http_session.post(
+                    f"http://127.0.0.1:{self.port}/start_profile",
+                    json=dict(
+                        gen_timeline=True,
+                        trace_name=trace_name,
+                        start_step=0,
+                        num_steps=config.profile_steps,
+                        enable_all_rank=True,
+                    ),
+                    timeout=5,
+                )
+                response.raise_for_status()
+                ack = response.json()
+                if ack.get("status") != "ok" or ack.get("error"):
+                    raise RuntimeError(f"start_profile failed: {ack}")
+                return ack
+
+            def read_status(timeout):
+                sent = time.monotonic()
+                response = pressure_stub.GetCachePressure(
+                    model_rpc_service_pb2.CachePressureRequestPB(
+                        target_ranks=target_ranks
+                    ),
+                    timeout=timeout,
+                )
+                received = time.monotonic()
+                # Standard decoder enforces rank identities and clock bounds.
+                decode_pressure_response(response, sent, received, target_ranks)
+                return raw_pressure_record(response, sent, received)
+
+            def stop_capture():
+                response = pressure_stub.StopProfile(
+                    model_rpc_service_pb2.StopProfileRequestPB(
+                        trace_name=trace_name,
+                        enable_all_rank=True,
+                        target_ranks=target_ranks,
+                    ),
+                    timeout=1,
+                )
+                value = MessageToDict(response, preserving_proto_field_name=True)
+                pages = value.get("ranks", [])
+                if sorted(int(p.get("world_rank", 0)) for p in pages) != sorted(
+                    target_ranks
+                ):
+                    raise RuntimeError(f"missing stop rank: {value}")
+                for page in pages:
+                    rank = int(page.get("world_rank", 0))
+                    if (
+                        not page.get("accepted")
+                        or page.get("error")
+                        or page.get("service_instance") != instances.get(rank)
+                        or page.get("profile", {}).get("trace_name") != trace_name
+                    ):
+                        raise RuntimeError(f"profile stop failed: {value}")
+                return value
+
+            controller = KinetoCapture(
+                start_capture=start_capture,
+                read_status=read_status,
+                stop_capture=stop_capture,
+                trace_name=trace_name,
+                directory=self.result_dir,
+                ranks=target_ranks,
+                instances=instances,
+                session_id=session_id,
+                timeout_s=min(config.capture_timeout_s, self.profile_trace_timeout),
+                requested_steps=config.profile_steps,
+            )
         max_cache = max(int(case["cache_len"]) for case in cases)
         seed_count = self.pressure_seed_count if max_cache else 0
         seed_tokens = max_cache + self.cache_commit_tail_tokens if max_cache else 1

@@ -574,6 +574,8 @@ message ProfileStatusPB {
     string collection_error = 7;
     string export_error = 8;
     string file_name = 9;
+    int64 capture_begin_ns = 10; // CLOCK_MONOTONIC, collector enable boundary.
+    int64 capture_end_ns = 11; // Collector disable/flush boundary, excludes export.
 }
 message StopProfileRequestPB {
     string trace_name = 1;

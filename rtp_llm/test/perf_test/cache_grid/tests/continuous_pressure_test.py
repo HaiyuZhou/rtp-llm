@@ -93,6 +93,38 @@ class InlineExecutor:
 
 
 class LifecycleTest(unittest.TestCase):
+    def test_early_capture_completion_preserves_measurement_and_finalizes_before_finished(
+        self,
+    ):
+        class Controller:
+            def start(self, now):
+                self.started = now
+
+            def pending(self, now):
+                return False
+
+            def stop(self, reason, now):
+                self.stopped = now
+
+            def consume(self, event):
+                if event["event"] == "finished":
+                    assert self.finalized
+
+            def finish(self, coverage):
+                self.finalized = True
+                return dict(trace_valid=True, pressure_valid=False)
+
+        controller = Controller()
+        result, events, _, _ = self.run_session(
+            controller=controller, cfg=config(measure_s=4, steady_s=1)
+        )
+        self.assertAlmostEqual(
+            result["measurement_end"] - result["measurement_start"], 4
+        )
+        self.assertFalse(any(e.get("phase") == "support" for e in events))
+        self.assertTrue(result["profile"]["trace_valid"])
+        self.assertFalse(result["profile"]["pressure_valid"])
+
     def run_session(
         self,
         *,
@@ -1046,6 +1078,9 @@ class TransportRegistrationTest(unittest.TestCase):
 
 
 class RunnerIntegrationTest(unittest.TestCase):
+    def test_continuous_capture_wiring_and_failure_preserve_requests_and_samples(self):
+        self._runner_case("profile_failure")
+
     def test_scheduler_timeout_override_preserves_legacy_default(self):
         from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
             CacheGridRunner,
@@ -1336,9 +1371,54 @@ class RunnerIntegrationTest(unittest.TestCase):
                 SamplingParams=lambda **kwargs: kwargs
             ),
         }
+        stop_requests = []
+
+        def stop_profile(request, timeout):
+            stop_requests.append(request)
+            response = pb.StopProfileResponsePB()
+            for rank, instance in ((0, "actual-wire"), (1, "peer-wire")):
+                page = response.ranks.add(
+                    world_rank=rank, service_instance=instance, accepted=True
+                )
+                page.profile.trace_name = request.trace_name
+            return response
+
+        def capture(**kwargs):
+            self.assertEqual(kwargs["ranks"], (0, 1))
+
+            class Adapter:
+                def start(self, now):
+                    kwargs["start_capture"]()
+                    kwargs["read_status"](1)
+
+                def pending(self, now):
+                    return False
+
+                def stop(self, reason, now):
+                    kwargs["stop_capture"]()
+
+                def finish(self, coverage):
+                    return dict(
+                        trace_valid=False,
+                        pressure_valid=True,
+                        reasons=["fixture_invalid_trace"],
+                    )
+
+            return Adapter()
+
+        if fault == "profile_failure":
+            runner.profile_only = True
+            runner.profile_trace_timeout = 120
+            response = Mock()
+            response.json.return_value = {"status": "ok"}
+            runner._http_session = SimpleNamespace(post=Mock(return_value=response))
+            runner.port = 123
         with patch.dict("sys.modules", dependencies), patch.object(
             cp, "PressureSession", session
-        ), patch("time.monotonic", clock):
+        ), patch("time.monotonic", clock), patch(
+            "rtp_llm.test.perf_test.cache_grid.runner.pressure_profile.KinetoCapture",
+            side_effect=capture,
+        ):
             result = runner._run_full_pressure(
                 [dict(input_len=16, cache_len=0, batch_size=1)],
                 config(
@@ -1348,15 +1428,39 @@ class RunnerIntegrationTest(unittest.TestCase):
                 ),
                 cp.ExecutionLimits(128, 2, 128, 64, 16),
                 SimpleNamespace(
-                    GetCachePressure=poll, ControlPressureDiagnostics=control
+                    GetCachePressure=poll,
+                    ControlPressureDiagnostics=control,
+                    StopProfile=stop_profile,
                 ),
                 (0, 1),
                 events.append,
-                evidence_manifest=dict(control_times=dict(capacity_send_s=1)),
+                evidence_manifest=dict(
+                    control_times=dict(capacity_send_s=1),
+                    epoch={"0": "actual-wire", "1": "peer-wire"},
+                ),
             )
         self.assertEqual(
             controls[-1].action, pb.PressureSessionControlRequestPB.DISABLE
         )
+        if fault == "profile_failure":
+            self.assertEqual(result["failure"], "profile_invalid")
+            ack_request = runner._http_session.post.call_args.kwargs["json"]
+            self.assertEqual(ack_request["num_steps"], 20)
+            self.assertEqual(ack_request["start_step"], 0)
+            self.assertTrue(ack_request["enable_all_rank"])
+            self.assertEqual(stop_requests[0].trace_name, ack_request["trace_name"])
+            summary = json.loads(
+                (runner.result_dir / "pressure/summary.json").read_text()
+            )
+            self.assertTrue(summary["validity"]["execution_valid"])
+            self.assertFalse(summary["validity"]["trace_valid"])
+            self.assertTrue(summary["validity"]["pressure_valid"]["profile"])
+            self.assertTrue((runner.result_dir / "pressure/requests.jsonl").read_text())
+            self.assertTrue(
+                (runner.result_dir / "pressure/cache_samples.jsonl").read_text()
+            )
+            self.assertTrue(any(":measurement:" in identity for identity in rpc_ids))
+            return
         if fault in (
             "transient_missing",
             "transient_error",

@@ -161,9 +161,18 @@ def load_cases(path):
 
 def build_plan(args, inherited=None):
     inherited = dict(os.environ if inherited is None else inherited)
+    continuous_profile = (
+        args.mode == "profile"
+        and args.pressure_mode == "continuous"
+        and args.pressure_preload
+    )
     if args.pressure_preload and args.pressure_mode != "continuous":
         raise ValueError("pressure preload requires continuous mode")
-    if args.pressure_preload and args.runs is not None:
+    if (
+        args.pressure_preload
+        and args.runs is not None
+        and not (continuous_profile and args.runs == 1)
+    ):
         raise ValueError("pressure time window conflicts with explicit --runs")
     full_tuning = any(
         getattr(args, "pressure_" + name.replace("-", "_")) is not None
@@ -188,12 +197,15 @@ def build_plan(args, inherited=None):
     if not 0 <= args.nsys_tail_seconds <= 60:
         raise ValueError("--nsys-tail-seconds must be between 0 and 60")
     source = args.result_dir.resolve()
-    replay = args.mode in ("retest", "profile")
+    replay = args.mode in ("retest", "profile") and not continuous_profile
     if (
-        args.mode == "run"
+        (args.mode == "run" or continuous_profile)
         and source.exists()
         and any(source.iterdir())
-        and not getattr(args, "allow_restart_without_checkpoint", False)
+        and (
+            continuous_profile
+            or not getattr(args, "allow_restart_without_checkpoint", False)
+        )
     ):
         raise ValueError("run requires an empty/new result directory; use resume")
     if args.mode == "resume" and not (source / "cache_grid_results.json").is_file():
@@ -221,8 +233,14 @@ def build_plan(args, inherited=None):
         raise ValueError("FIFO pressure scheduler requires --pressure-mode=continuous")
     if args.pressure_scheduler == "fifo" and args.pressure_batch_size not in (None, 1):
         raise ValueError("--pressure-batch-size does not apply to FIFO")
-    if args.mode == "profile" and args.pressure_mode == "continuous":
-        raise ValueError("profile mode does not support continuous pressure")
+    if (
+        args.mode == "profile"
+        and args.pressure_mode == "continuous"
+        and not continuous_profile
+    ):
+        raise ValueError("continuous profile requires pressure preload")
+    if continuous_profile and (args.profile_backend != "kineto" or not args.profile):
+        raise ValueError("continuous profile requires Kineto and explicit profile/grid")
     if replay != bool(args.cases):
         raise ValueError("--cases is required only for retest/profile")
     if (args.profile is None) != (args.grid is None):
@@ -467,11 +485,9 @@ def build_plan(args, inherited=None):
                     ),
                 },
             )
-            runner += [
-                "--cache_profile_only",
-                "--cache_profile_flat_output",
-                "--cache_profile_case_ids",
-            ] + list(map(str, ids))
+            runner += ["--cache_profile_only", "--cache_profile_flat_output"]
+            if not continuous_profile:
+                runner += ["--cache_profile_case_ids"] + list(map(str, ids))
             if args.profile_backend == "nsys":
                 env["GEN_TIMELINE_SYNC"] = "0"
                 runner = replace_args(runner, {"gen_timeline_sync": "False"})

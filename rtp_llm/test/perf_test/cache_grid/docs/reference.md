@@ -682,3 +682,57 @@ wrong-thread destructors never disable Kineto. A stuck model call or collector
 cannot be force-stopped from RPC: status remains incomplete, the external caller
 must bound cleanup and apply existing service teardown policy. Async saver joins
 and Kineto teardown themselves are not forcibly interrupted by these RPC bounds.
+
+### Continuous Kineto Capture
+
+Run a fresh full-pressure diagnostic epoch with the complete grid distribution:
+
+```bash
+python3 -m rtp_llm.test.perf_test.cache_grid.runner.cache_perf profile \
+  --profile /path/to/profile.json --grid /path/to/grid.json \
+  --result-dir /path/to/new-profile-run \
+  --pressure-mode=continuous --pressure-preload
+```
+
+Do not select `--cases`. `--runs` may be omitted or set to 1; it never repeats
+the pressure measurement. The profile must supply the same explicit pressure
+settings, physical block size, DP=1, exclusive input-ID service and complete
+commit tails required by an unprofiled full-pressure run. Materialized inputs,
+shared seeds and fixed workspace grids remain incompatible. Continuous Nsight
+capture is not enabled by this command. Ordinary case-profile replay is unchanged.
+
+After steady pressure qualifies, an independent controller starts Kineto with
+`start_step=0`, all TP ranks, a unique epoch trace name and 20 actual steps by
+default (`pressure.profile_steps`). Start, status, stop and file waiting never
+occupy sender workers. The fixed measurement window continues after early trace
+completion; unfinished captures receive same-distribution support subject to
+the configured capture/trace deadlines and support limit. Cleanup is bounded;
+a blocked transport or collector is reported as incomplete, not successful.
+
+Each rank's `capture_begin_ns` and `capture_end_ns` are owner-thread
+`CLOCK_MONOTONIC` collection boundaries, immediately before enable and after
+collection/flush returns. They exclude asynchronous export. Both are zero for
+a never-started capture; active collection has only begin, and completion
+retains both even while export is pending. Collection errors still invalidate
+the trace. These fields are also present in StopProfile and diagnostic status.
+
+The diagnostic-only ATen `pressure.step/<step_id>` range at the actual model
+forward uses the synchronized pressure step ID. The parser joins it to the
+sidecar, CPU forward ranges and CUDA runtime/driver calls on their CPU process,
+thread and interval, then to GPU kernels by correlation. GPU pid/tid values are
+not interpreted as OS identities. Kineto timestamps are never equated with
+server monotonic timestamps. Missing ranks, foreign identities, malformed JSON,
+unlinked model kernels and insufficient observed steps invalidate the trace.
+First-step gather omission and collection-boundary steps are excluded from
+usable adjacent pure-prefill pairs. The compact parser fixture comes from the
+installed CUDA toolchain; it is not a real model acceptance result.
+
+`pressure/summary.json.result.profile` retains per-rank status, trace paths,
+control timestamps/errors, observed/usable step counts and exclusions. Raw
+request, cache and step evidence and partial trace files remain on disk after
+failure. Capture pressure is assessed independently of measurement pressure over
+the union of all rank collection windows, conservatively widened by validated
+clock-offset bounds. Every target FULL group must pass across that union;
+SWA/LINEAR remain observations. A valid trace can have invalid capture pressure.
+Separate baseline directories are never reused by the profile CLI. Bounded
+step-history overflow is explicit and cannot certify a trace as complete.

@@ -227,6 +227,8 @@ TEST(TorchProfilerTest, WorkerCancellationCollectsWithoutAnotherForwardAndExport
     EXPECT_EQ(profile.status().state, "stopping");
     profile.serviceControl();  // Wrong-thread service must leave the collector alone.
     EXPECT_FALSE(profile.status().collection_complete);
+    EXPECT_GT(profile.status().capture_begin_ns, 0);
+    EXPECT_EQ(profile.status().capture_end_ns, 0);
     profile.configure(true, "replacement", 0, 1);
     EXPECT_EQ(profile.status().trace_name, "task12_worker");
     EXPECT_EQ(ready.wait_for(std::chrono::milliseconds(1)), std::future_status::ready);
@@ -239,6 +241,7 @@ TEST(TorchProfilerTest, WorkerCancellationCollectsWithoutAnotherForwardAndExport
     const auto status = profile.status();
     EXPECT_EQ(status.state, "finished");
     EXPECT_TRUE(status.collection_complete);
+    EXPECT_GT(status.capture_end_ns, status.capture_begin_ns);
     EXPECT_TRUE(status.collection_error.empty()) << status.collection_error;
     EXPECT_TRUE(status.export_complete) << status.export_error;
     EXPECT_TRUE(std::filesystem::exists(status.file_name));
@@ -278,10 +281,13 @@ TEST(TorchProfilerTest, AsyncSaverFailureIsObservable) {
 TEST(TorchProfilerTest, NaturallyCompletedLegacyPrefixCanCaptureAgainAfterIdempotentCleanup) {
     StepWindowProfiler       profile("/tmp");
     std::vector<std::string> files;
+    int64_t                  previous_end = 0;
     for (int capture = 0; capture < 2; ++capture) {
         profile.configure(true, "task12_repeated_legacy", 0, 1);
         ASSERT_TRUE(profile.enabled()) << "capture " << capture << " must rearm";
         EXPECT_EQ(profile.status().state, "armed");
+        EXPECT_EQ(profile.status().capture_begin_ns, 0);
+        EXPECT_EQ(profile.status().capture_end_ns, 0);
         std::thread worker([&] {
             profile.startStep();
             profile.finishStep();
@@ -294,6 +300,9 @@ TEST(TorchProfilerTest, NaturallyCompletedLegacyPrefixCanCaptureAgainAfterIdempo
         const auto status = profile.status();
         ASSERT_EQ(status.state, "finished");
         ASSERT_TRUE(status.collection_complete);
+        EXPECT_GT(status.capture_begin_ns, previous_end);
+        EXPECT_GT(status.capture_end_ns, status.capture_begin_ns);
+        previous_end = status.capture_end_ns;
         ASSERT_TRUE(status.collection_error.empty());
         ASSERT_TRUE(status.export_complete) << status.export_error;
         ASSERT_TRUE(std::filesystem::exists(status.file_name));

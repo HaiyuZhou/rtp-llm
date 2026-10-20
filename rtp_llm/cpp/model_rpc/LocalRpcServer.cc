@@ -862,6 +862,8 @@ void profileStatusToProto(const ProfileStatus& value, ProfileStatusPB* pb) {
     pb->set_collection_error(value.collection_error);
     pb->set_export_error(value.export_error);
     pb->set_file_name(value.file_name);
+    pb->set_capture_begin_ns(value.capture_begin_ns);
+    pb->set_capture_end_ns(value.capture_end_ns);
 }
 PressureTierPB pressureTier(Tier tier) {
     switch (tier) {

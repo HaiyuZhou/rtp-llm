@@ -307,7 +307,20 @@ def parse_args(
         parser.error(
             "cache profile runs must be non-negative and trace timeout positive"
         )
-    if bool(args.cache_profile_runs) != bool(args.cache_profile_case_ids):
+    continuous_profile = (
+        args.cache_pressure_preload
+        and args.cache_pressure_mode == "continuous"
+        and args.cache_profile_only
+    )
+    if continuous_profile and (
+        args.cache_profile_runs != 1
+        or args.cache_profile_case_ids
+        or args.cache_profile_backend != "kineto"
+    ):
+        parser.error("continuous profile requires one Kineto capture and no case IDs")
+    if not continuous_profile and bool(args.cache_profile_runs) != bool(
+        args.cache_profile_case_ids
+    ):
         parser.error(
             "--cache_profile_runs and --cache_profile_case_ids must be supplied together"
         )
@@ -386,7 +399,9 @@ def parse_args(
             raise ValueError("pressure time window conflicts with explicit count/runs")
         # Count is only a legacy checkpoint field in this time-bounded mode.
         args.cache_measure_runs = 3
-        if args.cache_profile_runs or args.cache_profile_only:
+        if (
+            args.cache_profile_runs or args.cache_profile_only
+        ) and not continuous_profile:
             raise ValueError("continuous pressure profiling is not supported yet")
         args._pressure_config = pressure_settings(profile or {}, args, direct=True)
     elif any(

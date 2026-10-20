@@ -537,6 +537,17 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertEqual(remaining, [])
         self.assertEqual(args._pressure_config.measure_s, 60)
         self.assertEqual(args._pressure_config.fill_max_requests, 50)
+        profiled, _ = parse_args(
+            flags
+            + [
+                "--cache_profile_only",
+                "--cache_profile_runs=1",
+                "--cache_grid_json=/tmp/grid.json",
+                "--partial=2",
+            ]
+        )
+        self.assertTrue(profiled.cache_profile_only)
+        self.assertEqual(profiled.cache_profile_case_ids, [])
         with self.assertRaisesRegex(ValueError, "count|runs"):
             parse_args(flags + ["--cache_measure_runs=3"])
         with self.assertRaisesRegex(ValueError, "continuous"):
@@ -3148,6 +3159,13 @@ class FullPressurePublicTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     runner = self.runner(directory, **options)
                     runner._close_resources()
+
+    def test_full_pressure_accepts_single_kineto_epoch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.runner(directory, profile_only=True, profile_runs=1)
+            self.assertTrue(runner.profile_only)
+            self.assertEqual(runner.profile_case_ids, set())
+            runner._close_resources()
 
     def test_full_pressure_capacity_rejection_precedes_probe(self):
         with tempfile.TemporaryDirectory() as directory:

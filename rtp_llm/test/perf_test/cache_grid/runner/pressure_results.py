@@ -544,13 +544,15 @@ class PressureEvidence:
                             measurement=event.get("pressure", {}).get("valid"),
                             # The actual capture window is supplied by Task 13;
                             # support coverage alone cannot certify that window.
-                            profile=None,
+                            profile=event.get("profile", {}).get("pressure_valid"),
                             support=event.get("support_pressure", {}).get("valid"),
                         ),
                         reuse_valid=None,
-                        trace_valid=None,
+                        trace_valid=event.get("profile", {}).get("trace_valid"),
                         trace_applicability=(
-                            "pending" if self.profile_requested else "not_applicable"
+                            ("validated" if event.get("profile") else "pending")
+                            if self.profile_requested
+                            else "not_applicable"
                         ),
                     ),
                 )

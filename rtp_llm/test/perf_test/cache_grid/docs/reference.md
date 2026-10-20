@@ -313,3 +313,47 @@ operation, and unused physical counters independently of evaluator projection.
 Call `select_targets(samples, ranks)` initially, then explicitly compare each
 later target tuple using `validate_inventory(current, frozen)`; topology/service
 changes and decreased counters are discontinuities, never negative progress.
+
+### Conservative diagnostic pressure evidence
+
+Pressure coverage is a sampled estimate, not proof of pressure between polls.
+`runner.pressure_diagnostics` provides interval union/intersection, `coverage`
+(ratio and longest unknown/invalid duration, in seconds), and `confirmed_segment`.
+Unknown time, including uncovered window edges, counts as invalid. Adjacent valid
+points are merged on each server timeline before uncertain outer boundaries are
+mapped to the client clock; every frozen FULL rank/group timeline is intersected.
+
+Task 7 integration contract: construct `PressureCoverage(baselines, config,
+max_segments=4096)` with complete pre-fill `RankSample` baselines. For each poll,
+decode via `decode_pressure_response` and call `add(decoded.samples, now)` using an
+injected client monotonic clock. Call `add((), now)` on failed polls, rather than
+holding the preceding value. Save `raw_pressure_record` separately (including
+`rank_offset_bounds_s`) for offline recomputation. The actual decoder populates
+optional `RankSample.offset_bounds` and per-endpoint, per-unit cumulative counters;
+hand-created local samples can omit bounds to use direct request timing.
+Fan-out bounds compose client/coordinator request timing with each rank's internal
+request timing. Bounds widen across a continuous segment for observed drift;
+inconsistent bounds break adjacency. Samples older than the configured maximum,
+unknown ages, excessive gaps, and missing ranks cannot add coverage.
+
+Use `intervals(start, end)` for continuous steady qualification (a full 3-second
+interval normally needs four 1Hz samples; uncertainty may require more).
+`assess(start, end)` returns immutable `CoverageAssessment`: ratio,
+`longest_invalid_s`, `valid`, clipped intervals, reason codes, `epoch_valid`, and
+`max_segments_per_target`. Measurement and profile windows use this same API.
+Continue same-distribution polling after t1 until a fresh adjacent sample closes
+the right window edge, then clip to [t0,t1); never extend a last point to t1.
+Service-instance, sequence, or cumulative endpoint counter reset terminates the
+epoch (`epoch_valid=False`); the runner must fail/restart with new baselines.
+Reasons are retained for auditing even if a later window has adequate coverage.
+At most 4096 maximal segments per target are retained by default. Overflow drops
+the oldest segment, reports `history_overflow`, and makes discarded time unknown;
+choose a frozen sufficient bound for all windows and persist raw samples to disk.
+
+Supply is a separate gate: `ActivitySample(last_dispatch_s, last_progress_s,
+active_step_started_s, running, waiting)` uses client-clock seconds.
+`assess_activity(sample, now, timeout_s)` returns validity and structured reasons;
+`activity_valid` returns its boolean. Unknown queue/running counts fail closed.
+Update progress from completions, allocation/publication deltas, and actual
+execution-step evidence. A recent active long-prefill step qualifies until the
+explicit activity timeout; queued work alone cannot mask lack of progress forever.

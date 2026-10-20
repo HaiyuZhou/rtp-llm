@@ -64,6 +64,8 @@ class RankSample:
     client_receive_s: float
     pools: tuple[PoolSample, ...]
     groups: tuple[GroupSample, ...]
+    offset_bounds: tuple[float, float] | None = None
+    counters: tuple[tuple[tuple, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -308,6 +310,15 @@ def raw_pressure_record(
         ),
     )
 
+    if hasattr(response, "ranks"):
+        record["rank_offset_bounds_s"] = {
+            str(rank.world_rank): _wire_offset_bounds(
+                response, rank, client_send_s, client_receive_s
+            )
+            for rank in response.ranks
+            if not rank.error
+        }
+
     # Reject protobuf nonfinite-double string representations as well as Python NaNs.
     def finite(value):
         if isinstance(value, dict):
@@ -444,8 +455,365 @@ def decode_pressure_response(
                 client_receive_s,
                 tuple(pools),
                 tuple(groups),
+                _wire_offset_bounds(response, rank, client_send_s, client_receive_s),
+                _wire_counters(rank),
             )
         )
     result = tuple(samples)
     select_targets(result, expected_ranks)
     return DecodedPressure(response.SerializeToString(), result)
+
+
+Interval = tuple[float, float]
+
+
+def merge_intervals(values) -> list[Interval]:
+    merged = []
+    for start, end in sorted(values):
+        if not math.isfinite(start) or not math.isfinite(end):
+            raise ValueError("interval endpoints must be finite")
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def intersect_intervals(left, right) -> list[Interval]:
+    left, right = merge_intervals(left), merge_intervals(right)
+    i = j = 0
+    output = []
+    while i < len(left) and j < len(right):
+        start, end = max(left[i][0], right[j][0]), min(left[i][1], right[j][1])
+        if end > start:
+            output.append((start, end))
+        if left[i][1] <= right[j][1]:
+            i += 1
+        else:
+            j += 1
+    return output
+
+
+def coverage(values, start, end) -> tuple[float, float]:
+    if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+        raise ValueError("coverage requires a positive finite window")
+    clipped = merge_intervals((max(a, start), min(b, end)) for a, b in values)
+    valid = 0.0
+    cursor = start
+    longest = 0.0
+    for a, b in clipped:
+        longest = max(longest, a - cursor)
+        valid += b - a
+        cursor = b
+    return valid / (end - start), max(longest, end - cursor)
+
+
+def confirmed_segment(start_server, end_server, offset_low, offset_high):
+    if (
+        not all(
+            math.isfinite(v)
+            for v in (start_server, end_server, offset_low, offset_high)
+        )
+        or offset_low > offset_high
+    ):
+        raise ValueError("invalid clock bounds")
+    start, end = start_server + offset_high, end_server + offset_low
+    return (start, end) if end > start else None
+
+
+def _wire_offset_bounds(response, rank, client_send, client_receive):
+    """Client minus rank clock; fan-out composes both transport uncertainties."""
+    received = getattr(response, "coordinator_received_ns", 0)
+    sent = getattr(response, "coordinator_sent_ns", 0)
+    rank_send = getattr(rank, "coordinator_send_ns", 0)
+    rank_receive = getattr(rank, "coordinator_receive_ns", 0)
+    if not any((received, sent, rank_send, rank_receive)):
+        return (
+            client_send - rank.sampled_monotonic_ns / 1e9,
+            client_receive - rank.sampled_monotonic_ns / 1e9,
+        )
+    if (
+        min(received, sent, rank_send, rank_receive) <= 0
+        or not received <= rank_send <= rank_receive <= sent
+    ):
+        raise ValueError("invalid coordinator timing bounds")
+    # Outer request establishes client-coordinator offset; internal request
+    # establishes coordinator-rank offset. No cross-process clocks are compared.
+    server = rank.sampled_monotonic_ns / 1e9
+    low = client_send - received / 1e9 + rank_send / 1e9 - server
+    high = client_receive - sent / 1e9 + rank_receive / 1e9 - server
+    if low > high:
+        raise ValueError("inconsistent composed clock bounds")
+    return low, high
+
+
+@dataclass(frozen=True)
+class ActivitySample:
+    last_dispatch_s: float
+    last_progress_s: float
+    active_step_started_s: float | None
+    running: int | None
+    waiting: int | None
+
+
+@dataclass(frozen=True)
+class ActivityAssessment:
+    valid: bool
+    reasons: tuple[str, ...]
+
+
+def assess_activity(sample, now, timeout_s) -> ActivityAssessment:
+    _number(now, "now", inclusive=True)
+    _number(timeout_s, "timeout_s")
+
+    def recent(value):
+        return (
+            value is not None and math.isfinite(value) and 0 <= now - value <= timeout_s
+        )
+
+    if sample.running is None or sample.waiting is None:
+        return ActivityAssessment(False, ("unknown_activity",))
+    _integer(sample.running, "running")
+    _integer(sample.waiting, "waiting")
+    active = recent(sample.active_step_started_s)
+    supplied = recent(sample.last_dispatch_s) or active or sample.waiting > 0
+    progressing = recent(sample.last_progress_s) or active
+    reasons = tuple(
+        reason
+        for valid, reason in (
+            (supplied, "supply_timeout"),
+            (progressing, "progress_timeout"),
+        )
+        if not valid
+    )
+    return ActivityAssessment(not reasons, reasons)
+
+
+def activity_valid(sample, now, timeout_s) -> bool:
+    return assess_activity(sample, now, timeout_s).valid
+
+
+@dataclass(frozen=True)
+class CoverageAssessment:
+    epoch_valid: bool
+    max_segments_per_target: int
+    ratio: float
+    longest_invalid_s: float
+    valid: bool
+    intervals: tuple[Interval, ...]
+    reasons: tuple[str, ...]
+
+
+class PressureCoverage:
+    """Bounded streaming sampled evidence, shared by all diagnostic windows.
+
+    Baselines are captured before fill. Call add once per poll, including empty
+    failed polls; persist raw evidence separately. Historical segments beyond
+    max_segments per target are dropped explicitly, so their time is unknown.
+    """
+
+    def __init__(self, baselines, config, max_segments=4096):
+        _integer(max_segments, "max_segments", 1)
+        self.config = config
+        self.ranks = tuple(sorted(s.rank for s in baselines))
+        self.targets = select_targets(tuple(baselines), self.ranks)
+        self.baselines = {s.rank: s for s in baselines}
+        self.previous = {}
+        self.last_seen = {}
+        self.segments = {(t.rank, t.group_id): [] for t in self.targets}
+        self.open_segments = {}
+        self.max_segments = max_segments
+        self.reasons = set()
+        self.epoch_valid = True
+
+    def _break(self, rank):
+        self.previous.pop(rank, None)
+        for key in list(self.open_segments):
+            if key[0] == rank:
+                del self.open_segments[key]
+
+    def add(self, samples, now):
+        _number(now, "now", inclusive=True)
+        if not self.epoch_valid:
+            return
+        samples = tuple(samples)
+        try:
+            validate_inventory(select_targets(samples, self.ranks), self.targets)
+        except ValueError:
+            self.reasons.add("inventory_discontinuity")
+            # A failed/missing poll breaks adjacency; changed service identity
+            # invalidates this epoch and requires new pre-fill baselines.
+            if any(
+                s.rank in self.baselines
+                and s.instance != self.baselines[s.rank].instance
+                for s in samples
+            ):
+                self.epoch_valid = False
+            for rank in self.ranks:
+                self._break(rank)
+            return
+        for sample in samples:
+            rank = sample.rank
+            bounds = sample.offset_bounds or (
+                sample.client_send_s - sample.server_s,
+                sample.client_receive_s - sample.server_s,
+            )
+            low, high = bounds
+            reference = self.last_seen.get(rank, self.baselines[rank])
+            old_counters = dict(reference.counters)
+            counters = dict(sample.counters)
+            old_groups = {g.group_id: g for g in reference.groups}
+            reset = (
+                old_counters
+                and (
+                    set(counters) != set(old_counters)
+                    or any(counters[k] < v for k, v in old_counters.items())
+                )
+            ) or any(
+                g.triggers < old_groups[g.group_id].triggers
+                or g.gpu_host_published < old_groups[g.group_id].gpu_host_published
+                for g in sample.groups
+                if g.group_id in old_groups
+            )
+            reason = (
+                "counter_reset"
+                if reset
+                else (
+                    "sequence_reset"
+                    if rank in self.last_seen and sample.sequence <= reference.sequence
+                    else None
+                )
+            )
+            self.last_seen[rank] = sample
+            if reason:
+                self.reasons.add(reason)
+                self.epoch_valid = False
+                self._break(rank)
+                continue
+            if (
+                not all(math.isfinite(v) for v in bounds)
+                or low > high
+                or now < sample.client_receive_s
+                or now - (sample.server_s + low) > self.config.max_sample_age_s
+            ):
+                self.reasons.add("stale_or_unknown_age")
+                self._break(rank)
+                continue
+            previous = self.previous.get(rank)
+            if previous:
+                old, old_bounds = previous
+                reason = None
+                if sample.sequence <= old.sequence:
+                    reason = "sequence_reset"
+                elif (
+                    not 0
+                    < sample.server_s - old.server_s
+                    <= self.config.max_sample_gap_s
+                    or not 0
+                    <= sample.client_receive_s - old.client_receive_s
+                    <= self.config.max_sample_gap_s
+                ):
+                    reason = "sample_gap"
+                elif max(low, old_bounds[0]) > min(high, old_bounds[1]):
+                    reason = "clock_discontinuity"
+                old_groups = {g.group_id: g for g in old.groups}
+                if any(
+                    g.triggers < old_groups[g.group_id].triggers
+                    or g.gpu_host_published < old_groups[g.group_id].gpu_host_published
+                    for g in sample.groups
+                    if g.group_id in old_groups
+                ):
+                    reason = "counter_reset"
+                if reason:
+                    self.reasons.add(reason)
+                    if reason in ("counter_reset", "sequence_reset"):
+                        self.epoch_valid = False
+                    self._break(rank)
+                    previous = None
+            if not self.epoch_valid:
+                continue
+            base = {g.group_id: g for g in self.baselines[rank].groups}
+            pools = {p.pool_id: p for p in sample.pools}
+            for target in (t for t in self.targets if t.rank == rank):
+                key = (rank, target.group_id)
+                group = next(g for g in sample.groups if g.group_id == target.group_id)
+                try:
+                    valid = group_valid(group, pools, base[group.group_id], self.config)
+                except ValueError:
+                    valid = False
+                if not valid:
+                    self.reasons.add("pressure_lost")
+                    self.open_segments.pop(key, None)
+                    continue
+                # Track a valid point even without an interval; next adjacent
+                # point extends it. Merge on the server clock before mapping.
+                current = self.open_segments.get(key) if previous else None
+                if current is None:
+                    self.open_segments[key] = [
+                        sample.server_s,
+                        sample.server_s,
+                        low,
+                        high,
+                    ]
+                else:
+                    current[1] = sample.server_s
+                    current[2] = min(current[2], low)
+                    current[3] = max(current[3], high)
+                    if self.segments[key] and self.segments[key][-1] is current:
+                        pass
+                    else:
+                        self.segments[key].append(current)
+                        if len(self.segments[key]) > self.max_segments:
+                            self.segments[key].pop(0)
+                            self.reasons.add("history_overflow")
+            self.previous[rank] = sample, bounds
+
+    def intervals(self, start, end):
+        coverage([], start, end)  # validate window
+        result = [(start, end)]
+        for segments in self.segments.values():
+            mapped = [confirmed_segment(*segment) for segment in segments]
+            result = intersect_intervals(result, [v for v in mapped if v is not None])
+        return result
+
+    def assess(self, start, end) -> CoverageAssessment:
+        values = self.intervals(start, end)
+        ratio, longest = coverage(values, start, end)
+        return CoverageAssessment(
+            self.epoch_valid,
+            self.max_segments,
+            ratio,
+            longest,
+            self.epoch_valid
+            and ratio >= self.config.min_coverage
+            and longest <= self.config.max_invalid_s,
+            tuple(values),
+            tuple(sorted(self.reasons)),
+        )
+
+
+def _wire_counters(rank):
+    """Preserve each cumulative endpoint and unit independently for reset checks."""
+    output = []
+    for group in rank.groups:
+        output.append((("trigger", group.group_id), group.watermark_trigger_count))
+    for transfer in rank.transfers:
+        endpoint = (
+            transfer.group_id,
+            transfer.pool_id,
+            transfer.operation,
+            transfer.source_tier,
+            transfer.target_tier,
+        )
+        for name in (
+            "copied_blocks",
+            "copied_bytes",
+            "published_blocks",
+            "published_bytes",
+            "failed_operations",
+        ):
+            value = getattr(transfer, name, 0)
+            output.append(((name,) + endpoint, _integer(value, name)))
+    return tuple(sorted(output))

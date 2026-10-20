@@ -375,5 +375,230 @@ class PressurePredicateTest(unittest.TestCase):
                 decode_pressure_response(message, 1.0, 1.1, (0,))
 
 
+class CoverageTest(unittest.TestCase):
+    def test_interval_contract(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            confirmed_segment,
+            coverage,
+            intersect_intervals,
+            merge_intervals,
+        )
+
+        self.assertEqual(coverage([(0, 57)], 0, 60), (0.95, 3))
+        self.assertEqual(merge_intervals([(0, 1), (1, 2), (2, 4)]), [(0, 4)])
+        self.assertEqual(confirmed_segment(0, 4, -0.01, 0.01), (0.01, 3.99))
+        self.assertEqual(intersect_intervals([(0, 60)], [(1, 59)]), [(1, 59)])
+
+    def test_adjacent_samples_and_reset(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        baseline = dataclasses.replace(
+            rank(), groups=(GroupSample(0, "FULL", ("gpu",), "host", 0, 0),)
+        )
+        evaluator = PressureCoverage((baseline,), configured())
+        for t in range(4):
+            evaluator.add(
+                (
+                    dataclasses.replace(
+                        rank(),
+                        sequence=t + 2,
+                        server_s=t,
+                        client_send_s=t,
+                        client_receive_s=t,
+                    ),
+                ),
+                t,
+            )
+            if t == 2:
+                self.assertFalse(evaluator.assess(0, 3).valid)
+        self.assertEqual(evaluator.intervals(0, 3), [(0, 3)])
+        evaluator.add(
+            (
+                dataclasses.replace(
+                    rank(), sequence=1, server_s=4, client_send_s=4, client_receive_s=4
+                ),
+            ),
+            4,
+        )
+        self.assertIn("sequence_reset", evaluator.reasons)
+        self.assertEqual(evaluator.intervals(3, 4), [])
+
+    def test_activity_timeout(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            ActivitySample,
+            activity_valid,
+        )
+
+        sample = ActivitySample(0, 0, 5, 1, 0)
+        self.assertTrue(activity_valid(sample, 10, 6))
+        self.assertFalse(activity_valid(sample, 12, 6))
+        self.assertFalse(activity_valid(ActivitySample(0, 0, None, 0, 1), 100, 6))
+
+    def test_uncertainty_is_applied_only_to_segment_edges(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        base = dataclasses.replace(
+            rank(), groups=(GroupSample(0, "FULL", ("gpu",), "host", 0, 0),)
+        )
+        e = PressureCoverage((base,), configured())
+        for t in range(5):
+            e.add(
+                (
+                    dataclasses.replace(
+                        rank(),
+                        sequence=t + 2,
+                        server_s=t,
+                        client_send_s=t,
+                        client_receive_s=t + 0.02,
+                        offset_bounds=(-0.01, 0.01),
+                    ),
+                ),
+                t + 0.02,
+            )
+        self.assertEqual(e.intervals(0, 4), [(0.01, 3.99)])
+
+    def test_gap_age_missing_and_retention(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        base = dataclasses.replace(
+            rank(), groups=(GroupSample(0, "FULL", ("gpu",), "host", 0, 0),)
+        )
+
+        def point(t, sequence):
+            return dataclasses.replace(
+                rank(),
+                sequence=sequence,
+                server_s=t,
+                client_send_s=t,
+                client_receive_s=t,
+            )
+
+        e = PressureCoverage((base,), configured(), max_segments=1)
+        e.add((point(0, 2),), 0)
+        e.add((point(2, 3),), 2)
+        self.assertEqual(e.intervals(0, 2), [(0, 2)])
+        e.add((point(4.01, 4),), 4.01)
+        self.assertIn("sample_gap", e.reasons)
+        e.add((point(5, 5),), 8)
+        self.assertIn("stale_or_unknown_age", e.reasons)
+        e.add((), 9)
+        e.add((point(10, 6),), 10)
+        e.add((point(11, 7),), 11)
+        self.assertEqual(e.intervals(0, 11), [(10, 11)])
+        self.assertIn("history_overflow", e.reasons)
+
+    def test_rank_intersection_and_endpoint_reset(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        bases = tuple(
+            dataclasses.replace(
+                rank(r), groups=(GroupSample(0, "FULL", ("gpu",), "host", 0, 0),)
+            )
+            for r in (0, 1)
+        )
+        e = PressureCoverage(bases, configured())
+        for t in range(4):
+            e.add(
+                tuple(
+                    dataclasses.replace(
+                        rank(r),
+                        sequence=t + 2,
+                        server_s=t,
+                        client_send_s=t,
+                        client_receive_s=t,
+                        pools=(
+                            rank(r).pools
+                            if t > 0 or r == 0
+                            else (
+                                PoolSample("gpu", 100, 0, 0, 0.8, 0.9),
+                                rank(r).pools[1],
+                            )
+                        ),
+                    )
+                    for r in (0, 1)
+                ),
+                t,
+            )
+        self.assertEqual(e.intervals(0, 3), [(1, 3)])
+        message = wire()
+        sample = decode_pressure_response(message, 1, 1.1, (0,)).samples[0]
+        base = dataclasses.replace(
+            sample,
+            groups=(
+                dataclasses.replace(sample.groups[0], triggers=0, gpu_host_published=0),
+            ),
+        )
+        e = PressureCoverage((base,), configured())
+        e.add((sample,), 1.1)
+        message.ranks[0].sequence = 2
+        message.ranks[0].sampled_monotonic_ns = 2000000000
+        message.ranks[0].transfers[0].published_blocks = 6
+        message.ranks[0].transfers[1].published_blocks = 100
+        e.add(decode_pressure_response(message, 2, 2.1, (0,)).samples, 2.1)
+        self.assertFalse(e.epoch_valid)
+        self.assertIn("counter_reset", e.reasons)
+
+    def test_clock_discontinuity_and_reset_after_missing_poll(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        base = dataclasses.replace(
+            rank(), groups=(GroupSample(0, "FULL", ("gpu",), "host", 0, 0),)
+        )
+        e = PressureCoverage((base,), configured())
+        e.add(
+            (
+                dataclasses.replace(
+                    rank(), sequence=2, server_s=0, client_send_s=0, client_receive_s=0
+                ),
+            ),
+            0,
+        )
+        e.add(
+            (
+                dataclasses.replace(
+                    rank(),
+                    sequence=3,
+                    server_s=1,
+                    client_send_s=1.1,
+                    client_receive_s=1.1,
+                ),
+            ),
+            1.1,
+        )
+        self.assertIn("clock_discontinuity", e.reasons)
+        self.assertEqual(e.intervals(0, 2), [])
+        e.add((), 2)
+        e.add(
+            (
+                dataclasses.replace(
+                    rank(), sequence=2, server_s=3, client_send_s=3, client_receive_s=3
+                ),
+            ),
+            3,
+        )
+        self.assertFalse(e.epoch_valid)
+        self.assertIn("sequence_reset", e.reasons)
+
+    def test_fanout_offset_composition(self):
+        message = wire()
+        message.coordinator_received_ns = 10_000_000_000
+        message.coordinator_sent_ns = 10_300_000_000
+        message.ranks[0].coordinator_send_ns = 10_100_000_000
+        message.ranks[0].coordinator_receive_ns = 10_200_000_000
+        sample = decode_pressure_response(message, 100, 100.5, (0,)).samples[0]
+        self.assertAlmostEqual(sample.offset_bounds[0], 99.1)
+        self.assertAlmostEqual(sample.offset_bounds[1], 99.4)
+
+
 if __name__ == "__main__":
     unittest.main()

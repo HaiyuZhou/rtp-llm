@@ -427,7 +427,7 @@ the supervisor wakeup without exposing its executor or future.
 
 `run --pressure-mode continuous --pressure-preload` selects the full-pressure
 baseline. Without preload, continuous execution remains finite. Continuous profile
-and replay remain rejected until their capture lifecycle is integrated.
+uses a separate single epoch; case replay remains incompatible with full pressure.
 
 Use the existing JSON/JSONC profile's `cache_grid.pressure` object. Required fields
 are `fill_timeout_s`, `fill_max_requests`, `fill_no_progress_s`, `fill_input_tokens`,
@@ -446,8 +446,8 @@ Optional profile fields use the shared PressureConfig defaults: `host_ratio=0.25
 `profile_steps=20`, `support_s=60`. `nsys_duration_s` has no duration default.
 CLI aliases include `--pressure-host-target-ratio`, `--pressure-steady-seconds`,
 `--pressure-measure-seconds`, `--pressure-profile-steps`, and
-`--pressure-profile-seconds`; the latter freezes an Nsight duration but does not
-enable continuous capture yet. Direct perf flags use the same names with
+`--pressure-profile-seconds`; the latter supplies the required Nsight duration.
+Direct perf flags use the same names with
 `cache_pressure_` and underscores. The resolved object is frozen in the profile
 snapshot and resume configuration. An inherited legacy `measure_runs` value is
 ignored; explicitly supplied `--runs`/`--cache_measure_runs` is rejected.
@@ -698,8 +698,9 @@ Do not select `--cases`. `--runs` may be omitted or set to 1; it never repeats
 the pressure measurement. The profile must supply the same explicit pressure
 settings, physical block size, DP=1, exclusive input-ID service and complete
 commit tails required by an unprofiled full-pressure run. Materialized inputs,
-shared seeds and fixed workspace grids remain incompatible. Continuous Nsight
-capture is not enabled by this command. Ordinary case-profile replay is unchanged.
+shared seeds and fixed workspace grids remain incompatible. Kineto is the default;
+select `--profile-backend=nsys` and an explicit `--pressure-profile-seconds` for
+continuous Nsight. Ordinary case-profile replay is unchanged.
 
 After steady pressure qualifies, an independent controller starts Kineto with
 `start_step=0`, all TP ranks, a unique epoch trace name and 20 actual steps by
@@ -736,3 +737,60 @@ clock-offset bounds. Every target FULL group must pass across that union;
 SWA/LINEAR remain observations. A valid trace can have invalid capture pressure.
 Separate baseline directories are never reused by the profile CLI. Bounded
 step-history overflow is explicit and cannot certify a trace as complete.
+
+## Continuous Nsight
+
+Use a fresh directory independently of baseline and Kineto. Nsight reuses the
+existing `nsys launch --trace=cuda,nvtx,osrt --session-new=...` session. An independent
+controller issues start only after steady qualification, then stop at the earlier
+explicit `nsys_duration_s`, capture deadline or support/cancellation boundary.
+It never calls Kineto start. Start failure still attempts stop; start, stop and
+export failures remain in the manifest, including multiple failures and partial
+artifacts. Each command has the explicit trace timeout. Stop/report flush and
+SQLite export run off sender workers; controller operation budgets are recorded.
+The fixed measurement continues after early capture completion.
+
+Installed toolchain checked: NVIDIA Nsight Systems 2025.6.3.541-256337736014v0.
+Its `nsys export --help` documents the command used here:
+
+```bash
+nsys export --type=sqlite --lazy=false --output=/path/pressure_epoch.sqlite \
+  /path/pressure_epoch.nsys-rep
+```
+
+Export is unfiltered and does not shift timestamps or overwrite existing files.
+`nsys/<trace>.nsys-rep`, `.sqlite` and `.normalized.json` are retained. The normalized
+artifact has `start_ns`/`end_ns`, explicit rank and actual step IDs, runtime/driver
+submissions, compute/communication kernels, copies, synchronization and NVTX stages.
+All times are nanoseconds within this export only (Kineto JSON uses microseconds;
+convert by 1000 when projecting to these units). Never compare export timestamps
+to server monotonic or wall-clock timestamps. Summary includes per-rank observed/
+usable IDs and adjacent-pair counts, exclusions, artifact paths and command errors.
+
+Only continuous Nsight enables `RTP_LLM_PRESSURE_NVTX=1` in the service. RAII ranges
+emit `pressure.step/<actual_step_id>` with an unsigned world-rank payload and
+executor/cache stage names. Ordinary runs do no NVTX emission or dynamic marker
+formatting. ATen step identity remains available for Kineto. Rank is never inferred
+from process arrival, device 0, or opaque service-instance strings. The parser uses
+NVIDIA's encoded `globalPid == (globalTid & 0xFFFFFFFFFF000000)` correlation join;
+device metadata maps per-process CUDA IDs to physical devices when available.
+Absent optional DRIVER, MEMCPY or context tables do not establish absent dependencies.
+Required schema/columns, rank payload, sidecar identity and correlated GPU work
+must validate before trace success. Unknown schemas fail closed.
+
+Capture pressure is independently assessed over the conservative client interval
+from start-call entry to successful stop acknowledgement, labelled
+`client_start_call_to_stop_ack`. This includes command/flush overhead, not the later
+SQLite export, and is not an exact GPU activity interval. Missing stop acknowledgement
+cannot certify this envelope. Execution, measurement pressure, capture pressure
+and trace validity remain separate; SWA/LINEAR remain observations.
+
+GPU gap candidates retain the next compute kernel, its correlated host submission,
+previous relevant compute completion and overlapping activity as event-index links.
+Correlations alone do not establish complete cross-stream dependencies or OS
+scheduling evidence. Current automatic attribution therefore reports
+`unresolved_gpu_dependency`, with `exposed_idle_ns=null`; candidate gap is not idle
+time or CPU delay. CPU wall and thread-CPU evidence remain separate. Perf/OS Runtime
+traces can supply additional linked evidence, never arithmetic subtraction.
+Real production marker/count and multi-rank Flash acceptance must be verified in
+the diagnostic matrix; toolchain smoke and parser fixtures are not that acceptance.

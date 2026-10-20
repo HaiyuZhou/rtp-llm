@@ -1183,7 +1183,6 @@ class CacheGridRunner:
                 and profile_only
                 and profile_runs == 1
                 and not tuple(profile_case_ids)
-                and profile_backend == "kineto"
             )
             if case_store is not None or (
                 (profile_runs or profile_only) and not continuous_profile
@@ -1244,6 +1243,12 @@ class CacheGridRunner:
             raise ValueError("unknown profile backend")
         if profile_backend == "nsys" and (not profile_only or not nsys_session):
             raise ValueError("nsys requires profile-only mode and a named session")
+        if (
+            profile_backend == "nsys"
+            and self.pressure_config is not None
+            and self.pressure_config.nsys_duration_s is None
+        ):
+            raise ValueError("continuous Nsight requires explicit nsys_duration_s")
         if not 0 <= nsys_tail_seconds <= 60:
             raise ValueError("nsys tail seconds must be between 0 and 60")
         if profile_runs < 0 or profile_trace_timeout <= 0 or profile_tp_size <= 0:
@@ -1875,7 +1880,7 @@ class CacheGridRunner:
             raise ValueError("full pressure requires ungrouped batch_size=1")
         session_id = uuid.uuid4().hex
         if controller is None and getattr(self, "profile_only", False):
-            from .pressure_profile import KinetoCapture
+            from .pressure_profile import KinetoCapture, NsightCapture
 
             trace_name = "pressure_" + session_id
             instances = {
@@ -1940,18 +1945,32 @@ class CacheGridRunner:
                         raise RuntimeError(f"profile stop failed: {value}")
                 return value
 
-            controller = KinetoCapture(
-                start_capture=start_capture,
-                read_status=read_status,
-                stop_capture=stop_capture,
+            capture_options = dict(
                 trace_name=trace_name,
                 directory=self.result_dir,
                 ranks=target_ranks,
                 instances=instances,
                 session_id=session_id,
-                timeout_s=min(config.capture_timeout_s, self.profile_trace_timeout),
-                requested_steps=config.profile_steps,
+                timeout_s=config.capture_timeout_s,
             )
+            if self.profile_backend == "nsys":
+                controller = NsightCapture(
+                    command=self._nsys_command,
+                    duration_s=config.nsys_duration_s,
+                    command_timeout_s=self.profile_trace_timeout,
+                    **capture_options,
+                )
+            else:
+                capture_options["timeout_s"] = min(
+                    config.capture_timeout_s, self.profile_trace_timeout
+                )
+                controller = KinetoCapture(
+                    start_capture=start_capture,
+                    read_status=read_status,
+                    stop_capture=stop_capture,
+                    requested_steps=config.profile_steps,
+                    **capture_options,
+                )
         max_cache = max(int(case["cache_len"]) for case in cases)
         seed_count = self.pressure_seed_count if max_cache else 0
         seed_tokens = max_cache + self.cache_commit_tail_tokens if max_cache else 1
@@ -2826,7 +2845,10 @@ class CacheGridRunner:
             time.sleep(0.5)
 
     def _nsys_command(self, record, action, *options):
-        command = [self.nsys_path, action, "--session=" + self.nsys_session, *options]
+        command = [self.nsys_path, action]
+        if action != "export":
+            command.append("--session=" + self.nsys_session)
+        command.extend(options)
         entry = {"command": command, "started_at": time.time()}
         record.setdefault("nsys_commands", []).append(entry)
         try:

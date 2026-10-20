@@ -1,5 +1,6 @@
 import copy
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -11,9 +12,215 @@ from unittest.mock import Mock
 from rtp_llm.test.perf_test.cache_grid.runner.continuous_pressure import BoundedSender
 from rtp_llm.test.perf_test.cache_grid.runner.pressure_profile import (
     KinetoCapture,
+    NsightCapture,
     ProfileController,
+    classify_gpu_gap,
+    run_nsys_window,
     validate_kineto,
 )
+
+
+class NsightPressureTest(unittest.TestCase):
+    def capture(self, fault=None):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            CoverageAssessment,
+        )
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        calls = []
+
+        def command(record, action, *options):
+            calls.append(action)
+            record.setdefault("nsys_commands", []).append(dict(action=action))
+            if action in (fault or ()):
+                raise RuntimeError("injected " + action)
+            if action == "stop":
+                capture.report.write_bytes(b"report")
+            if action == "export":
+                nsys_fixture(capture.sqlite)
+
+        capture = NsightCapture(
+            command=command,
+            duration_s=0.01,
+            trace_name="pressure_fixture",
+            directory=root,
+            ranks=(0, 1),
+            instances={0: "a", 1: "b"},
+            session_id="s",
+            timeout_s=1,
+            command_timeout_s=0.1,
+        )
+        capture.start(time.monotonic())
+        for rank in (0, 1):
+            capture.steps[rank].update((s["step_id"], s) for s in steps())
+        capture.controller.result(2)
+        coverage = Mock()
+        coverage.assess.return_value = CoverageAssessment(
+            True, 4096, 0.9, 3, True, (), ()
+        )
+        return capture.finish(coverage), calls, capture, coverage
+
+    def test_capture_is_duration_based_with_separate_export_and_pressure_bounds(self):
+        result, calls, capture, coverage = self.capture()
+        self.assertEqual(calls, ["start", "stop", "export"])
+        self.assertTrue(result["trace_valid"], result)
+        coverage.assess.assert_called_once_with(
+            capture.capture_begin_s, capture.capture_end_s
+        )
+        self.assertEqual(
+            result["pressure"]["bounds_kind"], "client_start_call_to_stop_ack"
+        )
+
+    def test_start_stop_and_export_failures_remain_invalid_and_preserve_partial_files(
+        self,
+    ):
+        for fault in (("start", "stop"), ("export",), ("stop",)):
+            with self.subTest(fault=fault):
+                result, calls, capture, _ = self.capture(fault)
+                self.assertFalse(result["trace_valid"], result)
+                self.assertIn("stop", calls)
+                errors = repr(result["control_errors"])
+                for action in fault:
+                    self.assertIn("injected " + action, errors)
+                if "export" in fault:
+                    self.assertTrue(capture.report.exists())
+                    self.assertIn(str(capture.report), result["partial_files"])
+
+    def test_stop_attempted_after_start_failure(self):
+        calls = []
+
+        def command(action):
+            calls.append(action)
+            if action == "start":
+                raise RuntimeError("injected start failure")
+
+        with self.assertRaisesRegex(RuntimeError, "start failure"):
+            run_nsys_window(command, duration_s=0.01, cancelled=threading.Event())
+        self.assertEqual(calls, ["start", "stop"])
+
+    def test_early_submission_is_not_cpu_delay(self):
+        result = classify_gpu_gap(90, 100, 130, dependency_complete=False)
+        self.assertEqual(result["classification"], "unresolved_gpu_dependency")
+        self.assertIsNone(result["exposed_idle_ns"])
+
+    def test_cancellation_and_explicit_duration(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        calls = []
+        run_nsys_window(calls.append, duration_s=60, cancelled=cancelled)
+        self.assertEqual(calls, ["start", "stop"])
+        for duration in (0, -1, float("inf"), float("nan")):
+            with self.assertRaises(ValueError):
+                run_nsys_window(calls.append, duration_s=duration, cancelled=cancelled)
+
+    def test_schema_identity_correlations_and_unknown_dependencies(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
+            normalize_nsys,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.sqlite"
+            nsys_fixture(path)
+            result = normalize_nsys(path, {0: steps(), 1: steps()})
+            self.assertTrue(result["trace_valid"], result)
+            self.assertEqual(result["ranks"]["0"]["observed_step_ids"], [1, 2, 3])
+            self.assertEqual(result["ranks"]["1"]["observed_step_ids"], [1, 2, 3])
+            self.assertTrue(result["gpu_gaps"])
+            self.assertTrue(
+                all(g["exposed_idle_ns"] is None for g in result["gpu_gaps"])
+            )
+            with sqlite3.connect(path) as db:
+                db.execute("UPDATE NVTX_EVENTS SET uint64Value=NULL")
+            result = normalize_nsys(path, {0: steps(), 1: steps()})
+            self.assertFalse(result["trace_valid"])
+            self.assertIn("missing_explicit_rank_metadata", result["reasons"])
+
+    def test_required_schema_checked_optional_tables_absent(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
+            normalize_nsys,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.sqlite"
+            nsys_fixture(path)
+            with sqlite3.connect(path) as db:
+                db.execute("DROP TABLE CUPTI_ACTIVITY_KIND_RUNTIME")
+            result = normalize_nsys(path, {0: steps()})
+            self.assertFalse(result["trace_valid"])
+            self.assertIn("unsupported_schema", result["reasons"])
+
+    def test_device_mapping_is_process_local_and_optional_schema_is_validated(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
+            normalize_nsys,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.sqlite"
+            nsys_fixture(path)
+            with sqlite3.connect(path) as db:
+                db.executescript(
+                    """
+                    CREATE TABLE TARGET_INFO_CUDA_DEVICE(gpuId INTEGER, cudaId INTEGER, pid INTEGER, uuid TEXT);
+                    INSERT INTO TARGET_INFO_CUDA_DEVICE VALUES(5,0,629566,'gpu-five'),(6,0,629567,'gpu-six');
+                    UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET deviceId=0;
+                """
+                )
+            result = normalize_nsys(path, {0: steps(), 1: steps()})
+            self.assertTrue(result["trace_valid"], result)
+            kernels = [e for e in result["events"] if e["kind"] == "kernel"]
+            self.assertEqual(
+                {e["physical_device"] for e in kernels if e["rank"] == 0}, {"gpu-five"}
+            )
+            self.assertEqual(
+                {e["physical_device"] for e in kernels if e["rank"] == 1}, {"gpu-six"}
+            )
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_DRIVER(start INTEGER)")
+            self.assertIn(
+                "unsupported_schema",
+                normalize_nsys(path, {0: steps(), 1: steps()})["reasons"],
+            )
+
+
+def nsys_fixture(path):
+    # Nsight 2025.6.3 column projection. Preserve NVIDIA's encoded PID/TID join.
+    with sqlite3.connect(path) as db:
+        db.executescript(
+            """
+          CREATE TABLE StringIds(id INTEGER, value TEXT);
+          CREATE TABLE NVTX_EVENTS(start INTEGER,end INTEGER,text TEXT,textId INTEGER,
+            globalTid INTEGER,uint64Value INTEGER);
+          CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME(start INTEGER,end INTEGER,
+            globalTid INTEGER,correlationId INTEGER,nameId INTEGER);
+          CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(start INTEGER,end INTEGER,
+            globalPid INTEGER,correlationId INTEGER,deviceId INTEGER,contextId INTEGER,
+            streamId INTEGER,demangledName INTEGER);
+          INSERT INTO StringIds VALUES(1,'cudaLaunchKernel'),(2,'model_matmul');
+        """
+        )
+        for rank in (0, 1):
+            pid = (1 << 48) | ((629566 + rank) << 24)
+            tid = pid | (629566 + rank)
+            for step in (1, 2, 3):
+                start = step * 1000
+                db.execute(
+                    "INSERT INTO NVTX_EVENTS VALUES(?,?,?,?,?,?)",
+                    (start, start + 100, f"pressure.step/{step}", None, tid, rank),
+                )
+                db.execute(
+                    "INSERT INTO NVTX_EVENTS VALUES(?,?,?,?,?,?)",
+                    (start + 1, start + 99, "executor.model_forward", None, tid, None),
+                )
+                db.execute(
+                    "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES(?,?,?,?,?)",
+                    (start + 10, start + 20, tid, step, 1),
+                )
+                db.execute(
+                    "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES(?,?,?,?,?,?,?,?)",
+                    (start + 30, start + 90, pid, step, rank, 1, 7, 2),
+                )
 
 
 class PressureProfileTest(unittest.TestCase):

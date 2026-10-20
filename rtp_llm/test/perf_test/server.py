@@ -53,6 +53,15 @@ class EngineServer:
         if getattr(self._args, "cache_profile_backend", "kineto") == "nsys":
             env["GEN_TIMELINE_SYNC"] = "0"
             engine_cli += " --gen_timeline_sync=False"
+        env["RTP_LLM_PRESSURE_NVTX"] = (
+            "1"
+            if (
+                getattr(self._args, "cache_profile_backend", "kineto") == "nsys"
+                and getattr(self._args, "cache_pressure_preload", False)
+                and getattr(self._args, "cache_pressure_mode", "") == "continuous"
+            )
+            else "0"
+        )
 
         logging.info(f"Starting server with engine CLI: {engine_cli}")
         logging.info(f"remaining_args (raw list): {self._remaining_args}")

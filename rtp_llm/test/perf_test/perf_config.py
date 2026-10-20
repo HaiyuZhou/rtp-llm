@@ -313,11 +313,9 @@ def parse_args(
         and args.cache_profile_only
     )
     if continuous_profile and (
-        args.cache_profile_runs != 1
-        or args.cache_profile_case_ids
-        or args.cache_profile_backend != "kineto"
+        args.cache_profile_runs != 1 or args.cache_profile_case_ids
     ):
-        parser.error("continuous profile requires one Kineto capture and no case IDs")
+        parser.error("continuous profile requires one capture and no case IDs")
     if not continuous_profile and bool(args.cache_profile_runs) != bool(
         args.cache_profile_case_ids
     ):
@@ -404,6 +402,12 @@ def parse_args(
         ) and not continuous_profile:
             raise ValueError("continuous pressure profiling is not supported yet")
         args._pressure_config = pressure_settings(profile or {}, args, direct=True)
+        if (
+            continuous_profile
+            and args.cache_profile_backend == "nsys"
+            and args._pressure_config.nsys_duration_s is None
+        ):
+            parser.error("continuous Nsight requires explicit nsys_duration_s")
     elif any(
         getattr(args, "cache_pressure_" + option.replace("-", "_")) is not None
         for option, _, _ in PRESSURE_OPTIONS

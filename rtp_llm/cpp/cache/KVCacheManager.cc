@@ -381,7 +381,8 @@ const CacheConfig& KVCacheManager::getMTPModuleCacheConfig(int mtp_module_id) co
 
 MallocResult KVCacheManager::malloc(const MallocInfo& malloc_info) {
     RTP_LLM_PROFILE_FUNCTION();
-    const int64_t malloc_begin_time_us = currentTimeUs();
+    PressureNvtxScope nvtx_scope("cache.malloc");
+    const int64_t     malloc_begin_time_us = currentTimeUs();
     RTP_LLM_CHECK(malloc_info.batch_kv_cache_resource && malloc_info.complete_token_ids);
 
     const int  seq_size_per_block = config_.seq_size_per_block;
@@ -439,7 +440,8 @@ void KVCacheManager::reportPrefillCacheHitMetrics(const MallocInfo& malloc_info,
 
 void KVCacheManager::free(const FreeInfo& free_info) {
     RTP_LLM_PROFILE_FUNCTION();
-    const int64_t begin_time_us = metrics_reporter_ == nullptr ? 0 : currentTimeUs();
+    PressureNvtxScope nvtx_scope("cache.free");
+    const int64_t     begin_time_us = metrics_reporter_ == nullptr ? 0 : currentTimeUs();
     RTP_LLM_CHECK(free_info.batch_kv_cache_resource && free_info.complete_token_ids);
     coordinator_manager_->free(free_info);
     reportCacheOperation(metrics_reporter_, RtpLLMCacheOperationMetricsCollector::OpType::FREE, begin_time_us);
@@ -487,7 +489,8 @@ std::function<void()> KVCacheManager::allocationChangeCallback() const {
 
 void KVCacheManager::insertIntoCache(const InsertInfo& insert_info, size_t& resident_prefix_length) {
     RTP_LLM_PROFILE_FUNCTION();
-    const int64_t begin_time_us = metrics_reporter_ == nullptr ? 0 : currentTimeUs();
+    PressureNvtxScope nvtx_scope("cache.insert");
+    const int64_t     begin_time_us = metrics_reporter_ == nullptr ? 0 : currentTimeUs();
     dropLastPartialBlock(insert_info.batch_kv_cache_resource);
     coordinator_manager_->insertIntoCache(insert_info, resident_prefix_length);
     reportCacheOperation(metrics_reporter_, RtpLLMCacheOperationMetricsCollector::OpType::INSERT, begin_time_us);

@@ -13,6 +13,25 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict
 from pathlib import Path
 
+from .pressure_nsys import classify_gpu_gap, normalize_nsys
+
+
+def run_nsys_window(command, *, duration_s, cancelled):
+    if not math.isfinite(duration_s) or duration_s <= 0:
+        raise ValueError("positive finite Nsight duration required")
+    try:
+        command("start")
+        cancelled.wait(duration_s)
+    except BaseException:
+        try:
+            command("stop")
+        except BaseException:
+            # The production command adapter records both failures.
+            pass
+        raise
+    else:
+        command("stop")
+
 
 class ProfileController:
     """Operations must honor their transport deadlines/cancellation event.
@@ -554,4 +573,215 @@ class KinetoCapture:
             str(path)
             for path in sorted(self.directory.glob(f"{self.trace_name}_wr*_*.json"))
         ]
+        return result
+
+
+class NsightCapture(KinetoCapture):
+    """Duration window with the same bounded sidecar ingestion as Kineto.
+
+    The client command envelope is conservative pressure evidence, not an exact
+    GPU activity boundary. SQLite timestamps never participate in that envelope.
+    """
+
+    def __init__(
+        self,
+        *,
+        command,
+        duration_s,
+        trace_name,
+        directory,
+        ranks,
+        instances,
+        session_id,
+        timeout_s,
+        command_timeout_s,
+    ):
+        if duration_s is None or not math.isfinite(duration_s) or duration_s <= 0:
+            raise ValueError("positive finite Nsight duration required")
+        if not math.isfinite(command_timeout_s) or command_timeout_s <= 0:
+            raise ValueError("positive finite Nsight command timeout required")
+        self.duration_s = min(duration_s, timeout_s)
+        self.command = command
+        self.output = (Path(directory) / "nsys" / trace_name).resolve()
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        self.report = self.output.with_suffix(".nsys-rep")
+        self.sqlite = self.output.with_suffix(".sqlite")
+        if self.report.exists() or self.sqlite.exists():
+            raise FileExistsError(self.output)
+        self.capture_begin_s = self.capture_end_s = None
+        self.command_record = dict(backend="nsys", trace_name=trace_name)
+        super().__init__(
+            start_capture=self._start_capture,
+            read_status=None,
+            stop_capture=self._stop_capture,
+            trace_name=trace_name,
+            directory=directory,
+            ranks=ranks,
+            instances=instances,
+            session_id=session_id,
+            timeout_s=timeout_s,
+            requested_steps=0,
+        )
+        # stop includes report flushing and a separate SQLite export, both with
+        # their own subprocess deadline. Sender workers continue throughout.
+        self.controller.timeouts.update(
+            start=command_timeout_s + 1, stop=2 * command_timeout_s + 2
+        )
+
+    def _start_capture(self):
+        self.capture_begin_s = time.monotonic()
+        self.command(
+            self.command_record,
+            "start",
+            "--sample=process-tree",
+            "--cpuctxsw=process-tree",
+            "--output=" + str(self.output),
+        )
+
+    def consume(self, event):
+        if event.get("event") != "pressure":
+            return
+        raw = event.get("raw", {})
+        pages = []
+        for page in raw.get("response", {}).get("ranks", []):
+            bounds = raw.get("rank_offset_bounds_s", {}).get(
+                str(int(page.get("world_rank", 0)))
+            )
+            records = []
+            for step in page.get("steps", []):
+                entered = int(step.get("forward_enter_ns", 0)) / 1e9
+                if (
+                    bounds
+                    and self.capture_begin_s is not None
+                    and entered + bounds[1] < self.capture_begin_s
+                ):
+                    continue
+                if (
+                    bounds
+                    and self.capture_end_s is not None
+                    and entered + bounds[0] > self.capture_end_s
+                ):
+                    continue
+                records.append(step)
+            pages.append(dict(page, steps=records))
+        super().consume(
+            dict(
+                event,
+                raw=dict(raw, response=dict(raw.get("response", {}), ranks=pages)),
+            )
+        )
+
+    def _wait(self):
+        self.controller.cancel.wait(
+            max(
+                0,
+                min(self.capture_begin_s + self.duration_s, self.deadline)
+                - time.monotonic(),
+            )
+        )
+        return {}
+
+    def _stop_capture(self):
+        self.command(self.command_record, "stop")
+        self.capture_end_s = time.monotonic()
+        if not self.report.is_file() or self.report.stat().st_size == 0:
+            raise RuntimeError("nsys stop did not produce a nonempty report")
+        self.command(
+            self.command_record,
+            "export",
+            "--type=sqlite",
+            "--lazy=false",
+            "--output=" + str(self.sqlite),
+            str(self.report),
+        )
+        if not self.sqlite.is_file() or self.sqlite.stat().st_size == 0:
+            raise RuntimeError("nsys export did not produce a nonempty SQLite file")
+
+    def pending(self, now):
+        # Stop at the capture deadline but keep cleanup/export visible as pending
+        # until the session's own support deadline bounds further traffic.
+        if self.started and now >= self.started_s + self.timeout_s:
+            self.controller.request_stop()
+        return self.started and not self.controller.done()
+
+    def finish(self, coverage):
+        if not self.started:
+            return dict(
+                trace_valid=False, pressure_valid=False, reasons=["profile_not_started"]
+            )
+        finish_deadline = time.monotonic() + 5
+        try:
+            result = self.controller.result(5)
+        except TimeoutError:
+            result = dict(
+                trace_valid=False,
+                reasons=["profile_cleanup_timeout"],
+                control_log=list(self.controller.log),
+            )
+        reasons = set(result.get("reasons", [])) | self.errors
+        if result.get("control_errors"):
+            reasons.add("profile_control_failed")
+        if self.evictions:
+            reasons.add("profile_step_history_overflow")
+        parsed = Future()
+        snapshot = {
+            rank: list(records.values()) for rank, records in self.steps.items()
+        }
+
+        def parse():
+            try:
+                normalized = normalize_nsys(self.sqlite, snapshot)
+                path = self.output.with_suffix(".normalized.json")
+                with path.open("x") as stream:
+                    json.dump(normalized, stream, allow_nan=False)
+                normalized["normalized_file"] = str(path)
+                normalized["normalized_event_count"] = len(normalized.pop("events", []))
+                gaps = normalized.pop("gpu_gaps", [])
+                normalized["gpu_gap_count"] = len(gaps)
+                normalized["gpu_gap_attribution"] = (
+                    "unavailable_cross_stream_dependency_and_os_evidence"
+                )
+                parsed.set_result(normalized)
+            except BaseException as exc:
+                parsed.set_exception(exc)
+
+        threading.Thread(target=parse, name="pressure-nsys-parse", daemon=True).start()
+        try:
+            normalized = parsed.result(max(0, finish_deadline - time.monotonic()))
+        except BaseException as exc:
+            normalized = dict(
+                trace_valid=False, reasons=["nsys_analysis_failed"], error=repr(exc)
+            )
+        reasons.update(normalized.get("reasons", []))
+        pressure = None
+        if (
+            self.capture_begin_s is not None
+            and self.capture_end_s is not None
+            and coverage is not None
+        ):
+            pressure = dict(
+                start_s=self.capture_begin_s,
+                end_s=self.capture_end_s,
+                bounds_kind="client_start_call_to_stop_ack",
+                **asdict(coverage.assess(self.capture_begin_s, self.capture_end_s)),
+            )
+        else:
+            reasons.add("missing_capture_operation_bounds")
+        result.update(normalized)
+        result.update(
+            trace_valid=not reasons,
+            reasons=sorted(reasons),
+            pressure=pressure,
+            pressure_valid=pressure["valid"] if pressure else False,
+            trace_name=self.trace_name,
+            backend="nsys",
+            duration_s=self.duration_s,
+            operation_timeout_s=dict(self.controller.timeouts),
+            nsys_commands=list(self.command_record.get("nsys_commands", [])),
+            trace_files=[str(self.report), str(self.sqlite)],
+            partial_files=[
+                str(p) for p in sorted(self.output.parent.glob(self.trace_name + "*"))
+            ],
+            state_evictions=self.evictions,
+        )
         return result

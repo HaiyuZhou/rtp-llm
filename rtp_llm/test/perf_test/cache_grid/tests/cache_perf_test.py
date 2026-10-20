@@ -16,6 +16,32 @@ from rtp_llm.test.perf_test.cache_grid.runner import cache_perf as cli
 
 
 class CachePerfTest(unittest.TestCase):
+    def test_continuous_nsys_has_explicit_duration_and_exclusive_collector(self):
+        self.pressure_profile()
+        plan = cli.build_plan(
+            self.args(
+                "profile",
+                extra=[
+                    "--pressure-mode=continuous",
+                    "--pressure-preload",
+                    "--profile-backend=nsys",
+                    "--pressure-profile-seconds=0.1",
+                ],
+            ),
+            {},
+        )
+        launch = json.loads(plan["artifacts"][cli.MANIFEST])
+        self.assertEqual(launch["env"]["RTP_LLM_PRESSURE_NVTX"], "1")
+        self.assertEqual(launch["env"]["GEN_TIMELINE_SYNC"], "0")
+        self.assertNotIn("--cache_profile_case_ids", launch["runner_args"])
+        self.assertTrue(any(a.startswith("--run_under=") for a in plan["command"]))
+        self.assertEqual(
+            json.loads(plan["artifacts"]["profile.snapshot.json"])["cache_grid"][
+                "pressure"
+            ]["nsys_duration_s"],
+            0.1,
+        )
+
     def test_continuous_profile_rejects_case_replay_and_multiple_epochs(self):
         self.pressure_profile()
         for extra in (["--cases=7"], ["--runs=2"], ["--profile-backend=nsys"]):

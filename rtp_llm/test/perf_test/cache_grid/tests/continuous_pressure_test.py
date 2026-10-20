@@ -1078,6 +1078,9 @@ class TransportRegistrationTest(unittest.TestCase):
 
 
 class RunnerIntegrationTest(unittest.TestCase):
+    def test_nsys_wiring_uses_duration_and_never_starts_kineto(self):
+        self._runner_case("nsys_failure")
+
     def test_continuous_capture_wiring_and_failure_preserve_requests_and_samples(self):
         self._runner_case("profile_failure")
 
@@ -1385,17 +1388,23 @@ class RunnerIntegrationTest(unittest.TestCase):
 
         def capture(**kwargs):
             self.assertEqual(kwargs["ranks"], (0, 1))
+            if fault == "nsys_failure":
+                self.assertEqual(kwargs["duration_s"], 0.1)
+                self.assertNotIn("start_capture", kwargs)
+                self.assertEqual(kwargs["command"], runner._nsys_command)
 
             class Adapter:
                 def start(self, now):
-                    kwargs["start_capture"]()
-                    kwargs["read_status"](1)
+                    if fault != "nsys_failure":
+                        kwargs["start_capture"]()
+                        kwargs["read_status"](1)
 
                 def pending(self, now):
                     return False
 
                 def stop(self, reason, now):
-                    kwargs["stop_capture"]()
+                    if fault != "nsys_failure":
+                        kwargs["stop_capture"]()
 
                 def finish(self, coverage):
                     return dict(
@@ -1406,8 +1415,9 @@ class RunnerIntegrationTest(unittest.TestCase):
 
             return Adapter()
 
-        if fault == "profile_failure":
+        if fault in ("profile_failure", "nsys_failure"):
             runner.profile_only = True
+            runner.profile_backend = "nsys" if fault == "nsys_failure" else "kineto"
             runner.profile_trace_timeout = 120
             response = Mock()
             response.json.return_value = {"status": "ok"}
@@ -1416,7 +1426,8 @@ class RunnerIntegrationTest(unittest.TestCase):
         with patch.dict("sys.modules", dependencies), patch.object(
             cp, "PressureSession", session
         ), patch("time.monotonic", clock), patch(
-            "rtp_llm.test.perf_test.cache_grid.runner.pressure_profile.KinetoCapture",
+            "rtp_llm.test.perf_test.cache_grid.runner.pressure_profile."
+            + ("NsightCapture" if fault == "nsys_failure" else "KinetoCapture"),
             side_effect=capture,
         ):
             result = runner._run_full_pressure(
@@ -1425,6 +1436,7 @@ class RunnerIntegrationTest(unittest.TestCase):
                     steady_s=1,
                     measure_s=4 if fault == "measurement_loss" else 2,
                     sample_period_s=0.5,
+                    nsys_duration_s=0.1 if fault == "nsys_failure" else None,
                 ),
                 cp.ExecutionLimits(128, 2, 128, 64, 16),
                 SimpleNamespace(
@@ -1442,6 +1454,12 @@ class RunnerIntegrationTest(unittest.TestCase):
         self.assertEqual(
             controls[-1].action, pb.PressureSessionControlRequestPB.DISABLE
         )
+        if fault == "nsys_failure":
+            runner._http_session.post.assert_not_called()
+            self.assertFalse(stop_requests)
+            self.assertEqual(result["failure"], "profile_invalid")
+            self.assertTrue(any(":measurement:" in identity for identity in rpc_ids))
+            return
         if fault == "profile_failure":
             self.assertEqual(result["failure"], "profile_invalid")
             ack_request = runner._http_session.post.call_args.kwargs["json"]

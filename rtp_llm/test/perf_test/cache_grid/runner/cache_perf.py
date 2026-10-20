@@ -239,8 +239,8 @@ def build_plan(args, inherited=None):
         and not continuous_profile
     ):
         raise ValueError("continuous profile requires pressure preload")
-    if continuous_profile and (args.profile_backend != "kineto" or not args.profile):
-        raise ValueError("continuous profile requires Kineto and explicit profile/grid")
+    if continuous_profile and not args.profile:
+        raise ValueError("continuous profile requires explicit profile/grid")
     if replay != bool(args.cases):
         raise ValueError("--cases is required only for retest/profile")
     if (args.profile is None) != (args.grid is None):
@@ -268,8 +268,17 @@ def build_plan(args, inherited=None):
     ):
         raise ValueError("profile currently supports ungrouped batch=1 only")
     env = environment(profile, args.env, inherited) if not saved else dict(saved["env"])
+    env["RTP_LLM_PRESSURE_NVTX"] = "0"
     if args.pressure_preload:
         settings = pressure_settings(profile, args)
+        if (
+            continuous_profile
+            and args.profile_backend == "nsys"
+            and settings.nsys_duration_s is None
+        ):
+            raise ValueError(
+                "continuous Nsight requires explicit nsys_duration_s (--pressure-profile-seconds)"
+            )
         engine_args = profile.get("engine_args", {})
         physical_block = profile.get("engine", {}).get(
             "seq_size_per_block",
@@ -490,6 +499,8 @@ def build_plan(args, inherited=None):
                 runner += ["--cache_profile_case_ids"] + list(map(str, ids))
             if args.profile_backend == "nsys":
                 env["GEN_TIMELINE_SYNC"] = "0"
+                if continuous_profile:
+                    env["RTP_LLM_PRESSURE_NVTX"] = "1"
                 runner = replace_args(runner, {"gen_timeline_sync": "False"})
         env["PERF_PROFILE_RUNS"] = "0"
         # Make all resolved names part of test_info and the existing resume guard.

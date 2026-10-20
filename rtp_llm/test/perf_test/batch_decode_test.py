@@ -1134,7 +1134,6 @@ def main() -> str:
                 and args.cache_profile_only
                 and args.cache_profile_runs == 1
                 and not args.cache_profile_case_ids
-                and args.cache_profile_backend == "kineto"
             )
             if args.cache_shared_seed:
                 raise ValueError(

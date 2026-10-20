@@ -1290,6 +1290,13 @@ class EngineServerSchedulerModeTest(unittest.TestCase):
         options = manager.call_args.kwargs
         self.assertEqual(options["env_args"]["GEN_TIMELINE_SYNC"], "0")
         self.assertTrue(options["smoke_args_str"].endswith("--gen_timeline_sync=False"))
+        self.assertEqual(options["env_args"]["RTP_LLM_PRESSURE_NVTX"], "0")
+        server._args.cache_pressure_preload = True
+        server._args.cache_pressure_mode = "continuous"
+        server.start(8192, 1)
+        self.assertEqual(
+            manager.call_args.kwargs["env_args"]["RTP_LLM_PRESSURE_NVTX"], "1"
+        )
 
     def _server(self):
         args = argparse.Namespace(partial=2, result_dir="/tmp/result", dp_size=1)
@@ -1366,6 +1373,29 @@ class EngineServerSchedulerModeTest(unittest.TestCase):
 
 
 class CacheGridProfileTest(unittest.TestCase):
+    def test_nsys_export_uses_report_argument_without_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.nsys_runner(tmp)
+            self.addCleanup(runner._close_resources)
+            with patch(
+                "rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner.subprocess.run"
+            ) as run:
+                run.return_value = subprocess.CompletedProcess(
+                    [], 0, stdout="exported", stderr=""
+                )
+                record = {}
+                runner._nsys_command(
+                    record, "export", "--type=sqlite", "/tmp/report.nsys-rep"
+                )
+            self.assertEqual(
+                run.call_args.args[0],
+                ["/test/nsys", "export", "--type=sqlite", "/tmp/report.nsys-rep"],
+            )
+            self.assertEqual(
+                run.call_args.kwargs["timeout"], runner.profile_trace_timeout
+            )
+            self.assertEqual(record["nsys_commands"][0]["returncode"], 0)
+
     def nsys_runner(self, tmp, **kwargs):
         return self.runner(
             tmp,
@@ -3164,6 +3194,30 @@ class FullPressurePublicTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             runner = self.runner(directory, profile_only=True, profile_runs=1)
             self.assertTrue(runner.profile_only)
+            self.assertEqual(runner.profile_case_ids, set())
+            runner._close_resources()
+
+    def test_full_pressure_nsys_requires_duration_and_accepts_single_epoch(self):
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "nsys_duration_s"):
+                self.runner(
+                    directory,
+                    profile_only=True,
+                    profile_runs=1,
+                    profile_backend="nsys",
+                    nsys_session="session",
+                )
+            runner = self.runner(
+                directory,
+                profile_only=True,
+                profile_runs=1,
+                profile_backend="nsys",
+                nsys_session="session",
+                pressure_config=replace(self.settings(), nsys_duration_s=0.1),
+            )
+            self.assertEqual(runner.profile_backend, "nsys")
             self.assertEqual(runner.profile_case_ids, set())
             runner._close_resources()
 

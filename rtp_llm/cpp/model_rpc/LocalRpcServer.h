@@ -65,6 +65,10 @@ public:
 
     grpc::Status SetLogLevel(grpc::ServerContext* context, const SetLogLevelRequestPB* request, EmptyPB* response);
 
+    grpc::Status GetCachePressure(grpc::ServerContext*, const CachePressureRequestPB*, CachePressureResponsePB*);
+    grpc::Status
+    GetCachePressureInternal(grpc::ServerContext*, const CachePressureRequestPB*, CachePressureResponsePB*);
+
     grpc::Status StartProfile(grpc::ServerContext* context, const StartProfileRequestPB* request, EmptyPB* response);
 
     grpc::Status
@@ -160,6 +164,10 @@ protected:
     virtual TorchAllocatorDumpResultPB dumpTorchAllocatorOnCurrentProcess(const std::string& dump_id);
 
 protected:
+    RPCPool                               pressure_rpc_pool_;
+    std::atomic<uint64_t>                 pressure_sequence_{0};
+    const std::string                     pressure_instance_ = makePressureInstance();
+    static std::string                    makePressureInstance();
     std::shared_ptr<EngineBase>           engine_;
     std::shared_ptr<MultimodalProcessor>  mm_processor_;
     EngineInitParams                      maga_init_params_;

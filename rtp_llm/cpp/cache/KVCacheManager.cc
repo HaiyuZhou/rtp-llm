@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
+#include "rtp_llm/cpp/engine_base/PressureDiagnostics.h"
 #include "rtp_llm/cpp/cache/events/KVCMPublisher.h"
 
 #include <algorithm>
@@ -30,6 +31,12 @@
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 
 namespace rtp_llm {
+ErrorResult<CachePressureSnapshot> KVCacheManager::getCachePressure() const {
+    if (!block_tree_cache_) {
+        return unsupportedCachePressure();
+    }
+    return block_tree_cache_->pressureSnapshot();
+}
 
 class KVCacheAllocationWaitState {
 public:

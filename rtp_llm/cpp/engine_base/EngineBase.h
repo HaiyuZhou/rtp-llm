@@ -1,6 +1,7 @@
 #pragma once
 
 #include <utility>
+#include "rtp_llm/cpp/engine_base/PressureDiagnostics.h"
 
 #include "absl/status/status.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
@@ -63,6 +64,10 @@ public:
 
     virtual absl::StatusOr<GenerateStreamPtr> preRun(const std::shared_ptr<GenerateInput>& generate_input,
                                                      preRunMode                            mode) = 0;
+
+    virtual ErrorResult<CachePressureSnapshot> getCachePressure() const {
+        return unsupportedCachePressure();
+    }
 
     virtual KVCacheInfo getCacheStatusInfo(int64_t latest_version, bool need_cache_keys) = 0;
 

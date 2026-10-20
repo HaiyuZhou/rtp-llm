@@ -5,6 +5,7 @@
 #include <future>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -13,6 +14,7 @@
 
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/model_rpc/LocalRpcServer.h"
+#include "rtp_llm/cpp/model_rpc/LocalRpcServiceImpl.h"
 #include "rtp_llm/cpp/model_rpc/RpcErrorCode.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 
@@ -33,6 +35,13 @@ public:
 
 class TestLocalRpcServer: public LocalRpcServer {
 public:
+    void configurePressure(int world_rank, int tp_rank = 0, int tp_size = 1, std::vector<std::string> addresses = {}) {
+        maga_init_params_.parallelism_config.world_rank    = world_rank;
+        maga_init_params_.parallelism_config.tp_rank       = tp_rank;
+        maga_init_params_.parallelism_config.tp_size       = tp_size;
+        maga_init_params_.runtime_config.worker_grpc_addrs = std::move(addresses);
+        meta_                                              = std::make_shared<RpcServerRuntimeMeta>();
+    }
     grpc::Status poll(std::shared_ptr<GenerateStream>& stream) {
         return pollStreamOutput(nullptr, "request", nullptr, stream);
     }
@@ -191,6 +200,23 @@ public:
 
 private:
     EngineFailureMode mode_;
+};
+
+class PressureEngine: public FailingEngine {
+public:
+    PressureEngine(): FailingEngine(EngineFailureMode::REJECT_ALL) {}
+    ErrorResult<CachePressureSnapshot> getCachePressure() const override {
+        ++snapshot_calls;
+        return CachePressureSnapshot(snapshot);
+    }
+    mutable int           snapshot_calls = 0;
+    CachePressureSnapshot snapshot;
+};
+class PressureService: public LocalRpcServiceImpl {
+public:
+    explicit PressureService(const std::shared_ptr<LocalRpcServer>& server) {
+        local_server_ = server;
+    }
 };
 
 class RecordingWriter: public LocalRpcServer::WriterInterface {
@@ -915,6 +941,299 @@ TEST(LocalRpcServerTest, PollWritesFinalLocalOutputBeforeRemoteHandoff) {
     EXPECT_EQ(stream->getStatus(), StreamState::RUNNING);
     EXPECT_FALSE(normal_stream->stream_cache_resource_->isResourceReleased());
     EXPECT_FALSE(normal_stream->hasOutput());
+}
+
+TEST(PressureRpcTest, UnsupportedEngineDoesNotReturnEmptySuccess) {
+    TestLocalRpcServer server;
+    server.setEngineForTest(std::make_shared<FailingEngine>(EngineFailureMode::REJECT_ALL));
+    CachePressureRequestPB request;
+    request.set_session_id("pressure-test");
+    CachePressureResponsePB response;
+    grpc::ServerContext     context;
+    EXPECT_EQ(server.GetCachePressureInternal(&context, &request, &response).error_code(),
+              grpc::StatusCode::UNIMPLEMENTED);
+    EXPECT_EQ(server.GetCachePressure(&context, &request, &response).error_code(), grpc::StatusCode::UNIMPLEMENTED);
+    ASSERT_EQ(response.ranks_size(), 1);
+    EXPECT_FALSE(response.ranks(0).error().empty());
+}
+
+TEST(PressureRpcTest, SnapshotSerializationPreservesPhysicalDimensionsAndPresence) {
+    auto                      engine = std::make_shared<PressureEngine>();
+    CachePressurePoolSnapshot pool;
+    pool.pool_id                    = "physical-host";
+    pool.pool_name                  = "host-name";
+    pool.tier                       = Tier::HOST;
+    pool.block_size_bytes           = 4096;
+    pool.total_blocks               = 100;
+    pool.used_blocks                = 70;
+    pool.free_blocks                = 30;
+    pool.available_blocks           = 40;
+    pool.pending_release_blocks     = 7;
+    pool.published_host_blocks      = 55;
+    pool.active_blocks              = 10;
+    pool.request_ref_blocks         = 12;
+    pool.block_cache_ref_blocks     = 65;
+    pool.load_ref_blocks            = 13;
+    pool.eviction_target_ref_blocks = 14;
+    pool.store_ref_blocks           = 15;
+    engine->snapshot.pools.push_back(pool);
+    pool.pool_id                      = "device";
+    pool.tier                         = Tier::DEVICE;
+    pool.request_ref_blocks_available = true;
+    engine->snapshot.pools.push_back(pool);
+    for (auto type : {CacheGroupType::FULL, CacheGroupType::SWA, CacheGroupType::LINEAR}) {
+        CachePressureGroupSnapshot group;
+        group.group_id                = engine->snapshot.groups.size();
+        group.group_type              = type;
+        group.device_pool_ids         = {"device"};
+        group.host_pool_id            = "physical-host";
+        group.device_watermark        = {0.1, 0.2};
+        group.host_watermark          = {0.3, 0.4};
+        group.disk_watermark          = {0.5, 0.6};
+        group.watermark_trigger_count = 17;
+        engine->snapshot.groups.push_back(group);
+    }
+    for (auto tier : {Tier::DEVICE, Tier::HOST, Tier::DISK, Tier::REMOTE, Tier::NONE}) {
+        CachePressureTransferSnapshot transfer;
+        transfer.group_id          = 2;
+        transfer.pool_id           = "endpoint";
+        transfer.pool_tier         = tier;
+        transfer.source_tier       = Tier::DEVICE;
+        transfer.target_tier       = Tier::HOST;
+        transfer.operation         = CacheTransferOperation::EVICT;
+        transfer.copied_blocks     = 2;
+        transfer.copied_bytes      = 8192;
+        transfer.published_blocks  = 1;
+        transfer.published_bytes   = 4096;
+        transfer.failed_operations = 3;
+        engine->snapshot.transfers.push_back(transfer);
+    }
+    for (auto op : {CacheTransferOperation::LOAD, CacheTransferOperation::STORE}) {
+        CachePressureTransferSnapshot transfer;
+        transfer.operation = op;
+        engine->snapshot.transfers.push_back(transfer);
+    }
+    auto server = std::make_shared<TestLocalRpcServer>();
+    server->configurePressure(4);
+    server->setEngineForTest(engine);
+    PressureService         service(server);
+    CachePressureRequestPB  request;
+    CachePressureResponsePB response;
+    grpc::ServerContext     context;
+    ASSERT_TRUE(service.GetCachePressure(&context, &request, &response).ok());
+    CachePressureResponsePB roundtrip;
+    ASSERT_TRUE(roundtrip.ParseFromString(response.SerializeAsString()));
+    ASSERT_EQ(roundtrip.ranks_size(), 1);
+    EXPECT_EQ(roundtrip.requested_ranks(0), 4);
+    EXPECT_EQ(roundtrip.schema_version(), 1);
+    const auto& rank = roundtrip.ranks(0);
+    EXPECT_EQ(rank.world_rank(), 4);
+    EXPECT_FALSE(rank.service_instance().empty());
+    EXPECT_EQ(rank.sequence(), 1);
+    EXPECT_GT(rank.sampled_monotonic_ns(), 0);
+    EXPECT_GE(rank.collect_duration_ns(), 0);
+    EXPECT_LE(rank.coordinator_send_ns(), rank.sampled_monotonic_ns());
+    EXPECT_GE(rank.coordinator_receive_ns(), rank.sampled_monotonic_ns() + rank.collect_duration_ns());
+    EXPECT_FALSE(rank.has_activity());
+    EXPECT_FALSE(rank.step_history_available());
+    ASSERT_EQ(rank.pools_size(), 2);
+    const auto& pb = rank.pools(0);
+    EXPECT_EQ(pb.pool_id(), "physical-host");
+    EXPECT_EQ(pb.pool_name(), "host-name");
+    EXPECT_EQ(pb.tier(), PRESSURE_HOST);
+    EXPECT_EQ(pb.block_size_bytes(), 4096);
+    EXPECT_EQ(pb.total_blocks(), 100);
+    EXPECT_EQ(pb.used_blocks(), 70);
+    EXPECT_EQ(pb.free_blocks(), 30);
+    EXPECT_EQ(pb.available_blocks(), 40);
+    EXPECT_EQ(pb.pending_release_blocks(), 7);
+    EXPECT_EQ(pb.published_host_blocks(), 55);
+    EXPECT_EQ(pb.active_blocks(), 10);
+    EXPECT_EQ(pb.block_cache_ref_blocks(), 65);
+    EXPECT_EQ(pb.load_ref_blocks(), 13);
+    EXPECT_EQ(pb.eviction_target_ref_blocks(), 14);
+    EXPECT_EQ(pb.store_ref_blocks(), 15);
+    EXPECT_FALSE(pb.has_request_ref_blocks());
+    EXPECT_TRUE(rank.pools(1).has_request_ref_blocks());
+    EXPECT_EQ(rank.pools(1).request_ref_blocks().value(), 12);
+    EXPECT_EQ(rank.pools(1).tier(), PRESSURE_DEVICE);
+    ASSERT_EQ(rank.groups_size(), 3);
+    EXPECT_EQ(rank.groups(0).group_type(), PRESSURE_FULL);
+    EXPECT_EQ(rank.groups(1).group_type(), PRESSURE_SWA);
+    EXPECT_EQ(rank.groups(2).group_type(), PRESSURE_LINEAR);
+    EXPECT_EQ(rank.groups(2).group_id(), 2);
+    EXPECT_EQ(rank.groups(0).device_pool_ids(0), "device");
+    EXPECT_EQ(rank.groups(0).host_pool_id().value(), "physical-host");
+    EXPECT_FALSE(rank.groups(0).has_disk_pool_id());
+    EXPECT_DOUBLE_EQ(rank.groups(0).device_watermark().low_ratio(), 0.1);
+    EXPECT_DOUBLE_EQ(rank.groups(0).host_watermark().high_ratio(), 0.4);
+    EXPECT_DOUBLE_EQ(rank.groups(0).disk_watermark().high_ratio(), 0.6);
+    EXPECT_EQ(rank.groups(0).watermark_trigger_count(), 17);
+    ASSERT_EQ(rank.transfers_size(), 7);
+    const std::array<PressureTierPB, 5> tiers = {
+        PRESSURE_DEVICE, PRESSURE_HOST, PRESSURE_DISK, PRESSURE_REMOTE, PRESSURE_NONE};
+    for (int i = 0; i < 5; ++i) {
+        const auto& transfer = rank.transfers(i);
+        EXPECT_EQ(transfer.group_id(), 2);
+        EXPECT_EQ(transfer.pool_id(), "endpoint");
+        EXPECT_EQ(transfer.pool_tier(), tiers[i]);
+        EXPECT_EQ(transfer.source_tier(), PRESSURE_DEVICE);
+        EXPECT_EQ(transfer.target_tier(), PRESSURE_HOST);
+        EXPECT_EQ(transfer.operation(), PRESSURE_EVICT);
+        EXPECT_EQ(transfer.copied_blocks(), 2);
+        EXPECT_EQ(transfer.copied_bytes(), 8192);
+        EXPECT_EQ(transfer.published_blocks(), 1);
+        EXPECT_EQ(transfer.published_bytes(), 4096);
+        EXPECT_EQ(transfer.failed_operations(), 3);
+    }
+    EXPECT_EQ(rank.transfers(5).operation(), PRESSURE_LOAD);
+    EXPECT_EQ(rank.transfers(6).operation(), PRESSURE_STORE);
+}
+
+TEST(PressureRpcTest, ValidatesTargetsPageCapAndRankZero) {
+    TestLocalRpcServer server;
+    server.configurePressure(4, 0, 2);
+    auto engine = std::make_shared<PressureEngine>();
+    server.setEngineForTest(engine);
+    CachePressureRequestPB  request;
+    CachePressureResponsePB response;
+    grpc::ServerContext     context;
+    request.add_target_ranks(4);
+    request.add_target_ranks(4);
+    EXPECT_EQ(server.GetCachePressure(&context, &request, &response).error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+    request.mutable_target_ranks()->Set(1, 6);
+    EXPECT_EQ(server.GetCachePressure(&context, &request, &response).error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+    request.clear_target_ranks();
+    request.set_max_step_records(1025);
+    EXPECT_EQ(server.GetCachePressure(&context, &request, &response).error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(server.GetCachePressureInternal(&context, &request, &response).error_code(),
+              grpc::StatusCode::INVALID_ARGUMENT);
+    request.set_max_step_records(1024);
+    EXPECT_TRUE(server.GetCachePressureInternal(&context, &request, &response).ok());
+    server.configurePressure(5, 1, 2);
+    EXPECT_EQ(server.GetCachePressure(&context, &request, &response).error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+    EXPECT_TRUE(server.GetCachePressureInternal(&context, &request, &response).ok());
+    EXPECT_EQ(response.ranks(0).world_rank(), 5);
+}
+
+TEST(PressureRpcTest, SequenceAndInstanceResetAreExplicit) {
+    auto                    engine = std::make_shared<PressureEngine>();
+    CachePressureRequestPB  request;
+    CachePressureResponsePB response;
+    grpc::ServerContext     context;
+    TestLocalRpcServer      first;
+    first.setEngineForTest(engine);
+    ASSERT_TRUE(first.GetCachePressureInternal(&context, &request, &response).ok());
+    const auto instance = response.ranks(0).service_instance();
+    ASSERT_TRUE(first.GetCachePressureInternal(&context, &request, &response).ok());
+    EXPECT_EQ(response.ranks(0).sequence(), 2);
+    EXPECT_EQ(response.ranks(0).service_instance(), instance);
+    TestLocalRpcServer restarted;
+    restarted.setEngineForTest(engine);
+    ASSERT_TRUE(restarted.GetCachePressureInternal(&context, &request, &response).ok());
+    EXPECT_EQ(response.ranks(0).sequence(), 1);
+    EXPECT_NE(response.ranks(0).service_instance(), instance);
+}
+
+TEST(PressureRpcTest, MissingRankPreservesLocalEvidence) {
+    TestLocalRpcServer server;
+    server.configurePressure(4, 0, 2);
+    server.setEngineForTest(std::make_shared<PressureEngine>());
+    grpc::ServerContext     context;
+    CachePressureRequestPB  request;
+    CachePressureResponsePB response;
+    ASSERT_TRUE(server.GetCachePressure(&context, &request, &response).ok());
+    ASSERT_EQ(response.ranks_size(), 2);
+    EXPECT_EQ(response.requested_ranks(0), 4);
+    EXPECT_EQ(response.requested_ranks(1), 5);
+    EXPECT_EQ(response.ranks(0).sequence(), 1);
+    EXPECT_TRUE(response.ranks(0).error().empty());
+    EXPECT_EQ(response.ranks(1).world_rank(), 5);
+    EXPECT_FALSE(response.ranks(1).error().empty());
+}
+
+TEST(PressureRpcTest, HealthAndOrdinaryStatusNeverSnapshot) {
+    TestLocalRpcServer server;
+    server.configurePressure(0);
+    auto engine = std::make_shared<PressureEngine>();
+    server.setEngineForTest(engine);
+    grpc::ServerContext   context;
+    EmptyPB               empty;
+    CheckHealthResponsePB health;
+    CacheVersionPB        version;
+    CacheStatusPB         cache;
+    StatusVersionPB       worker_version;
+    WorkerStatusPB        worker;
+    EXPECT_TRUE(server.CheckHealth(&context, &empty, &health).ok());
+    EXPECT_TRUE(server.GetCacheStatus(&context, &version, &cache).ok());
+    EXPECT_TRUE(server.GetWorkerStatus(&context, &worker_version, &worker).ok());
+    EXPECT_EQ(engine->snapshot_calls, 0);
+}
+
+TEST(PressureRpcTest, FanoutUsesOnlyInternalMethodAndChecksReturnedIdentity) {
+    auto peer_server = std::make_shared<TestLocalRpcServer>();
+    peer_server->configurePressure(5, 1, 2);
+    auto peer_engine = std::make_shared<PressureEngine>();
+    peer_server->setEngineForTest(peer_engine);
+    PressureService     peer_service(peer_server);
+    grpc::ServerBuilder builder;
+    int                 port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(&peer_service);
+    auto grpc_server = builder.BuildAndStart();
+    ASSERT_NE(grpc_server, nullptr);
+    TestLocalRpcServer coordinator;
+    coordinator.configurePressure(4, 0, 2, {"", "127.0.0.1:" + std::to_string(port)});
+    coordinator.setEngineForTest(std::make_shared<PressureEngine>());
+    CachePressureRequestPB  request;
+    CachePressureResponsePB response;
+    grpc::ServerContext     context;
+    ASSERT_TRUE(coordinator.GetCachePressure(&context, &request, &response).ok());
+    ASSERT_EQ(response.ranks_size(), 2);
+    EXPECT_EQ(response.ranks(1).world_rank(), 5);
+    EXPECT_TRUE(response.ranks(1).error().empty());
+    EXPECT_EQ(peer_engine->snapshot_calls, 1);
+    EXPECT_LE(response.ranks(1).coordinator_send_ns(), response.ranks(1).coordinator_receive_ns());
+    peer_server->configurePressure(6, 1, 2);
+    ASSERT_TRUE(coordinator.GetCachePressure(&context, &request, &response).ok());
+    EXPECT_EQ(response.ranks(1).world_rank(), 5);
+    EXPECT_EQ(response.ranks(1).error(), "invalid rank response");
+    grpc_server->Shutdown();
+}
+
+class TimeoutPressureService: public RpcService::Service {
+public:
+    grpc::Status GetCachePressureInternal(grpc::ServerContext* context,
+                                          const CachePressureRequestPB*,
+                                          CachePressureResponsePB*) override {
+        while (!context->IsCancelled()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return {grpc::StatusCode::CANCELLED, "deadline"};
+    }
+};
+TEST(PressureRpcTest, PeerDeadlineRetainsSuccessfulRankAndBoundsWait) {
+    TimeoutPressureService service;
+    grpc::ServerBuilder    builder;
+    int                    port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(&service);
+    auto grpc_server = builder.BuildAndStart();
+    ASSERT_NE(grpc_server, nullptr);
+    TestLocalRpcServer coordinator;
+    coordinator.configurePressure(0, 0, 2, {"", "127.0.0.1:" + std::to_string(port)});
+    coordinator.setEngineForTest(std::make_shared<PressureEngine>());
+    CachePressureRequestPB  request;
+    CachePressureResponsePB response;
+    grpc::ServerContext     context;
+    const auto              begin = std::chrono::steady_clock::now();
+    ASSERT_TRUE(coordinator.GetCachePressure(&context, &request, &response).ok());
+    EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(3));
+    ASSERT_EQ(response.ranks_size(), 2);
+    EXPECT_TRUE(response.ranks(0).error().empty());
+    EXPECT_FALSE(response.ranks(1).error().empty());
+    EXPECT_GE(response.ranks(1).coordinator_receive_ns(), response.ranks(1).coordinator_send_ns());
+    grpc_server->Shutdown();
 }
 
 }  // namespace rtp_llm

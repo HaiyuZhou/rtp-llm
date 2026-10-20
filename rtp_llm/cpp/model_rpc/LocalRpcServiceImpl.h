@@ -105,6 +105,17 @@ public:
         return local_server_->StartProfileInternal(context, request, response);
     }
 
+    ::grpc::Status GetCachePressure(::grpc::ServerContext*        context,
+                                    const CachePressureRequestPB* request,
+                                    CachePressureResponsePB*      response) override {
+        return local_server_->GetCachePressure(context, request, response);
+    }
+    ::grpc::Status GetCachePressureInternal(::grpc::ServerContext*        context,
+                                            const CachePressureRequestPB* request,
+                                            CachePressureResponsePB*      response) override {
+        return local_server_->GetCachePressureInternal(context, request, response);
+    }
+
     ::grpc::Status DumpTorchAllocator(::grpc::ServerContext*             context,
                                       const TorchAllocatorDumpRequestPB* request,
                                       TorchAllocatorDumpResponsePB*      response) override {

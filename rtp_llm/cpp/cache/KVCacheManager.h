@@ -135,6 +135,8 @@ public:
     // succeeded; the transfer outcome is reported through mem_response.code.
     bool executeFunction(const FunctionRequestPB& request, FunctionResponsePB& response);
 
+    ErrorResult<CachePressureSnapshot> getCachePressure() const;
+
     BlockTreeCachePtr blockTreeCache() const {
         return block_tree_cache_;
     }

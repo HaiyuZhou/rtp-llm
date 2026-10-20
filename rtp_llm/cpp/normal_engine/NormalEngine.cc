@@ -657,6 +657,13 @@ absl::Status NormalEngine::initSystemPrompt() {
     return absl::OkStatus();
 }
 
+ErrorResult<CachePressureSnapshot> NormalEngine::getCachePressure() const {
+    if (!resource_context_.cache_manager) {
+        return unsupportedCachePressure();
+    }
+    return resource_context_.cache_manager->getCachePressure();
+}
+
 KVCacheInfo NormalEngine::getCacheStatusInfo(int64_t latest_version, bool need_cache_keys) {
     return resource_context_.cache_manager->getKVCacheInfo(latest_version, need_cache_keys);
 }

@@ -246,3 +246,33 @@ transfer 记录按 group、物理 pool、operation、source/target tier 分类�
 DEVICE 成员块与打包 HOST/DISK record 的块数和字节数不必相等；不要跨源/目标 pool 相加后当成单一传输量。
 GPU→HOST 发布量应选择 `source_tier=DEVICE,target_tier=HOST,pool_tier=HOST` 的目标记录。
 cache 层不提供 scheduler waiting/running、服务实例/rank、跨 rank 原子性或采样时间；上层必须提供或显式标记 unavailable。
+
+
+## 可选压力诊断 RPC（schema_version=1）
+
+显式调用 `RpcService.GetCachePressure`，请求应发往 TP rank 0；`target_ranks` 使用真实 world rank，
+留空表示当前 TP group 的全部 rank。重复或拓扑之外的 rank 会返回 INVALID_ARGUMENT。
+`GetCachePressureInternal` 只采本机，绝不递归 fan-out；旧服务或不支持的 engine 返回 UNIMPLEMENTED，
+不能把缺少字段视作零占用。普通 CheckHealth/GetWorkerStatus/GetCacheStatus 不调用压力采样。
+
+公共响应逐项保留 requested_ranks，并为每个目标返回一个 rank record。
+不可达、超时、身份不匹配等失败保存在该 rank 的 error，其他 rank 的证据仍然可用。
+peer 调用共享最长 1000 ms deadline，并取调用者 deadline 中更早者；总远端等待不按 rank 数累加。
+连接复用既有 RPCPool 设施；诊断使用独立 fan-out，避免普通 BroadcastManager 的超时 fail-fast 策略丢失部分证据。
+每个服务实例有独立 service_instance 和递增 sequence；重启后实例标识变化且 sequence 从 1 开始。
+这不是跨 rank 原子快照，不能直接比较不同进程的单调时钟。
+
+`sampled_monotonic_ns`、`collect_duration_ns`、`coordinator_send_ns/coordinator_receive_ns` 及
+响应级 `coordinator_received_ns/coordinator_sent_ns` 均以纳秒表示。
+单调时间来自各自进程 steady clock；每个 rank 的 send/receive 是 coordinator 的查询边界，
+可计算往返时长并保留采样时钟的映射不确定范围，collect_duration 包括本机快照与协议转换成本。
+字段有 presence：request_ref_blocks 缺席表示不可测，activity 缺席表示 scheduler counts 不可用。
+`step_history_available=false` 表示当前没有 step 记录能力，steps 为空不等于没有执行。
+`max_step_records` 上限 1024；`after_step_sequence` 按 world rank 分页，step session/control 的记录由后续执行步骤 recorder 填充。
+
+wire enums 是稳定协议值并经显式转换：tier DEVICE/HOST/DISK/REMOTE/NONE=1/2/3/4/5，
+group FULL/SWA/LINEAR=1/2/3，operation LOAD/EVICT/STORE=1/2/3；0 均表示 unspecified。
+transfer 保留 group_id、pool_id、pool_tier、operation、source_tier、target_tier 和独立 copy/publication/failure 计数，
+不汇总不同物理 endpoint。PressureStepPB 预留 session、step/sequence、wall/CPU 纳秒边界、context/decode counts/tokens、
+request IDs、phase/completed。PressureSessionControlRequestPB 预留 ENABLE/MARK_PHASE/DISABLE、session/phase/capacity；
+本版本尚不提供 session mutation RPC。

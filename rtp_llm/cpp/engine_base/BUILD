@@ -77,6 +77,7 @@ cc_library(
     ],
     deps = [
         ":executor",
+        ":pressure_diagnostics",
         ":profiler",
         ":worker_status_info",
         "//rtp_llm/cpp/engine_base/stream:stream",
@@ -87,5 +88,12 @@ cc_library(
         "//rtp_llm/models_py/bindings:no_block_copy_hdr",
         "//:rtp_compute_ops",
     ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "pressure_diagnostics",
+    hdrs = ["PressureDiagnostics.h"],
+    deps = ["//rtp_llm/cpp/cache/block_tree_cache", "//rtp_llm/cpp/utils:error_code"],
     visibility = ["//visibility:public"],
 )

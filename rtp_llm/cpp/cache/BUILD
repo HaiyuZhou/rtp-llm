@@ -367,6 +367,7 @@ cc_library(
     }),
     visibility = ["//visibility:public"],
     deps = [
+        "//rtp_llm/cpp/engine_base:pressure_diagnostics",
         "//rtp_llm/cpp/cache/events:kv_cache_event_publisher",
         ":cache_async_context",
         ":cache_core",

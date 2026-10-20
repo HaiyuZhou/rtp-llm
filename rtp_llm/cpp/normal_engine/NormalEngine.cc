@@ -958,6 +958,12 @@ ErrorResult<int64_t> NormalEngine::controlPressureDiagnostics(const PressureSess
     return result.get();
 }
 
+void NormalEngine::wakePressureControlProgress() {
+    if (parallelism_config.tp_rank == 0 && parallelism_config.tp_size > 1 && scheduler_) {
+        scheduler_->wakeForControl();
+    }
+}
+
 void NormalEngine::applyPressureControls() {
     if (!pressure_controls_pending_.load(std::memory_order_acquire)) {
         return;

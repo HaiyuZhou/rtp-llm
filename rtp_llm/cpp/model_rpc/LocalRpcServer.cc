@@ -1101,10 +1101,32 @@ grpc::Status LocalRpcServer::ControlPressureDiagnostics(grpc::ServerContext*    
             local_record->set_error(local_status.error_message());
         }
     }
-    for (size_t i = 0; i < pending.size(); ++i) {
-        void* tag = nullptr;
-        bool  ok  = false;
-        queue.Next(&tag, &ok);
+    bool cancellation_sent = false;
+    for (size_t i = 0; i < pending.size();) {
+        void*      tag = nullptr;
+        bool       ok  = false;
+        const auto now = std::chrono::system_clock::now();
+        if (now >= deadline || context->IsCancelled()) {
+            if (!cancellation_sent) {
+                for (auto& call : pending) {
+                    call->context.TryCancel();
+                }
+                cancellation_sent = true;
+            }
+            queue.Next(&tag, &ok);
+        } else {
+            // A peer may enqueue after the root's first empty TP broadcast, or
+            // root may not be a target at all. Keep the existing idle TP loop
+            // progressing only while this bounded control fan-out is pending.
+            if (engine_) {
+                engine_->wakePressureControlProgress();
+            }
+            if (queue.AsyncNext(&tag, &ok, std::min(deadline, now + std::chrono::milliseconds(10)))
+                != grpc::CompletionQueue::GOT_EVENT) {
+                continue;
+            }
+        }
+        ++i;
         auto* call = static_cast<Pending*>(tag);
         if (ok && call->status.ok() && call->response.schema_version() == 1 && call->response.ranks_size() == 1
             && call->response.ranks(0).world_rank() == call->rank) {

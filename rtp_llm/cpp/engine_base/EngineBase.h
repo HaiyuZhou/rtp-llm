@@ -76,6 +76,7 @@ public:
                                                             std::chrono::system_clock::time_point) {
         return {kPressureDiagnosticsUnsupported, "pressure session diagnostics unsupported"};
     }
+    virtual void wakePressureControlProgress() {}
 
     virtual KVCacheInfo getCacheStatusInfo(int64_t latest_version, bool need_cache_keys) = 0;
 

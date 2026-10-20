@@ -42,6 +42,7 @@ public:
     getPressureSteps(const std::string& session_id, uint64_t after_sequence, size_t limit) const override;
     ErrorResult<int64_t> controlPressureDiagnostics(const PressureSessionControl&         control,
                                                     std::chrono::system_clock::time_point deadline) override;
+    void                 wakePressureControlProgress() override;
     KVCacheInfo          getCacheStatusInfo(int64_t latest_version, bool need_cache_keys) override;
     absl::Status         step();
     absl::Status         startLoop();

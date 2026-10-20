@@ -516,6 +516,12 @@ own `service_instance` and reports its actual engine-thread
 `applied_monotonic_ns`; these timestamps are not a simultaneous barrier. Peer
 errors remain in the response alongside successful ranks. The common RPC budget
 is at most one second. Expired queued controls are not applied later.
+While peer acknowledgements are pending, the coordinator wakes the root scheduler
+at bounded 10 ms intervals so the existing idle TP broadcast releases peers to
+apply their queued controls. This also applies to peer-only targets and delayed
+peer enqueue. Root session state is not changed by these wakeups. Wakeups stop on
+completion, cancellation, or the common deadline; cancellation still drains every
+outstanding RPC completion. No extra per-forward collective is introduced.
 
 Session IDs must be nonempty (at most 256 bytes). ENABLE defaults to 4096 retained
 completed forwards; `recorder_capacity` accepts 1 through 65536 (zero selects the

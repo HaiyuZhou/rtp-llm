@@ -92,4 +92,19 @@ TEST_F(StepWindowProfilerConfigureTest, StopIsScopedAndCanDisarmBeforeStart) {
     EXPECT_EQ(profiler_.status().trace_name, "sessionB_window0");
 }
 
+TEST_F(StepWindowProfilerConfigureTest, CancelledWindowRemainsBlockedAfterFinishedCleanup) {
+    profiler_.configure(true, "cancelled_window", 0, 20);
+    ASSERT_TRUE(profiler_.requestStop("cancelled_window"));
+    profiler_.serviceControl();
+    EXPECT_TRUE(profiler_.requestStop("cancelled_window"));
+    profiler_.configure(true, "cancelled_window", 3, 1);
+    EXPECT_FALSE(profiler_.enabled());
+    EXPECT_EQ(profiler_.status().state, "finished");
+    profiler_.configure(true, "next_window", 0, 20);
+    EXPECT_TRUE(profiler_.enabled());
+    EXPECT_TRUE(profiler_.requestStop("cancelled_window"));
+    EXPECT_FALSE(profiler_.status().stop_requested);
+    EXPECT_EQ(profiler_.status().trace_name, "next_window");
+}
+
 }  // namespace rtp_llm

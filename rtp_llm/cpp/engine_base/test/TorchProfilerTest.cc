@@ -244,6 +244,8 @@ TEST(TorchProfilerTest, WorkerCancellationCollectsWithoutAnotherForwardAndExport
     EXPECT_TRUE(std::filesystem::exists(status.file_name));
     EXPECT_EQ(TorchProfileTestPeer::steps(profile), 1);
     EXPECT_TRUE(profile.requestStop("task12_worker"));
+    profile.configure(true, "task12_worker", 0, 20);
+    EXPECT_FALSE(profile.enabled());
     if (const auto* fixture_dir = std::getenv("RTP_PROFILE_FIXTURE_DIR"); fixture_dir && status.export_complete) {
         std::filesystem::create_directories(fixture_dir);
         std::filesystem::copy_file(status.file_name,
@@ -271,6 +273,40 @@ TEST(TorchProfilerTest, AsyncSaverFailureIsObservable) {
     EXPECT_TRUE(profile.status().collection_error.empty());
     EXPECT_FALSE(profile.status().export_complete);
     EXPECT_FALSE(profile.status().export_error.empty());
+}
+
+TEST(TorchProfilerTest, NaturallyCompletedLegacyPrefixCanCaptureAgainAfterIdempotentCleanup) {
+    StepWindowProfiler       profile("/tmp");
+    std::vector<std::string> files;
+    for (int capture = 0; capture < 2; ++capture) {
+        profile.configure(true, "task12_repeated_legacy", 0, 1);
+        ASSERT_TRUE(profile.enabled()) << "capture " << capture << " must rearm";
+        EXPECT_EQ(profile.status().state, "armed");
+        std::thread worker([&] {
+            profile.startStep();
+            profile.finishStep();
+        });
+        worker.join();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (profile.status().state != "finished" && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const auto status = profile.status();
+        ASSERT_EQ(status.state, "finished");
+        ASSERT_TRUE(status.collection_complete);
+        ASSERT_TRUE(status.collection_error.empty());
+        ASSERT_TRUE(status.export_complete) << status.export_error;
+        ASSERT_TRUE(std::filesystem::exists(status.file_name));
+        EXPECT_FALSE(status.stop_requested);
+        files.push_back(status.file_name);
+        // Cleanup after natural completion is idempotent, not cancellation.
+        EXPECT_TRUE(profile.requestStop("task12_repeated_legacy"));
+        EXPECT_TRUE(profile.requestStop("task12_repeated_legacy"));
+    }
+    ASSERT_EQ(files.size(), 2);
+    EXPECT_NE(files[0], files[1]);
+    for (const auto& file : files)
+        std::filesystem::remove(file);
 }
 
 TEST(TorchProfilerTest, RealDuplicateFlowDoesNotEscapeWrapper) {

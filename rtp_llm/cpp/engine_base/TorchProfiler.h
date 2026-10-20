@@ -162,6 +162,7 @@ private:
     mutable std::mutex            mu_;
     std::string                   trace_name_;
     std::string                   last_finished_trace_;
+    std::string                   last_cancelled_trace_;
     ProfileStatus                 status_;
     std::thread::id               owner_thread_;
     std::shared_ptr<TorchProfile> profiler_;

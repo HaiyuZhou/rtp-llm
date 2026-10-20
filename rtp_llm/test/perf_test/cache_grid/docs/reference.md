@@ -648,8 +648,10 @@ Each stop rank response contains `world_rank`, its independent `service_instance
 `accepted`, `profile`, and `error`. `accepted` means only that the matching
 cancellation request was accepted. A duplicate stop of the last finished trace
 is idempotent and cannot cancel a newer trace. A mismatched trace is rejected.
-A stopped window cannot be resurrected by a duplicate start. A different window
-can start after the prior collection/export has settled.
+A cancelled window cannot be resurrected by a duplicate start. Naturally
+completed legacy filename prefixes can be reused for counter-suffixed captures,
+including after idempotent stop cleanup. A window can start after the prior
+collection/export has settled, unless its identity matches the last cancellation.
 
 `GetCachePressure.ranks[].profile` adds `supported`, `trace_name`, `state`,
 `stop_requested`, `collection_complete`, `export_complete`, `collection_error`,

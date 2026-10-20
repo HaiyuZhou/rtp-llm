@@ -248,9 +248,9 @@ void StepWindowProfiler::configure(bool enable, const std::string& trace_name, i
         return;
     }
     std::lock_guard<std::mutex> lock(mu_);
-    // Keep ownership until both collection and export settle. A duplicate start
-    // cannot resurrect the just-cancelled window.
-    if (status_.state != "finished" || (!safe_name.empty() && safe_name == last_finished_trace_)) {
+    // Completed legacy prefixes may be reused for counter-suffixed captures.
+    // Only actual cancellation prevents a window from being resurrected.
+    if (status_.state != "finished" || (!safe_name.empty() && safe_name == last_cancelled_trace_)) {
         return;
     }
     trace_name_        = safe_name;
@@ -271,6 +271,9 @@ bool StepWindowProfiler::requestStop(const std::string& trace_name) {
         || (trace_name.empty() && status_.trace_name.empty() && status_.state == "finished"
             && !status_.collection_complete)) {
         return !trace_name.empty() && trace_name == last_finished_trace_;
+    }
+    if (status_.state != "finished" && !status_.collection_complete) {
+        last_cancelled_trace_ = trace_name;
     }
     enabled_.store(false, std::memory_order_release);
     status_.stop_requested = true;

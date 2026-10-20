@@ -276,3 +276,40 @@ transfer 保留 group_id、pool_id、pool_tier、operation、source_tier、targe
 不汇总不同物理 endpoint。PressureStepPB 预留 session、step/sequence、wall/CPU 纳秒边界、context/decode counts/tokens、
 request IDs、phase/completed。PressureSessionControlRequestPB 预留 ENABLE/MARK_PHASE/DISABLE、session/phase/capacity；
 本版本尚不提供 session mutation RPC。
+
+## FULL pressure diagnostic contracts
+
+`runner.pressure_diagnostics` defines immutable settings, rank/pool/group samples,
+and a pure FULL target selector. This module alone does not enable diagnostics or
+change normal continuous execution. Supply explicit `fill_timeout_s`,
+`fill_max_requests`, `fill_no_progress_s`, `fill_input_tokens`,
+`gpu_tolerance_blocks`, `activity_timeout_s`, `drain_timeout_s`, and
+`capture_timeout_s`; there are no experiment defaults for these required values.
+A requested Nsight capture must also resolve an explicit positive
+`nsys_duration_s` before execution.
+
+Defaults: host residency ratio 0.25; sample period 1 s; maximum sample gap and
+age 2 s; steady coverage 3 s with a 60 s timeout; measurement 60 s; minimum
+coverage 0.95; longest invalid interval 2 s; Kineto 20 actual steps; profile
+support 60 s. Budgets must be finite and positive, integer settings reject bools,
+and GPU tolerance is a nonnegative integer no greater than each selected
+pool's floored low threshold. These settings must freeze before sending work.
+
+Each expected rank must contain FULL groups with mapped positive-capacity host
+pools. The predicate uses any associated device pool's `used - pending_release`
+against `floor(capacity * low_ratio) - gpu_tolerance_blocks`, published host
+residency against `ceil(capacity * host_ratio)`, and strictly positive trigger
+and successful DEVICE-to-HOST publication deltas against the before-seed epoch
+baseline. EVICT and STORE publication use only the HOST destination endpoint;
+source endpoint counters are never added again. SWA/LINEAR remain observations.
+
+`decode_pressure_response(response, client_send_s, client_receive_s,
+expected_ranks)` accepts the schema-1 protobuf and returns immutable evaluator
+samples plus the complete serialized wire response. `raw_pressure_record` with
+the response and the same client times returns a JSON-safe full protobuf record
+for `cache_samples.jsonl` (protobuf int64 values retain their JSON strings).
+It retains step, activity, optional-wrapper presence, coordinator timing, transfer
+operation, and unused physical counters independently of evaluator projection.
+Call `select_targets(samples, ranks)` initially, then explicitly compare each
+later target tuple using `validate_inventory(current, frozen)`; topology/service
+changes and decreased counters are discontinuities, never negative progress.

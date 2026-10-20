@@ -2002,6 +2002,23 @@ class CacheGridRunner:
                     or not set(observed_ranks).issubset(target_ranks)
                 ):
                     raise ValueError("pressure rank protocol mismatch")
+                payload_ranks = [
+                    rank
+                    for rank in response.ranks
+                    if not rank.error
+                    or any(
+                        field.name
+                        not in {
+                            "world_rank",
+                            "service_instance",
+                            "error",
+                            "coordinator_send_ns",
+                            "coordinator_receive_ns",
+                        }
+                        for field, _ in rank.ListFields()
+                    )
+                ]
+                payload_rank_ids = {rank.world_rank for rank in payload_ranks}
                 if any(
                     rank.world_rank not in instances
                     or (
@@ -2009,19 +2026,33 @@ class CacheGridRunner:
                         and instances[rank.world_rank] != rank.service_instance
                     )
                     or (
-                        not rank.error
+                        rank.world_rank in payload_rank_ids
                         and (
-                            not rank.service_instance
-                            or not rank.step_history_available
-                            or any(step.session_id != session_id for step in rank.steps)
+                            not rank.service_instance or not rank.step_history_available
                         )
                     )
+                    or any(step.session_id != session_id for step in rank.steps)
                     for rank in response.ranks
                 ):
                     raise ValueError("rank instance or diagnostic history mismatch")
                 if len(observed_ranks) != len(target_ranks) or any(
                     rank.error for rank in response.ranks
                 ):
+                    if payload_ranks:
+                        # Validate concrete payloads with the shared decoder. This
+                        # view never becomes coverage or changes the frozen targets.
+                        available = model_rpc_service_pb2.CachePressureResponsePB()
+                        available.CopyFrom(response)
+                        available.ClearField("ranks")
+                        available.ClearField("requested_ranks")
+                        for rank in payload_ranks:
+                            copied = available.ranks.add()
+                            copied.CopyFrom(rank)
+                            copied.ClearField("error")
+                            available.requested_ranks.append(rank.world_rank)
+                        decode_pressure_response(
+                            available, sent, received, tuple(available.requested_ranks)
+                        )
                     raw["sampling_error"] = "missing rank or failed rank sample"
                     # A partial page provides no complete coverage or cursor boundary.
                     return PressurePoll((), raw, step_history_complete=False)

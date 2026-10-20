@@ -1078,6 +1078,17 @@ class RunnerIntegrationTest(unittest.TestCase):
     def test_poll_instance_corruption_remains_fatal(self):
         self._runner_case("poll_instance")
 
+    def test_missing_or_failed_peer_cannot_mask_available_corruption(self):
+        for fault in ("missing_corrupt", "error_corrupt", "errored_foreign_session"):
+            with self.subTest(fault=fault):
+                self._runner_case(fault)
+
+    def test_empty_rank_transport_error_remains_recoverable(self):
+        self._runner_case("empty_transport_error")
+
+    def test_measurement_loss_recovers_for_cleanup_but_fails_coverage(self):
+        self._runner_case("measurement_loss")
+
     def test_runner_all_rank_control_and_poll_failures_retain_evidence(self):
         for fault in (
             "missing",
@@ -1102,6 +1113,7 @@ class RunnerIntegrationTest(unittest.TestCase):
         controls = []
         sequence = [0]
         missing_polls = []
+        corrupt_polls = []
 
         def control(request, timeout):
             self.assertLessEqual(timeout, 1)
@@ -1216,15 +1228,35 @@ class RunnerIntegrationTest(unittest.TestCase):
             if fault == "poll_instance":
                 peer.service_instance = "restarted-peer"
             measuring = any(control.phase == "measurement" for control in controls)
+            if (
+                fault in ("missing_corrupt", "error_corrupt")
+                and measuring
+                and not corrupt_polls
+            ):
+                corrupt_polls.append(len(polls) - 1)
+                rank.pools[0].tier = 99
+                if fault == "missing_corrupt":
+                    del response.ranks[-1]
+                else:
+                    peer.error = "peer deadline"
+            if fault == "errored_foreign_session" and measuring and not corrupt_polls:
+                corrupt_polls.append(len(polls) - 1)
+                peer.error = "peer deadline"
+                peer.steps.add(session_id="foreign-session", step_id=100)
             if measuring and (
                 fault == "persistent_missing"
+                or (fault == "measurement_loss" and controls[-1].phase == "measurement")
                 or (
-                    fault in ("transient_missing", "transient_error")
+                    fault
+                    in ("transient_missing", "transient_error", "empty_transport_error")
                     and not missing_polls
                 )
             ):
                 missing_polls.append(len(polls) - 1)
-                if fault == "transient_error":
+                if fault == "empty_transport_error":
+                    peer.Clear()
+                    peer.world_rank, peer.error = 1, "temporary transport error"
+                elif fault == "transient_error":
                     peer.error = "temporary peer deadline"
                 else:
                     del response.ranks[-1]
@@ -1309,7 +1341,11 @@ class RunnerIntegrationTest(unittest.TestCase):
         ), patch("time.monotonic", clock):
             result = runner._run_full_pressure(
                 [dict(input_len=16, cache_len=0, batch_size=1)],
-                config(steady_s=1, measure_s=2, sample_period_s=0.5),
+                config(
+                    steady_s=1,
+                    measure_s=4 if fault == "measurement_loss" else 2,
+                    sample_period_s=0.5,
+                ),
                 cp.ExecutionLimits(128, 2, 128, 64, 16),
                 SimpleNamespace(
                     GetCachePressure=poll, ControlPressureDiagnostics=control
@@ -1321,7 +1357,13 @@ class RunnerIntegrationTest(unittest.TestCase):
         self.assertEqual(
             controls[-1].action, pb.PressureSessionControlRequestPB.DISABLE
         )
-        if fault in ("transient_missing", "transient_error", "persistent_missing"):
+        if fault in (
+            "transient_missing",
+            "transient_error",
+            "persistent_missing",
+            "empty_transport_error",
+            "measurement_loss",
+        ):
             self.assertTrue(missing_polls)
             summary = json.loads(
                 (runner.result_dir / "pressure/summary.json").read_text()
@@ -1333,10 +1375,16 @@ class RunnerIntegrationTest(unittest.TestCase):
             else:
                 self.assertIsNone(result["failure"])
                 self.assertEqual(
-                    result["measurement_end"] - result["measurement_start"], 2
+                    result["measurement_end"] - result["measurement_start"],
+                    4 if fault == "measurement_loss" else 2,
                 )
                 self.assertTrue(summary["validity"]["execution_valid"])
                 self.assertFalse(any(e["event"] == "error" for e in events))
+                if fault == "measurement_loss":
+                    self.assertFalse(result["pressure"]["valid"])
+                    self.assertLess(result["pressure"]["ratio"], 0.95)
+                    self.assertGreater(result["pressure"]["longest_invalid_s"], 2)
+                    self.assertGreater((1 - result["pressure"]["ratio"]) * 4, 2)
             first = missing_polls[0]
             self.assertEqual(
                 dict(polls[first].after_step_sequence),

@@ -600,6 +600,11 @@ page emits execution-error evidence, including outstanding polls consumed during
 cleanup after an earlier profile failure. Final draining retries incomplete rank
 pages within its existing bounds; an incomplete page cannot certify an empty,
 complete history. `PressurePoll.step_history_complete=false` marks these pages.
+Before treating a page as recoverable loss, all available concrete payloads pass
+the shared schema decoder. An RPC error permits absent payload, but cannot hide
+explicit foreign-session steps or malformed available data. Validation uses a
+protobuf copy of available payloads only; raw evidence, frozen targets and cursor
+eligibility continue to refer to the original full response.
 
 `summary.json.baseline_steps` reports per-rank eligibility and exclusion counts,
 forward wall/CPU durations, preparation wall durations, and adjacent forward

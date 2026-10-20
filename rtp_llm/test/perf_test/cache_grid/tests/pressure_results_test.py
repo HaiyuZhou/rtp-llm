@@ -164,3 +164,7 @@ class PressureResultsTest(unittest.TestCase):
             self.assertFalse(
                 json.loads((root / "manifest.json").read_text())["complete"]
             )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -26,6 +26,13 @@ test_deps = [
 ] + cuda13_torch_link_deps + torch_deps() + no_block_copy_link_deps()
 
 cc_test(
+    name = "cache_pressure_state_test",
+    srcs = ["CachePressureStateTest.cc"],
+    copts = test_copts,
+    deps = test_deps,
+)
+
+cc_test(
     name = "block_tree_task_pool_test",
     srcs = ["BlockTreeTaskPoolTest.cc"],
     copts = test_copts,

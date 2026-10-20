@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/load/LoadTaskRunner.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/BlockTree.h"
 
 #include <exception>
 #include <string>
@@ -9,8 +10,14 @@
 
 namespace rtp_llm {
 
-LoadTaskRunner::LoadTaskRunner(const std::vector<GroupSetPtr>& group_sets, int host_timeout_ms, int disk_timeout_ms):
-    group_sets_(group_sets), host_timeout_ms_(host_timeout_ms), disk_timeout_ms_(disk_timeout_ms) {}
+LoadTaskRunner::LoadTaskRunner(const std::vector<GroupSetPtr>& group_sets,
+                               int                             host_timeout_ms,
+                               int                             disk_timeout_ms,
+                               BlockTree*                      pressure_tree):
+    pressure_tree_(pressure_tree),
+    group_sets_(group_sets),
+    host_timeout_ms_(host_timeout_ms),
+    disk_timeout_ms_(disk_timeout_ms) {}
 
 LoadTaskRunner::TaskPtr LoadTaskRunner::createTask(const std::shared_ptr<LoadAsyncContext>& context) {
     const std::vector<TransferDescriptor>& load_descs = context->loadDescs();
@@ -133,6 +140,10 @@ void LoadTaskRunner::reportStageFinished(const Task&                            
                                          const std::vector<TransferDescriptor>& descriptors,
                                          int64_t                                begin_time_us,
                                          bool                                   success) const {
+    if (pressure_tree_) {
+        pressure_tree_->recordPressureCopy(
+            CacheTransferOperation::LOAD, descriptors, source_tier == Tier::HOST ? task.host_result : task.disk_result);
+    }
     static const std::vector<TransferDescriptor> empty_descriptors;
     metrics_reporter.reportTransferFinished(CacheTransferOperation::LOAD,
                                             source_tier,

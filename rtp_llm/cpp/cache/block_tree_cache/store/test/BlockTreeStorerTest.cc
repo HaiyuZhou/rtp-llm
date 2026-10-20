@@ -787,6 +787,10 @@ TEST(BlockTreeStorerTest, HostAndDiskInsertReturnBeforeTransferSettlement) {
             }
             FAIL() << "HOST/DISK transfer did not enter the controlled barrier";
         }
+        const auto reserved = env->cache->pressureSnapshot();
+        EXPECT_TRUE(reserved.transfers.empty());
+        for (const auto& pool : reserved.pools)
+            EXPECT_EQ(pool.published_host_blocks, 0u);
         const auto before_release = insert.waitFor(std::chrono::seconds(5));
         barrier->release();
         const auto after_cleanup =
@@ -799,6 +803,17 @@ TEST(BlockTreeStorerTest, HostAndDiskInsertReturnBeforeTransferSettlement) {
             << "async HOST/DISK insert must return while transfer is blocked";
         BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*env->cache);
 
+        const auto published      = env->cache->pressureSnapshot();
+        size_t     target_records = 0;
+        for (const auto& transfer : published.transfers) {
+            if (transfer.pool_tier != target_tier)
+                continue;
+            ++target_records;
+            EXPECT_EQ(transfer.copied_blocks, 1u);
+            EXPECT_EQ(transfer.published_blocks, 1u);
+            EXPECT_EQ(transfer.failed_operations, 0u);
+        }
+        EXPECT_EQ(target_records, 1u);
         const auto path = env->cache->tree()->findNode({100});
         ASSERT_EQ(path.size(), 1u);
         const GroupSetResource& resource = path.back()->group_set_resources[0];
@@ -852,7 +867,7 @@ TEST(BlockTreeStorerTest, StorageHandlesUseTopologyGroupsAndResolveGpuBuffers) {
         return group;
     };
     auto topology  = CacheTopology::create({make_group("z_group", 0), make_group("a_group", 1)},
-                                          {{0, {"z_group"}}, {1, {"a_group"}}});
+                                           {{0, {"z_group"}}, {1, {"a_group"}}});
     auto pool_z    = makeDevicePool({{16, 0}}, kStoreDeviceBlocks, "storage_tag_z");
     auto pool_a    = makeDevicePool({{16, 0}}, kStoreDeviceBlocks, "storage_tag_a");
     auto group_set = std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{pool_z, pool_a}, nullptr, nullptr);
@@ -1102,6 +1117,15 @@ TEST(BlockTreeStorerTest, DuplicateStoreForSameKeyReleasesLoserBlock) {
     barrier->release();
     block_tree_cache_test::BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*env.cache);
 
+    size_t host_records = 0;
+    for (const auto& transfer : env.cache->pressureSnapshot().transfers) {
+        if (transfer.pool_tier != Tier::HOST)
+            continue;
+        ++host_records;
+        EXPECT_EQ(transfer.copied_blocks, 2u);
+        EXPECT_EQ(transfer.published_blocks, 1u);
+    }
+    EXPECT_EQ(host_records, 1u);
     auto find = env.cache->tree()->findNode({100});
     ASSERT_EQ(find.size(), 1u);
     const GroupSetResource& resource = find.back()->group_set_resources[0];

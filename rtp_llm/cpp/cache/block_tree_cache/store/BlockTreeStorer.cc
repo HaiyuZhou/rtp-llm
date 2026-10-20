@@ -28,7 +28,7 @@ BlockTreeStorer::BlockTreeStorer(BlockTree*                      tree,
     transfer_dispatcher_(transfer_dispatcher),
     task_pool_(task_pool),
     metrics_reporter_(metrics_reporter),
-    store_task_runner_(tree_->groupSets()),
+    store_task_runner_(tree_->groupSets(), tree),
     mutex_(mutex),
     host_timeout_ms_(host_timeout_ms),
     disk_timeout_ms_(disk_timeout_ms),
@@ -218,6 +218,16 @@ size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish) {
                 task.target_tier, {descriptor.singleBlockAt(task.target_tier)});
         }
         insert_result = tree_->insertNode(task.cache_keys, resources, true, false);
+        for (const auto& descriptor : task.descriptors()) {
+            if (descriptor.path_index >= insert_result.path.size())
+                continue;
+            const auto* node     = insert_result.path[descriptor.path_index];
+            const auto& resource = node->group_set_resources[descriptor.group_set_id];
+            if (!resource.transfer_detached && resource.hasTier(task.target_tier)
+                && resource.getBlocks(task.target_tier) == descriptor.target_blocks) {
+                tree_->recordPressurePublication(CacheTransferOperation::STORE, descriptor);
+            }
+        }
     }
 
     store_task_runner_.releaseTaskResources(task);

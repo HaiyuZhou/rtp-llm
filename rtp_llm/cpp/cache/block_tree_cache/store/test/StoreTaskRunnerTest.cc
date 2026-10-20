@@ -15,6 +15,7 @@
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCacheMetricsReporter.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCache.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/test/BlockTreeCacheTestUtils.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/BlockTransferDispatcher.h"
@@ -34,9 +35,9 @@ TEST(StoreTaskRunnerTest, PrepareTaskCreatesHostTransferAndTemporaryHolds) {
     const std::shared_ptr<const CacheTopology> topology    = makeTestTopology({group});
     DeviceBlockPoolPtr                         device_pool = makeTestDevicePool({{16, 0}}, 2, "store_task_runner");
     std::shared_ptr<HostBlockPool>             host_pool   = block_transfer_engine_test::makeHostPool(16, 1);
-    GroupSetPtr group_set = makeTestGroupSet(0, topology, {"group0"}, {device_pool}, host_pool);
-    const std::vector<GroupSetPtr>             group_sets{group_set};
-    StoreTaskRunner                            runner(group_sets);
+    GroupSetPtr                    group_set = makeTestGroupSet(0, topology, {"group0"}, {device_pool}, host_pool);
+    const std::vector<GroupSetPtr> group_sets{group_set};
+    StoreTaskRunner                runner(group_sets);
 
     MultiNodeBlocks source_holder = allocateDeviceBlocksForTest(*group_set, 1);
     ASSERT_EQ(source_holder.size(), 1u);
@@ -75,7 +76,7 @@ TEST(StoreTaskRunnerTest, PrepareTaskRecordsPathIndexInTransferDescriptors) {
     const std::shared_ptr<const CacheTopology> topology = makeTestTopology({group});
     DeviceBlockPoolPtr             device_pool = makeTestDevicePool({{16, 0}}, 4, "store_task_runner_path_index");
     std::shared_ptr<HostBlockPool> host_pool   = block_transfer_engine_test::makeHostPool(16, 2);
-    GroupSetPtr                    group_set = makeTestGroupSet(0, topology, {"group0"}, {device_pool}, host_pool);
+    GroupSetPtr                    group_set   = makeTestGroupSet(0, topology, {"group0"}, {device_pool}, host_pool);
     const std::vector<GroupSetPtr> group_sets{group_set};
     StoreTaskRunner                runner(group_sets);
 
@@ -154,6 +155,65 @@ public:
     std::vector<std::vector<TransferDescriptor>>            batches;
     std::vector<std::shared_ptr<TransferBatchAsyncContext>> contexts;
 };
+
+TEST(StoreTaskRunnerTest, PressureCountsSuccessfulBatchWithinFailedStoreWithoutMetrics) {
+    auto                          env = FullSWAEnvironment::create();
+    StoreTaskRunner               runner(env->groups, env->cache->tree());
+    BlockTreeCacheMetricsReporter metrics{nullptr};
+    auto                          engine = std::make_shared<PendingStoreTransferEngine>();
+    BlockTransferDispatcher       dispatcher(engine);
+    auto task = std::make_shared<StoreTaskRunner::Task>(Tier::DISK, CacheKeysType{}, std::chrono::seconds(30));
+    task->transfer_task.addDescriptor(TransferDescriptor::deviceToDisk(0, {1, 1}, 1));
+    task->transfer_task.addDescriptor(TransferDescriptor::deviceToDisk(0, {2, 2}, 2));
+    size_t callbacks = 0;
+    runner.runTransfer(task, dispatcher, metrics, [&](ErrorInfo error) {
+        EXPECT_FALSE(error.ok());
+        ++callbacks;
+    });
+    ASSERT_EQ(engine->contexts.size(), 2u);
+    engine->contexts[0]->complete(ErrorInfo::OkStatus());
+    engine->contexts[1]->complete(ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "injected failure"));
+    EXPECT_EQ(callbacks, 1u);
+    const auto& id = env->cache->tree()->pressurePoolId(env->disk_pools[0].get());
+    const auto  evidence =
+        env->cache->tree()->pressureState().transfer({0, id, CacheTransferOperation::STORE, Tier::DEVICE, Tier::DISK});
+    EXPECT_EQ(evidence.copied_blocks, 1u);
+    EXPECT_EQ(evidence.copied_bytes, env->disk_pools[0]->blockSizeBytes());
+    EXPECT_EQ(evidence.published_blocks, 0u);
+    EXPECT_EQ(evidence.failed_operations, 1u);
+}
+
+TEST(StoreTaskRunnerTest, PressureFailuresAreClassifiedByAffectedGroup) {
+    auto                          env = FullSWAEnvironment::create();
+    StoreTaskRunner               runner(env->groups, env->cache->tree());
+    BlockTreeCacheMetricsReporter metrics{nullptr};
+    auto                          engine = std::make_shared<PendingStoreTransferEngine>();
+    BlockTransferDispatcher       dispatcher(engine);
+    auto task = std::make_shared<StoreTaskRunner::Task>(Tier::DISK, CacheKeysType{}, std::chrono::seconds(30));
+    task->transfer_task.addDescriptor(TransferDescriptor::deviceToDisk(0, {1, 1}, 1));
+    task->transfer_task.addDescriptor(TransferDescriptor::deviceToDisk(1, {2}, 2));
+    size_t callbacks = 0;
+    runner.runTransfer(task, dispatcher, metrics, [&](ErrorInfo error) {
+        EXPECT_FALSE(error.ok());
+        ++callbacks;
+    });
+    ASSERT_EQ(engine->contexts.size(), 2u);
+    engine->contexts[0]->complete(ErrorInfo::OkStatus());
+    engine->contexts[1]->complete(ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "injected failure"));
+    EXPECT_EQ(callbacks, 1u);
+    const auto& id = env->cache->tree()->pressurePoolId(env->disk_pools[0].get());
+    const auto  evidence =
+        env->cache->tree()->pressureState().transfer({0, id, CacheTransferOperation::STORE, Tier::DEVICE, Tier::DISK});
+    EXPECT_EQ(evidence.copied_blocks, 1u);
+    EXPECT_EQ(evidence.copied_bytes, env->disk_pools[0]->blockSizeBytes());
+    EXPECT_EQ(evidence.published_blocks, 0u);
+    EXPECT_EQ(evidence.failed_operations, 0u);
+    const auto& failed_id = env->cache->tree()->pressurePoolId(env->disk_pools[1].get());
+    const auto  failed    = env->cache->tree()->pressureState().transfer(
+        {1, failed_id, CacheTransferOperation::STORE, Tier::DEVICE, Tier::DISK});
+    EXPECT_EQ(failed.copied_blocks, 0u);
+    EXPECT_EQ(failed.failed_operations, 1u);
+}
 
 TEST(StoreTaskRunnerTest, DiskFailureWaitsForEverySubmittedBatch) {
     const auto                     group    = makeTestGroupBase(defaultCacheGroupPolicy(CacheGroupType::FULL));
@@ -250,7 +310,7 @@ TEST(StoreTaskRunnerTest, RunTransferReturnsDispatcherFailure) {
     const std::shared_ptr<const CacheTopology> topology = makeTestTopology({group});
     DeviceBlockPoolPtr             device_pool = makeTestDevicePool({{16, 0}}, 2, "store_task_runner_transfer");
     std::shared_ptr<HostBlockPool> host_pool   = block_transfer_engine_test::makeHostPool(16, 1);
-    GroupSetPtr                    group_set = makeTestGroupSet(0, topology, {"group0"}, {device_pool}, host_pool);
+    GroupSetPtr                    group_set   = makeTestGroupSet(0, topology, {"group0"}, {device_pool}, host_pool);
     const std::vector<GroupSetPtr> group_sets{group_set};
     StoreTaskRunner                runner(group_sets);
 

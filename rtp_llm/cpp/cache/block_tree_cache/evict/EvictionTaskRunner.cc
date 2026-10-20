@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/evict/EvictionTaskRunner.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/BlockTree.h"
 
 #include <algorithm>
 #include <utility>
@@ -9,8 +10,9 @@
 namespace rtp_llm {
 
 EvictionTaskRunner::EvictionTaskRunner(const std::vector<GroupSetPtr>& group_sets,
-                                       const BlockTransferDispatcher*  transfer_dispatcher):
-    group_sets_(group_sets), transfer_dispatcher_(transfer_dispatcher) {}
+                                       const BlockTransferDispatcher*  transfer_dispatcher,
+                                       BlockTree*                      pressure_tree):
+    pressure_tree_(pressure_tree), group_sets_(group_sets), transfer_dispatcher_(transfer_dispatcher) {}
 
 void EvictionTaskRunner::runTransfer(std::shared_ptr<const EvictionTransferTask> task,
                                      BlockTreeCacheMetricsReporter&              metrics_reporter,
@@ -43,6 +45,9 @@ void EvictionTaskRunner::runTransfer(std::shared_ptr<const EvictionTransferTask>
     transfer_dispatcher_->runTransfer(
         task->transfer_task,
         [this, task, &metrics_reporter, transfer_begin, on_done = std::move(on_done)](TransferResult result) mutable {
+            if (pressure_tree_) {
+                pressure_tree_->recordPressureCopy(CacheTransferOperation::EVICT, task->descriptors(), result);
+            }
             const bool success = result.ok();
             metrics_reporter.reportTransferFinished(CacheTransferOperation::EVICT,
                                                     task->descriptors().front().source_tier,

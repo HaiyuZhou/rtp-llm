@@ -223,3 +223,26 @@ PyTorch record_function 不自动转为 NVTX，kernel 名称和 launch correlati
 结果标记 seed_mode=shared_prefix_v1，保存 shared_seed ID、耗时和刷新记录，不能混用独立 seed 的目录。
 重启续测会重新 seed。实际命中不足时，用当前 cache_len+tail 刷新并以新后缀重试一次；
 失效请求不进入正式统计，刷新耗时计入 case elapsed_s。重试仍失败则停止，不无限重试。
+
+## 缓存压力快照的计数口径
+
+`BlockTreeCache::pressureSnapshot()` 是按需调用的结构化诊断接口；普通健康检查不会调用它。
+采样持有 cache mutex，只枚举固定物理 pool/group 拓扑，不扫描树节点或返回请求、cache key。
+物理 pool 按指针去重，启动时冻结的 `pool_id` 区分同名 pool；group 保留 DEVICE/HOST/DISK 映射。
+`total_blocks/used_blocks/free_blocks` 描述物理占用；`available_blocks` 还包括可回收的纯 CACHE 引用块。
+各 reference category 可能重叠，不能相加计算 used；非 DEVICE pool 的 request 引用标记为不可用，不能解释为已测量的零。
+`pending_release_blocks` 是已排入驱逐流程、尚未完成源释放的块数。
+水位是 group 对应 tier 的配置，`watermark_trigger_count` 累加各 tier 从未触发到触发的转换，重复轮询不累加。
+
+`published_host_blocks` 是当前仍有效、已经成功发布的 HOST 物理块去重数。
+HOST 目标预留及尚未发布的副本不计入；有效 HOST 源在 LOAD_PENDING/LOADING 期间继续计入，
+直到源所有权失效或释放；detached 数据立即移除。它不由引用类别相减推算，也不依赖事件发布或外部 metrics 开关。
+
+transfer 记录按 group、物理 pool、operation、source/target tier 分类：
+`copied_blocks/copied_bytes` 记录成功复制，包括整体失败中已成功的 descriptor；
+`published_blocks/published_bytes` 仅在成功接受的 settlement 后累加，重复 store 的落败副本及 detached 目标不会增加 publication。
+`failed_operations` 记录失败的逻辑复制操作。回收只减少当前 residency，不倒扣累计 copy/publication。
+每个源/目标 pool 分别以自己的物理 block 和 `block_size_bytes` 为单位，
+DEVICE 成员块与打包 HOST/DISK record 的块数和字节数不必相等；不要跨源/目标 pool 相加后当成单一传输量。
+GPU→HOST 发布量应选择 `source_tier=DEVICE,target_tier=HOST,pool_tier=HOST` 的目标记录。
+cache 层不提供 scheduler waiting/running、服务实例/rank、跨 rank 原子性或采样时间；上层必须提供或显式标记 unavailable。

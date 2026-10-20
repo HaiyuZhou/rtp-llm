@@ -1,3 +1,4 @@
+#include <unordered_set>
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCache.h"
 
 #include <algorithm>
@@ -234,6 +235,101 @@ CacheStats BlockTreeCache::getStats() const {
 std::vector<BlockTreePoolMetricsSnapshot> BlockTreeCache::poolMetricsSnapshots() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return metrics_reporter_->collectPoolMetricsSnapshots(tree_->groupSets());
+}
+
+CachePressureSnapshot BlockTreeCache::pressureSnapshot() const {
+    CachePressureSnapshot snapshot;
+    // Lock order: cache -> individual pool / pending-release / ledger mutex.
+    // Each subordinate lock is released before acquiring another. Copy callbacks
+    // take only the ledger lock. No serialization or tree walk occurs here.
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& physical : tree_->pressurePools()) {
+        const auto*               pool = physical.pool;
+        CachePressurePoolSnapshot record;
+        record.pool_id                    = physical.id;
+        record.tier                       = physical.tier;
+        record.pool_name                  = pool->poolName();
+        record.block_size_bytes           = pool->blockSizeBytes();
+        record.total_blocks               = pool->totalBlocksNum();
+        record.free_blocks                = pool->freeBlocksNum();
+        record.used_blocks                = record.total_blocks - record.free_blocks;
+        record.available_blocks           = pool->availableBlocksNum();
+        record.active_blocks              = pool->activeBlocksNum();
+        record.block_cache_ref_blocks     = pool->referencedBlocksNum(BlockTreeRefType::CACHE);
+        record.load_ref_blocks            = pool->referencedBlocksNum(BlockTreeRefType::LOAD);
+        record.eviction_target_ref_blocks = pool->referencedBlocksNum(BlockTreeRefType::EVICTION);
+        record.store_ref_blocks           = pool->referencedBlocksNum(BlockTreeRefType::STORE);
+        if (physical.tier == Tier::DEVICE) {
+            record.request_ref_blocks           = static_cast<const DeviceBlockPool*>(pool)->referencedBlocksNum();
+            record.request_ref_blocks_available = true;
+        }
+        record.pending_release_blocks = evictor_.pendingReleaseBlocks(pool);
+        record.published_host_blocks  = tree_->pressureState().pool(physical.id).published_host_blocks;
+        snapshot.pools.push_back(std::move(record));
+    }
+    for (const auto& group : tree_->groupSets()) {
+        CachePressureGroupSnapshot record;
+        record.group_id   = group->groupSetId();
+        record.group_type = group->groupType();
+        std::vector<const IBlockPool*> pools;
+        for (const auto& pool : group->devicePools()) {
+            if (pool) {
+                record.device_pool_ids.push_back(tree_->pressurePoolId(pool.get()));
+                pools.push_back(pool.get());
+            }
+        }
+        if (group->hostPool()) {
+            record.host_pool_id = tree_->pressurePoolId(group->hostPool().get());
+            pools.push_back(group->hostPool().get());
+        }
+        if (group->diskPool()) {
+            record.disk_pool_id = tree_->pressurePoolId(group->diskPool().get());
+            pools.push_back(group->diskPool().get());
+        }
+        record.device_watermark        = config_.watermark_device;
+        record.host_watermark          = config_.watermark_host;
+        record.disk_watermark          = config_.watermark_disk;
+        record.watermark_trigger_count = tree_->pressureState().watermarkTriggers(record.group_id);
+        snapshot.groups.push_back(record);
+        // Fixed key universe: topology pools x three operations x six directions.
+        // Deduplicate member pools shared within a group as well as across groups.
+        std::unordered_set<const IBlockPool*> visited;
+        for (const auto* pool : pools) {
+            if (!visited.insert(pool).second) {
+                continue;
+            }
+            const auto& id        = tree_->pressurePoolId(pool);
+            Tier        pool_tier = Tier::DEVICE;
+            if (group->hostPool().get() == pool) {
+                pool_tier = Tier::HOST;
+            } else if (group->diskPool().get() == pool) {
+                pool_tier = Tier::DISK;
+            }
+            for (auto operation :
+                 {CacheTransferOperation::LOAD, CacheTransferOperation::EVICT, CacheTransferOperation::STORE}) {
+                for (auto source : {Tier::DEVICE, Tier::HOST, Tier::DISK}) {
+                    for (auto target : {Tier::DEVICE, Tier::HOST, Tier::DISK}) {
+                        if (source == target || (pool_tier != source && pool_tier != target))
+                            continue;
+                        const auto evidence =
+                            tree_->pressureState().transfer({record.group_id, id, operation, source, target});
+                        if (!evidence.copied_blocks && !evidence.published_blocks && !evidence.failed_operations)
+                            continue;
+                        CachePressureTransferSnapshot transfer;
+                        static_cast<TransferEvidence&>(transfer) = evidence;
+                        transfer.group_id                        = record.group_id;
+                        transfer.pool_id                         = id;
+                        transfer.pool_tier                       = pool_tier;
+                        transfer.operation                       = operation;
+                        transfer.source_tier                     = source;
+                        transfer.target_tier                     = target;
+                        snapshot.transfers.push_back(std::move(transfer));
+                    }
+                }
+            }
+        }
+    }
+    return snapshot;
 }
 
 void BlockTreeCache::reportMetrics() const {

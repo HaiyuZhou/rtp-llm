@@ -16,6 +16,7 @@ namespace rtp_llm {
 
 class BlockTransferDispatcher;
 class BlockTreeCacheMetricsReporter;
+class BlockTree;
 
 class StoreTaskRunner {
 public:
@@ -42,7 +43,7 @@ public:
     };
     using TaskPtr = std::shared_ptr<Task>;
 
-    explicit StoreTaskRunner(const std::vector<GroupSetPtr>& group_sets);
+    explicit StoreTaskRunner(const std::vector<GroupSetPtr>& group_sets, BlockTree* pressure_tree = nullptr);
 
     bool prepareTask(Task& task, const std::vector<std::vector<GroupSetResource>>& resources);
     void runTransfer(TaskPtr                        task,
@@ -52,6 +53,7 @@ public:
     void releaseTaskResources(const Task& task);
 
 private:
+    BlockTree*                      pressure_tree_{nullptr};
     const std::vector<GroupSetPtr>& group_sets_;
 };
 

@@ -18,6 +18,15 @@
 namespace rtp_llm {
 
 class BlockTreeEvictor;
+class CachePressureState;
+enum class CacheTransferOperation : uint8_t;
+struct TransferDescriptor;
+struct TransferResult;
+struct PressurePhysicalPool {
+    std::string       id;
+    Tier              tier;
+    const IBlockPool* pool;
+};
 
 struct ReusableGroupLocation {
     size_t group_set_id{0};
@@ -76,7 +85,7 @@ public:
         return node_pool_.size();
     }
     CacheKeysType cacheKeys() const;
-    int64_t keyVersion() const {
+    int64_t       keyVersion() const {
         return key_version_;
     }
 
@@ -93,15 +102,31 @@ public:
     KVCacheSnapshot logicalCacheSnapshot() const;
     void            refreshPublishedState(const TreeNode* node);
 
+    // Fixed topology identities, frozen at construction. Mutations require cache mutex.
+    const std::vector<PressurePhysicalPool>& pressurePools() const {
+        return pressure_pools_;
+    }
+    const std::string&  pressurePoolId(const IBlockPool* pool) const;
+    CachePressureState& pressureState() const;
+    void                refreshPressureHostOwner(const TreeNode* node, size_t group_id);
+    void recordPressurePublication(CacheTransferOperation operation, const TransferDescriptor& descriptor);
+    // Called by copy callbacks without the cache lock; reads immutable topology only.
+    void recordPressureCopy(CacheTransferOperation                 operation,
+                            const std::vector<TransferDescriptor>& descriptors,
+                            const TransferResult&                  result);
+
 private:
-    void                               removePublishedKey(CacheKeyType key);
-    KVCacheEventPublisherPtr           event_publisher_;
-    std::vector<ReusableGroupLocation> publication_groups_;
-    std::unordered_set<CacheKeyType>   published_keys_;
-    int64_t                            publication_version_{-1};
+    // Outlives workflow collaborators and their drained callbacks.
+    std::unique_ptr<CachePressureState>           pressure_state_;
+    std::vector<PressurePhysicalPool>             pressure_pools_;
+    std::unordered_map<const IBlockPool*, size_t> pressure_pool_indices_;
+    void                                          removePublishedKey(CacheKeyType key);
+    KVCacheEventPublisherPtr                      event_publisher_;
+    std::vector<ReusableGroupLocation>            publication_groups_;
+    std::unordered_set<CacheKeyType>              published_keys_;
+    int64_t                                       publication_version_{-1};
 
     friend class BlockTreeEvictor;
-
     BlockTreeInsertResult insertNodeImpl(const CacheKeysType&                              cache_keys,
                                          const std::vector<std::vector<GroupSetResource>>& resources,
                                          bool                                              collect_path,
@@ -111,10 +136,10 @@ private:
     TreeNode* createNode(CacheKeyType key, TreeNode* parent);
     void      releaseNode(TreeNode* node);
 
-    std::vector<GroupSetPtr>              group_sets_;
-    ReusableGroupLocations                reusable_group_locations_;
-    std::unique_ptr<TreeNode>             root_;
-    std::deque<std::unique_ptr<TreeNode>> node_pool_;
+    std::vector<GroupSetPtr>                                    group_sets_;
+    ReusableGroupLocations                                      reusable_group_locations_;
+    std::unique_ptr<TreeNode>                                   root_;
+    std::deque<std::unique_ptr<TreeNode>>                       node_pool_;
     std::unordered_map<CacheKeyType, std::unique_ptr<TreeNode>> pending_node_pool_;
     // Indexed together with node_pool_ for contiguous snapshot copies.
     CacheKeysType cache_keys_;

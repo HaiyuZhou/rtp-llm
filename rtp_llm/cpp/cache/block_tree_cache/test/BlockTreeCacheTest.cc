@@ -27,6 +27,77 @@ namespace rtp_llm {
 namespace {
 using namespace block_tree_cache_test;
 
+uint64_t publishedHostBlocks(const CachePressureSnapshot& snapshot) {
+    uint64_t blocks = 0;
+    for (const auto& pool : snapshot.pools) {
+        if (pool.tier == Tier::HOST)
+            blocks += pool.published_host_blocks;
+    }
+    return blocks;
+}
+
+TEST(BlockTreePressureTest, DeduplicatesSharedDevicePoolAndRetainsGroupMappings) {
+    auto       pool     = makeStructuralDevicePool(0);
+    auto       first    = std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{pool}, nullptr, nullptr);
+    auto       second   = std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{pool}, nullptr, nullptr);
+    auto       cache    = makeBlockTreeCacheForTest({first, second});
+    const auto snapshot = cache->pressureSnapshot();
+    ASSERT_EQ(snapshot.pools.size(), 1u);
+    ASSERT_EQ(snapshot.groups.size(), 2u);
+    EXPECT_EQ(snapshot.groups[0].device_pool_ids, snapshot.groups[1].device_pool_ids);
+    ASSERT_EQ(snapshot.groups[0].device_pool_ids.size(), 1u);
+    EXPECT_EQ(snapshot.groups[0].device_pool_ids[0], snapshot.pools[0].pool_id);
+    EXPECT_TRUE(snapshot.pools[0].request_ref_blocks_available);
+    EXPECT_FALSE(snapshot.groups[0].host_pool_id.has_value());
+}
+
+TEST(BlockTreePressureTest, CountsSettledHostDataAndRemovesItOnReclaim) {
+    auto env = block_tree_cache_test::FullSWAEnvironment::create();
+    env->insertRequestPath();
+    env->releaseRequestRefs();
+    EXPECT_EQ(publishedHostBlocks(env->cache->pressureSnapshot()), 0u);
+    env->demoteAll(Tier::DEVICE);
+    EXPECT_GT(publishedHostBlocks(env->cache->pressureSnapshot()), 0u);
+    const auto settled = env->cache->pressureSnapshot();
+    ASSERT_EQ(settled.groups.size(), 2u);
+    EXPECT_NE(settled.groups[0].host_pool_id, settled.groups[1].host_pool_id);
+    for (const auto& group : settled.groups)
+        EXPECT_EQ(group.watermark_trigger_count, 1u);
+    uint64_t host_copies = 0, host_publications = 0;
+    for (const auto& transfer : settled.transfers) {
+        EXPECT_EQ(transfer.operation, CacheTransferOperation::EVICT);
+        EXPECT_EQ(transfer.source_tier, Tier::DEVICE);
+        EXPECT_EQ(transfer.target_tier, Tier::HOST);
+        EXPECT_EQ(transfer.failed_operations, 0u);
+        if (transfer.pool_tier != Tier::HOST)
+            continue;
+        host_copies += transfer.copied_blocks;
+        host_publications += transfer.published_blocks;
+        const auto pool = std::find_if(settled.pools.begin(), settled.pools.end(), [&](const auto& pool) {
+            return pool.pool_id == transfer.pool_id;
+        });
+        ASSERT_NE(pool, settled.pools.end());
+        EXPECT_EQ(transfer.copied_bytes, transfer.copied_blocks * pool->block_size_bytes);
+        EXPECT_EQ(transfer.published_bytes, transfer.published_blocks * pool->block_size_bytes);
+    }
+    EXPECT_EQ(host_copies, publishedHostBlocks(settled));
+    EXPECT_EQ(host_publications, publishedHostBlocks(settled));
+    EXPECT_EQ(host_publications, env->keys.size() * env->groups.size());
+    const auto repeated = env->cache->pressureSnapshot();
+    ASSERT_EQ(repeated.pools.size(), settled.pools.size());
+    for (size_t i = 0; i < settled.pools.size(); ++i)
+        EXPECT_EQ(repeated.pools[i].pool_id, settled.pools[i].pool_id);
+    env->reclaimAll();
+    EXPECT_EQ(publishedHostBlocks(env->cache->pressureSnapshot()), 0u);
+    uint64_t retained_publications = 0;
+    for (const auto& transfer : env->cache->pressureSnapshot().transfers) {
+        if (transfer.pool_tier == Tier::HOST)
+            retained_publications += transfer.published_blocks;
+    }
+    EXPECT_EQ(retained_publications, host_publications);
+    env->expectFullyReclaimed();
+}
+
 double
 snapshotQps(kmonitor::MutableMetric* metric, const kmonitor::MetricsTags& tags, const char* expected_name = nullptr) {
     if (metric == nullptr) {
@@ -2218,6 +2289,7 @@ static std::unique_ptr<BlockTreeCache> makeHostOnlyLoadCache(std::vector<DeviceB
     const MultiNodeResource device_resource{full->groupSetId(), Tier::DEVICE, {{find.back(), device_blocks}}};
     resource.evictFromTier(Tier::DEVICE);
     full->unreferenceBlocks(device_resource, BlockTreeRefType::CACHE);
+    cache->tree()->refreshPressureHostOwner(find.back(), 0);
     return cache;
 }
 
@@ -2571,6 +2643,7 @@ TEST_F(BlockTreeCacheTest, LoadContextCommitTriggersLoad) {
     ASSERT_NE(device_pool, nullptr);
     std::unique_ptr<BlockTreeCache> cache = makeHostOnlyLoadCache({device_pool});
 
+    EXPECT_EQ(publishedHostBlocks(cache->pressureSnapshot()), 1u);
     BlockTreeMatchResult              result       = cache->match({200});
     std::shared_ptr<LoadAsyncContext> load_context = takeLoadContext(result);
     ASSERT_NE(load_context, nullptr);
@@ -2586,10 +2659,20 @@ TEST_F(BlockTreeCacheTest, LoadContextCommitTriggersLoad) {
     ASSERT_EQ(load_context->loadDescs().size(), 1u);
     load_context->setTargetBlocks(0, {request_target});
 
+    EXPECT_EQ(publishedHostBlocks(cache->pressureSnapshot()), 1u);
     EXPECT_TRUE(load_context->commit());
 
     block_tree_cache_test::releaseRequestRefsForTest(*cache, result.matched_device_resources);
     block_tree_cache_test::BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+    EXPECT_EQ(publishedHostBlocks(cache->pressureSnapshot()), 0u);
+    uint64_t publications = 0;
+    for (const auto& transfer : cache->pressureSnapshot().transfers) {
+        if (transfer.operation == CacheTransferOperation::LOAD && transfer.pool_tier == Tier::DEVICE) {
+            publications += transfer.published_blocks;
+            EXPECT_EQ(transfer.copied_blocks, 1u);
+        }
+    }
+    EXPECT_EQ(publications, 1u);
     device_pool->decRef(request_targets);
 }
 

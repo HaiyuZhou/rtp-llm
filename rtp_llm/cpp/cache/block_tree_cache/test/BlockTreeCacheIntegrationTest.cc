@@ -1264,6 +1264,15 @@ TEST_F(BlockTreeCacheIntegrationTest, DirectDropDetachesInFlightLoadAndDiscardsI
     resources[1][0].host_block    = host_source;
     ASSERT_TRUE(insertGroupSetResources(*cache, {100, 200}, resources));
 
+    const auto host_residency = [&]() {
+        uint64_t blocks = 0;
+        for (const auto& pool : cache->pressureSnapshot().pools) {
+            if (pool.tier == Tier::HOST)
+                blocks += pool.published_host_blocks;
+        }
+        return blocks;
+    };
+    EXPECT_EQ(host_residency(), 1u);
     BlockTreeMatchResult              result  = cache->match({100, 200});
     std::shared_ptr<LoadAsyncContext> context = takeLoadContext(result);
     ASSERT_NE(context, nullptr);
@@ -1280,11 +1289,13 @@ TEST_F(BlockTreeCacheIntegrationTest, DirectDropDetachesInFlightLoadAndDiscardsI
     auto path = cache->tree()->findNode({100, 200});
     ASSERT_EQ(path.size(), 2u);
     EXPECT_EQ(path[1]->group_set_resources[0].transfer_state, GroupSetTransferState::LOADING);
+    EXPECT_EQ(host_residency(), 1u);
     EXPECT_EQ(cache->evictForGroup("group0", /*num_blocks=*/1), 1);
     EXPECT_TRUE(cache->tree()->findNode({100, 200}).empty());
     ASSERT_EQ(cache->tree()->pending_node_pool_.size(), 1u);
     EXPECT_EQ(cache->tree()->pending_node_pool_.at(200).get(), path[1]);
     EXPECT_TRUE(path[1]->group_set_resources[0].transfer_detached);
+    EXPECT_EQ(host_residency(), 0u);
     EXPECT_TRUE(host_pool->isAllocated(host_source));
     const auto after_drop = cache->getKeySnapshot();
     EXPECT_TRUE(after_drop.keys.empty());
@@ -1294,6 +1305,14 @@ TEST_F(BlockTreeCacheIntegrationTest, DirectDropDetachesInFlightLoadAndDiscardsI
     context->waitDone();
 
     EXPECT_FALSE(context->success());
+    EXPECT_EQ(host_residency(), 0u);
+    for (const auto& transfer : cache->pressureSnapshot().transfers) {
+        if (transfer.operation == CacheTransferOperation::LOAD) {
+            EXPECT_EQ(transfer.copied_blocks, 0u);
+            EXPECT_EQ(transfer.published_blocks, 0u);
+            EXPECT_EQ(transfer.failed_operations, 1u);
+        }
+    }
     EXPECT_FALSE(host_pool->isAllocated(host_source));
     EXPECT_TRUE(cache->tree()->findNode({100, 200}).empty());
     EXPECT_TRUE(cache->tree()->pending_node_pool_.empty());
@@ -2454,7 +2473,7 @@ TEST_P(BlockTreeCacheLowerTierTest, TransferExceptionSettlesLoadAndRestoresCandi
     }
     const CacheStats          candidates_before = environment->cache->getStats();
     const std::vector<size_t> host_free_before  = {environment->host_pools[0]->freeBlocksNum(),
-                                                  environment->host_pools[1]->freeBlocksNum()};
+                                                   environment->host_pools[1]->freeBlocksNum()};
 
     BlockTreeMatchResult              result  = environment->cache->match(environment->keys);
     std::shared_ptr<LoadAsyncContext> context = takeLoadContext(result);
@@ -2596,7 +2615,7 @@ TEST_F(BlockTreeCacheIntegrationTest, DiskLoadDirectTransferExceptionRestoresSou
 
     const std::vector<GroupSetResource> resources_before = environment->resourcesForPathNode(0);
     const std::vector<size_t>           host_free_before = {environment->host_pools[0]->freeBlocksNum(),
-                                                  environment->host_pools[1]->freeBlocksNum()};
+                                                            environment->host_pools[1]->freeBlocksNum()};
     BlockTreeMatchResult                result           = environment->cache->match(environment->keys);
     std::shared_ptr<LoadAsyncContext>   context          = takeLoadContext(result);
     ASSERT_NE(context, nullptr);

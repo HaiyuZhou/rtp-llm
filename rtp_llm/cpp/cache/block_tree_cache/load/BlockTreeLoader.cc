@@ -36,7 +36,7 @@ BlockTreeLoader::BlockTreeLoader(BlockTree*                      tree,
     enable_device_cache_(enable_device_cache),
     storage_backend_(std::move(storage_backend)),
     settled_(std::move(settled)),
-    load_task_runner_(tree_->groupSets(), host_timeout_ms, disk_timeout_ms),
+    load_task_runner_(tree_->groupSets(), host_timeout_ms, disk_timeout_ms, tree),
     load_join_registry_(tree),
     load_context_coordinator_(std::make_shared<LoadContextCoordinator>(
         [this](const std::shared_ptr<LoadAsyncContext>& context) { return commitLoad(context); },
@@ -553,7 +553,7 @@ bool BlockTreeLoader::settleLoadLocked(LoadTaskRunner::Task&                    
         if (resource.transfer_detached) {
             evictor_.discardDetachedTransfer({desc});
             detached_nodes.insert(desc.node);
-            state_settled     = true;
+            state_settled = true;
             continue;
         }
         if (settlement_success) {
@@ -565,6 +565,8 @@ bool BlockTreeLoader::settleLoadLocked(LoadTaskRunner::Task&                    
                 group_set->unreferenceBlocks(source_protection, BlockTreeRefType::CACHE);
                 resource.evictFromTier(desc.source_tier);
                 task.target_installed[desc_index] = true;
+                tree_->recordPressurePublication(CacheTransferOperation::LOAD, desc);
+                tree_->refreshPressureHostOwner(desc.node, desc.group_set_id);
             }
             const bool state_changed = changeTransferState(
                 desc.node, desc.group_set_id, GroupSetTransferState::LOADING, GroupSetTransferState::IDLE);

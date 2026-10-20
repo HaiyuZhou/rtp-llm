@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/store/StoreTaskRunner.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/BlockTree.h"
 
 #include <exception>
 
@@ -10,7 +11,8 @@
 
 namespace rtp_llm {
 
-StoreTaskRunner::StoreTaskRunner(const std::vector<GroupSetPtr>& group_sets): group_sets_(group_sets) {}
+StoreTaskRunner::StoreTaskRunner(const std::vector<GroupSetPtr>& group_sets, BlockTree* pressure_tree):
+    pressure_tree_(pressure_tree), group_sets_(group_sets) {}
 
 bool StoreTaskRunner::prepareTask(Task& task, const std::vector<std::vector<GroupSetResource>>& resources) {
     for (size_t key_index = 0; key_index < task.cache_keys.size(); ++key_index) {
@@ -51,6 +53,9 @@ void StoreTaskRunner::runTransfer(TaskPtr                        task,
         auto stage_state = std::make_shared<TransferStageState>(
             [this, task, &metrics_reporter, transfer_begin, callback](TransferResult result) mutable {
                 try {
+                    if (pressure_tree_) {
+                        pressure_tree_->recordPressureCopy(CacheTransferOperation::STORE, task->descriptors(), result);
+                    }
                     static const std::vector<TransferDescriptor> empty_descriptors;
                     metrics_reporter.reportTransferFinished(CacheTransferOperation::STORE,
                                                             Tier::DEVICE,
@@ -70,20 +75,26 @@ void StoreTaskRunner::runTransfer(TaskPtr                        task,
                     task->phase = Task::Phase::FINISHED;
                     callback(ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "unknown store completion exception"));
                 }
-            });
+            },
+            task->descriptors().size());
 
-        const auto submit_batch = [&](const std::vector<TransferDescriptor>& descriptors) {
+        const auto submit_batch = [&](const std::vector<TransferDescriptor>& descriptors, std::vector<size_t> indices) {
             stage_state->addBatch();
-            transfer_dispatcher.runTransfer(
-                task->transfer_task.subtask(descriptors),
-                [stage_state](TransferResult result) { stage_state->completeBatch(std::move(result)); });
+            transfer_dispatcher.runTransfer(task->transfer_task.subtask(descriptors),
+                                            [stage_state, indices = std::move(indices)](TransferResult result) {
+                                                stage_state->completeBatch(std::move(result), indices);
+                                            });
         };
         if (task->target_tier == Tier::DISK) {
-            for (const auto& descriptor : task->descriptors()) {
-                submit_batch({descriptor});
+            for (size_t i = 0; i < task->descriptors().size(); ++i) {
+                submit_batch({task->descriptors()[i]}, {i});
             }
         } else if (!task->descriptors().empty()) {
-            submit_batch(task->descriptors());
+            std::vector<size_t> indices;
+            for (size_t i = 0; i < task->descriptors().size(); ++i) {
+                indices.push_back(i);
+            }
+            submit_batch(task->descriptors(), std::move(indices));
         }
         stage_state->finishSubmitting();
     } catch (const std::exception& error) {

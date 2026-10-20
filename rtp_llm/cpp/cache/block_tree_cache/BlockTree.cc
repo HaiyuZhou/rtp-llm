@@ -4,12 +4,28 @@
 #include <cassert>
 #include <stdexcept>
 
+#include "rtp_llm/cpp/cache/block_tree_cache/CachePressureState.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/transfer/TransferTypes.h"
+
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 
 namespace rtp_llm {
 
 BlockTree::BlockTree(std::vector<GroupSetPtr> group_sets): group_sets_(std::move(group_sets)) {
+    pressure_state_     = std::make_unique<CachePressureState>();
+    const auto add_pool = [this](Tier tier, const IBlockPool* pool) {
+        if (pool && pressure_pool_indices_.emplace(pool, pressure_pools_.size()).second) {
+            pressure_pools_.push_back({"pool_" + std::to_string(pressure_pools_.size()), tier, pool});
+        }
+    };
+    for (const auto& group : group_sets_) {
+        for (const auto& pool : group->devicePools()) {
+            add_pool(Tier::DEVICE, pool.get());
+        }
+        add_pool(Tier::HOST, group->hostPool().get());
+        add_pool(Tier::DISK, group->diskPool().get());
+    }
     for (size_t group_set_id = 0; group_set_id < group_sets_.size(); ++group_set_id) {
         const auto& group_tags = group_sets_[group_set_id]->groupTags();
         for (size_t member_group_id = 0; member_group_id < group_tags.size(); ++member_group_id) {
@@ -86,6 +102,7 @@ void BlockTree::releaseNode(TreeNode* node) {
             resource.disk_block = NULL_BLOCK_IDX;
         }
         resource.transfer_state = GroupSetTransferState::IDLE;
+        refreshPressureHostOwner(node, group_set_id);
     }
 }
 
@@ -194,7 +211,7 @@ BlockTreeInsertResult BlockTree::insertNodeImpl(const CacheKeysType&            
         if (pending_node_pool_.count(key)) {
             break;
         }
-        auto         it  = current->children.find(key);
+        auto it = current->children.find(key);
         if (it != current->children.end()) {
             TreeNode* child = it->second;
             if (is_resident
@@ -296,6 +313,9 @@ BlockTreeInsertResult BlockTree::insertNodeImpl(const CacheKeysType&            
         if (collect_path) {
             result.path.push_back(current);
         }
+        for (size_t group_id = 0; group_id < group_sets_.size(); ++group_id) {
+            refreshPressureHostOwner(current, group_id);
+        }
         refreshPublishedState(current);
         inserted_prefix_length = i + 1;
     }
@@ -316,6 +336,9 @@ bool BlockTree::isRemovable(TreeNode* node) const {
 }
 
 void BlockTree::removeNode(TreeNode* node) {
+    for (size_t group_id = 0; group_id < group_sets_.size(); ++group_id) {
+        pressure_state_->setHostOwner({group_id, node->cache_key}, std::nullopt);
+    }
     RTP_LLM_LOG_DEBUG("removing node key=%ld, pool_size=%zu", node->cache_key, node_pool_.size());
 
     if (node->parent == nullptr) {
@@ -420,6 +443,98 @@ void BlockTree::refreshPublishedState(const TreeNode* node) {
     if (published_keys_.insert(node->cache_key).second) {
         ++publication_version_;
         (void)event_publisher_->tryPublish({KVCacheEventType::BLOCK_ADD, static_cast<int64_t>(node->cache_key), 0});
+    }
+}
+
+CachePressureState& BlockTree::pressureState() const {
+    return *pressure_state_;
+}
+
+const std::string& BlockTree::pressurePoolId(const IBlockPool* pool) const {
+    return pressure_pools_.at(pressure_pool_indices_.at(pool)).id;
+}
+
+void BlockTree::refreshPressureHostOwner(const TreeNode* node, size_t group_id) {
+    const auto& resource = node->group_set_resources.at(group_id);
+    if (resource.transfer_detached || !resource.hasTier(Tier::HOST)) {
+        pressure_state_->setHostOwner({group_id, node->cache_key}, std::nullopt);
+    } else {
+        const auto& pool = group_sets_.at(group_id)->hostPool();
+        pressure_state_->setHostOwner({group_id, node->cache_key},
+                                      PressureBlock{pressurePoolId(pool.get()), resource.host_block});
+    }
+}
+
+// Every endpoint is reported in its own physical pool units (packed HOST/DISK
+// record versus individual DEVICE member blocks). No request-derived keys.
+void BlockTree::recordPressurePublication(CacheTransferOperation operation, const TransferDescriptor& desc) {
+    const auto& group = group_sets_.at(desc.group_set_id);
+    for (Tier tier : {desc.source_tier, desc.target_tier}) {
+        const auto record = [&](const IBlockPool* pool, uint64_t blocks) {
+            if (pool && blocks) {
+                pressure_state_->recordPublication(
+                    {desc.group_set_id, pressurePoolId(pool), operation, desc.source_tier, desc.target_tier},
+                    blocks,
+                    blocks * pool->blockSizeBytes());
+            }
+        };
+        if (tier == Tier::DEVICE) {
+            const auto& blocks = desc.blocksAt(tier);
+            for (size_t i = 0; i < group->devicePools().size() && i < blocks.size(); ++i) {
+                if (!isNullBlockIdx(blocks[i]))
+                    record(group->devicePools()[i].get(), 1);
+            }
+        } else if (tier == Tier::HOST) {
+            record(group->hostPool().get(), desc.blocksAt(tier).size());
+        } else if (tier == Tier::DISK) {
+            record(group->diskPool().get(), desc.blocksAt(tier).size());
+        }
+    }
+}
+
+void BlockTree::recordPressureCopy(CacheTransferOperation                 operation,
+                                   const std::vector<TransferDescriptor>& descriptors,
+                                   const TransferResult&                  result) {
+    // Aggregate once per logical operation/key so failed_operations is not a block count.
+    struct CopyTotal {
+        uint64_t blocks{0};
+        uint64_t bytes{0};
+        bool     failed{false};
+    };
+    std::map<PressureTransferKey, CopyTotal> totals;
+    for (size_t index = 0; index < descriptors.size(); ++index) {
+        const auto& desc   = descriptors[index];
+        const auto& group  = group_sets_.at(desc.group_set_id);
+        const bool  copied = result.blockError(index) == CacheCopyError::NONE;
+        for (Tier tier : {desc.source_tier, desc.target_tier}) {
+            const auto add = [&](const IBlockPool* pool, uint64_t blocks) {
+                if (!pool) {
+                    return;
+                }
+                auto& total =
+                    totals[{desc.group_set_id, pressurePoolId(pool), operation, desc.source_tier, desc.target_tier}];
+                if (copied) {
+                    total.blocks += blocks;
+                    total.bytes += blocks * pool->blockSizeBytes();
+                } else {
+                    total.failed = true;
+                }
+            };
+            if (tier == Tier::DEVICE) {
+                const auto& blocks = desc.blocksAt(tier);
+                for (size_t i = 0; i < group->devicePools().size() && i < blocks.size(); ++i) {
+                    if (!isNullBlockIdx(blocks[i]))
+                        add(group->devicePools()[i].get(), 1);
+                }
+            } else if (tier == Tier::HOST) {
+                add(group->hostPool().get(), desc.blocksAt(tier).size());
+            } else if (tier == Tier::DISK) {
+                add(group->diskPool().get(), desc.blocksAt(tier).size());
+            }
+        }
+    }
+    for (const auto& [key, total] : totals) {
+        pressure_state_->recordCopy(key, total.blocks, total.bytes, !total.failed);
     }
 }
 

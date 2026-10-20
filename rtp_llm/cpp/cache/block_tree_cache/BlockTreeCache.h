@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTree.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/CachePressureState.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCacheMetricsReporter.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/evict/BlockTreeEvictor.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/group_set/GroupSet.h"
@@ -31,6 +32,33 @@ struct BlockTreeKeySnapshot {
     int64_t                   version{-1};
     std::vector<CacheKeyType> keys;
 };
+struct CachePressurePoolSnapshot: BlockTreePoolMetricsSnapshot {
+    std::string pool_id;
+    uint64_t    pending_release_blocks{0};
+    uint64_t    published_host_blocks{0};
+    bool        request_ref_blocks_available{false};
+};
+struct CachePressureGroupSnapshot {
+    size_t                     group_id{0};
+    CacheGroupType             group_type{CacheGroupType::FULL};
+    std::vector<std::string>   device_pool_ids;
+    std::optional<std::string> host_pool_id, disk_pool_id;
+    TierWatermark              device_watermark, host_watermark, disk_watermark;
+    uint64_t                   watermark_trigger_count{0};
+};
+struct CachePressureTransferSnapshot: TransferEvidence {
+    size_t                 group_id{0};
+    std::string            pool_id;
+    Tier                   pool_tier{Tier::NONE};
+    CacheTransferOperation operation{CacheTransferOperation::LOAD};
+    Tier                   source_tier{Tier::NONE}, target_tier{Tier::NONE};
+};
+struct CachePressureSnapshot {
+    std::vector<CachePressurePoolSnapshot>     pools;
+    std::vector<CachePressureGroupSnapshot>    groups;
+    std::vector<CachePressureTransferSnapshot> transfers;
+};
+
 // Unified configuration for BlockTreeCache behavior and pool sizing.
 struct BlockTreeCacheConfig {
     // ---- Tier enable flags ----
@@ -135,6 +163,7 @@ public:
     // (target_tier = NONE, content dropped). Returns the number actually freed.
     int evictForGroup(std::string_view group_tag, size_t num_blocks);
 
+    CachePressureSnapshot                     pressureSnapshot() const;
     CacheStats                                getStats() const;
     std::vector<BlockTreePoolMetricsSnapshot> poolMetricsSnapshots() const;
     void                                      reportMetrics() const;
@@ -194,9 +223,9 @@ private:
     mutable std::mutex                             mutex_;
     BlockTreeEvictor                               evictor_;
     bool                                           initialized_{false};
-    BlockTreeLoader                             loader_;
-    BlockTreeStorer                             storer_;
-    std::unique_ptr<FullPrefixInvariantScanner> full_prefix_scanner_;
+    BlockTreeLoader                                loader_;
+    BlockTreeStorer                                storer_;
+    std::unique_ptr<FullPrefixInvariantScanner>    full_prefix_scanner_;
 };
 
 using BlockTreeCachePtr = std::shared_ptr<BlockTreeCache>;

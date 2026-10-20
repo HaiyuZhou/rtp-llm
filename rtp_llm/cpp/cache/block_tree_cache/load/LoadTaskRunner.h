@@ -15,6 +15,7 @@
 namespace rtp_llm {
 
 class BlockTreeCacheMetricsReporter;
+class BlockTree;
 class BlockTransferDispatcher;
 
 class LoadTaskRunner {
@@ -52,7 +53,10 @@ public:
     };
     using TaskPtr = std::shared_ptr<Task>;
 
-    LoadTaskRunner(const std::vector<GroupSetPtr>& group_sets, int host_timeout_ms, int disk_timeout_ms);
+    LoadTaskRunner(const std::vector<GroupSetPtr>& group_sets,
+                   int                             host_timeout_ms,
+                   int                             disk_timeout_ms,
+                   BlockTree*                      pressure_tree = nullptr);
 
     TaskPtr createTask(const std::shared_ptr<LoadAsyncContext>& context);
     void    runTransfer(TaskPtr                        task,
@@ -62,16 +66,17 @@ public:
     void    releaseTaskResources(const Task& task);
 
 private:
-    void startDiskTransfer(TaskPtr                        task,
-                           const BlockTransferDispatcher& transfer_dispatcher,
-                           BlockTreeCacheMetricsReporter& metrics_reporter,
-                           TransferDoneCallback           callback);
-    void reportStageFinished(const Task&                            task,
-                             BlockTreeCacheMetricsReporter&         metrics_reporter,
-                             Tier                                   source_tier,
-                             const std::vector<TransferDescriptor>& descriptors,
-                             int64_t                                begin_time_us,
-                             bool                                   success) const;
+    BlockTree* pressure_tree_{nullptr};
+    void       startDiskTransfer(TaskPtr                        task,
+                                 const BlockTransferDispatcher& transfer_dispatcher,
+                                 BlockTreeCacheMetricsReporter& metrics_reporter,
+                                 TransferDoneCallback           callback);
+    void       reportStageFinished(const Task&                            task,
+                                   BlockTreeCacheMetricsReporter&         metrics_reporter,
+                                   Tier                                   source_tier,
+                                   const std::vector<TransferDescriptor>& descriptors,
+                                   int64_t                                begin_time_us,
+                                   bool                                   success) const;
 
     const std::vector<GroupSetPtr>& group_sets_;
     int                             host_timeout_ms_{0};

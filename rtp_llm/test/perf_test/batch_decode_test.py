@@ -921,6 +921,26 @@ def _full_pressure_startup(args, remaining, max_input_len):
     )
     from rtp_llm.server.server_args.server_args import EnvArgumentParser
 
+    scheduler = argparse.Namespace()
+    parser = EnvArgumentParser(allow_abbrev=False)
+    init_fifo_scheduler_group_args(parser, scheduler)
+    bound_flags = {action.dest for action in parser._actions} | {
+        "seq_size_per_block",
+        "tp_size",
+        "pp_size",
+        "dp_size",
+        "world_size",
+        "local_world_size",
+        "max_seq_len",
+        "concurrency_limit",
+    }
+    seen = set()
+    for argument in remaining:
+        name = argument.split("=", 1)[0].removeprefix("--")
+        if argument.startswith("--") and name in bound_flags:
+            if name in seen:
+                raise ValueError(f"duplicate full-pressure startup flag: {name}")
+            seen.add(name)
     block = extract_arg(remaining, "seq_size_per_block")
     if block is None or int(block) <= 0:
         raise ValueError(
@@ -934,9 +954,6 @@ def _full_pressure_startup(args, remaining, max_input_len):
     if tp < 1 or int(os.environ.get("WORLD_SIZE", str(tp))) != tp:
         raise ValueError("full pressure requires one complete TP world")
     model_tokens = max(args.max_seq_len, max_input_len + args.decode_test_length)
-    scheduler = argparse.Namespace()
-    parser = EnvArgumentParser(allow_abbrev=False)
-    init_fifo_scheduler_group_args(parser, scheduler)
     scheduler_argv = []
     for action in parser._actions:
         value = extract_arg(remaining, action.dest)
@@ -1194,6 +1211,10 @@ def main() -> str:
                 full_pressure_startup=_full_pressure_startup(
                     args, remaining, max(int(case["input_len"]) for case in cases)
                 ),
+            )
+            resume_config["workload"].update(
+                cache_pressure_scheduler=args.cache_pressure_scheduler,
+                cache_pressure_batch_size=args.cache_pressure_batch_size,
             )
         if args.cache_shared_seed:
             resume_config["cache_seed_mode"] = "shared_prefix_v1"

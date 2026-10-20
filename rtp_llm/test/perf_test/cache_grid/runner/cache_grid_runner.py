@@ -1064,6 +1064,17 @@ class CacheGridRunner:
                 cache_pressure_preload=True,
                 pressure_settings=asdict(self.pressure_config),
             )
+            run_config["workload"] = dict(
+                run_config.get("workload", {}),
+                cache_pressure_mode=pressure_mode,
+                cache_pressure_scheduler=pressure_scheduler,
+                cache_pressure_batch_size=pressure_batch_size,
+                cache_pressure_client_concurrency=pressure_client_concurrency,
+                cache_pressure_seed_count=pressure_seed_count,
+                cache_pressure_request_rate=pressure_request_rate,
+                cache_pressure_arrival=pressure_arrival,
+                cache_pressure_random_seed=pressure_random_seed,
+            )
         measure_runs = 3 if measure_runs is None else measure_runs
         if request_transport not in {"http_prompt", "dashsc_input_ids"}:
             raise ValueError(

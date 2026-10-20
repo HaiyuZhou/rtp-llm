@@ -473,6 +473,30 @@ class _TailMergingTokenizer:
 
 
 class BatchDecodeTest(unittest.TestCase):
+    def test_full_pressure_startup_rejects_duplicate_bound_and_topology_flags(self):
+        from rtp_llm.test.perf_test import batch_decode_test as entry
+
+        args = argparse.Namespace(
+            max_seq_len=32768, concurrency_limit=8, dp_size=1, decode_test_length=1
+        )
+        for name, first, last in (
+            ("max_batch_tokens_size", "65536", "8192"),
+            ("max_context_batch_size", "8", "1"),
+            ("seq_size_per_block", "4096", "512"),
+            ("tp_size", "8", "1"),
+            ("pp_size", "1", "2"),
+        ):
+            for duplicates in (
+                [f"--{name}={first}", f"--{name}", last],
+                [f"--{name}", first, f"--{name}={last}"],
+            ):
+                argv = (
+                    [] if name == "seq_size_per_block" else ["--seq_size_per_block=512"]
+                ) + duplicates
+                with self.subTest(argv=argv), patch.dict(os.environ, {}, clear=True):
+                    with self.assertRaisesRegex(ValueError, "duplicate.*" + name):
+                        entry._full_pressure_startup(args, argv, 8192)
+
     def test_full_pressure_startup_projects_real_engine_defaults(self):
         from rtp_llm.test.perf_test import batch_decode_test as entry
 
@@ -2930,6 +2954,26 @@ class ContinuousPressureTest(unittest.TestCase):
 
 
 class FullPressurePublicTest(unittest.TestCase):
+    def test_full_pressure_direct_resume_freezes_actual_schedule(self):
+        for name, changed in (
+            ("pressure_client_concurrency", 1),
+            ("pressure_seed_count", 5),
+            ("pressure_request_rate", 2.0),
+            ("pressure_arrival", "poisson"),
+            ("pressure_random_seed", 7),
+            ("pressure_batch_size", 2),
+            ("pressure_scheduler", "fifo"),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                runner = self.runner(directory)
+                runner._save(complete=False)
+                runner._close_resources()
+                same = self.runner(directory)
+                same._close_resources()
+                with self.assertRaisesRegex(ValueError, "incompatible|run_config"):
+                    resumed = self.runner(directory, **{name: changed})
+                    resumed._close_resources()
+
     def test_baseline_main_passes_pressure_config_and_preserves_resume_settings(self):
         from dataclasses import asdict
 
@@ -2987,7 +3031,16 @@ class FullPressurePublicTest(unittest.TestCase):
                 CacheGridRunner, "run", autospec=True, return_value=[]
             ) as run:
                 server.return_value.port = 8000
+
+                def checkpoint(runner):
+                    self.addCleanup(runner._close_resources)
+                    runner._save(complete=False)
+                    return []
+
+                run.side_effect = checkpoint
                 entry.main()
+                entry.main()
+                self.assertEqual(run.call_count, 2)
             runner = run.call_args.args[0]
             self.addCleanup(runner._close_resources)
             self.assertEqual(runner.pressure_config, self.settings())

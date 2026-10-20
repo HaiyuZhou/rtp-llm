@@ -681,9 +681,7 @@ class PressureCoverage:
                 "counter_reset"
                 if reset
                 else (
-                    "sequence_reset"
-                    if rank in self.last_seen and sample.sequence <= reference.sequence
-                    else None
+                    "sequence_reset" if sample.sequence <= reference.sequence else None
                 )
             )
             self.last_seen[rank] = sample

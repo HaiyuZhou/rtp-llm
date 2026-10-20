@@ -425,6 +425,37 @@ class CoverageTest(unittest.TestCase):
         self.assertIn("sequence_reset", evaluator.reasons)
         self.assertEqual(evaluator.intervals(3, 4), [])
 
+    def test_first_sample_sequence_must_exceed_prefill_baseline(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        baseline = dataclasses.replace(
+            rank(),
+            sequence=10,
+            groups=(GroupSample(0, "FULL", ("gpu",), "host", 0, 0),),
+        )
+        for first_sequence in (9, 10):
+            with self.subTest(first_sequence=first_sequence):
+                evaluator = PressureCoverage((baseline,), configured())
+                for t in range(5):
+                    evaluator.add(
+                        (
+                            dataclasses.replace(
+                                rank(),
+                                sequence=first_sequence + t,
+                                server_s=t,
+                                client_send_s=t,
+                                client_receive_s=t,
+                            ),
+                        ),
+                        t,
+                    )
+                self.assertFalse(evaluator.epoch_valid)
+                self.assertIn("sequence_reset", evaluator.reasons)
+                self.assertEqual(evaluator.intervals(0, 4), [])
+                self.assertFalse(evaluator.assess(0, 4).valid)
+
     def test_activity_timeout(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             ActivitySample,
@@ -532,6 +563,7 @@ class CoverageTest(unittest.TestCase):
         sample = decode_pressure_response(message, 1, 1.1, (0,)).samples[0]
         base = dataclasses.replace(
             sample,
+            sequence=0,
             groups=(
                 dataclasses.replace(sample.groups[0], triggers=0, gpu_host_published=0),
             ),

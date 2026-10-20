@@ -46,7 +46,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -891,8 +891,15 @@ def _post_prefill(
     }
 
 
-def _post_prefill_ids(stub, input_ids, timeout: int, request_id: str) -> Dict[str, Any]:
-    """Send pre-tokenized INT32 ids over Dash-SC gRPC and record end-to-end TTFT."""
+def _post_prefill_ids(
+    stub,
+    input_ids,
+    timeout: int,
+    request_id: str,
+    *,
+    register_call: Optional[Callable[[Any], None]] = None,
+) -> Dict[str, Any]:
+    """Send token ids and optionally register the cancellable call before reading."""
     from rtp_llm.dash_sc.client import build_model_infer_request
     from rtp_llm.dash_sc.codec import SamplingParams
 
@@ -911,6 +918,8 @@ def _post_prefill_ids(stub, input_ids, timeout: int, request_id: str) -> Dict[st
             timeout=timeout,
             metadata=(("x-dashscope-inner-loggingconsent", "none"),),
         )
+        if register_call is not None:
+            register_call(responses)
         values: Dict[str, Any] = {}
         output_len = 0
         for response in responses:

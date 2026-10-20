@@ -1010,6 +1010,13 @@ test_suite(
 )
 
 py_test(
+    name = "cache_grid_continuous_pressure_test",
+    main = "cache_grid/tests/continuous_pressure_test.py",
+    srcs = ["cache_grid/tests/continuous_pressure_test.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
     name = "cache_grid_pressure_diagnostics_test",
     main = "cache_grid/tests/pressure_diagnostics_test.py",
     srcs = ["cache_grid/tests/pressure_diagnostics_test.py"],

@@ -218,6 +218,61 @@ class LifecycleTest(unittest.TestCase):
             if fail_action == "enable":
                 self.assertFalse(any(e["event"] == "dispatch" for e in events))
 
+    def test_invalid_outstanding_final_poll_cannot_be_hidden_by_clean_page(self):
+        self._assert_cleanup_diagnostic_failure(final_steps=True)
+
+    def test_profile_failure_does_not_hide_invalid_drain_poll(self):
+        self._assert_cleanup_diagnostic_failure(final_steps=False)
+
+    def _assert_cleanup_diagnostic_failure(self, *, final_steps):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_results import (
+            PressureEvidence,
+            PressureWriter,
+        )
+
+        _, _, _, session = self.run_session()
+        session.state.phase = "drain"
+        session.state.failure = None if final_steps else "profile_timeout"
+        invalid = cp.PressurePoll(
+            (),
+            dict(
+                diagnostics_error="invalid clock bounds",
+                response=dict(ranks=[dict(world_rank=0)]),
+            ),
+        )
+        session.poll_future = Future()
+        session.poll_future.set_result(invalid)
+        session.poll_executor = InlineExecutor()
+        session.poll = lambda timeout: cp.PressurePoll(
+            (), dict(response=dict(ranks=[]))
+        )
+        session.next_poll = float("inf")
+        with tempfile.TemporaryDirectory() as directory:
+            writer = PressureWriter(Path(directory), {})
+            events = []
+            session.sink = PressureEvidence(
+                writer, events.append, profile_requested=True
+            )
+            if final_steps:
+                session._final_steps()
+            else:
+                session._drain()
+            session.emit("finished", failure=session.state.failure)
+            writer.close()
+            summary = json.loads(
+                (Path(directory) / "pressure/summary.json").read_text()
+            )
+            self.assertFalse(summary["validity"]["execution_valid"])
+            self.assertTrue(any(event["event"] == "error" for event in events))
+            self.assertTrue(
+                any(
+                    event["event"] == "pressure" and event["raw"] == invalid.raw
+                    for event in events
+                )
+            )
+            if not final_steps:
+                self.assertEqual(summary["result"]["failure"], "profile_timeout")
+
     def test_all_cold_fills_then_uninterrupted_formal_schedule(self):
         result, events, batches, state = self.run_session()
         dispatch = [e for e in events if e["event"] == "dispatch"]
@@ -1010,6 +1065,19 @@ class RunnerIntegrationTest(unittest.TestCase):
     def test_real_runner_transport_and_protobuf_polling(self):
         self._runner_case()
 
+    def test_transient_missing_or_failed_rank_remains_unknown_and_measurement_continues(
+        self,
+    ):
+        for fault in ("transient_missing", "transient_error"):
+            with self.subTest(fault=fault):
+                self._runner_case(fault)
+
+    def test_persistent_missing_rank_fails_coverage_and_final_drain(self):
+        self._runner_case("persistent_missing")
+
+    def test_poll_instance_corruption_remains_fatal(self):
+        self._runner_case("poll_instance")
+
     def test_runner_all_rank_control_and_poll_failures_retain_evidence(self):
         for fault in (
             "missing",
@@ -1033,6 +1101,7 @@ class RunnerIntegrationTest(unittest.TestCase):
         clock, events, polls, rpc_ids = FakeClock(), [], [], []
         controls = []
         sequence = [0]
+        missing_polls = []
 
         def control(request, timeout):
             self.assertLessEqual(timeout, 1)
@@ -1144,6 +1213,21 @@ class RunnerIntegrationTest(unittest.TestCase):
                 del response.ranks[-1]
             if fault == "poll_clock":
                 response.coordinator_received_ns = 1
+            if fault == "poll_instance":
+                peer.service_instance = "restarted-peer"
+            measuring = any(control.phase == "measurement" for control in controls)
+            if measuring and (
+                fault == "persistent_missing"
+                or (
+                    fault in ("transient_missing", "transient_error")
+                    and not missing_polls
+                )
+            ):
+                missing_polls.append(len(polls) - 1)
+                if fault == "transient_error":
+                    peer.error = "temporary peer deadline"
+                else:
+                    del response.ranks[-1]
             return response
 
         def infer(requests, **kwargs):
@@ -1237,6 +1321,34 @@ class RunnerIntegrationTest(unittest.TestCase):
         self.assertEqual(
             controls[-1].action, pb.PressureSessionControlRequestPB.DISABLE
         )
+        if fault in ("transient_missing", "transient_error", "persistent_missing"):
+            self.assertTrue(missing_polls)
+            summary = json.loads(
+                (runner.result_dir / "pressure/summary.json").read_text()
+            )
+            if fault == "persistent_missing":
+                self.assertEqual(result["failure"], "diagnostics_drain_failed")
+                self.assertFalse(result["pressure"]["valid"])
+                self.assertFalse(summary["validity"]["execution_valid"])
+            else:
+                self.assertIsNone(result["failure"])
+                self.assertEqual(
+                    result["measurement_end"] - result["measurement_start"], 2
+                )
+                self.assertTrue(summary["validity"]["execution_valid"])
+                self.assertFalse(any(e["event"] == "error" for e in events))
+            first = missing_polls[0]
+            self.assertEqual(
+                dict(polls[first].after_step_sequence),
+                dict(polls[first + 1].after_step_sequence),
+            )
+            self.assertTrue(
+                any(
+                    e["event"] == "pressure" and e["raw"].get("sampling_error")
+                    for e in events
+                )
+            )
+            return
         if fault:
             self.assertIsNotNone(result["failure"])
             evidence = json.loads(

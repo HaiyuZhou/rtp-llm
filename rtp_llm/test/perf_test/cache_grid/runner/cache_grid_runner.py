@@ -1992,19 +1992,39 @@ class CacheGridRunner:
             )
             try:
                 raw = raw_pressure_record(response, sent, received)
+                observed_ranks = [rank.world_rank for rank in response.ranks]
+                if response.schema_version != 1:
+                    raise ValueError("unsupported pressure schema")
                 if (
-                    len(response.ranks) != len(target_ranks)
-                    or {rank.world_rank for rank in response.ranks} != set(target_ranks)
-                    or any(
-                        rank.world_rank not in instances
-                        or instances[rank.world_rank] != rank.service_instance
-                        or not rank.step_history_available
-                        or rank.error
-                        or any(step.session_id != session_id for step in rank.steps)
-                        for rank in response.ranks
+                    len(response.requested_ranks) != len(target_ranks)
+                    or set(response.requested_ranks) != set(target_ranks)
+                    or len(observed_ranks) != len(set(observed_ranks))
+                    or not set(observed_ranks).issubset(target_ranks)
+                ):
+                    raise ValueError("pressure rank protocol mismatch")
+                if any(
+                    rank.world_rank not in instances
+                    or (
+                        rank.service_instance
+                        and instances[rank.world_rank] != rank.service_instance
                     )
+                    or (
+                        not rank.error
+                        and (
+                            not rank.service_instance
+                            or not rank.step_history_available
+                            or any(step.session_id != session_id for step in rank.steps)
+                        )
+                    )
+                    for rank in response.ranks
                 ):
                     raise ValueError("rank instance or diagnostic history mismatch")
+                if len(observed_ranks) != len(target_ranks) or any(
+                    rank.error for rank in response.ranks
+                ):
+                    raw["sampling_error"] = "missing rank or failed rank sample"
+                    # A partial page provides no complete coverage or cursor boundary.
+                    return PressurePoll((), raw, step_history_complete=False)
                 decoded = decode_pressure_response(
                     response, sent, received, tuple(target_ranks)
                 )

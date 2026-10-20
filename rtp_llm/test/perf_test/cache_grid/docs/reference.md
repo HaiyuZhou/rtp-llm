@@ -592,6 +592,15 @@ the raw pages and `steps.jsonl` also projects each untouched wire step as a
 `offset_bounds_s`; these writes precede filtering. There is no claim that an
 incomplete final drain contains all server records.
 
+Temporary missing ranks and rank RPC errors are retained as `sampling_error` pages
+and contribute unknown coverage without immediately ending measurement. Such pages
+advance no completed-record cursor. Instance, session, history, schema, rank
+protocol and clock corruption remain fatal `diagnostics_error` pages. Every fatal
+page emits execution-error evidence, including outstanding polls consumed during
+cleanup after an earlier profile failure. Final draining retries incomplete rank
+pages within its existing bounds; an incomplete page cannot certify an empty,
+complete history. `PressurePoll.step_history_complete=false` marks these pages.
+
 `summary.json.baseline_steps` reports per-rank eligibility and exclusion counts,
 forward wall/CPU durations, preparation wall durations, and adjacent forward
 gap wall/CPU distributions. Membership uses root `source_request_ids` matched to

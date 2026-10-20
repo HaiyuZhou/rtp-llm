@@ -220,6 +220,7 @@ class PressurePoll:
     raw: dict
     activity: tuple = ()
     step_page_full: bool = False
+    step_history_complete: bool = True
 
 
 class DispatchClosed(Exception):
@@ -392,7 +393,8 @@ class PressureSession:
             if self.poll_future is not None:
                 evidence = self.poll_future.result(timeout=1.0)
                 self.poll_future = None
-                self.emit("pressure", at_s=self.clock(), raw=evidence.raw)
+                if not self._record_pressure(evidence):
+                    raise RuntimeError(evidence.raw["diagnostics_error"])
             # One extra empty page handles an exactly full final page.
             for _ in range(17):
                 remaining = deadline - self.clock()
@@ -400,10 +402,9 @@ class PressureSession:
                     break
                 future = self.poll_executor.submit(self.poll, min(1.0, remaining))
                 evidence = future.result(timeout=min(1.1, remaining))
-                self.emit("pressure", at_s=self.clock(), raw=evidence.raw)
-                if evidence.raw.get("diagnostics_error"):
+                if not self._record_pressure(evidence):
                     raise RuntimeError(evidence.raw["diagnostics_error"])
-                if not evidence.step_page_full:
+                if evidence.step_history_complete and not evidence.step_page_full:
                     return
             raise RuntimeError("final step drain limit reached")
         except Exception as exc:
@@ -587,13 +588,21 @@ class PressureSession:
         with self.lock:
             self._apply_poll(evidence)
 
+    def _record_pressure(self, evidence):
+        self.emit("pressure", at_s=self.clock(), raw=evidence.raw)
+        error = evidence.raw.get("diagnostics_error")
+        if error:
+            self.emit(
+                "error", action="diagnostics_poll", error=error, at_s=self.clock()
+            )
+        return not error
+
     def _apply_poll(self, evidence):
         now = self.clock()
         self.last_poll_s = min(
             (s.client_receive_s for s in evidence.samples), default=now
         )
-        self.emit("pressure", at_s=now, raw=evidence.raw)
-        if evidence.raw.get("diagnostics_error"):
+        if not self._record_pressure(evidence):
             self.fail("diagnostics_poll_failed")
             return
         self.coverage.add(evidence.samples, now)
@@ -783,7 +792,7 @@ class PressureSession:
                                 self.config,
                             )
             except Exception:
-                self.emit("pressure", at_s=self.clock(), raw=baseline.raw)
+                self._record_pressure(baseline)
                 raise
             self.emit(
                 "frozen",
@@ -792,7 +801,7 @@ class PressureSession:
                 targets=[asdict(t) for t in self.coverage.targets],
                 raw_baseline=baseline.raw,
             )
-            self.emit("pressure", at_s=self.clock(), raw=baseline.raw)
+            self._record_pressure(baseline)
             self.next_poll = self.clock()
             if self.seed_count:
                 self.emit("phase", phase="seed", at_s=self.clock())

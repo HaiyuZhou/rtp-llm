@@ -538,6 +538,164 @@ from rtp_llm.test.perf_test.cache_grid.runner.continuous_pressure import (
 )
 
 
+class WarmupCutoffTest(unittest.TestCase):
+    def run_cutoff(
+        self,
+        kind="fill",
+        scheduler="batch_decode",
+        preparation_fails=False,
+        past_drain=False,
+    ):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            GroupSample,
+            PoolSample,
+            RankSample,
+        )
+
+        clock = FakeClock()
+        first_sent, crossed, batch_complete = Event(), Event(), Event()
+        cancellation, second_attempted = Event(), Event()
+        events, dispatched, cancelled, batches = [], [], [], []
+        sample_sequence = [0]
+
+        def poll(timeout):
+            sample_sequence[0] += 1
+            now = clock()
+            sample = RankSample(
+                0,
+                "service",
+                sample_sequence[0],
+                now,
+                now,
+                now,
+                (
+                    PoolSample("gpu", 100, 90, 0, 0.8, 0.9),
+                    PoolSample("host", 100, 0, 0, 0.8, 0.9, 0),
+                ),
+                (GroupSample(0, "FULL", ("gpu",), "host", 0, 0),),
+            )
+            return cp.PressurePoll((sample,), {})
+
+        def payload(request_kind, job_id):
+            self.assertEqual(request_kind, kind)
+            if job_id == 1:
+                if not first_sent.wait(2):
+                    raise AssertionError("first request never actually dispatched")
+                clock.now = 1.21
+                crossed.set()
+                if preparation_fails:
+                    raise RuntimeError("second preparation failed")
+                if past_drain and not cancellation.wait(2):
+                    raise AssertionError("drain did not cancel the partial batch")
+            return {"input_ids": [job_id + 1] * 16}
+
+        def request(payload, register, before):
+            try:
+                identity = before(payload)
+            finally:
+                if payload["input_ids"][0] == 2:
+                    second_attempted.set()
+            dispatched.append(identity)
+            if len(dispatched) == 1:
+                first_sent.set()
+            else:
+                batch_complete.set()
+
+            class Call:
+                def cancel(self):
+                    cancelled.append(identity)
+                    batch_complete.set()
+                    cancellation.set()
+                    return True
+
+            register(Call())
+            if scheduler == "batch_decode" and not batch_complete.wait(2):
+                raise AssertionError(
+                    "partial scheduler batch was neither completed nor cancelled"
+                )
+            return dict(success=True, input_len=16, output_len=1)
+
+        def sleep(seconds):
+            # Only the second worker advances across the fill deadline. After
+            # that, let cleanup progress even if the partial batch is blocked.
+            if crossed.is_set():
+                clock.now = round(clock.now + 0.01, 8)
+            time.sleep(0.001)
+
+        session = cp.PressureSession(
+            config(fill_timeout_s=0.2, drain_timeout_s=0.2, sample_period_s=0.01),
+            session_id="partial",
+            limits=cp.ExecutionLimits(128, 2, 128, 64, 16),
+            concurrency=2,
+            scheduler=scheduler,
+            batch_size=1,
+            max_input_tokens=16,
+            seed_count=2 if kind == "seed" else 0,
+            seed_input_tokens=16,
+            make_payload=payload,
+            request=request,
+            poll=poll,
+            sink=events.append,
+            set_batch=lambda count, **kwargs: batches.append(count),
+            clock=clock,
+            sleep=sleep,
+        )
+        result = session.run()
+        if past_drain:
+            self.assertTrue(second_attempted.wait(2))
+        self.assertTrue(first_sent.is_set())
+        self.assertTrue(crossed.is_set())
+        if preparation_fails:
+            self.assertIn(result["failure"], ("pressure_not_reached", "request_failed"))
+        else:
+            self.assertEqual(result["failure"], "pressure_not_reached")
+        return events, dispatched, cancelled, batches, session
+
+    def test_delayed_fill_preparation_completes_actual_partial_batch(self):
+        events, dispatched, cancelled, batches, session = self.run_cutoff()
+        self.assertEqual(batches, [2])
+        self.assertEqual(dispatched, ["partial:fill:0", "partial:padding:1"])
+        self.assertEqual(cancelled, [])
+        self.assertEqual(session.formal_submitted, 0)
+        self.assertEqual(session.padding_submitted, 0)
+        padding = next(
+            e for e in events if e["event"] == "dispatch" and e["phase"] == "padding"
+        )
+        self.assertEqual(padding["padding_for"], "fill")
+
+    def test_delayed_seed_preparation_completes_actual_partial_batch(self):
+        events, dispatched, cancelled, batches, _ = self.run_cutoff(kind="seed")
+        self.assertEqual(batches, [2])
+        self.assertEqual(dispatched, ["partial:seed:0", "partial:padding:1"])
+        self.assertEqual(cancelled, [])
+
+    def test_fifo_never_dispatches_warmup_padding(self):
+        _, dispatched, cancelled, batches, _ = self.run_cutoff(scheduler="fifo")
+        self.assertEqual(dispatched, ["partial:fill:0"])
+        self.assertEqual(batches, [])
+        self.assertEqual(cancelled, [])
+
+    def test_failed_preparation_reports_incomplete_actual_tail(self):
+        events, dispatched, cancelled, _, _ = self.run_cutoff(preparation_fails=True)
+        self.assertEqual(dispatched, ["partial:fill:0"])
+        self.assertEqual(cancelled, ["partial:fill:0"])
+        failure = next(
+            e
+            for e in events
+            if e["event"] == "error" and e.get("reason") == "padding_failed"
+        )
+        self.assertEqual(
+            (failure["stage"], failure["submitted"], failure["batch_size"]),
+            ("fill", 1, 2),
+        )
+
+    def test_warmup_tail_cannot_dispatch_after_drain_deadline(self):
+        events, dispatched, cancelled, _, _ = self.run_cutoff(past_drain=True)
+        self.assertEqual(dispatched, ["partial:fill:0"])
+        self.assertEqual(cancelled, ["partial:fill:0"])
+        self.assertTrue(any(e.get("reason") == "padding_failed" for e in events))
+
+
 class BoundedSenderTest(unittest.TestCase):
     def test_does_not_construct_or_submit_when_full(self):
         sender = BoundedSender(2)

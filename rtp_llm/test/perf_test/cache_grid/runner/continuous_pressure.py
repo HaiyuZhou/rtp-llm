@@ -307,6 +307,7 @@ class PressureSession:
         self.jobs = {}
         self.job_id = self.sequence = self.formal_submitted = 0
         self.padding_submitted = 0
+        self.warmup_batch = None
         self.fill_sent = 0
         self.closed = False
         self.supply_deadline = float("inf")
@@ -328,6 +329,10 @@ class PressureSession:
 
     def fail(self, reason):
         with self.lock:
+            if self.state.phase != "drain":
+                self.supply_deadline = min(
+                    self.supply_deadline, self.clock() + self.config.drain_timeout_s
+                )
             self.state.fail(reason)
 
     def _advance(self):
@@ -355,6 +360,10 @@ class PressureSession:
             if self.state.phase == "support" and self.support_started is None:
                 self.support_started = self.state.measurement_end
             if self.state.phase != previous:
+                if self.state.phase == "drain":
+                    self.supply_deadline = min(
+                        self.supply_deadline, now + self.config.drain_timeout_s
+                    )
                 self.emit("phase", phase=self.state.phase, at_s=now)
 
     def _before(self, job_id, kind, scheduled, payload):
@@ -363,16 +372,29 @@ class PressureSession:
         with self.lock:
             self._advance()
             phase = self.state.phase if kind == "formal" else kind
+            batch = self.warmup_batch
+            warmup_tail = (
+                self.state.phase == "drain"
+                and batch is not None
+                and kind == batch["kind"]
+                and 0 < batch["submitted"] < batch["size"]
+            )
             if (
                 self.closed
                 or self.clock() >= self.supply_deadline
-                or (kind != "padding" and self.state.phase == "drain")
+                or (
+                    kind != "padding"
+                    and self.state.phase == "drain"
+                    and not warmup_tail
+                )
                 or (
                     kind == "formal"
                     and phase not in ("steady", "measurement", "support")
                 )
             ):
                 raise DispatchClosed()
+            if warmup_tail:
+                phase = "padding"
             ids = payload["input_ids"]
             expected = (
                 self.config.fill_input_tokens
@@ -403,12 +425,16 @@ class PressureSession:
             )
             if scheduled is not None:
                 record["schedule_lag_s"] = max(0, now - self.formal_origin - scheduled)
+            if warmup_tail:
+                record["padding_for"] = kind
             self.jobs[job_id] = record
             self.last_dispatch = now
             if kind == "formal":
                 self.formal_submitted += 1
             elif kind == "padding":
                 self.padding_submitted += 1
+            elif batch is not None and kind == batch["kind"]:
+                batch["submitted"] += 1
             self.emit("dispatch", **record)
             return identity
 
@@ -608,6 +634,12 @@ class PressureSession:
             self._configure_batch(count)
         if self.state.phase == "drain":
             return
+        with self.lock:
+            self.warmup_batch = (
+                dict(kind=kind, size=count, submitted=0)
+                if self.scheduler == "batch_decode"
+                else None
+            )
         for _ in range(count):
             self._submit(kind)
         while self.sender.pending and self.state.phase != "drain":
@@ -741,7 +773,7 @@ class PressureSession:
         started = self.clock()
         self.emit("phase", phase="drain", at_s=started)
         self.support_end = started
-        deadline = started + self.config.drain_timeout_s
+        deadline = min(self.supply_deadline, started + self.config.drain_timeout_s)
         self.supply_deadline = deadline
         if self.controller and not self.profile_stopped:
             self.profile_stopped = True
@@ -790,6 +822,17 @@ class PressureSession:
             self.scheduler,
             self.batch_size,
         ):
+            self.fail("padding_failed")
+        batch = self.warmup_batch
+        if batch is not None and batch["submitted"] % batch["size"]:
+            self.emit(
+                "error",
+                reason="padding_failed",
+                stage=batch["kind"],
+                submitted=batch["submitted"],
+                batch_size=batch["size"],
+                at_s=self.clock(),
+            )
             self.fail("padding_failed")
         if self.poll_future is not None:
             self.poll_future.cancel()

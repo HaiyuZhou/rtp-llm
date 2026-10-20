@@ -3,8 +3,308 @@
 import json
 import math
 import os
+import random
 import threading
+from collections import Counter, OrderedDict
 from pathlib import Path
+
+
+def server_window(start_ns, end_ns, offset_bounds_ns):
+    low, high = offset_bounds_ns
+    return math.ceil(start_ns - low), math.floor(end_ns - high)
+
+
+def step_exclusion(step, start_ns, end_ns):
+    if not step.get("complete"):
+        return "incomplete"
+    if step.get("decode_batch", 0):
+        return "decode"
+    phases, kinds = step.get("member_phases", []), step.get("member_kinds", [])
+    if (
+        not phases
+        or len(phases) != len(kinds)
+        or len(phases) != step.get("context_batch")
+        or any(value is None for value in phases + kinds)
+    ):
+        return "unknown_membership"
+    if "padding" in kinds or "padding" in phases:
+        return "padding"
+    if all(value == "support" for value in phases):
+        return "support"
+    if len(set(phases)) > 1:
+        return "mixed_phase"
+    if any(value != "measurement" for value in phases):
+        return "other_phase"
+    if any(value != "formal" for value in kinds):
+        return "other_kind"
+    if not start_ns <= step["begin_ns"] < step["end_ns"] <= end_ns:
+        return "boundary"
+    return None
+
+
+def step_eligible(step, start_ns, end_ns):
+    return step_exclusion(step, start_ns, end_ns) is None
+
+
+def step_gap(previous, current):
+    if (previous["session_id"], previous["instance"]) != (
+        current["session_id"],
+        current["instance"],
+    ):
+        return None
+    if current["step_id"] != previous["step_id"] + 1:
+        return None
+    wall = current["forward_enter_ns"] - previous["forward_return_ns"]
+    cpu = current["forward_enter_cpu_ns"] - previous["forward_return_cpu_ns"]
+    if wall < 0 or cpu < 0:
+        return None
+    return {"wall_ns": wall, "cpu_ns": cpu}
+
+
+class BoundedDistribution:
+    """Algorithm R reservoir with reproducible local PRNG and exact moments."""
+
+    def __init__(self, capacity=4096):
+        if capacity < 1:
+            raise ValueError("positive reservoir capacity required")
+        self.capacity, self.values = capacity, []
+        self.count = self.total = 0
+        self.maximum = None
+        self.random = random.Random(0)
+
+    def add(self, value):
+        self.count += 1
+        self.total += value
+        self.maximum = value if self.maximum is None else max(self.maximum, value)
+        if len(self.values) < self.capacity:
+            self.values.append(value)
+        else:
+            index = self.random.randrange(self.count)
+            if index < self.capacity:
+                self.values[index] = value
+
+    def summary(self):
+        ordered = sorted(self.values)
+
+        def quantile(q):
+            return ordered[math.ceil(q * len(ordered)) - 1] if ordered else None
+
+        return dict(
+            count=self.count,
+            mean=self.total / self.count if self.count else None,
+            max=self.maximum,
+            p50=quantile(0.5),
+            p95=quantile(0.95),
+            p99=quantile(0.99) if self.count >= 1000 else None,
+            p99_status="estimated" if self.count >= 1000 else "insufficient",
+            reservoir_size=len(ordered),
+            reservoir_capacity=self.capacity,
+            algorithm="algorithm_r_seed_0_nearest_rank",
+        )
+
+
+class StepAnalysis:
+    """Bounded association of persisted wire pages with actual dispatch identities."""
+
+    def __init__(self, ranks, session_id, capacity=4096):
+        self.ranks, self.session_id, self.capacity = tuple(ranks), session_id, capacity
+        self.requests, self.roots = OrderedDict(), OrderedDict()
+        self.pending = {rank: OrderedDict() for rank in ranks}
+        self.instances, self.last_sequence, self.previous = {}, {}, {}
+        self.exclusions = {rank: Counter() for rank in ranks}
+        self.eligible = Counter()
+        self.distributions = {
+            rank: {
+                name: BoundedDistribution(capacity)
+                for name in (
+                    "forward_wall_ns",
+                    "forward_cpu_ns",
+                    "preparation_wall_ns",
+                    "gap_wall_ns",
+                    "gap_cpu_ns",
+                )
+            }
+            for rank in ranks
+        }
+        self.window = None
+        self.state_evictions = self.cursor_losses = 0
+        self.invalid_ranks = set()
+
+    def _put(self, mapping, key, value):
+        mapping[key] = value
+        if len(mapping) > self.capacity:
+            mapping.popitem(last=False)
+            self.state_evictions += 1
+
+    def dispatch(self, event):
+        phase = event["phase"]
+        kind = event.get(
+            "kind", "formal" if phase in ("steady", "measurement", "support") else phase
+        )
+        self._put(self.requests, event["request_id"], (phase, kind))
+
+    def consume(self, raw):
+        pages = raw.get("response", {}).get("ranks", [])
+        bounds = raw.get("rank_offset_bounds_s", {})
+        if raw.get("diagnostics_error"):
+            self.previous.clear()
+            self.roots.clear()
+            for rank in self.ranks:
+                self._flush(rank, final=True)
+            return
+        # Root membership is decoded before any peer page, independent of wire order.
+        for page in sorted(pages, key=lambda p: int(p.get("world_rank", 0))):
+            rank = int(page.get("world_rank", 0))
+            if rank not in self.pending:
+                continue
+            instance = page.get("service_instance")
+            if rank in self.instances and self.instances[rank] != instance:
+                self.invalid_ranks.add(rank)
+            self.instances[rank] = instance
+            lost = page.get("step_records_lost", False)
+            if lost:
+                self.cursor_losses += 1
+                self._flush(rank, final=True)
+                self.previous.pop(rank, None)
+                if rank == 0:
+                    self.roots.clear()
+                    self.previous.clear()
+                    for pending_rank in self.ranks:
+                        self._flush(pending_rank, final=True)
+            if not page.get("step_history_available", False) or page.get("error"):
+                self.previous.pop(rank, None)
+                continue
+            for wire in page.get("steps", []):
+                if wire.get("session_id") != self.session_id:
+                    self.exclusions[rank]["session_mismatch"] += 1
+                    self.previous.pop(rank, None)
+                    continue
+                identity = int(wire.get("step_id", 0))
+                if rank == 0 and rank not in self.invalid_ranks:
+                    members = [
+                        self.requests.get(v, (None, None))
+                        for v in wire.get("source_request_ids", [])
+                    ]
+                    self._put(
+                        self.roots,
+                        identity,
+                        (
+                            int(wire.get("context_count", 0)),
+                            int(wire.get("decode_count", 0)),
+                            int(wire.get("executed_tokens", 0)),
+                            members,
+                        ),
+                    )
+                if not wire.get("completed", False):
+                    continue  # Active sequence zero must never move the completed cursor.
+                sequence = int(wire.get("sequence", 0))
+                if sequence <= self.last_sequence.get(rank, 0):
+                    continue
+                if self.last_sequence.get(rank, 0) + 1 != sequence:
+                    # Do not create adjacency through a pending missing-record boundary.
+                    self._flush(rank, final=True)
+                    self.previous.pop(rank, None)
+                self.last_sequence[rank] = sequence
+                step = dict(
+                    session_id=self.session_id,
+                    instance=instance,
+                    step_id=identity,
+                    complete=True,
+                    context_batch=int(wire.get("context_count", 0)),
+                    decode_batch=int(wire.get("decode_count", 0)),
+                    executed_tokens=int(wire.get("executed_tokens", 0)),
+                    begin_ns=int(wire.get("preparation_begin_ns", 0)),
+                    end_ns=int(wire.get("end_ns", 0)),
+                    forward_enter_ns=int(wire.get("forward_enter_ns", 0)),
+                    forward_return_ns=int(wire.get("forward_return_ns", 0)),
+                    forward_enter_cpu_ns=int(wire.get("cpu_start_ns", 0)),
+                    forward_return_cpu_ns=int(wire.get("cpu_end_ns", 0)),
+                    offset_bounds_ns=tuple(v * 1e9 for v in bounds.get(str(rank), ())),
+                )
+                if len(self.pending[rank]) >= self.capacity:
+                    _, oldest = self.pending[rank].popitem(last=False)
+                    self._observe(rank, oldest, unknown=True)
+                    self.state_evictions += 1
+                self.pending[rank][sequence] = step
+        for rank in self.ranks:
+            self._flush(rank)
+
+    def _flush(self, rank, final=False):
+        pending = self.pending[rank]
+        while pending:
+            sequence, step = next(iter(pending.items()))
+            if step["step_id"] not in self.roots and not final:
+                break
+            pending.pop(sequence)
+            self._observe(rank, step)
+
+    def _observe(self, rank, step, unknown=False):
+        root = self.roots.get(step["step_id"])
+        members = []
+        if (
+            not unknown
+            and rank not in self.invalid_ranks
+            and 0 not in self.invalid_ranks
+            and root
+            and root[:3]
+            == (step["context_batch"], step["decode_batch"], step["executed_tokens"])
+        ):
+            members = root[3]
+        step["member_phases"] = [v[0] for v in members]
+        step["member_kinds"] = [v[1] for v in members]
+        window = (0, 0)
+        if self.window and len(step["offset_bounds_ns"]) == 2:
+            window = server_window(*self.window, step["offset_bounds_ns"])
+        reason = step_exclusion(step, *window)
+        if reason is None and not (
+            0
+            < step["begin_ns"]
+            <= step["forward_enter_ns"]
+            <= step["forward_return_ns"]
+            <= step["end_ns"]
+            and 0 <= step["forward_enter_cpu_ns"] <= step["forward_return_cpu_ns"]
+        ):
+            reason = "invalid_clocks"
+        if reason:
+            self.exclusions[rank][reason] += 1
+            self.previous.pop(rank, None)
+            return
+        self.eligible[rank] += 1
+        dist = self.distributions[rank]
+        dist["forward_wall_ns"].add(
+            step["forward_return_ns"] - step["forward_enter_ns"]
+        )
+        dist["forward_cpu_ns"].add(
+            step["forward_return_cpu_ns"] - step["forward_enter_cpu_ns"]
+        )
+        dist["preparation_wall_ns"].add(step["forward_enter_ns"] - step["begin_ns"])
+        previous = self.previous.get(rank)
+        gap = step_gap(previous, step) if previous else None
+        if gap:
+            dist["gap_wall_ns"].add(gap["wall_ns"])
+            dist["gap_cpu_ns"].add(gap["cpu_ns"])
+        self.previous[rank] = step
+
+    def summary(self, final=True):
+        if final:
+            for rank in self.ranks:
+                self._flush(rank, final=True)
+        return dict(
+            state_capacity=self.capacity,
+            state_evictions=self.state_evictions,
+            cursor_losses=self.cursor_losses,
+            ranks={
+                str(rank): dict(
+                    eligible=self.eligible[rank],
+                    exclusions=dict(self.exclusions[rank]),
+                    **{
+                        name: value.summary()
+                        for name, value in self.distributions[rank].items()
+                    }
+                )
+                for rank in self.ranks
+            },
+        )
 
 
 class RequestWindow:
@@ -110,7 +410,15 @@ MANIFEST_PROJECTION = (
 class PressureEvidence:
     """Serialized supervisor sink retaining only outstanding dispatched jobs."""
 
-    def __init__(self, writer, downstream=None, *, profile_requested=False):
+    def __init__(
+        self,
+        writer,
+        downstream=None,
+        *,
+        profile_requested=False,
+        target_ranks=(),
+        session_id=None
+    ):
         self.writer, self.downstream = writer, downstream
         self.profile_requested = profile_requested
         self.pending = {}
@@ -118,6 +426,7 @@ class PressureEvidence:
         self.duration = None
         self.execution_failed = False
         self.lock = threading.RLock()
+        self.steps = StepAnalysis(target_ranks, session_id)
 
     def abort(self, error):
         with self.lock:
@@ -174,8 +483,34 @@ class PressureEvidence:
                 self.window = RequestWindow(
                     event["at_s"], event["at_s"] + self.duration
                 )
+                self.steps.window = (self.window.start * 1e9, self.window.end * 1e9)
+            elif kind == "pressure":
+                for page in event["raw"].get("response", {}).get("ranks", []):
+                    for record in page.get("steps", []):
+                        self.writer.append(
+                            "steps",
+                            dict(
+                                event="step_record",
+                                world_rank=page.get("world_rank", 0),
+                                service_instance=page.get("service_instance"),
+                                record=record,
+                                offset_bounds_s=event["raw"]
+                                .get("rank_offset_bounds_s", {})
+                                .get(str(page.get("world_rank", 0))),
+                            ),
+                        )
+                self.steps.consume(event["raw"])
+            elif kind == "control":
+                controls = self.writer.manifest.get("control_times")
+                if controls is None:
+                    controls = self.writer.manifest["control_times"] = {}
+                controls.setdefault("diagnostics", []).append(event)
+                self.writer._atomic("manifest.json", self.writer.manifest)
+                if event.get("result") and not event["result"].get("success"):
+                    self.execution_failed = True
             elif kind == "dispatch":
                 self.pending[event["job_id"]] = (event, None)
+                self.steps.dispatch(event)
             elif kind == "completion":
                 if event.get("result", {}).get("success") is not True:
                     self.execution_failed = True
@@ -197,6 +532,7 @@ class PressureEvidence:
                 summary = dict(
                     execution_mode="full_pressure_diagnostic_v1",
                     metrics=[],
+                    baseline_steps=self.steps.summary(),
                     window=self.window.summary() if self.window else None,
                     result=event,
                     validity=dict(

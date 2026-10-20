@@ -568,3 +568,53 @@ delivery. No diagnostic CUDA synchronization is added. `executed_tokens` is the
 root execution-token total; normal decode contributes one token per decode batch
 row and the remainder is `context_tokens`. Active copies are immutable. A thrown
 forward clears active state without publishing a successful completed record.
+
+### Client step analysis and controls
+
+The full-pressure runner enables its unique session on every target rank before
+the baseline or seeds, with an explicit 4096-record capacity. Controls run on a
+dedicated one-worker executor (at most 16 pending markers), separate from sender
+and pressure-poll workers. Each RPC has a one-second deadline. Schema, rank set,
+positive applied timestamp and stable per-rank service instance are checked;
+partial enable is a failure and still attempts DISABLE for the owned session.
+Phase markers are asynchronous observations, not membership barriers: actual
+dispatch identities determine request phases. `control` events and manifest
+`control_times.diagnostics` retain full responses, client send/receive times,
+rank application times and validation errors, including partial acknowledgements.
+
+Cleanup attempts DISABLE after request drain, then drains completed pages with
+a two-second / 17-page bound (256 completed records per page). Active sequence
+zero remains independently visible. Control and final-drain failures are recorded
+before `finished` and make execution validity false. Raw response pages are
+preserved even when rank or clock validation fails. `cache_samples.jsonl` contains
+the raw pages and `steps.jsonl` also projects each untouched wire step as a
+`step_record` event with `world_rank`, `service_instance`, `record` and
+`offset_bounds_s`; these writes precede filtering. There is no claim that an
+incomplete final drain contains all server records.
+
+`summary.json.baseline_steps` reports per-rank eligibility and exclusion counts,
+forward wall/CPU durations, preparation wall durations, and adjacent forward
+gap wall/CPU distributions. Membership uses root `source_request_ids` matched to
+actual dispatch events, then session/root step ID and synchronized counts/tokens
+to join peers. Numeric stream IDs and completion order are never substituted.
+Each rank keeps its own instance identity and CPU clock. Membership, root-step
+associations and pending steps are bounded to 4096 entries each (pending per rank);
+evictions and cursor losses are reported. Missing or evicted membership is unknown,
+and cannot become eligible. Loss breaks adjacency, including delayed pending pages.
+
+Only complete, pure formal measurement prefill steps with known membership fit
+the window. Exclusions distinguish support, mixed phases, padding, decode,
+incomplete, unknown membership and uncertain boundaries. For client-minus-server
+offset bounds `[low, high]`, client `[t0,t1)` maps conservatively to server bounds
+`[ceil(t0-low), floor(t1-high)]`; the entire preparation-to-return interval must
+fit. Gap subtraction uses the original server timestamps on the same executor
+thread and requires consecutive eligible step IDs with no intervening loss.
+Background-thread wall durations are never added to executor wall time.
+
+Means and maxima use exact streaming counters. Quantiles use a deterministic
+Algorithm R reservoir (seed 0, capacity 4096) and nearest-rank estimates. Each
+distribution reports count, reservoir size/capacity and algorithm. p99 is null
+with `p99_status=insufficient` below 1000 eligible intervals; above that threshold
+it is `estimated`. This threshold is a reporting heuristic, not a confidence
+guarantee. Reservoir sampling has sampling error and supplies no tail-error bound;
+20-step traces should be interpreted structurally, not as reliable tail estimates.

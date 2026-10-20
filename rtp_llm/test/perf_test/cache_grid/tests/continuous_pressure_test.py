@@ -105,7 +105,8 @@ class LifecycleTest(unittest.TestCase):
         payload_hook=None,
         seed_count=0,
         rate=3,
-        control=None
+        control=None,
+        diagnostics_control=None
     ):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             GroupSample,
@@ -170,6 +171,7 @@ class LifecycleTest(unittest.TestCase):
             sink=events.append,
             set_batch=control or (lambda count, **kwargs: batches.append(count)),
             controller=controller,
+            diagnostics_control=diagnostics_control,
             clock=clock,
             sleep=clock.sleep,
             executor_factory=InlineExecutor,
@@ -177,6 +179,44 @@ class LifecycleTest(unittest.TestCase):
         )
         result = state.run()
         return result, events, batches, state
+
+    def test_diagnostics_enable_and_disable_enclose_baseline_and_work(self):
+        controls = []
+        polls_after_disable = []
+
+        def poll(evidence, count, clock):
+            self.assertEqual(controls[0][0], "enable")
+            polls_after_disable.append(controls[-1][0] == "disable")
+            return evidence
+
+        result, events, _, _ = self.run_session(
+            diagnostics_control=lambda action, phase, timeout: controls.append(
+                (action, phase)
+            ),
+            poll_transform=poll,
+        )
+        self.assertIsNone(result["failure"])
+        self.assertEqual(controls[0], ("enable", ""))
+        self.assertEqual(controls[-1], ("disable", ""))
+        self.assertIn(("phase", "measurement"), controls)
+        self.assertEqual(events[-1]["event"], "finished")
+        self.assertTrue(polls_after_disable[-1])
+
+    def test_partial_enable_and_disable_failure_are_final_failures(self):
+        for fail_action in ("enable", "disable", "phase"):
+            calls = []
+
+            def control(action, phase, timeout):
+                calls.append(action)
+                if action == fail_action:
+                    raise ValueError("partial rank failure")
+
+            result, events, _, _ = self.run_session(diagnostics_control=control)
+            self.assertIsNotNone(result["failure"])
+            self.assertEqual(calls[-1], "disable")
+            self.assertTrue(any(e["event"] == "error" for e in events))
+            if fail_action == "enable":
+                self.assertFalse(any(e["event"] == "dispatch" for e in events))
 
     def test_all_cold_fills_then_uninterrupted_formal_schedule(self):
         result, events, batches, state = self.run_session()
@@ -968,18 +1008,68 @@ class RunnerIntegrationTest(unittest.TestCase):
             self.assertEqual(configure.call_args.kwargs["timeout"], 0.2)
 
     def test_real_runner_transport_and_protobuf_polling(self):
+        self._runner_case()
+
+    def test_runner_all_rank_control_and_poll_failures_retain_evidence(self):
+        for fault in (
+            "missing",
+            "unsupported",
+            "partial",
+            "duplicate",
+            "restart",
+            "disable",
+            "poll_rank",
+            "poll_clock",
+        ):
+            with self.subTest(fault=fault):
+                self._runner_case(fault)
+
+    def _runner_case(self, fault=None):
         from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2 as pb
         from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
             CacheGridRunner,
         )
 
         clock, events, polls, rpc_ids = FakeClock(), [], [], []
+        controls = []
         sequence = [0]
 
+        def control(request, timeout):
+            self.assertLessEqual(timeout, 1)
+            controls.append(request)
+            response = pb.PressureSessionControlResponsePB(schema_version=1)
+            response.ranks.add(
+                world_rank=0,
+                service_instance="actual-wire",
+                applied_monotonic_ns=int(clock() * 1e9),
+            )
+            if fault != "missing":
+                response.ranks.add(
+                    world_rank=1,
+                    service_instance="peer-wire",
+                    applied_monotonic_ns=int(clock() * 1e9),
+                )
+            if fault == "unsupported":
+                response.schema_version = 99
+            elif fault == "partial":
+                response.ranks[-1].error = "unsupported executor"
+            elif fault == "duplicate":
+                response.ranks[-1].world_rank = 0
+            elif fault == "restart" and request.action != 1:
+                response.ranks[-1].service_instance = "new-peer"
+            elif fault == "disable" and request.action == 3:
+                response.ranks[-1].error = "timeout"
+            return response
+
         def poll(request, timeout):
+            self.assertEqual(
+                controls[0].action, pb.PressureSessionControlRequestPB.ENABLE
+            )
             polls.append(request)
             sequence[0] += 1
-            response = pb.CachePressureResponsePB(schema_version=1, requested_ranks=[0])
+            response = pb.CachePressureResponsePB(
+                schema_version=1, requested_ranks=[0, 1]
+            )
             rank = response.ranks.add(
                 world_rank=0,
                 service_instance="actual-wire",
@@ -1018,6 +1108,42 @@ class RunnerIntegrationTest(unittest.TestCase):
             rank.activity.running_requests.value = 1
             rank.activity.waiting_requests.value = 0
             rank.next_step_sequence = sequence[0]
+            rank.step_history_available = True
+            if rpc_ids:
+                begin = int((clock() - 0.1) * 1e9)
+                rank.steps.add(
+                    session_id=request.session_id,
+                    step_id=sequence[0],
+                    sequence=sequence[0],
+                    completed=True,
+                    context_count=1,
+                    preparation_begin_ns=begin,
+                    forward_enter_ns=begin + 100,
+                    forward_return_ns=begin + 200,
+                    end_ns=begin + 200,
+                    cpu_start_ns=sequence[0] * 100,
+                    cpu_end_ns=sequence[0] * 100 + 10,
+                    source_request_ids=[rpc_ids[-1]],
+                    executed_tokens=16,
+                )
+                rank.steps.add(
+                    session_id=request.session_id,
+                    step_id=sequence[0] + 1,
+                    sequence=0,
+                    completed=False,
+                    context_count=1,
+                    wall_start_ns=int(clock() * 1e9),
+                    source_request_ids=[rpc_ids[-1]],
+                )
+            peer = response.ranks.add()
+            peer.CopyFrom(rank)
+            peer.world_rank, peer.service_instance = 1, "peer-wire"
+            for step in peer.steps:
+                del step.source_request_ids[:]
+            if fault == "poll_rank":
+                del response.ranks[-1]
+            if fault == "poll_clock":
+                response.coordinator_received_ns = 1
             return response
 
         def infer(requests, **kwargs):
@@ -1101,14 +1227,43 @@ class RunnerIntegrationTest(unittest.TestCase):
                 [dict(input_len=16, cache_len=0, batch_size=1)],
                 config(steady_s=1, measure_s=2, sample_period_s=0.5),
                 cp.ExecutionLimits(128, 2, 128, 64, 16),
-                SimpleNamespace(GetCachePressure=poll),
-                (0,),
+                SimpleNamespace(
+                    GetCachePressure=poll, ControlPressureDiagnostics=control
+                ),
+                (0, 1),
                 events.append,
+                evidence_manifest=dict(control_times=dict(capacity_send_s=1)),
             )
+        self.assertEqual(
+            controls[-1].action, pb.PressureSessionControlRequestPB.DISABLE
+        )
+        if fault:
+            self.assertIsNotNone(result["failure"])
+            evidence = json.loads(
+                (runner.result_dir / "pressure/summary.json").read_text()
+            )
+            self.assertFalse(evidence["validity"]["execution_valid"])
+            self.assertTrue(
+                any(
+                    e["event"] == "control" and e["result"]["response"]["ranks"]
+                    for e in events
+                )
+            )
+            if fault in ("poll_rank", "poll_clock"):
+                self.assertTrue(
+                    any(
+                        e["event"] == "pressure" and e["raw"].get("response")
+                        for e in events
+                    )
+                )
+            return
         self.assertIsNone(result["failure"])
+        self.assertIn("measurement", [r.phase for r in controls])
         evidence = json.loads((runner.result_dir / "pressure/summary.json").read_text())
         self.assertEqual(evidence["metrics"], [])
         self.assertGreater(evidence["window"]["measurement_requests"], 0)
+        self.assertGreater(evidence["baseline_steps"]["ranks"]["0"]["eligible"], 0)
+        self.assertGreater(evidence["baseline_steps"]["ranks"]["1"]["eligible"], 0)
         self.assertTrue((runner.result_dir / "pressure/requests.jsonl").exists())
         self.assertTrue(any(":fill:" in identity for identity in rpc_ids))
         self.assertTrue(any(":measurement:" in identity for identity in rpc_ids))

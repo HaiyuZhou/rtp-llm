@@ -219,6 +219,7 @@ class PressurePoll:
     samples: tuple
     raw: dict
     activity: tuple = ()
+    step_page_full: bool = False
 
 
 class DispatchClosed(Exception):
@@ -253,6 +254,7 @@ class PressureSession:
         sink,
         set_batch,
         controller=None,
+        diagnostics_control=None,
         rate=0,
         poisson=False,
         random_seed=0,
@@ -300,6 +302,8 @@ class PressureSession:
             sink,
         )
         self.set_batch, self.controller = set_batch, controller
+        self.diagnostics_control = diagnostics_control
+        self.control_jobs = []
         self.clock, self.sleep, self.executor_factory = clock, sleep, executor_factory
         self.sender = BoundedSender(concurrency)
         self.lock = threading.RLock()
@@ -326,6 +330,85 @@ class PressureSession:
     def emit(self, event, **values):
         with self.lock:
             self.sink(dict(event=event, session_id=self.session_id, **values))
+            if event == "phase" and self.diagnostics_control:
+                if len(self.control_jobs) >= 16:
+                    raise RuntimeError("diagnostic control queue full")
+                self.control_jobs.append(
+                    (
+                        "phase",
+                        values["phase"],
+                        self.control_executor.submit(
+                            self.diagnostics_control, "phase", values["phase"], 1.0
+                        ),
+                    )
+                )
+
+    def _control_result(self, action, phase, future, timeout=0):
+        try:
+            result = future.result(timeout=timeout)
+            self.emit(
+                "control",
+                action=action,
+                phase=phase,
+                result=result,
+                received_s=self.clock(),
+            )
+            if result is not None and not result.get("success", False):
+                raise RuntimeError("diagnostic rank acknowledgement failed")
+        except Exception as exc:
+            self.emit(
+                "error", action=action, phase=phase, error=repr(exc), at_s=self.clock()
+            )
+            self.fail("diagnostics_control_failed")
+            return False
+        return True
+
+    def _collect_controls(self):
+        with self.lock:
+            pending = []
+            for action, phase, future in self.control_jobs:
+                if future.done():
+                    self._control_result(action, phase, future)
+                else:
+                    pending.append((action, phase, future))
+            self.control_jobs = pending
+
+    def _disable_diagnostics(self):
+        # Pending phase markers cannot delay cleanup behind a growing work queue.
+        for action, phase, future in self.control_jobs:
+            if future.cancel():
+                self.emit("control_cancelled", action=action, phase=phase)
+            else:
+                self._control_result(action, phase, future, timeout=1.1)
+        self.control_jobs.clear()
+        future = self.control_executor.submit(
+            self.diagnostics_control, "disable", "", 1.0
+        )
+        self._control_result("disable", "", future, timeout=1.1)
+
+    def _final_steps(self):
+        deadline = self.clock() + 2.0
+        try:
+            if self.poll_future is not None:
+                evidence = self.poll_future.result(timeout=1.0)
+                self.poll_future = None
+                self.emit("pressure", at_s=self.clock(), raw=evidence.raw)
+            # One extra empty page handles an exactly full final page.
+            for _ in range(17):
+                remaining = deadline - self.clock()
+                if remaining <= 0:
+                    break
+                future = self.poll_executor.submit(self.poll, min(1.0, remaining))
+                evidence = future.result(timeout=min(1.1, remaining))
+                self.emit("pressure", at_s=self.clock(), raw=evidence.raw)
+                if evidence.raw.get("diagnostics_error"):
+                    raise RuntimeError(evidence.raw["diagnostics_error"])
+                if not evidence.step_page_full:
+                    return
+            raise RuntimeError("final step drain limit reached")
+        except Exception as exc:
+            self.emit("error", action="final_steps", error=repr(exc), at_s=self.clock())
+            self.fail("diagnostics_drain_failed")
 
     def fail(self, reason):
         with self.lock:
@@ -510,6 +593,9 @@ class PressureSession:
             (s.client_receive_s for s in evidence.samples), default=now
         )
         self.emit("pressure", at_s=now, raw=evidence.raw)
+        if evidence.raw.get("diagnostics_error"):
+            self.fail("diagnostics_poll_failed")
+            return
         self.coverage.add(evidence.samples, now)
         self.ready = False
         if not self.coverage.epoch_valid:
@@ -590,6 +676,7 @@ class PressureSession:
             self.fail("unknown_activity")
 
     def _tick(self):
+        self._collect_controls()
         self._collect()
         now = self.clock()
         if self.poll_future is not None and self.poll_future.done():
@@ -669,19 +756,35 @@ class PressureSession:
         self.poll_executor = self.executor_factory(
             max_workers=1, thread_name_prefix="pressure-poll"
         )
+        if self.diagnostics_control:
+            self.control_executor = self.executor_factory(
+                max_workers=1, thread_name_prefix="pressure-control"
+            )
         try:
+            if self.diagnostics_control:
+                future = self.control_executor.submit(
+                    self.diagnostics_control, "enable", "", 1.0
+                )
+                if not self._control_result("enable", "", future, timeout=1.1):
+                    raise RuntimeError("diagnostic enable failed")
             baseline = self.poll(self.config.sample_period_s)
-            self.coverage = PressureCoverage(tuple(baseline.samples), self.config)
-            # Run predicate validation before sending, including tolerance reachability.
-            for sample in baseline.samples:
-                for group in sample.groups:
-                    if group.group_type == "FULL":
-                        group_valid(
-                            group,
-                            {p.pool_id: p for p in sample.pools},
-                            group,
-                            self.config,
-                        )
+            try:
+                if baseline.raw.get("diagnostics_error"):
+                    raise RuntimeError(baseline.raw["diagnostics_error"])
+                self.coverage = PressureCoverage(tuple(baseline.samples), self.config)
+                # Validate reachability before sending any requests.
+                for sample in baseline.samples:
+                    for group in sample.groups:
+                        if group.group_type == "FULL":
+                            group_valid(
+                                group,
+                                {p.pool_id: p for p in sample.pools},
+                                group,
+                                self.config,
+                            )
+            except Exception:
+                self.emit("pressure", at_s=self.clock(), raw=baseline.raw)
+                raise
             self.emit(
                 "frozen",
                 config=asdict(self.config),
@@ -689,6 +792,7 @@ class PressureSession:
                 targets=[asdict(t) for t in self.coverage.targets],
                 raw_baseline=baseline.raw,
             )
+            self.emit("pressure", at_s=self.clock(), raw=baseline.raw)
             self.next_poll = self.clock()
             if self.seed_count:
                 self.emit("phase", phase="seed", at_s=self.clock())
@@ -748,6 +852,12 @@ class PressureSession:
             try:
                 self._drain()
             finally:
+                if self.diagnostics_control:
+                    try:
+                        self._disable_diagnostics()
+                        self._final_steps()
+                    finally:
+                        self.control_executor.shutdown(wait=False, cancel_futures=True)
                 self.executor.shutdown(wait=False, cancel_futures=True)
                 self.poll_executor.shutdown(wait=False, cancel_futures=True)
         result = dict(

@@ -1835,6 +1835,8 @@ class CacheGridRunner:
         endpoint. limits must project resolved server admission/model/token/KV
         bounds, never guesses based on the requested workload.
         """
+        from google.protobuf.json_format import MessageToDict
+
         from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2
 
         from .continuous_pressure import PressurePoll, PressureSession
@@ -1867,6 +1869,61 @@ class CacheGridRunner:
         order = list(range(len(cases)))
         formal_index = seed_index = 0
         cursors = {}
+        instances = {
+            int(rank.get("world_rank", 0)): rank["service_instance"]
+            for rank in (evidence_manifest or {})
+            .get("startup_pressure", {})
+            .get("response", {})
+            .get("ranks", [])
+            if rank.get("service_instance")
+        }
+
+        def diagnostics_control(action, phase, timeout):
+            actions = dict(enable=1, phase=2, disable=3)
+            sent = time.monotonic()
+            record = dict(action=action, phase=phase, client_send_s=sent)
+            try:
+                response = pressure_stub.ControlPressureDiagnostics(
+                    model_rpc_service_pb2.PressureSessionControlRequestPB(
+                        session_id=session_id,
+                        action=actions[action],
+                        phase=phase,
+                        recorder_capacity=4096 if action == "enable" else 0,
+                        target_ranks=target_ranks,
+                    ),
+                    timeout=min(timeout, 1.0),
+                )
+                record["response"] = MessageToDict(
+                    response,
+                    preserving_proto_field_name=True,
+                    use_integers_for_enums=True,
+                )
+                errors = []
+                seen = set()
+                if response.schema_version != 1:
+                    errors.append("unsupported control schema")
+                for ack in response.ranks:
+                    rank = ack.world_rank
+                    if rank in seen or rank not in target_ranks:
+                        errors.append("duplicate or unexpected control rank")
+                    seen.add(rank)
+                    if (
+                        ack.error
+                        or not ack.service_instance
+                        or ack.applied_monotonic_ns <= 0
+                    ):
+                        errors.append("rank acknowledgement failed: " + str(rank))
+                    elif rank in instances and instances[rank] != ack.service_instance:
+                        errors.append("rank instance changed: " + str(rank))
+                    elif rank in target_ranks:
+                        instances[rank] = ack.service_instance
+                if seen != set(target_ranks):
+                    errors.append("missing control ranks")
+                record.update(success=not errors, errors=errors)
+            except Exception as exc:
+                record.update(success=False, errors=[repr(exc)])
+            record["client_receive_s"] = time.monotonic()
+            return record
 
         def make_payload(kind, job_id):
             nonlocal formal_index, seed_index
@@ -1924,10 +1981,36 @@ class CacheGridRunner:
                 timeout=timeout,
             )
             received = time.monotonic()
-            raw = raw_pressure_record(response, sent, received)
-            decoded = decode_pressure_response(
-                response, sent, received, tuple(target_ranks)
+            raw = dict(
+                client_send_s=sent,
+                client_receive_s=received,
+                response=MessageToDict(
+                    response,
+                    preserving_proto_field_name=True,
+                    use_integers_for_enums=True,
+                ),
             )
+            try:
+                raw = raw_pressure_record(response, sent, received)
+                if (
+                    len(response.ranks) != len(target_ranks)
+                    or {rank.world_rank for rank in response.ranks} != set(target_ranks)
+                    or any(
+                        rank.world_rank not in instances
+                        or instances[rank.world_rank] != rank.service_instance
+                        or not rank.step_history_available
+                        or rank.error
+                        or any(step.session_id != session_id for step in rank.steps)
+                        for rank in response.ranks
+                    )
+                ):
+                    raise ValueError("rank instance or diagnostic history mismatch")
+                decoded = decode_pressure_response(
+                    response, sent, received, tuple(target_ranks)
+                )
+            except Exception as exc:
+                raw["diagnostics_error"] = repr(exc)
+                return PressurePoll((), raw)
             samples = {s.rank: s for s in decoded.samples}
             activity = []
             for rank in response.ranks:
@@ -1962,7 +2045,15 @@ class CacheGridRunner:
                     )
                 )
                 cursors[rank.world_rank] = rank.next_step_sequence
-            return PressurePoll(decoded.samples, raw, tuple(activity))
+            return PressurePoll(
+                decoded.samples,
+                raw,
+                tuple(activity),
+                any(
+                    sum(step.completed for step in rank.steps) >= 256
+                    for rank in response.ranks
+                ),
+            )
 
         manifest = {key: None for key in MANIFEST_PROJECTION}
         manifest.update(evidence_manifest or {})
@@ -1973,7 +2064,11 @@ class CacheGridRunner:
             getattr(self, "_pressure_epoch_dir", self.result_dir), manifest
         )
         evidence = PressureEvidence(
-            writer, sink, profile_requested=controller is not None
+            writer,
+            sink,
+            profile_requested=controller is not None,
+            target_ranks=target_ranks,
+            session_id=session_id,
         )
         session = PressureSession(
             config,
@@ -1991,6 +2086,7 @@ class CacheGridRunner:
             sink=evidence,
             set_batch=self._set_prefill_batch_size,
             controller=controller,
+            diagnostics_control=diagnostics_control,
             rate=self.pressure_request_rate,
             poisson=self.pressure_arrival == "poisson",
             random_seed=self.pressure_random_seed,

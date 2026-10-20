@@ -6,13 +6,17 @@ import os
 import sys
 from typing import Dict, List, Optional, Tuple
 
-from rtp_llm.test.perf_test.cache_grid.config.perf_profile import engine_section
+from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
+    PRESSURE_OPTIONS,
+    engine_section,
+)
 from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     fingerprint as profile_fingerprint,
 )
 from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     load_profile,
     merge_engine_args,
+    pressure_settings,
     resolve_int,
 )
 from rtp_llm.test.perf_test.dataclass import PerfTestConfig
@@ -35,6 +39,11 @@ def parse_args(
     )
 
     perf = parser.add_argument_group("perf test configuration")
+    perf.add_argument("--cache_pressure_preload", action="store_true")
+    for option, _, value_type in PRESSURE_OPTIONS:
+        perf.add_argument(
+            "--cache_pressure_" + option.replace("-", "_"), type=value_type
+        )
     perf.add_argument(
         "--batch_size",
         type=str,
@@ -369,6 +378,22 @@ def parse_args(
 
     args._profile = profile
     args._profile_sha256 = profile_sha256
+    args._pressure_config = None
+    if args.cache_pressure_preload:
+        if args.cache_pressure_mode != "continuous":
+            raise ValueError("pressure preload requires continuous mode")
+        if "cache_measure_runs" in explicit_names:
+            raise ValueError("pressure time window conflicts with explicit count/runs")
+        # Count is only a legacy checkpoint field in this time-bounded mode.
+        args.cache_measure_runs = 3
+        if args.cache_profile_runs or args.cache_profile_only:
+            raise ValueError("continuous pressure profiling is not supported yet")
+        args._pressure_config = pressure_settings(profile or {}, args, direct=True)
+    elif any(
+        getattr(args, "cache_pressure_" + option.replace("-", "_")) is not None
+        for option, _, _ in PRESSURE_OPTIONS
+    ):
+        raise ValueError("pressure window/fill settings require cache_pressure_preload")
     args.batch_size_explicit = any(
         item == "--batch_size" or item.startswith("--batch_size=")
         for item in parsed_argv

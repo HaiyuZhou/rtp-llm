@@ -35,6 +35,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import statistics
@@ -1000,7 +1001,8 @@ class CacheGridRunner:
         pressure_request_rate: float = 0.0,
         pressure_arrival: str = "constant",
         pressure_random_seed: int = 0,
-        measure_runs: int = 3,
+        pressure_config=None,
+        measure_runs: int | None = None,
         checkpoint_every: int = 100,
         cache_commit_tail_tokens: int = 4096,
         fail_fast: bool = True,
@@ -1028,6 +1030,41 @@ class CacheGridRunner:
         nsys_tail_seconds: float = 0.1,
     ):
         self.port = port
+        self.pressure_config = pressure_config
+        if pressure_config is not None:
+            from dataclasses import asdict
+
+            from .pressure_diagnostics import resolve_pressure_config
+
+            self.pressure_config = resolve_pressure_config(asdict(pressure_config))
+            startup = (run_config or {}).get("full_pressure_startup", {})
+            if pressure_mode != "continuous":
+                raise ValueError("pressure preload requires continuous mode")
+            if measure_runs is not None:
+                raise ValueError(
+                    "pressure time window conflicts with explicit count/runs"
+                )
+            if allow_resume_mismatch:
+                raise ValueError("full pressure resume requires immutable settings")
+            if grpc_port not in (None, port + 8):
+                raise ValueError(
+                    "full pressure requires the owned input-ID service endpoint"
+                )
+            if (
+                startup.get("dp_size") != 1
+                or startup.get("exclusive_service") is not True
+            ):
+                raise ValueError("full pressure requires DP=1 and exclusive service")
+            if (run_config or {}).get("workspace_tokens") is not None or (
+                grid_metadata or {}
+            ).get("generator", {}).get("workspace_tokens") is not None:
+                raise ValueError("full pressure cannot use fixed workspace")
+            run_config = dict(
+                run_config or {},
+                cache_pressure_preload=True,
+                pressure_settings=asdict(self.pressure_config),
+            )
+        measure_runs = 3 if measure_runs is None else measure_runs
         if request_transport not in {"http_prompt", "dashsc_input_ids"}:
             raise ValueError(
                 f"unsupported cache request transport: {request_transport}"
@@ -1051,6 +1088,20 @@ class CacheGridRunner:
             )
         self.factory = PrefixPromptFactory(tokenizer)
         self.cases = [normalize_cache_case(case) for case in cases]
+        if pressure_config is not None and (
+            not self.cases
+            or any(
+                c["cache_len"]
+                and (
+                    cache_commit_tail_tokens <= 0
+                    or c["cache_len"] % cache_commit_tail_tokens
+                    or c["cache_len"] + cache_commit_tail_tokens > c["input_len"]
+                )
+                for c in self.cases
+                if not is_grouped_case(c)
+            )
+        ):
+            raise ValueError("full pressure requires cases with complete commit tails")
         if len({c["case_id"] for c in self.cases}) != len(self.cases):
             raise ValueError("cache grid case_id values must be unique")
         self.shared_seed = shared_seed
@@ -1084,7 +1135,7 @@ class CacheGridRunner:
                 )
             if pressure_seed_count <= 0:
                 raise ValueError("continuous pressure seed count must be positive")
-            if pressure_request_rate < 0:
+            if not math.isfinite(pressure_request_rate) or pressure_request_rate < 0:
                 raise ValueError(
                     "continuous pressure request rate must be non-negative"
                 )
@@ -1907,7 +1958,9 @@ class CacheGridRunner:
         manifest["missing_metadata"] = [
             key for key in MANIFEST_PROJECTION if manifest[key] is None
         ]
-        writer = PressureWriter(self.result_dir, manifest)
+        writer = PressureWriter(
+            getattr(self, "_pressure_epoch_dir", self.result_dir), manifest
+        )
         evidence = PressureEvidence(
             writer, sink, profile_requested=controller is not None
         )
@@ -2730,7 +2783,158 @@ class CacheGridRunner:
             # Abort rather than let a partially armed profiler affect later requests.
             raise
 
+    def _run_full_pressure_public(self):
+        from dataclasses import asdict
+
+        import grpc
+
+        from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2 as pb
+        from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2_grpc as rpc
+
+        from .continuous_pressure import ExecutionLimits
+        from .pressure_diagnostics import (
+            decode_pressure_response,
+            raw_pressure_record,
+            select_targets,
+        )
+
+        startup = self.run_config["full_pressure_startup"]
+        ranks = tuple(startup["target_ranks"])
+        epoch_id = uuid.uuid4().hex
+        self._pressure_epoch_dir = self.result_dir / "pressure_epochs" / epoch_id
+        self._pressure_epoch_dir.mkdir(parents=True, exist_ok=False)
+        # A root checkpoint guards the workload only; each epoch reruns every phase.
+        self._results.clear()
+        self._save(complete=False)
+        with grpc.insecure_channel(f"127.0.0.1:{self.port + 1}") as channel:
+            stub = rpc.RpcServiceStub(channel)
+            sent = time.perf_counter()
+            response = stub.GetCachePressure(
+                pb.CachePressureRequestPB(target_ranks=ranks),
+                timeout=min(self.request_timeout, self.pressure_config.fill_timeout_s),
+            )
+            received = time.perf_counter()
+            raw = raw_pressure_record(response, sent, received)
+            (self._pressure_epoch_dir / "startup_pressure.json").write_text(
+                json.dumps(raw, allow_nan=False, indent=2) + "\n"
+            )
+            decoded = decode_pressure_response(response, sent, received, ranks)
+            targets = select_targets(decoded.samples, ranks)
+            available = []
+            for rank in response.ranks:
+                required = {
+                    pool_id
+                    for target in targets
+                    if target.rank == rank.world_rank
+                    for pool_id in target.device_pool_ids
+                }
+                for pool in rank.pools:
+                    if pool.pool_id in required:
+                        if pool.available_blocks > pool.total_blocks:
+                            raise ValueError("invalid live available KV blocks")
+                        available.append(int(pool.available_blocks))
+            limits = ExecutionLimits(
+                model_tokens=startup["model_tokens"],
+                admission_requests=startup["admission_requests"],
+                batch_tokens=startup["batch_tokens"],
+                available_kv_blocks=min(available),
+                block_tokens=startup["block_tokens"],
+            )
+            for tokens in [
+                self.pressure_config.fill_input_tokens,
+                self.expected_block_size + self.cache_commit_tail_tokens,
+                2 * self.expected_block_size,
+                *[int(case["input_len"]) for case in self.cases],
+            ]:
+                limits.concurrency_for(tokens)
+            if self.pressure_client_concurrency > limits.concurrency_for(
+                max(int(case["input_len"]) for case in self.cases)
+            ):
+                raise ValueError("formal concurrency exceeds frozen execution limits")
+            source_root = Path(__file__).parent
+            source_files = sorted(source_root.glob("*.py")) + sorted(
+                (source_root.parent / "config").glob("*.py")
+            )
+            source_files += [
+                source_root.parent.parent / name
+                for name in ("perf_config.py", "batch_decode_test.py")
+            ]
+            source_hashes = {
+                str(path.relative_to(source_root.parent.parent)): hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                for path in source_files
+            }
+            profile_hash = (
+                self.profile_sha256
+                or hashlib.sha256(
+                    json.dumps(self.profile or {}, sort_keys=True).encode()
+                ).hexdigest()
+            )
+            grid_hash = (
+                self.grid_sha256
+                or hashlib.sha256(
+                    json.dumps(self.cases, sort_keys=True).encode()
+                ).hexdigest()
+            )
+            manifest = dict(
+                code_hash=hashlib.sha256(
+                    json.dumps(source_hashes, sort_keys=True).encode()
+                ).hexdigest(),
+                code_hash_scope="python_pressure_toolchain",
+                source_hashes=source_hashes,
+                profile_hash=profile_hash,
+                grid_hash=grid_hash,
+                resolved_settings=dict(
+                    self.run_config, pressure=asdict(self.pressure_config)
+                ),
+                input_identity=dict(
+                    grid_hash=grid_hash,
+                    tokenizer=getattr(
+                        self.factory.tokenizer,
+                        "name_or_path",
+                        type(self.factory.tokenizer).__name__,
+                    ),
+                    random_seed=self.pressure_random_seed,
+                ),
+                epoch={str(sample.rank): sample.instance for sample in decoded.samples},
+                clock_bounds={
+                    str(sample.rank): sample.offset_bounds for sample in decoded.samples
+                },
+                control_times=dict(capacity_send_s=sent, capacity_receive_s=received),
+                startup_pressure=raw,
+                epoch_id=epoch_id,
+            )
+            (self.result_dir / "pressure_latest.json").write_text(
+                json.dumps(
+                    dict(epoch_id=epoch_id, directory=str(self._pressure_epoch_dir)),
+                    indent=2,
+                )
+                + "\n"
+            )
+            logging.info("full pressure epoch evidence: %s", self._pressure_epoch_dir)
+            self._probe_reuse_granularity()
+            result = self._run_full_pressure(
+                self.cases,
+                self.pressure_config,
+                limits,
+                stub,
+                ranks,
+                None,
+                evidence_manifest=manifest,
+            )
+            if result.get("failure"):
+                raise RuntimeError(
+                    f"full pressure failed: {result['failure']}; see {self._pressure_epoch_dir}"
+                )
+            return []
+
     def run(self) -> List[Dict[str, Any]]:
+        if self.pressure_config is not None:
+            try:
+                return self._run_full_pressure_public()
+            finally:
+                self._close_resources()
         if self.profile_only:
             try:
                 return self._run_profiles()

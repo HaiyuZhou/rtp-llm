@@ -4,11 +4,13 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import os
 import shlex
 import subprocess
 import time
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 
 from rtp_llm.test.perf_test.cache_grid.config.grid_config import (
@@ -17,8 +19,10 @@ from rtp_llm.test.perf_test.cache_grid.config.grid_config import (
     resolve_cache_block_size,
 )
 from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
+    PRESSURE_OPTIONS,
     is_sensitive_environment_name,
     load_profile,
+    pressure_settings,
     profile_environment,
 )
 from rtp_llm.test.perf_test.cache_grid.runner.generate_cache_grid import (
@@ -157,6 +161,16 @@ def load_cases(path):
 
 def build_plan(args, inherited=None):
     inherited = dict(os.environ if inherited is None else inherited)
+    if args.pressure_preload and args.pressure_mode != "continuous":
+        raise ValueError("pressure preload requires continuous mode")
+    if args.pressure_preload and args.runs is not None:
+        raise ValueError("pressure time window conflicts with explicit --runs")
+    full_tuning = any(
+        getattr(args, "pressure_" + name.replace("-", "_")) is not None
+        for name, _, _ in PRESSURE_OPTIONS
+    )
+    if full_tuning and not args.pressure_preload:
+        raise ValueError("pressure window/fill settings require --pressure-preload")
     pressure_tuning = any(
         value is not None
         for value in (
@@ -195,6 +209,8 @@ def build_plan(args, inherited=None):
         or args.skip_reuse_validation
         or args.pressure_mode is not None
         or pressure_tuning
+        or args.pressure_preload
+        or full_tuning
     ):
         raise ValueError(
             "resume uses frozen configuration; launch overrides are forbidden"
@@ -216,6 +232,8 @@ def build_plan(args, inherited=None):
     if args.runs is not None and args.runs <= 0 or args.trace_timeout <= 0:
         raise ValueError("runs/trace-timeout must be positive")
     saved = load_saved(source) if not args.profile else None
+    if replay and saved and "--cache_pressure_preload" in saved["runner_args"]:
+        raise ValueError("full continuous pressure cannot use case replay/profile")
     profile = (
         load_profile(args.profile) if args.profile else copy.deepcopy(saved["profile"])
     )
@@ -232,6 +250,59 @@ def build_plan(args, inherited=None):
     ):
         raise ValueError("profile currently supports ungrouped batch=1 only")
     env = environment(profile, args.env, inherited) if not saved else dict(saved["env"])
+    if args.pressure_preload:
+        settings = pressure_settings(profile, args)
+        engine_args = profile.get("engine_args", {})
+        physical_block = profile.get("engine", {}).get(
+            "seq_size_per_block",
+            engine_args.get(
+                "seq_size_per_block", engine_args.get("--seq_size_per_block")
+            ),
+        )
+        if physical_block is None or int(str(physical_block)) <= 0:
+            raise ValueError(
+                "full pressure requires explicitly resolved seq_size_per_block"
+            )
+        for name in ("pressure_batch_size", "pressure_seed_count"):
+            if getattr(args, name) is not None and getattr(args, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if (
+            args.pressure_client_concurrency is not None
+            and args.pressure_client_concurrency < 0
+        ):
+            raise ValueError("pressure concurrency must be non-negative")
+        if args.pressure_request_rate is not None and (
+            not math.isfinite(args.pressure_request_rate)
+            or args.pressure_request_rate < 0
+        ):
+            raise ValueError("pressure request rate must be finite and non-negative")
+        if args.pressure_client_concurrency and args.pressure_client_concurrency < (
+            args.pressure_batch_size or 1
+        ):
+            raise ValueError("pressure concurrency must be at least batch size")
+        if profile.get("engine", {}).get("dp_size", 1) != 1:
+            raise ValueError("full pressure requires DP=1")
+        if env.get("CACHE_PERF_EXISTING_SERVER_PORT"):
+            raise ValueError("full pressure requires an exclusive owned service")
+        if grid_workspace_tokens(payload) is not None:
+            raise ValueError("full pressure cannot use fixed workspace")
+        if any(c.get("batch_size", 1) != 1 or "request_groups" in c for c in cases):
+            raise ValueError("full pressure requires ungrouped batch_size=1")
+        block = resolve_cache_block_size(payload)
+        tail = profile.get("cache_grid", {}).get("commit_tail_tokens", 4096)
+        if (
+            block <= 0
+            or tail < block
+            or any(
+                c["cache_len"]
+                and (c["cache_len"] % tail or c["cache_len"] + tail > c["input_len"])
+                for c in cases
+            )
+        ):
+            raise ValueError(
+                "full pressure requires a known block and complete commit tail"
+            )
+        profile.setdefault("cache_grid", {})["pressure"] = asdict(settings)
     if saved and args.env:
         overrides = environment({}, args.env, {})
         env.update(overrides)
@@ -295,7 +366,7 @@ def build_plan(args, inherited=None):
         )
         if args.runs is not None and args.mode != "profile":
             updates["cache_measure_runs"] = args.runs
-        elif not saved:
+        elif not saved and not args.pressure_preload:
             updates["cache_measure_runs"] = int(
                 profile.get("cache_grid", {}).get("measure_runs", 3)
             )
@@ -350,6 +421,8 @@ def build_plan(args, inherited=None):
                 "allow_resume_mismatch",
             ),
         )
+        if args.pressure_preload:
+            runner.append("--cache_pressure_preload")
         if args.skip_reuse_validation and "--cache_skip_reuse_validation" not in runner:
             runner.append("--cache_skip_reuse_validation")
         if workspace is not None:
@@ -544,6 +617,9 @@ def parser():
     p.add_argument("--cases", help="comma-separated original case IDs")
     p.add_argument("--runs", type=int)
     p.add_argument("--pressure-mode", choices=("case", "continuous"))
+    p.add_argument("--pressure-preload", action="store_true")
+    for option, _, value_type in PRESSURE_OPTIONS:
+        p.add_argument("--pressure-" + option, type=value_type)
     p.add_argument("--pressure-scheduler", choices=("batch_decode", "fifo"))
     p.add_argument("--pressure-batch-size", type=int)
     p.add_argument("--pressure-client-concurrency", type=int)

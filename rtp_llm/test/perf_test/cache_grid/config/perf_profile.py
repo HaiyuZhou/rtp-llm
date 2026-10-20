@@ -35,6 +35,48 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = 1
 
+# CLI spelling, immutable PressureConfig field, parser type.
+PRESSURE_OPTIONS = (
+    ("fill-timeout", "fill_timeout_s", float),
+    ("fill-max-requests", "fill_max_requests", int),
+    ("fill-no-progress", "fill_no_progress_s", float),
+    ("fill-input-tokens", "fill_input_tokens", int),
+    ("gpu-tolerance-blocks", "gpu_tolerance_blocks", int),
+    ("activity-timeout", "activity_timeout_s", float),
+    ("drain-timeout", "drain_timeout_s", float),
+    ("capture-timeout", "capture_timeout_s", float),
+    ("host-target-ratio", "host_ratio", float),
+    ("sample-period", "sample_period_s", float),
+    ("max-sample-gap", "max_sample_gap_s", float),
+    ("max-sample-age", "max_sample_age_s", float),
+    ("steady-seconds", "steady_s", float),
+    ("steady-timeout", "steady_timeout_s", float),
+    ("measure-seconds", "measure_s", float),
+    ("min-coverage", "min_coverage", float),
+    ("max-invalid-seconds", "max_invalid_s", float),
+    ("profile-steps", "profile_steps", int),
+    ("support-seconds", "support_s", float),
+    ("profile-seconds", "nsys_duration_s", float),
+)
+
+
+def pressure_settings(profile, args, *, direct=False):
+    from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+        resolve_pressure_config,
+    )
+
+    values = profile.get("cache_grid", {}).get("pressure", {})
+    if not isinstance(values, dict):
+        raise ProfileError("cache_grid.pressure must be a JSON object")
+    values = dict(values)
+    prefix = "cache_pressure_" if direct else "pressure_"
+    for option, field, _ in PRESSURE_OPTIONS:
+        value = getattr(args, prefix + option.replace("-", "_"), None)
+        if value is not None:
+            values[field] = value
+    return resolve_pressure_config(values)
+
+
 _ENGINE_ARGS_NAMESPACE_KEYS = frozenset(
     {
         "dp_size",

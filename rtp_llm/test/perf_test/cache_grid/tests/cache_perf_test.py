@@ -16,6 +16,119 @@ from rtp_llm.test.perf_test.cache_grid.runner import cache_perf as cli
 
 
 class CachePerfTest(unittest.TestCase):
+    def pressure_profile(self):
+        profile = load_profile(self.profile)
+        profile["engine"]["seq_size_per_block"] = 512
+        profile["cache_grid"]["pressure"] = dict(
+            fill_timeout_s=120,
+            fill_max_requests=1000,
+            fill_no_progress_s=30,
+            fill_input_tokens=8192,
+            gpu_tolerance_blocks=2,
+            activity_timeout_s=30,
+            drain_timeout_s=30,
+            capture_timeout_s=120,
+        )
+        self.profile.write_text(json.dumps(profile))
+        return profile
+
+    def test_full_pressure_requires_known_physical_block_before_launch(self):
+        profile = self.pressure_profile()
+        del profile["engine"]["seq_size_per_block"]
+        self.profile.write_text(json.dumps(profile))
+        with self.assertRaisesRegex(ValueError, "seq_size_per_block"):
+            cli.build_plan(
+                self.args(extra=["--pressure-mode=continuous", "--pressure-preload"]),
+                {},
+            )
+
+    def test_full_pressure_freezes_resolved_profile_and_forwards_overrides(self):
+        self.pressure_profile()
+        plan = cli.build_plan(
+            self.args(
+                extra=[
+                    "--pressure-mode=continuous",
+                    "--pressure-preload",
+                    "--pressure-fill-max-requests=77",
+                    "--pressure-measure-seconds=12",
+                ]
+            ),
+            {},
+        )
+        frozen = json.loads(plan["artifacts"]["profile.snapshot.json"])
+        settings = frozen["cache_grid"]["pressure"]
+        self.assertEqual(settings["measure_s"], 12)
+        self.assertEqual(settings["fill_max_requests"], 77)
+        self.assertEqual(settings["host_ratio"], 0.25)
+        self.assertEqual(settings["steady_s"], 3)
+        runner = json.loads(plan["artifacts"][cli.MANIFEST])["runner_args"]
+        self.assertIn("--cache_pressure_preload", runner)
+        self.assertNotIn("--cache_measure_runs=5", runner)
+
+    def test_full_pressure_requires_explicit_budgets(self):
+        with self.assertRaisesRegex(ValueError, "pressure settings"):
+            cli.build_plan(
+                self.args(extra=["--pressure-mode=continuous", "--pressure-preload"]),
+                {},
+            )
+
+    def test_full_pressure_resume_keeps_frozen_time_config_and_rejects_replay(self):
+        self.pressure_profile()
+        plan = cli.build_plan(
+            self.args(extra=["--pressure-mode=continuous", "--pressure-preload"]), {}
+        )
+        self.result.mkdir()
+        for name, value in plan["artifacts"].items():
+            (self.result / name).write_bytes(value)
+        (self.result / "cache_grid_results.json").write_text("{}")
+        resumed = cli.build_plan(self.args("resume", explicit=False), {})
+        self.assertTrue(
+            any("--cache_pressure_preload" in value for value in resumed["command"])
+        )
+        with self.assertRaisesRegex(ValueError, "continuous|pressure"):
+            cli.build_plan(
+                self.args("profile", explicit=False, extra=["--cases=7"]), {}
+            )
+
+    def test_full_pressure_rejects_nonfinite_negative_and_shared_service(self):
+        self.pressure_profile()
+        for extra in (
+            ["--pressure-measure-seconds=nan"],
+            ["--pressure-fill-max-requests=-1"],
+            ["--pressure-request-rate=nan"],
+            ["--pressure-batch-size=-1"],
+            ["--env=CACHE_PERF_EXISTING_SERVER_PORT=9000"],
+        ):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                cli.build_plan(
+                    self.args(
+                        extra=[
+                            "--pressure-mode=continuous",
+                            "--pressure-preload",
+                            *extra,
+                        ]
+                    ),
+                    {},
+                )
+
+    def test_pressure_preload_requires_continuous(self):
+        with self.assertRaisesRegex(ValueError, "continuous"):
+            cli.build_plan(self.args(extra=["--pressure-preload"]), {})
+
+    def test_explicit_count_conflicts_with_pressure_time_window(self):
+        with self.assertRaisesRegex(ValueError, "runs|count"):
+            cli.build_plan(
+                self.args(
+                    extra=[
+                        "--pressure-mode=continuous",
+                        "--pressure-preload",
+                        "--pressure-measure-seconds=60",
+                        "--runs=5",
+                    ]
+                ),
+                {},
+            )
+
     def test_launcher_resolves_repository_after_move(self):
         self.assertEqual(cli.REPO, Path(__file__).resolve().parents[5])
 

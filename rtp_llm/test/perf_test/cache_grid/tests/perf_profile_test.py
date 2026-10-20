@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     ProfileError,
@@ -11,6 +12,7 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     fingerprint,
     load_profile,
     merge_engine_args,
+    pressure_settings,
     resolve_int,
     resolve_label,
     resolve_str,
@@ -27,6 +29,32 @@ def _minimal_profile(**overrides):
 
 
 class ValidateProfileTest(unittest.TestCase):
+    def test_pressure_settings_use_explicit_zero_and_reject_unknown_or_nan(self):
+        values = dict(
+            fill_timeout_s=20,
+            fill_max_requests=10,
+            fill_no_progress_s=5,
+            fill_input_tokens=512,
+            gpu_tolerance_blocks=2,
+            activity_timeout_s=10,
+            drain_timeout_s=10,
+            capture_timeout_s=60,
+        )
+        profile = _minimal_profile(cache_grid=dict(pressure=values))
+        config = pressure_settings(
+            profile, SimpleNamespace(pressure_gpu_tolerance_blocks=0)
+        )
+        self.assertEqual(config.gpu_tolerance_blocks, 0)
+        self.assertEqual(config.measure_s, 60)
+        self.assertEqual(values["gpu_tolerance_blocks"], 2)
+        with self.assertRaises(ValueError):
+            pressure_settings(
+                profile, SimpleNamespace(pressure_fill_timeout=float("nan"))
+            )
+        values["invented_capacity"] = 1
+        with self.assertRaisesRegex(ValueError, "pressure settings"):
+            pressure_settings(profile, SimpleNamespace())
+
     def test_minimal_valid_profile(self):
         validate_profile({"schema_version": 1})
 

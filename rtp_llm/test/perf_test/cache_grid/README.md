@@ -9,6 +9,27 @@
 
 ## 配置 profile
 
+### FULL pressure baseline
+
+Full-pressure diagnostics are an explicit opt-in, separate from finite continuous
+measurements. See [the required pressure settings](docs/reference.md#full-pressure-cli-and-resume).
+Add `cache_grid.pressure` to the existing profile, with explicit fill budgets,
+GPU tolerance and activity/drain/capture deadlines, then run:
+
+```bash
+./tools/cache_perf run --profile /path/local.jsonc --grid /path/grid.json \
+  --result-dir /path/full-pressure --pressure-mode continuous --pressure-preload \
+  --pressure-scheduler fifo --pressure-measure-seconds 60
+./tools/cache_perf resume --result-dir /path/full-pressure
+```
+
+Resume freezes the workload and starts a new seed/fill/steady/measurement session.
+`pressure_latest.json` points to the new epoch directory; previous epoch evidence
+is retained. This mode requires an owned DP=1 service, input IDs, ungrouped requests,
+and an explicitly resolved physical `seq_size_per_block`. Fixed workspaces,
+materialized inputs, shared-seed mode, explicit `--runs` and continuous profiling
+are rejected. Existing finite continuous and case profiling commands keep their paths.
+
 复制 [通用模板](config/local.example.jsonc) 或 [DSV4 模板](config/dsv4_local.example.jsonc)，
 填写测试机器实际配置。模板数值只是示例，不代表其他模型的容量或缓存粒度。
 

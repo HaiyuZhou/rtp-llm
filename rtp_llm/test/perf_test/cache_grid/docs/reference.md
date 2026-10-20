@@ -423,6 +423,60 @@ is barred from dispatch. `CancellableRequestHandle(..., on_done=callback)` provi
 the supervisor wakeup without exposing its executor or future.
 # Incremental full-pressure diagnostic evidence
 
+## Full-pressure CLI and resume
+
+`run --pressure-mode continuous --pressure-preload` selects the full-pressure
+baseline. Without preload, continuous execution remains finite. Continuous profile
+and replay remain rejected until their capture lifecycle is integrated.
+
+Use the existing JSON/JSONC profile's `cache_grid.pressure` object. Required fields
+are `fill_timeout_s`, `fill_max_requests`, `fill_no_progress_s`, `fill_input_tokens`,
+`gpu_tolerance_blocks`, `activity_timeout_s`, `drain_timeout_s`, and
+`capture_timeout_s`. These are experiment choices with no invented defaults.
+The corresponding CLI overrides are `--pressure-fill-timeout`,
+`--pressure-fill-max-requests`, `--pressure-fill-no-progress`,
+`--pressure-fill-input-tokens`, `--pressure-gpu-tolerance-blocks`,
+`--pressure-activity-timeout`, `--pressure-drain-timeout`, and
+`--pressure-capture-timeout`. Explicit CLI values, including zero GPU tolerance,
+override profile values; missing, negative and nonfinite settings are rejected.
+
+Optional profile fields use the shared PressureConfig defaults: `host_ratio=0.25`,
+`sample_period_s=1`, `max_sample_gap_s=2`, `max_sample_age_s=2`, `steady_s=3`,
+`steady_timeout_s=60`, `measure_s=60`, `min_coverage=0.95`, `max_invalid_s=2`,
+`profile_steps=20`, `support_s=60`. `nsys_duration_s` has no duration default.
+CLI aliases include `--pressure-host-target-ratio`, `--pressure-steady-seconds`,
+`--pressure-measure-seconds`, `--pressure-profile-steps`, and
+`--pressure-profile-seconds`; the latter freezes an Nsight duration but does not
+enable continuous capture yet. Direct perf flags use the same names with
+`cache_pressure_` and underscores. The resolved object is frozen in the profile
+snapshot and resume configuration. An inherited legacy `measure_runs` value is
+ignored; explicitly supplied `--runs`/`--cache_measure_runs` is rejected.
+
+Startup requires a known positive physical/base `seq_size_per_block` in engine
+arguments, owned exclusive service, DP=1, PP=1 and the complete TP rank set. The
+existing-server shortcut is rejected. Model/admission limits come from actual
+startup arguments; token limits use the engine's FIFO argument resolver and
+`finalize_scheduler_config`, including the real default context-batch calculation.
+Before probe or seeds, the real coordinator RPC at HTTP port + 1 must return
+supported FULL groups on every target rank. The KV bound is the minimum live
+`available_blocks` of their physical device pools: it already excludes active,
+non-reclaimable reservations. It is not total capacity, total-minus-used, or an
+additional subtraction of overlapping reference counters. The physical base block
+span conservatively overestimates CP-sharded request allocations; a grid alignment
+of 4096 with physical blocks of 512 retains a 512-token execution bound. SWA/LINEAR
+remain observed without FULL-pressure gates.
+
+Every public invocation writes `pressure_epochs/<unique-id>/startup_pressure.json`
+and, after successful preflight, `pressure/` evidence within that epoch directory.
+`pressure_latest.json` identifies the latest started diagnostic epoch. Root launch
+snapshots and the empty exact-results checkpoint guard immutable resume inputs;
+completed case rows never skip seed/fill/steady. Prior epoch files are never replaced.
+The manifest includes actual profile/grid hashes, Python pressure-toolchain content
+hashes (with their explicit scope), resolved startup/settings, generated-input
+identity, service-instance epoch, clock bounds and capacity RPC control timestamps.
+Raw session observations and actual dispatch token hashes remain authoritative.
+No diagnostic request enters exact-fit metrics.
+
 The internal full-pressure runner writes `pressure/manifest.json`, raw
 `cache_samples.jsonl`, supervisor `steps.jsonl`, terminal `requests.jsonl`, and
 an atomic `summary.json`. Files are flushed on each event and close. An interrupted

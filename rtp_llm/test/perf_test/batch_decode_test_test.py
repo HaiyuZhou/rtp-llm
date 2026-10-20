@@ -473,6 +473,51 @@ class _TailMergingTokenizer:
 
 
 class BatchDecodeTest(unittest.TestCase):
+    def test_full_pressure_startup_projects_real_engine_defaults(self):
+        from rtp_llm.test.perf_test import batch_decode_test as entry
+
+        args = argparse.Namespace(
+            max_seq_len=32768, concurrency_limit=8, dp_size=1, decode_test_length=1
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            projection = entry._full_pressure_startup(
+                args,
+                [
+                    "--seq_size_per_block=512",
+                    "--max_context_batch_size=3",
+                    "--tp_size=8",
+                ],
+                8192,
+            )
+        self.assertEqual(projection["model_tokens"], 32768)
+        self.assertEqual(projection["batch_tokens"], 3 * 32768)
+        self.assertEqual(projection["block_tokens"], 512)
+        self.assertEqual(projection["target_ranks"], list(range(8)))
+        with self.assertRaisesRegex(ValueError, "seq_size_per_block"):
+            entry._full_pressure_startup(args, [], 8192)
+
+    def test_full_pressure_parser_resolves_required_settings_and_count_conflict(self):
+        flags = [
+            "--cache_pressure_mode=continuous",
+            "--cache_pressure_preload",
+            "--cache_pressure_fill_timeout=20",
+            "--cache_pressure_fill_max_requests=50",
+            "--cache_pressure_fill_no_progress=10",
+            "--cache_pressure_fill_input_tokens=1024",
+            "--cache_pressure_gpu_tolerance_blocks=1",
+            "--cache_pressure_activity_timeout=20",
+            "--cache_pressure_drain_timeout=20",
+            "--cache_pressure_capture_timeout=120",
+        ]
+        args, remaining = parse_args(flags)
+        self.assertEqual(remaining, [])
+        self.assertEqual(args._pressure_config.measure_s, 60)
+        self.assertEqual(args._pressure_config.fill_max_requests, 50)
+        with self.assertRaisesRegex(ValueError, "count|runs"):
+            parse_args(flags + ["--cache_measure_runs=3"])
+        with self.assertRaisesRegex(ValueError, "continuous"):
+            parse_args(["--cache_pressure_preload"])
+
     def test_effective_grid_max_seq_len_uses_decode_need(self):
         args = argparse.Namespace(max_seq_len=8192, decode_test_length=30)
         self.assertEqual(_effective_grid_max_seq_len(args, [1024, 65536]), 65566)
@@ -2882,6 +2927,233 @@ class ContinuousPressureTest(unittest.TestCase):
                 pressure_client_concurrency=0,
             )
             runner._close_resources()
+
+
+class FullPressurePublicTest(unittest.TestCase):
+    def test_baseline_main_passes_pressure_config_and_preserves_resume_settings(self):
+        from dataclasses import asdict
+
+        from rtp_llm.test.perf_test import batch_decode_test as entry
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "profile.json"
+            profile.write_text(
+                json.dumps(
+                    dict(
+                        schema_version=1,
+                        cache_grid=dict(
+                            pressure=asdict(self.settings()), measure_runs=5
+                        ),
+                        engine=dict(tokenizer_path="/mock", seq_size_per_block=512),
+                    )
+                )
+            )
+            grid = root / "grid.json"
+            grid.write_text(
+                json.dumps(
+                    dict(
+                        schema_version=2,
+                        generator=dict(cache_alignment=4096),
+                        cases=[
+                            dict(case_id=0, batch_size=1, input_len=8192, cache_len=0)
+                        ],
+                    )
+                )
+            )
+            parsed = parse_args(
+                [
+                    "--profile=" + str(profile),
+                    "--cache_grid_json=" + str(grid),
+                    "--result_dir=" + directory,
+                    "--partial=2",
+                    "--cache_pressure_mode=continuous",
+                    "--cache_pressure_preload",
+                ]
+            )
+            self.assertEqual(parsed[0].cache_measure_runs, 3)
+            with patch.object(entry, "parse_args", return_value=parsed), patch.object(
+                entry, "_ensure_xgrammar_lib_path"
+            ), patch.object(
+                entry, "resolve_perf_engine_paths", side_effect=lambda x: x
+            ), patch.object(
+                entry, "EngineServer"
+            ) as server, patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                return_value=_WordTokenizer(),
+            ), patch.object(
+                entry, "collect_timeline_files"
+            ), patch.object(
+                CacheGridRunner, "run", autospec=True, return_value=[]
+            ) as run:
+                server.return_value.port = 8000
+                entry.main()
+            runner = run.call_args.args[0]
+            self.addCleanup(runner._close_resources)
+            self.assertEqual(runner.pressure_config, self.settings())
+            self.assertEqual(
+                runner.run_config["pressure_settings"], asdict(self.settings())
+            )
+            self.assertEqual(
+                runner.run_config["full_pressure_startup"]["block_tokens"], 512
+            )
+
+    def settings(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            resolve_pressure_config,
+        )
+
+        return resolve_pressure_config(
+            dict(
+                fill_timeout_s=20,
+                fill_max_requests=50,
+                fill_no_progress_s=10,
+                fill_input_tokens=1024,
+                gpu_tolerance_blocks=1,
+                activity_timeout_s=20,
+                drain_timeout_s=20,
+                capture_timeout_s=120,
+            )
+        )
+
+    def response(self):
+        from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2 as pb
+
+        response = pb.CachePressureResponsePB(schema_version=1, requested_ranks=[0])
+        rank = response.ranks.add(
+            world_rank=0,
+            service_instance="service-one",
+            sequence=1,
+            sampled_monotonic_ns=1,
+        )
+        rank.pools.add(
+            pool_id="gpu",
+            tier=1,
+            total_blocks=100,
+            used_blocks=90,
+            available_blocks=70,
+            active_blocks=30,
+        )
+        rank.pools.add(
+            pool_id="host",
+            tier=2,
+            total_blocks=100,
+            used_blocks=30,
+            published_host_blocks=25,
+        )
+        group = rank.groups.add(group_id=0, group_type=1, device_pool_ids=["gpu"])
+        group.host_pool_id.value = "host"
+        group.device_watermark.low_ratio = 0.8
+        group.device_watermark.high_ratio = 0.9
+        group.host_watermark.low_ratio = 0.8
+        group.host_watermark.high_ratio = 0.9
+        return response
+
+    def runner(self, directory, **overrides):
+        cases = overrides.pop(
+            "cases", [dict(case_id=0, batch_size=1, input_len=8192, cache_len=0)]
+        )
+        options = dict(
+            pressure_mode="continuous",
+            pressure_config=self.settings(),
+            request_transport="dashsc_input_ids",
+            expected_block_size=4096,
+            run_config=dict(
+                full_pressure_startup=dict(
+                    model_tokens=16384,
+                    admission_requests=2,
+                    batch_tokens=32768,
+                    block_tokens=512,
+                    target_ranks=[0],
+                    dp_size=1,
+                    exclusive_service=True,
+                )
+            ),
+            grid_sha256="grid",
+            profile_sha256="profile",
+        )
+        options.update(overrides)
+        return CacheGridRunner(8000, _WordTokenizer(), cases, directory, **options)
+
+    def test_full_pressure_direct_incompatibilities(self):
+        for options in (
+            dict(measure_runs=3),
+            dict(pressure_mode="case"),
+            dict(allow_resume_mismatch=True),
+            dict(grpc_port=9999),
+            dict(cases=[dict(case_id=0, batch_size=1, input_len=6144, cache_len=4096)]),
+            dict(shared_seed=True),
+            dict(profile_only=True),
+            dict(request_transport="http_prompt"),
+            dict(expected_block_size=0),
+            dict(pressure_request_rate=float("nan")),
+            dict(grid_metadata={"generator": {"workspace_tokens": 8192}}),
+        ):
+            with self.subTest(
+                options=options
+            ), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(ValueError):
+                    runner = self.runner(directory, **options)
+                    runner._close_resources()
+
+    def test_full_pressure_capacity_rejection_precedes_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.runner(directory)
+            response = self.response()
+            response.ranks[0].pools[0].available_blocks = 20
+            with patch(
+                "rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2_grpc.RpcServiceStub"
+            ) as stub, patch.object(
+                runner, "_probe_reuse_granularity"
+            ) as probe, patch.object(
+                runner, "_run_full_pressure", return_value={"failure": None}
+            ):
+                stub.return_value.GetCachePressure.return_value = response
+                with self.assertRaisesRegex(ValueError, "concurrency"):
+                    runner.run()
+                probe.assert_not_called()
+
+    def test_public_full_pressure_uses_live_available_blocks_and_fresh_epochs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            epochs = []
+            for attempt in range(2):
+                runner = self.runner(directory)
+                runner._results = {runner.case_key(runner.cases[0]): {"status": "ok"}}
+                with patch(
+                    "rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2_grpc.RpcServiceStub"
+                ) as stub, patch.object(
+                    runner, "_probe_reuse_granularity"
+                ), patch.object(
+                    runner, "_run_full_pressure", return_value={"failure": None}
+                ) as run:
+                    stub.return_value.GetCachePressure.return_value = self.response()
+                    runner.run()
+                cases, config, limits = run.call_args.args[:3]
+                self.assertEqual(len(cases), 1)
+                self.assertEqual(limits.available_kv_blocks, 70)
+                self.assertEqual(limits.block_tokens, 512)
+                manifest = run.call_args.kwargs["evidence_manifest"]
+                self.assertEqual(manifest["epoch"]["0"], "service-one")
+                self.assertTrue(manifest["code_hash"])
+                epochs.append(
+                    json.loads((Path(directory) / "pressure_latest.json").read_text())[
+                        "directory"
+                    ]
+                )
+            self.assertNotEqual(*epochs)
+
+    def test_public_full_pressure_rejects_missing_full_before_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.runner(directory)
+            response = self.response()
+            response.ranks[0].groups[0].group_type = 2
+            with patch(
+                "rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2_grpc.RpcServiceStub"
+            ) as stub, patch.object(runner, "_probe_reuse_granularity") as probe:
+                stub.return_value.GetCachePressure.return_value = response
+                with self.assertRaisesRegex(ValueError, "FULL"):
+                    runner.run()
+                probe.assert_not_called()
 
 
 if __name__ == "__main__":

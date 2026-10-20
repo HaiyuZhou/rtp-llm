@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -913,11 +914,57 @@ def _run_decode(
 # ---------------------------------------------------------------------------
 
 
+def _full_pressure_startup(args, remaining, max_input_len):
+    from rtp_llm.config.engine_config import finalize_scheduler_config
+    from rtp_llm.server.server_args.fifo_scheduler_group_args import (
+        init_fifo_scheduler_group_args,
+    )
+    from rtp_llm.server.server_args.server_args import EnvArgumentParser
+
+    block = extract_arg(remaining, "seq_size_per_block")
+    if block is None or int(block) <= 0:
+        raise ValueError(
+            "full pressure requires explicitly resolved seq_size_per_block"
+        )
+    if args.dp_size != 1 or os.environ.get("CACHE_PERF_EXISTING_SERVER_PORT"):
+        raise ValueError("full pressure requires DP=1 and an exclusive owned service")
+    if int(extract_arg(remaining, "pp_size") or os.environ.get("PP_SIZE", "1")) != 1:
+        raise ValueError("full pressure requires PP=1")
+    tp = int(extract_arg(remaining, "tp_size") or os.environ.get("TP_SIZE", "1"))
+    if tp < 1 or int(os.environ.get("WORLD_SIZE", str(tp))) != tp:
+        raise ValueError("full pressure requires one complete TP world")
+    model_tokens = max(args.max_seq_len, max_input_len + args.decode_test_length)
+    scheduler = argparse.Namespace()
+    parser = EnvArgumentParser(allow_abbrev=False)
+    init_fifo_scheduler_group_args(parser, scheduler)
+    scheduler_argv = []
+    for action in parser._actions:
+        value = extract_arg(remaining, action.dest)
+        if value is not None:
+            scheduler_argv.append(f"--{action.dest}={value}")
+    scheduler = parser.parse_args(scheduler_argv)
+    finalize_scheduler_config(scheduler, model_tokens)
+    if min(model_tokens, args.concurrency_limit, scheduler.max_batch_tokens_size) <= 0:
+        raise ValueError("full pressure requires resolved positive execution limits")
+    return dict(
+        model_tokens=model_tokens,
+        admission_requests=args.concurrency_limit,
+        batch_tokens=scheduler.max_batch_tokens_size,
+        block_tokens=int(block),
+        target_ranks=list(range(tp)),
+        dp_size=args.dp_size,
+        exclusive_service=True,
+    )
+
+
 def main() -> str:
     from rtp_llm.config.log_config import setup_logging
 
     setup_logging()
     args, remaining = parse_args()
+    full_pressure = getattr(args, "cache_pressure_preload", False)
+    if full_pressure and not args.cache_grid_json:
+        raise ValueError("full pressure requires cache_grid_json")
     engine_env_names = _apply_engine_env(
         [
             f"{key}={value}"
@@ -1002,6 +1049,8 @@ def main() -> str:
             grid_bytes = stream.read()
         grid_payload = json.loads(grid_bytes)
         workspace = grid_workspace_tokens(grid_payload)
+        if full_pressure and workspace is not None:
+            raise ValueError("full pressure cannot use fixed workspace")
         if workspace is not None:
             if args.cache_workspace_tokens not in (None, workspace):
                 raise ValueError("CLI/grid workspace_tokens mismatch")
@@ -1138,6 +1187,14 @@ def main() -> str:
         resume_config = _build_cache_resume_config(
             args, remaining, engine_env_names, expected_block_size
         )
+        if full_pressure:
+            resume_config.update(
+                cache_pressure_preload=True,
+                pressure_settings=asdict(args._pressure_config),
+                full_pressure_startup=_full_pressure_startup(
+                    args, remaining, max(int(case["input_len"]) for case in cases)
+                ),
+            )
         if args.cache_shared_seed:
             resume_config["cache_seed_mode"] = "shared_prefix_v1"
         elif args.cache_pressure_mode == "continuous":
@@ -1184,6 +1241,7 @@ def main() -> str:
             and checkpoint_ok_keys == planned_case_keys
             and not args.cache_profile_runs
             and not args.materialize_cache_cases
+            and not full_pressure
         ):
             if checkpoint.get("complete") is not True:
                 _finalize_completed_cache_checkpoint(args.result_dir, checkpoint, cases)
@@ -1313,7 +1371,8 @@ def main() -> str:
                 pressure_request_rate=args.cache_pressure_request_rate,
                 pressure_arrival=args.cache_pressure_arrival,
                 pressure_random_seed=args.cache_pressure_random_seed,
-                measure_runs=args.cache_measure_runs,
+                pressure_config=args._pressure_config if full_pressure else None,
+                measure_runs=None if full_pressure else args.cache_measure_runs,
                 checkpoint_every=args.cache_checkpoint_every,
                 cache_commit_tail_tokens=args.cache_commit_tail_tokens,
                 skip_reuse_validation=args.cache_skip_reuse_validation,

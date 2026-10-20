@@ -51,6 +51,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 
+from rtp_llm.test.perf_test.cache_grid.runner.continuous_pressure import DispatchClosed
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
     SERVER_LATENCY_CONTRACT,
     current_metrics,
@@ -898,6 +899,7 @@ def _post_prefill_ids(
     request_id: str,
     *,
     register_call: Optional[Callable[[Any], None]] = None,
+    before_dispatch: Optional[Callable[[], str]] = None,
 ) -> Dict[str, Any]:
     """Send token ids and optionally register the cancellable call before reading."""
     from rtp_llm.dash_sc.client import build_model_infer_request
@@ -913,6 +915,9 @@ def _post_prefill_ids(
             enable_thinking=False,
             force_sp_accept=True,
         )
+        if before_dispatch is not None:
+            request_id = before_dispatch()
+            request.id = request_id
         responses = stub.ModelStreamInfer(
             iter((request,)),
             timeout=timeout,
@@ -964,6 +969,8 @@ def _post_prefill_ids(
             "ttft_ms": wall_ms,
             "ttft_source": "client_dashsc_grpc_input_ids_wall_max_new_tokens_1",
         }
+    except DispatchClosed:
+        raise
     except Exception as exc:
         return {
             "success": False,
@@ -1748,6 +1755,167 @@ class CacheGridRunner:
         suffix += (self.factory._filler_ids * suffix_len)[: suffix_len - len(suffix)]
         return prefix + suffix
 
+    def _run_full_pressure(
+        self,
+        pending,
+        config,
+        limits,
+        pressure_stub,
+        target_ranks,
+        sink,
+        controller=None,
+    ):
+        """Internal opt-in entry; CLI validation/wiring is owned by the caller.
+
+        pressure_stub is the generated RpcServiceStub on the real rank-zero
+        endpoint. limits must project resolved server admission/model/token/KV
+        bounds, never guesses based on the requested workload.
+        """
+        from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2
+
+        from .continuous_pressure import PressurePoll, PressureSession
+        from .pressure_diagnostics import (
+            ActivitySample,
+            decode_pressure_response,
+            raw_pressure_record,
+        )
+
+        cases = tuple(dict(case) for case in pending)
+        if not cases or self._grpc_stub is None:
+            raise ValueError("full pressure requires cases and input-ID transport")
+        if any(
+            is_grouped_case(case) or int(case.get("batch_size", 1)) != 1
+            for case in cases
+        ):
+            raise ValueError("full pressure requires ungrouped batch_size=1")
+        session_id = uuid.uuid4().hex
+        max_cache = max(int(case["cache_len"]) for case in cases)
+        seed_count = self.pressure_seed_count if max_cache else 0
+        seed_tokens = max_cache + self.cache_commit_tail_tokens if max_cache else 1
+        self._continuous_seed_ids = [None] * seed_count
+        producer_lock = threading.Lock()
+        rng = random.Random(self.pressure_random_seed)
+        order = list(range(len(cases)))
+        formal_index = seed_index = 0
+        cursors = {}
+
+        def make_payload(kind, job_id):
+            nonlocal formal_index, seed_index
+            nonce = f"{session_id}_{job_id}"
+            with producer_lock:
+                if kind in ("seed", "fill"):
+                    tokens = seed_tokens if kind == "seed" else config.fill_input_tokens
+                    with self._continuous_prompt_lock:
+                        _, ids = self.factory._exact_text_and_ids(
+                            tokens, f"diagnostic_{kind}_{nonce}_"
+                        )
+                    payload = dict(input_ids=ids, nonce=nonce)
+                    if kind == "seed":
+                        family = seed_index
+                        seed_index += 1
+                        self._continuous_seed_ids[family] = ids
+                        payload["family"] = family
+                    return payload
+                if formal_index % len(cases) == 0:
+                    rng.shuffle(order)
+                index = formal_index
+                formal_index += 1
+                case_index = order[index % len(cases)]
+                case = cases[case_index]
+                family = index % seed_count if seed_count else 0
+                ids = self._continuous_request_ids(case, family, nonce)
+                return dict(
+                    input_ids=ids,
+                    nonce=nonce,
+                    family=family,
+                    epoch=index // len(cases),
+                    case_index=case_index,
+                    requested_cache_len=int(case["cache_len"]),
+                )
+
+        def request(payload, register, before):
+            return _post_prefill_ids(
+                self._grpc_stub,
+                payload["input_ids"],
+                self.request_timeout,
+                "pending",
+                register_call=register,
+                before_dispatch=lambda: before(payload),
+            )
+
+        def poll(timeout):
+            sent = time.monotonic()
+            response = pressure_stub.GetCachePressure(
+                model_rpc_service_pb2.CachePressureRequestPB(
+                    session_id=session_id,
+                    target_ranks=target_ranks,
+                    after_step_sequence=cursors,
+                    max_step_records=256,
+                ),
+                timeout=timeout,
+            )
+            received = time.monotonic()
+            raw = raw_pressure_record(response, sent, received)
+            decoded = decode_pressure_response(
+                response, sent, received, tuple(target_ranks)
+            )
+            samples = {s.rank: s for s in decoded.samples}
+            activity = []
+            for rank in response.ranks:
+                sample = samples[rank.world_rank]
+                low = sample.offset_bounds[0]
+                active = [
+                    step.wall_start_ns / 1e9 + low
+                    for step in rank.steps
+                    if not step.completed
+                ]
+                progress = [
+                    step.wall_end_ns / 1e9 + low
+                    for step in rank.steps
+                    if step.completed
+                ]
+                a = rank.activity
+                activity.append(
+                    ActivitySample(
+                        0,
+                        max(progress, default=0),
+                        max(active, default=None),
+                        (
+                            a.running_requests.value
+                            if a.HasField("running_requests")
+                            else None
+                        ),
+                        (
+                            a.waiting_requests.value
+                            if a.HasField("waiting_requests")
+                            else None
+                        ),
+                    )
+                )
+                cursors[rank.world_rank] = rank.next_step_sequence
+            return PressurePoll(decoded.samples, raw, tuple(activity))
+
+        return PressureSession(
+            config,
+            session_id=session_id,
+            limits=limits,
+            concurrency=self.pressure_client_concurrency,
+            scheduler=self.pressure_scheduler,
+            batch_size=self.pressure_batch_size,
+            max_input_tokens=max(int(c["input_len"]) for c in cases),
+            seed_count=seed_count,
+            seed_input_tokens=seed_tokens,
+            make_payload=make_payload,
+            request=request,
+            poll=poll,
+            sink=sink,
+            set_batch=self._set_prefill_batch_size,
+            controller=controller,
+            rate=self.pressure_request_rate,
+            poisson=self.pressure_arrival == "poisson",
+            random_seed=self.pressure_random_seed,
+        ).run()
+
     def _continuous_metric(self, case, runs):
         total_len = int(case["input_len"])
         cache_len = int(case["cache_len"])
@@ -2092,14 +2260,16 @@ class CacheGridRunner:
                 )
         return {"case": case, "members": members, "seeds": seeds}
 
-    def _set_prefill_batch_size(self, batch_size):
+    def _set_prefill_batch_size(self, batch_size, *, timeout=None):
         """Wait for scheduler acknowledgement before submitting a complete batch."""
         return configure_scheduler(
             self.port,
             batch_size=batch_size,
             mode="prefill",
             post=self._http_session.post,
-            timeout=min(self.request_timeout, 60),
+            timeout=min(
+                self.request_timeout, 60, timeout if timeout is not None else 60
+            ),
         )
 
     def _seed_grouped_payload(self, payload):

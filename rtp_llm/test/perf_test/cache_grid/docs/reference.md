@@ -357,3 +357,67 @@ active_step_started_s, running, waiting)` uses client-clock seconds.
 Update progress from completions, allocation/publication deltas, and actual
 execution-step evidence. A recent active long-prefill step qualifies until the
 explicit activity timeout; queued work alone cannot mask lack of progress forever.
+
+### Full-pressure lifecycle (internal opt-in API)
+
+`CacheGridRunner._run_full_pressure(pending, config, limits, pressure_stub,
+target_ranks, sink, controller=None)` is the diagnostic entry point. Existing
+finite continuous invocations still use `_run_continuous`. Public CLI validation
+must resolve the existing profile/server settings and pass frozen
+`ExecutionLimits(model_tokens, admission_requests, batch_tokens,
+available_kv_blocks, block_tokens)`. Include the one generated token in every
+model/token/KV bound. The KV bound is the conservative simultaneous-request
+budget after non-reclaimable reservations, not configured total capacity; use the
+most restrictive real pool/rank bound. No workload-derived default is inferred.
+The pressure stub is the generated `RpcServiceStub` connected to the actual
+rank-zero endpoint; target ranks are real world ranks. Startup validation remains
+responsible for exclusive DP=1 service, explicit opt-in and unsupported options.
+
+The supervisor freezes configuration, targets and raw baselines before seed
+requests. Seed and fill batches obey the immutable limits. Scheduler controls
+receive the remaining stage/progress budget through
+`set_batch(count, timeout=remaining_s)`; the finite runner retains its existing
+default timeout when no override is supplied. All-cold grids skip seeds but still
+fill. Fill uses independent unique inputs, completes each feasible
+batch, then re-polls actual residency before entering steady. Request/time and
+pressure-progress budgets terminate fill explicitly. Steady uses contiguous
+sampled intervals, not the number of samples. Formal requests repeat a lazy,
+deterministically shuffled grid through steady, measurement and optional support.
+No boundary drains or repair fill are inserted. Inputs and pending requests are
+bounded by concurrency; completion wakes the supervisor to replenish capacity.
+
+`PressurePhases(config, started_s)` exposes `phase`, `measurement_start`,
+`measurement_end`, `failure`, and `advance(now_s, fill_ready=...,
+steady_covered_s=..., profile_pending=...)`. The actual RPC's optional
+`before_dispatch()` hook runs after request construction, returns its final ID,
+and records phase/identity at dispatch. Preparation that crosses the final cutoff
+is rejected before sending. Arrival offsets remain cumulative despite lag.
+
+`sink(event)` receives serialized bounded events: `frozen`, `phase`, `dispatch`,
+`completion`, `pressure`, `pressure_lost`, `cancellation`, `error`, `finished`.
+It must persist or aggregate incrementally and return promptly. Dispatch events
+carry session/job/monotonic sequence, phase, request ID, actual token SHA256 and
+length, scheduled/dispatch times, lag, and nonce/family/grid epoch/case metadata.
+Completion events retain dispatch membership, actual completion time and a
+measurement-boundary crossing flag. Cancellation events retain the dispatch
+record and whether transport cancellation was accepted; this does not assert
+that the server completed cancellation. Raw pressure records retain rank clock
+bounds and full protobuf evidence. The final result contains failure, fixed
+measurement boundaries, measurement coverage and separate support coverage.
+
+An optional capture controller implements nonblocking `start(t0)`,
+`pending(now) -> bool`, and `stop(reason, now)`. Measurement remains [t0,t1).
+Pending capture receives same-distribution support until completion, the support
+cap, or the earlier `t0 + capture_timeout_s`. Stop is called explicitly even on
+failure. Configure the activity timeout for expected long prefill duration;
+repeatedly observing an unchanged old active step does not reset its progress
+budget. No profile collection is implemented by the supervisor itself.
+
+Final fixed-batch padding counts actual formal and support dispatches. FIFO
+never receives batch controls or padding. Drain continues pressure polling past
+the window edge and is bounded by `drain_timeout_s`; live RPCs are cancelled at
+the deadline and cancellation evidence is emitted. Dedicated executors shut down
+without waiting indefinitely. Transport deadlines bound RPC worker lifetime;
+Python cannot forcibly stop arbitrary token-generation code, so late preparation
+is barred from dispatch. `CancellableRequestHandle(..., on_done=callback)` provides
+the supervisor wakeup without exposing its executor or future.

@@ -7,10 +7,23 @@ sleep waiting for scheduled arrivals.
 
 from __future__ import annotations
 
+import hashlib
+import math
 import random
+import struct
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Protocol
+
+from .pressure_diagnostics import (
+    PressureCoverage,
+    assess_activity,
+    group_valid,
+    select_targets,
+    validate_inventory,
+)
 
 
 class RequestHandle(Protocol):
@@ -60,6 +73,8 @@ class ArrivalClock:
     """Cumulative offsets from one formal-distribution session origin."""
 
     def __init__(self, rate: float, poisson: bool, seed: int):
+        if isinstance(rate, bool) or not math.isfinite(rate) or rate < 0:
+            raise ValueError("arrival rate must be finite and nonnegative")
         self.rate, self.poisson = rate, poisson
         self.rng = random.Random(seed)
         self.offset = 0.0
@@ -90,11 +105,14 @@ class CancellableRequestHandle:
         self,
         executor: ThreadPoolExecutor,
         request: Callable[[Callable[[Any], None]], dict],
+        on_done: Callable[[], None] | None = None,
     ):
         self._lock = threading.Lock()
         self._call = None
         self._cancel_requested = False
         self._future = executor.submit(request, self._register_call)
+        if on_done is not None:
+            self._future.add_done_callback(lambda future: on_done())
 
     def _register_call(self, call: Any) -> None:
         with self._lock:
@@ -117,3 +135,661 @@ class CancellableRequestHandle:
         if call is not None:
             return bool(call.cancel()) or worker_cancelled
         return worker_cancelled
+
+
+def padding_needed(submitted: int, scheduler: str, batch_size: int) -> int:
+    return (-submitted) % batch_size if scheduler == "batch_decode" else 0
+
+
+@dataclass(frozen=True)
+class ExecutionLimits:
+    """Verified service limits, in tokens and per-request physical KV blocks.
+
+    available_kv_blocks is the conservative simultaneous request budget after
+    non-reclaimable reservations, not total configured cache capacity.
+    """
+
+    model_tokens: int
+    admission_requests: int
+    batch_tokens: int
+    available_kv_blocks: int
+    block_tokens: int
+
+    def __post_init__(self):
+        if any(type(v) is not int or v <= 0 for v in vars(self).values()):
+            raise ValueError("execution limits must be positive integers")
+
+    def concurrency_for(self, input_tokens):
+        if type(input_tokens) is not int or not 0 < input_tokens < self.model_tokens:
+            raise ValueError("request exceeds model token limit including output")
+        count = min(
+            self.admission_requests,
+            self.batch_tokens // (input_tokens + 1),
+            self.available_kv_blocks
+            // math.ceil((input_tokens + 1) / self.block_tokens),
+        )
+        if count < 1:
+            raise ValueError("request exceeds admission/token/KV budget")
+        return count
+
+
+class PressurePhases:
+    def __init__(self, config, started_s):
+        self.config = config
+        self.phase = "fill"
+        self.entered = started_s
+        self.measurement_start = None
+        self.measurement_end = None
+        self.failure = None
+
+    def fail(self, reason):
+        if self.failure is None:
+            self.failure = reason
+        self.phase = "drain"
+
+    def advance(
+        self, now_s, *, fill_ready=False, steady_covered_s=0.0, profile_pending=False
+    ):
+        if self.phase in ("fill", "steady"):
+            timeout = (
+                self.config.fill_timeout_s
+                if self.phase == "fill"
+                else self.config.steady_timeout_s
+            )
+            if now_s - self.entered >= timeout:
+                self.fail("pressure_not_reached")
+            elif self.phase == "fill" and fill_ready:
+                self.phase, self.entered = "steady", now_s
+            elif self.phase == "steady" and steady_covered_s >= self.config.steady_s:
+                self.phase = "measurement"
+                self.measurement_start = now_s
+                self.measurement_end = now_s + self.config.measure_s
+        elif self.phase == "measurement" and now_s >= self.measurement_end:
+            self.phase = "support" if profile_pending else "drain"
+        if self.phase == "support":
+            if not profile_pending:
+                self.phase = "drain"
+            elif now_s >= self.measurement_end + self.config.support_s:
+                self.fail("profile_timeout")
+        return self.phase
+
+
+@dataclass(frozen=True)
+class PressurePoll:
+    samples: tuple
+    raw: dict
+    activity: tuple = ()
+
+
+class DispatchClosed(Exception):
+    """Input preparation crossed the final supply cutoff; no RPC was sent."""
+
+
+class PressureSession:
+    """Bounded supervisor. Callbacks do not retain an experiment's event history.
+
+    poll(timeout) returns PressurePoll; request(payload, register, before) invokes
+    before(payload) immediately before its real RPC and uses the returned ID.
+    make_payload(kind, job_id) runs only in accepted request workers. sink(event)
+    must be fast, thread safe and persist/aggregate incrementally. Controller
+    start(now), pending(now), stop(reason, now) must be nonblocking.
+    """
+
+    def __init__(
+        self,
+        config,
+        *,
+        session_id,
+        limits,
+        concurrency,
+        scheduler,
+        batch_size,
+        max_input_tokens,
+        seed_count,
+        seed_input_tokens,
+        make_payload,
+        request,
+        poll,
+        sink,
+        set_batch,
+        controller=None,
+        rate=0,
+        poisson=False,
+        random_seed=0,
+        clock=time.monotonic,
+        sleep=time.sleep,
+        executor_factory=ThreadPoolExecutor,
+    ):
+        self.config, self.limits = config, limits
+        self.arrivals = ArrivalClock(rate, poisson, random_seed)
+        if scheduler not in ("fifo", "batch_decode"):
+            raise ValueError("unknown scheduler")
+        if type(concurrency) is not int or concurrency < 1:
+            raise ValueError("positive concurrency required")
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("positive batch size required")
+        if scheduler == "fifo" and batch_size != 1:
+            raise ValueError("FIFO has no fixed batch")
+        formal_limit = limits.concurrency_for(max_input_tokens)
+        if concurrency > formal_limit or batch_size > concurrency:
+            raise ValueError("formal concurrency exceeds frozen execution limits")
+        self.fill_batch = min(
+            concurrency, limits.concurrency_for(config.fill_input_tokens)
+        )
+        self.seed_batch = (
+            min(concurrency, limits.concurrency_for(seed_input_tokens))
+            if seed_count
+            else 0
+        )
+        if type(seed_count) is not int or seed_count < 0:
+            raise ValueError("invalid seed count")
+        self.session_id, self.scheduler, self.batch_size = (
+            session_id,
+            scheduler,
+            batch_size,
+        )
+        self.seed_count = seed_count
+        self.max_input_tokens, self.seed_input_tokens = (
+            max_input_tokens,
+            seed_input_tokens,
+        )
+        self.make_payload, self.request, self.poll, self.sink = (
+            make_payload,
+            request,
+            poll,
+            sink,
+        )
+        self.set_batch, self.controller = set_batch, controller
+        self.clock, self.sleep, self.executor_factory = clock, sleep, executor_factory
+        self.sender = BoundedSender(concurrency)
+        self.lock = threading.RLock()
+        self.wakeup = threading.Event()
+        self.jobs = {}
+        self.job_id = self.sequence = self.formal_submitted = 0
+        self.padding_submitted = 0
+        self.fill_sent = 0
+        self.closed = False
+        self.supply_deadline = float("inf")
+        self.profile_started = False
+        self.profile_pending = False
+        self.profile_stopped = False
+        self.support_started = None
+        self.last_poll_s = float("-inf")
+        self.poll_future = None
+        self.next_poll = float("inf")
+        self.last_progress = self.last_dispatch = clock()
+        self.last_execution_progress = clock()
+        self.progress = None
+        self.ready = False
+
+    def emit(self, event, **values):
+        with self.lock:
+            self.sink(dict(event=event, session_id=self.session_id, **values))
+
+    def fail(self, reason):
+        with self.lock:
+            self.state.fail(reason)
+
+    def _advance(self):
+        with self.lock:
+            now = self.clock()
+            previous = self.state.phase
+            if (
+                self.profile_started
+                and self.profile_pending
+                and now >= self.state.measurement_start + self.config.capture_timeout_s
+            ):
+                self.state.fail("profile_timeout")
+            covered = 0.0
+            if self.state.phase == "steady" and now > self.state.entered:
+                intervals = self.coverage.intervals(self.state.entered, now)
+                if (
+                    intervals
+                    and self.ready
+                    and now - intervals[-1][1] <= self.config.max_sample_age_s
+                ):
+                    covered = intervals[-1][1] - intervals[-1][0]
+            self.state.advance(
+                now, steady_covered_s=covered, profile_pending=self.profile_pending
+            )
+            if self.state.phase == "support" and self.support_started is None:
+                self.support_started = self.state.measurement_end
+            if self.state.phase != previous:
+                self.emit("phase", phase=self.state.phase, at_s=now)
+
+    def _before(self, job_id, kind, scheduled, payload):
+        # Serialize phase classification and identity allocation at the transport
+        # boundary, after token generation. Workers never wait for arrival times.
+        with self.lock:
+            self._advance()
+            phase = self.state.phase if kind == "formal" else kind
+            if (
+                self.closed
+                or self.clock() >= self.supply_deadline
+                or (kind != "padding" and self.state.phase == "drain")
+                or (
+                    kind == "formal"
+                    and phase not in ("steady", "measurement", "support")
+                )
+            ):
+                raise DispatchClosed()
+            ids = payload["input_ids"]
+            expected = (
+                self.config.fill_input_tokens
+                if kind == "fill"
+                else self.seed_input_tokens if kind == "seed" else self.max_input_tokens
+            )
+            if len(ids) > expected or (
+                kind in ("seed", "fill") and len(ids) != expected
+            ):
+                raise ValueError("generated input violates frozen token bound")
+            self.limits.concurrency_for(len(ids))
+            now = self.clock()
+            sequence = self.sequence
+            self.sequence += 1
+            identity = f"{self.session_id}:{phase}:{sequence}"
+            record = dict(
+                job_id=job_id,
+                sequence=sequence,
+                phase=phase,
+                request_id=identity,
+                dispatched_s=now,
+                scheduled_offset_s=scheduled,
+                input_len=len(ids),
+                input_sha256=hashlib.sha256(
+                    struct.pack(f"<{len(ids)}i", *ids)
+                ).hexdigest(),
+                metadata={k: v for k, v in payload.items() if k != "input_ids"},
+            )
+            if scheduled is not None:
+                record["schedule_lag_s"] = max(0, now - self.formal_origin - scheduled)
+            self.jobs[job_id] = record
+            self.last_dispatch = now
+            if kind == "formal":
+                self.formal_submitted += 1
+            elif kind == "padding":
+                self.padding_submitted += 1
+            self.emit("dispatch", **record)
+            return identity
+
+    def _submit(self, kind, scheduled=None):
+        job_id = self.job_id
+
+        def work(register):
+            try:
+                payload = self.make_payload(kind, job_id)
+                result = self.request(
+                    payload,
+                    register,
+                    lambda p: self._before(job_id, kind, scheduled, p),
+                )
+                return dict(result, _pressure_completed_s=self.clock())
+            except DispatchClosed:
+                return {"not_dispatched": True}
+
+        accepted = self.sender.submit(
+            job_id,
+            lambda: CancellableRequestHandle(
+                self.executor, work, on_done=self.wakeup.set
+            ),
+        )
+        if accepted:
+            self.job_id += 1
+        return accepted
+
+    def _collect(self):
+        for job_id, result in self.sender.collect():
+            with self.lock:
+                record = self.jobs.pop(job_id, None)
+            if record is None:
+                if not result.get("not_dispatched"):
+                    self.fail("request_failed")
+                    self.emit(
+                        "completion",
+                        job_id=job_id,
+                        completed_s=self.clock(),
+                        result=result,
+                    )
+                continue
+            result = dict(result)
+            now = result.pop("_pressure_completed_s", self.clock())
+            self.emit(
+                "completion",
+                **record,
+                completed_s=now,
+                result=result,
+                crossing=record["phase"] == "measurement"
+                and now >= self.state.measurement_end,
+            )
+            if result.get("success"):
+                self.last_execution_progress = max(self.last_execution_progress, now)
+            if not (
+                result.get("success")
+                and result.get("input_len") == record["input_len"]
+                and result.get("output_len") == 1
+            ):
+                self.fail(
+                    "padding_failed"
+                    if record["phase"] == "padding"
+                    else "request_failed"
+                )
+
+    def _consume_poll(self, evidence):
+        with self.lock:
+            self._apply_poll(evidence)
+
+    def _apply_poll(self, evidence):
+        now = self.clock()
+        self.last_poll_s = min(
+            (s.client_receive_s for s in evidence.samples), default=now
+        )
+        self.emit("pressure", at_s=now, raw=evidence.raw)
+        self.coverage.add(evidence.samples, now)
+        self.ready = False
+        if not self.coverage.epoch_valid:
+            self.fail("pressure_epoch_invalid")
+            return
+        if len(evidence.samples) == len(self.coverage.ranks):
+            try:
+                validate_inventory(
+                    select_targets(evidence.samples, self.coverage.ranks),
+                    self.coverage.targets,
+                )
+            except ValueError:
+                self.coverage.epoch_valid = False
+                self.fail("pressure_epoch_invalid")
+                return
+            try:
+                self.ready = all(
+                    group_valid(
+                        g,
+                        {p.pool_id: p for p in s.pools},
+                        next(
+                            b
+                            for b in self.coverage.baselines[s.rank].groups
+                            if b.group_id == g.group_id
+                        ),
+                        self.config,
+                    )
+                    for s in evidence.samples
+                    for g in s.groups
+                    if g.group_type == "FULL"
+                )
+                self.ready = self.ready and all(
+                    0
+                    <= now
+                    - (
+                        s.server_s
+                        + (s.offset_bounds or (s.client_send_s - s.server_s,))[0]
+                    )
+                    <= self.config.max_sample_age_s
+                    for s in evidence.samples
+                )
+            except (ValueError, KeyError, StopIteration):
+                self.ready = False
+        if not self.ready and self.state.phase in ("measurement", "support"):
+            self.emit("pressure_lost", phase=self.state.phase, at_s=now)
+        progress = tuple(
+            (
+                s.rank,
+                tuple((g.group_id, g.triggers, g.gpu_host_published) for g in s.groups),
+                tuple(
+                    (p.pool_id, p.used - p.pending_release, p.host_resident)
+                    for p in s.pools
+                ),
+            )
+            for s in evidence.samples
+        )
+        if progress and progress != self.progress:
+            self.last_progress, self.progress = now, progress
+        if evidence.activity:
+            for activity in evidence.activity:
+                activity = type(activity)(
+                    self.last_dispatch,
+                    max(
+                        self.last_progress,
+                        self.last_execution_progress,
+                        activity.last_progress_s,
+                    ),
+                    activity.active_step_started_s,
+                    activity.running,
+                    activity.waiting,
+                )
+                assessment = assess_activity(
+                    activity, now, self.config.activity_timeout_s
+                )
+                if not assessment.valid:
+                    self.fail(assessment.reasons[0])
+        elif now - self.last_progress >= self.config.activity_timeout_s:
+            self.fail("unknown_activity")
+
+    def _tick(self):
+        self._collect()
+        now = self.clock()
+        if self.poll_future is not None and self.poll_future.done():
+            try:
+                evidence = self.poll_future.result()
+            except Exception as exc:
+                evidence = PressurePoll((), {"error": repr(exc)})
+            self.poll_future = None
+            self._consume_poll(evidence)
+        if self.poll_future is None and now >= self.next_poll:
+            self.next_poll = now + self.config.sample_period_s
+            self.poll_future = self.poll_executor.submit(
+                self.poll, self.config.sample_period_s
+            )
+        if self.controller and self.profile_started and not self.profile_stopped:
+            self.profile_pending = self.controller.pending(now)
+        self._advance()
+        if (
+            self.state.phase == "fill"
+            and now - self.last_progress >= self.config.fill_no_progress_s
+        ):
+            self.fail("pressure_not_reached")
+        if (
+            self.state.phase == "measurement"
+            and self.controller
+            and not self.profile_started
+        ):
+            self.controller.start(self.state.measurement_start)
+            self.profile_started = True
+            self.profile_pending = self.controller.pending(now)
+
+    def _pause(self):
+        delay = min(0.01, self.config.sample_period_s / 10)
+        if self.sleep is time.sleep:
+            self.wakeup.wait(delay)
+            self.wakeup.clear()
+        else:
+            self.sleep(delay)
+
+    def _batch(self, kind, count):
+        if self.scheduler == "batch_decode":
+            self._configure_batch(count)
+        if self.state.phase == "drain":
+            return
+        for _ in range(count):
+            self._submit(kind)
+        while self.sender.pending and self.state.phase != "drain":
+            self._tick()
+            self._pause()
+
+    def _configure_batch(self, count):
+        now = self.clock()
+        if self.state.phase == "fill":
+            remaining = min(
+                self.state.entered + self.config.fill_timeout_s - now,
+                self.last_progress + self.config.fill_no_progress_s - now,
+            )
+        else:
+            remaining = self.state.entered + self.config.steady_timeout_s - now
+        if remaining <= 0:
+            self.fail("pressure_not_reached")
+            return
+        self.set_batch(count, timeout=remaining)
+        self._advance()
+
+    def run(self):
+        self.state = PressurePhases(self.config, self.clock())
+        self.executor = self.executor_factory(
+            max_workers=self.sender.limit, thread_name_prefix="pressure-request"
+        )
+        self.poll_executor = self.executor_factory(
+            max_workers=1, thread_name_prefix="pressure-poll"
+        )
+        try:
+            baseline = self.poll(self.config.sample_period_s)
+            self.coverage = PressureCoverage(tuple(baseline.samples), self.config)
+            # Run predicate validation before sending, including tolerance reachability.
+            for sample in baseline.samples:
+                for group in sample.groups:
+                    if group.group_type == "FULL":
+                        group_valid(
+                            group,
+                            {p.pool_id: p for p in sample.pools},
+                            group,
+                            self.config,
+                        )
+            self.emit(
+                "frozen",
+                config=asdict(self.config),
+                limits=asdict(self.limits),
+                targets=[asdict(t) for t in self.coverage.targets],
+                raw_baseline=baseline.raw,
+            )
+            self.next_poll = self.clock()
+            if self.seed_count:
+                self.emit("phase", phase="seed", at_s=self.clock())
+            for start in range(0, self.seed_count, self.seed_batch or 1):
+                if self.state.phase == "drain":
+                    break
+                self._batch("seed", min(self.seed_batch, self.seed_count - start))
+            self.state.entered = self.clock()
+            self.last_progress = self.clock()
+            if self.state.phase != "drain":
+                self.emit("phase", phase="fill", at_s=self.clock())
+            while self.state.phase == "fill":
+                self._tick()
+                if self.state.phase == "drain":
+                    break
+                if self.fill_sent and self.ready and not self.sender.pending:
+                    self.state.advance(self.clock(), fill_ready=True)
+                    self.emit("phase", phase="steady", at_s=self.clock())
+                    break
+                if (
+                    self.fill_sent >= self.config.fill_max_requests
+                    or self.clock() - self.last_progress
+                    >= self.config.fill_no_progress_s
+                ):
+                    self.fail("pressure_not_reached")
+                    break
+                count = min(
+                    self.fill_batch, self.config.fill_max_requests - self.fill_sent
+                )
+                self._batch("fill", count)
+                self.fill_sent += count
+                completed = self.clock()
+                while self.last_poll_s < completed and self.state.phase != "drain":
+                    self._tick()
+                    if self.state.phase != "drain":
+                        self._pause()
+            if self.state.phase == "steady":
+                if self.scheduler == "batch_decode":
+                    self._configure_batch(self.batch_size)
+                self.formal_origin = self.clock()
+                due = self.arrivals.next_offset()
+                while self.state.phase in ("steady", "measurement", "support"):
+                    self._tick()
+                    while (
+                        self.state.phase in ("steady", "measurement", "support")
+                        and self.clock() >= self.formal_origin + due
+                    ):
+                        if not self._submit("formal", due):
+                            break
+                        due = self.arrivals.next_offset()
+                    if self.state.phase != "drain":
+                        self._pause()
+        except Exception as exc:
+            self.fail("supervisor_failed")
+            self.emit("error", error=repr(exc), at_s=self.clock())
+        finally:
+            try:
+                self._drain()
+            finally:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+                self.poll_executor.shutdown(wait=False, cancel_futures=True)
+        result = dict(
+            failure=self.state.failure,
+            measurement_start=self.state.measurement_start,
+            measurement_end=self.state.measurement_end,
+        )
+        if self.state.measurement_end is not None:
+            result["pressure"] = asdict(
+                self.coverage.assess(
+                    self.state.measurement_start, self.state.measurement_end
+                )
+            )
+        if self.support_started is not None and self.support_end > self.support_started:
+            result["support_pressure"] = asdict(
+                self.coverage.assess(self.support_started, self.support_end)
+            )
+        self.emit("finished", **result)
+        return result
+
+    def _drain(self):
+        self.state.phase = "drain"
+        started = self.clock()
+        self.emit("phase", phase="drain", at_s=started)
+        self.support_end = started
+        deadline = started + self.config.drain_timeout_s
+        self.supply_deadline = deadline
+        if self.controller and not self.profile_stopped:
+            self.profile_stopped = True
+            try:
+                self.controller.stop(self.state.failure or "complete", started)
+            except Exception as exc:
+                self.fail("profile_stop_failed")
+                self.emit("error", error=repr(exc), at_s=self.clock())
+        # Dispatch count is frozen by the phase lock: late formal workers cannot
+        # become measurement members or change the fixed batch's tail size.
+        with self.lock:
+            tail = padding_needed(
+                self.formal_submitted, self.scheduler, self.batch_size
+            )
+        while self.clock() < deadline:
+            self._collect()
+            if tail and self._submit("padding"):
+                tail -= 1
+            if hasattr(self, "coverage"):
+                self._tick()
+            edge = (
+                self.support_end
+                if self.support_started is not None
+                else self.state.measurement_end
+            )
+            edge_pending = edge is not None and self.last_poll_s <= edge
+            if not self.sender.pending and not tail and not edge_pending:
+                break
+            self._pause()
+        with self.lock:
+            self.closed = True
+        if self.sender.pending or tail:
+            self.fail("drain_timeout")
+            for job_id, handle in list(self.sender.pending.items()):
+                cancelled = handle.cancel()
+                self.emit(
+                    "cancellation",
+                    job_id=job_id,
+                    at_s=self.clock(),
+                    accepted=cancelled,
+                    dispatch=self.jobs.get(job_id),
+                )
+            self._collect()
+        if padding_needed(
+            self.formal_submitted + self.padding_submitted,
+            self.scheduler,
+            self.batch_size,
+        ):
+            self.fail("padding_failed")
+        if self.poll_future is not None:
+            self.poll_future.cancel()

@@ -1,10 +1,535 @@
 """Bounded continuous request supply, without engine imports."""
 
+import struct
+import time
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
-from threading import Event
+from dataclasses import replace
+from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+from rtp_llm.test.perf_test.cache_grid.runner import continuous_pressure as cp
+from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+    resolve_pressure_config,
+)
+
+
+def config(**changes):
+    values = dict(
+        fill_timeout_s=120,
+        fill_max_requests=1000,
+        fill_no_progress_s=30,
+        fill_input_tokens=16,
+        gpu_tolerance_blocks=0,
+        activity_timeout_s=30,
+        drain_timeout_s=60,
+        capture_timeout_s=120,
+    )
+    values.update(changes)
+    return resolve_pressure_config(values)
+
+
+class PhaseTest(unittest.TestCase):
+    def test_measurement_ends_without_waiting_for_profile(self):
+        state = cp.PressurePhases(config(), started_s=0)
+        self.assertEqual(state.advance(2, fill_ready=True), "steady")
+        self.assertEqual(state.advance(5, steady_covered_s=3), "measurement")
+        self.assertEqual(state.measurement_end, 65)
+        self.assertEqual(state.advance(65, profile_pending=True), "support")
+        self.assertEqual(state.advance(125, profile_pending=True), "drain")
+        self.assertEqual(state.failure, "profile_timeout")
+        self.assertEqual(cp.padding_needed(6, "batch_decode", 4), 2)
+        self.assertEqual(cp.padding_needed(6, "fifo", 4), 0)
+
+    def test_timeouts_and_existing_failure(self):
+        state = cp.PressurePhases(config(), started_s=0)
+        self.assertEqual(state.advance(120, fill_ready=True), "drain")
+        self.assertEqual(state.failure, "pressure_not_reached")
+        state = cp.PressurePhases(config(), started_s=0)
+        state.advance(1, fill_ready=True)
+        self.assertEqual(state.advance(61, steady_covered_s=3), "drain")
+
+    def test_reject_nonfinite_and_negative_arrival_rates(self):
+        for rate in (-1, float("inf"), float("nan"), True):
+            with self.subTest(rate=rate), self.assertRaises(ValueError):
+                cp.ArrivalClock(rate, False, 0)
+
+    def test_execution_limits_bound_long_requests(self):
+        limits = cp.ExecutionLimits(128, 8, 100, 12, 16)
+        self.assertEqual(limits.concurrency_for(33), 2)
+        with self.assertRaises(ValueError):
+            limits.concurrency_for(128)
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now = round(self.now + seconds, 8)
+
+
+class InlineExecutor:
+    def __init__(self, **kwargs):
+        self.closed = False
+
+    def submit(self, fn, *args):
+        future = Future()
+        try:
+            future.set_result(fn(*args))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self, **kwargs):
+        self.closed = True
+
+
+class LifecycleTest(unittest.TestCase):
+    def run_session(
+        self,
+        *,
+        valid=True,
+        cfg=None,
+        controller=None,
+        scheduler="fifo",
+        fail_padding=False,
+        poll_transform=None,
+        payload_hook=None,
+        seed_count=0,
+        rate=3,
+        control=None
+    ):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            GroupSample,
+            PoolSample,
+            RankSample,
+        )
+
+        clock, events, batches = FakeClock(), [], []
+        counter = [0]
+
+        def poll(timeout):
+            counter[0] += 1
+            group = GroupSample(
+                0, "FULL", ("gpu",), "host", int(counter[0] > 1), int(counter[0] > 1)
+            )
+            sample = RankSample(
+                0,
+                "service",
+                counter[0],
+                clock(),
+                clock(),
+                clock(),
+                (
+                    PoolSample("gpu", 100, 90, 0, 0.8, 0.9),
+                    PoolSample("host", 100, 30, 0, 0.8, 0.9, 25 if valid else 0),
+                ),
+                (group,),
+            )
+            evidence = cp.PressurePoll((sample,), {}, ())
+            return (
+                poll_transform(evidence, counter[0], clock)
+                if poll_transform
+                else evidence
+            )
+
+        def request(payload, register, before):
+            identity = before(payload)
+            return dict(
+                success=not (fail_padding and ":padding:" in identity),
+                input_len=16,
+                output_len=1,
+            )
+
+        def payload(kind, sequence):
+            if payload_hook:
+                payload_hook(kind, sequence, clock)
+            return {"input_ids": [1] * 16, "case": "cold"}
+
+        state = cp.PressureSession(
+            cfg or config(measure_s=3, steady_s=1, sample_period_s=0.5),
+            session_id="session",
+            limits=cp.ExecutionLimits(128, 8, 256, 64, 16),
+            concurrency=4,
+            scheduler=scheduler,
+            batch_size=3 if scheduler == "batch_decode" else 1,
+            max_input_tokens=16,
+            seed_count=seed_count,
+            seed_input_tokens=16,
+            make_payload=payload,
+            request=request,
+            poll=poll,
+            sink=events.append,
+            set_batch=control or (lambda count, **kwargs: batches.append(count)),
+            controller=controller,
+            clock=clock,
+            sleep=clock.sleep,
+            executor_factory=InlineExecutor,
+            rate=rate,
+        )
+        result = state.run()
+        return result, events, batches, state
+
+    def test_all_cold_fills_then_uninterrupted_formal_schedule(self):
+        result, events, batches, state = self.run_session()
+        dispatch = [e for e in events if e["event"] == "dispatch"]
+        self.assertIsNone(result["failure"])
+        self.assertEqual(batches, [])
+        self.assertTrue(any(e["phase"] == "fill" for e in dispatch))
+        self.assertFalse(any(e["phase"] == "seed" for e in dispatch))
+        formal = [e for e in dispatch if e["phase"] in ("steady", "measurement")]
+        self.assertEqual(
+            [e["sequence"] for e in dispatch], sorted({e["sequence"] for e in dispatch})
+        )
+        self.assertTrue(any(e["phase"] == "measurement" for e in formal))
+        for first, second in zip(formal, formal[1:]):
+            self.assertAlmostEqual(
+                second["scheduled_offset_s"] - first["scheduled_offset_s"], 1 / 3
+            )
+        self.assertTrue(
+            all(
+                e["dispatched_s"] < result["measurement_end"]
+                for e in formal
+                if e["phase"] == "measurement"
+            )
+        )
+        self.assertGreater(state.last_poll_s, result["measurement_end"])
+
+    def test_insufficient_residency_stops_at_request_budget(self):
+        result, events, _, _ = self.run_session(
+            valid=False, cfg=config(fill_max_requests=3)
+        )
+        self.assertEqual(result["failure"], "pressure_not_reached")
+        self.assertEqual(
+            sum(e["event"] == "dispatch" and e["phase"] == "fill" for e in events), 3
+        )
+
+    def test_support_capture_deadline_stops_controller(self):
+        class Controller:
+            def __init__(self):
+                self.stops = []
+
+            def start(self, now):
+                self.started = now
+
+            def pending(self, now):
+                return True
+
+            def stop(self, reason, now):
+                self.stops.append((reason, now))
+
+        controller = Controller()
+        result, events, _, _ = self.run_session(
+            controller=controller,
+            cfg=config(
+                measure_s=2,
+                steady_s=1,
+                capture_timeout_s=3,
+                support_s=10,
+                sample_period_s=0.5,
+            ),
+        )
+        self.assertEqual(result["failure"], "profile_timeout")
+        self.assertTrue(any(e.get("phase") == "support" for e in events))
+        self.assertIn("support_pressure", result)
+        self.assertAlmostEqual(controller.stops[0][1], controller.started + 3, places=2)
+
+    def test_fixed_batch_tail_is_padded_and_failure_recorded(self):
+        result, events, batches, _ = self.run_session(
+            scheduler="batch_decode", fail_padding=True
+        )
+        formal = [
+            e
+            for e in events
+            if e["event"] == "dispatch"
+            and e["phase"] in ("steady", "measurement", "support", "padding")
+        ]
+        self.assertEqual(len(formal) % 3, 0)
+        self.assertIn(3, batches)
+        self.assertTrue(any(e["phase"] == "padding" for e in formal))
+        self.assertEqual(result["failure"], "padding_failed")
+
+    def test_fill_time_and_no_progress_budgets(self):
+        for settings in (dict(fill_timeout_s=1), dict(fill_no_progress_s=1)):
+            with self.subTest(settings=settings):
+                result, _, _, state = self.run_session(
+                    valid=False, cfg=config(**settings)
+                )
+                self.assertEqual(result["failure"], "pressure_not_reached")
+                self.assertLess(state.clock(), 4)
+
+    def test_seed_batches_are_bounded_and_baseline_precedes_sends(self):
+        result, events, batches, _ = self.run_session(
+            seed_count=7, scheduler="batch_decode"
+        )
+        self.assertIsNone(result["failure"])
+        self.assertEqual(events[0]["event"], "frozen")
+        self.assertEqual(batches[:2], [4, 3])
+        self.assertEqual(
+            sum(e["event"] == "dispatch" and e["phase"] == "seed" for e in events), 7
+        )
+
+    def test_steady_uses_elapsed_coverage_and_times_out(self):
+        def alternate(evidence, count, clock):
+            if count > 3 and count % 2:
+                return cp.PressurePoll((), {"missing": True})
+            return evidence
+
+        result, _, _, _ = self.run_session(
+            poll_transform=alternate,
+            cfg=config(steady_timeout_s=3, steady_s=2, sample_period_s=0.5),
+        )
+        self.assertEqual(result["failure"], "pressure_not_reached")
+        self.assertIsNone(result["measurement_start"])
+
+    def test_measurement_pressure_loss_never_injects_repair_fill(self):
+        def lose(evidence, count, clock):
+            if clock() >= 4:
+                sample = evidence.samples[0]
+                evidence = replace(
+                    evidence,
+                    samples=(
+                        replace(
+                            sample,
+                            pools=(
+                                sample.pools[0],
+                                replace(sample.pools[1], host_resident=0),
+                            ),
+                        ),
+                    ),
+                )
+            return evidence
+
+        result, events, _, _ = self.run_session(poll_transform=lose)
+        self.assertFalse(result["pressure"]["valid"])
+        self.assertTrue(any(e["event"] == "pressure_lost" for e in events))
+        formal_start = next(
+            e["dispatched_s"]
+            for e in events
+            if e["event"] == "dispatch" and e["phase"] == "steady"
+        )
+        self.assertFalse(
+            any(
+                e["event"] == "dispatch"
+                and e["phase"] == "fill"
+                and e["dispatched_s"] >= formal_start
+                for e in events
+            )
+        )
+
+    def test_service_restart_ends_epoch(self):
+        def restart(evidence, count, clock):
+            return (
+                replace(
+                    evidence, samples=(replace(evidence.samples[0], instance="new"),)
+                )
+                if count > 5
+                else evidence
+            )
+
+        result, _, _, _ = self.run_session(poll_transform=restart)
+        self.assertEqual(result["failure"], "pressure_epoch_invalid")
+
+    def test_complete_changed_target_inventory_ends_epoch(self):
+        def change(evidence, count, clock):
+            if count > 5:
+                sample = evidence.samples[0]
+                return replace(
+                    evidence,
+                    samples=(
+                        replace(
+                            sample, groups=(replace(sample.groups[0], group_id=1),)
+                        ),
+                    ),
+                )
+            return evidence
+
+        result, _, _, _ = self.run_session(
+            poll_transform=change, cfg=config(steady_timeout_s=4)
+        )
+        self.assertEqual(result["failure"], "pressure_epoch_invalid")
+
+    def test_support_finishes_before_cap(self):
+        class Controller:
+            def start(self, now):
+                self.started = now
+
+            def pending(self, now):
+                return now < self.started + 4
+
+            def stop(self, reason, now):
+                self.stopped = now
+
+        controller = Controller()
+        result, events, _, _ = self.run_session(controller=controller)
+        self.assertIsNone(result["failure"])
+        self.assertAlmostEqual(controller.stopped, controller.started + 4, places=2)
+        self.assertTrue(any(e.get("phase") == "support" for e in events))
+
+    def test_controller_stop_failure_still_returns_terminal_record(self):
+        class Controller:
+            def start(self, now):
+                pass
+
+            def pending(self, now):
+                return False
+
+            def stop(self, reason, now):
+                raise RuntimeError("stop failed")
+
+        result, events, _, _ = self.run_session(controller=Controller())
+        self.assertEqual(result["failure"], "profile_stop_failed")
+        self.assertEqual(events[-1]["event"], "finished")
+
+    def test_dispatch_exactly_at_t1_is_support_after_input_generation(self):
+        class Controller:
+            def start(self, now):
+                self.end = now + 3
+
+            def pending(self, now):
+                return now < self.end + 1
+
+            def stop(self, reason, now):
+                pass
+
+        controller = Controller()
+        moved = []
+
+        def delay(kind, sequence, clock):
+            if kind == "formal" and hasattr(controller, "end") and not moved:
+                clock.now = controller.end
+                moved.append(True)
+
+        result, events, _, _ = self.run_session(
+            controller=controller, payload_hook=delay
+        )
+        dispatch = [e for e in events if e["event"] == "dispatch"]
+        at_end = [e for e in dispatch if e["dispatched_s"] == result["measurement_end"]]
+        self.assertTrue(at_end)
+        self.assertTrue(all(e["phase"] == "support" for e in at_end))
+
+    def test_failed_poll_breaks_coverage_and_is_retained(self):
+        def fail(evidence, count, clock):
+            if 4 <= clock() <= 5:
+                raise TimeoutError("poll timed out")
+            return evidence
+
+        result, events, _, _ = self.run_session(poll_transform=fail)
+        self.assertFalse(result["pressure"]["valid"])
+        self.assertTrue(any("error" in e.get("raw", {}) for e in events))
+
+    def test_invalid_baseline_tolerance_sends_nothing_and_cleans_up(self):
+        result, events, _, _ = self.run_session(cfg=config(gpu_tolerance_blocks=1000))
+        self.assertEqual(result["failure"], "supervisor_failed")
+        self.assertFalse(any(e["event"] == "dispatch" for e in events))
+
+    def test_padding_preparation_cannot_silently_cross_drain_deadline(self):
+        def delay(kind, sequence, clock):
+            if kind == "padding":
+                clock.now += 100
+
+        result, _, _, _ = self.run_session(scheduler="batch_decode", payload_hook=delay)
+        self.assertIsNotNone(result["failure"])
+
+    def test_blocked_scheduler_control_obeys_remaining_fill_budget(self):
+        budgets = []
+
+        def control(count, *, timeout):
+            budgets.append(timeout)
+            raise TimeoutError("bounded scheduler acknowledgement")
+
+        result, events, _, _ = self.run_session(
+            scheduler="batch_decode", cfg=config(fill_timeout_s=0.2), control=control
+        )
+        self.assertEqual(result["failure"], "supervisor_failed")
+        self.assertEqual(len(budgets), 1)
+        self.assertGreater(budgets[0], 0)
+        self.assertLessEqual(budgets[0], 0.2)
+        self.assertFalse(any(e["event"] == "dispatch" for e in events))
+
+    def test_blocked_rpc_is_cancelled_at_drain_without_boundary_drain(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            GroupSample,
+            PoolSample,
+            RankSample,
+        )
+
+        events, cancels = [], []
+        sequence = [0]
+
+        def poll(timeout):
+            now = time.monotonic()
+            sequence[0] += 1
+            group = GroupSample(0, "FULL", ("gpu",), "host", sequence[0], sequence[0])
+            sample = RankSample(
+                0,
+                "service",
+                sequence[0],
+                now,
+                now,
+                now,
+                (
+                    PoolSample("gpu", 100, 90, 0, 0.8, 0.9),
+                    PoolSample("host", 100, 30, 0, 0.8, 0.9, 25),
+                ),
+                (group,),
+            )
+            return cp.PressurePoll((sample,), {})
+
+        def request(payload, register, before):
+            identity = before(payload)
+            if ":fill:" not in identity:
+                cancelled = Event()
+
+                class Call:
+                    def cancel(self):
+                        cancels.append(time.monotonic())
+                        cancelled.set()
+                        return True
+
+                register(Call())
+                if not cancelled.wait(2):
+                    raise AssertionError("missing bounded cancellation")
+            return dict(success=True, input_len=16, output_len=1)
+
+        session = cp.PressureSession(
+            config(
+                sample_period_s=0.01,
+                steady_s=0.02,
+                measure_s=0.03,
+                drain_timeout_s=0.03,
+                activity_timeout_s=1,
+            ),
+            session_id="blocked",
+            limits=cp.ExecutionLimits(128, 2, 128, 64, 16),
+            concurrency=2,
+            scheduler="fifo",
+            batch_size=1,
+            max_input_tokens=16,
+            seed_count=0,
+            seed_input_tokens=16,
+            make_payload=lambda kind, i: {"input_ids": [1] * 16},
+            request=request,
+            poll=poll,
+            sink=events.append,
+            set_batch=lambda count: self.fail("FIFO control"),
+        )
+        began = time.monotonic()
+        result = session.run()
+        self.assertLess(time.monotonic() - began, 1)
+        self.assertEqual(result["failure"], "drain_timeout")
+        self.assertEqual(len(cancels), 2)
+        self.assertTrue(all(t >= result["measurement_end"] for t in cancels))
+        self.assertEqual(sum(e["event"] == "cancellation" for e in events), 2)
+        self.assertTrue(
+            any(e["event"] == "phase" and e["phase"] == "measurement" for e in events)
+        )
+
 
 from rtp_llm.test.perf_test.cache_grid.runner.continuous_pressure import (
     ArrivalClock,
@@ -79,6 +604,15 @@ class ArrivalClockTest(unittest.TestCase):
 
 
 class CancellableRequestHandleTest(unittest.TestCase):
+    def test_completion_wakes_supervisor(self):
+        woke = Event()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            handle = CancellableRequestHandle(
+                executor, lambda register: {}, on_done=woke.set
+            )
+            self.assertTrue(woke.wait(2))
+            self.assertTrue(handle.done())
+
     def test_cancels_running_rpc(self):
         started, cancelled = Event(), Event()
 
@@ -146,6 +680,69 @@ class CancellableRequestHandleTest(unittest.TestCase):
 
 
 class TransportRegistrationTest(unittest.TestCase):
+    def test_closed_dispatch_propagates_without_sending(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            _post_prefill_ids,
+        )
+
+        stub = Mock()
+        dependencies = {
+            "rtp_llm.dash_sc.client": SimpleNamespace(
+                build_model_infer_request=lambda **kwargs: SimpleNamespace(id="pending")
+            ),
+            "rtp_llm.dash_sc.codec": SimpleNamespace(
+                SamplingParams=lambda **kwargs: kwargs
+            ),
+        }
+
+        def closed():
+            raise cp.DispatchClosed()
+
+        with patch.dict("sys.modules", dependencies), self.assertRaises(
+            cp.DispatchClosed
+        ):
+            _post_prefill_ids(stub, [1], 2, "pending", before_dispatch=closed)
+        stub.ModelStreamInfer.assert_not_called()
+
+    def test_dispatch_hook_sets_identity_immediately_before_rpc(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            _post_prefill_ids,
+        )
+
+        order = []
+        request = SimpleNamespace(id="old")
+
+        def build(**kwargs):
+            order.append("build")
+            return request
+
+        def before():
+            order.append("dispatch")
+            return "session:support:9"
+
+        def invoke(requests, **kwargs):
+            self.assertEqual(next(requests).id, "session:support:9")
+            order.append("rpc")
+            return iter(())
+
+        dependencies = {
+            "rtp_llm.dash_sc.client": SimpleNamespace(build_model_infer_request=build),
+            "rtp_llm.dash_sc.codec": SimpleNamespace(
+                SamplingParams=lambda **kwargs: kwargs
+            ),
+        }
+        with patch.dict("sys.modules", dependencies):
+            result = _post_prefill_ids(
+                SimpleNamespace(ModelStreamInfer=invoke),
+                [1],
+                2,
+                "old",
+                before_dispatch=before,
+            )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["request_id"], "session:support:9")
+        self.assertEqual(order, ["build", "dispatch", "rpc"])
+
     def test_post_prefill_ids_registers_actual_call_before_iteration(self):
         from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
             _post_prefill_ids,
@@ -190,6 +787,169 @@ class TransportRegistrationTest(unittest.TestCase):
             )
         self.assertTrue(result["success"])
         self.assertEqual(stub.ModelStreamInfer.call_args.kwargs["timeout"], 17)
+
+
+class RunnerIntegrationTest(unittest.TestCase):
+    def test_scheduler_timeout_override_preserves_legacy_default(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            CacheGridRunner,
+        )
+
+        runner = CacheGridRunner.__new__(CacheGridRunner)
+        runner.port, runner.request_timeout = 123, 100
+        runner._http_session = SimpleNamespace(post=Mock())
+        with patch(
+            "rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner.configure_scheduler"
+        ) as configure:
+            runner._set_prefill_batch_size(4)
+            self.assertEqual(configure.call_args.kwargs["timeout"], 60)
+            runner._set_prefill_batch_size(4, timeout=0.2)
+            self.assertEqual(configure.call_args.kwargs["timeout"], 0.2)
+
+    def test_real_runner_transport_and_protobuf_polling(self):
+        from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2 as pb
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            CacheGridRunner,
+        )
+
+        clock, events, polls, rpc_ids = FakeClock(), [], [], []
+        sequence = [0]
+
+        def poll(request, timeout):
+            polls.append(request)
+            sequence[0] += 1
+            response = pb.CachePressureResponsePB(schema_version=1, requested_ranks=[0])
+            rank = response.ranks.add(
+                world_rank=0,
+                service_instance="actual-wire",
+                sequence=sequence[0],
+                sampled_monotonic_ns=int(clock() * 1e9),
+            )
+            rank.pools.add(pool_id="gpu", tier=1, total_blocks=100, used_blocks=90)
+            rank.pools.add(
+                pool_id="host",
+                tier=2,
+                total_blocks=100,
+                used_blocks=30,
+                published_host_blocks=25,
+            )
+            group = rank.groups.add(
+                group_id=0,
+                group_type=1,
+                device_pool_ids=["gpu"],
+                watermark_trigger_count=sequence[0],
+            )
+            group.host_pool_id.value = "host"
+            group.device_watermark.low_ratio, group.device_watermark.high_ratio = (
+                0.8,
+                0.9,
+            )
+            group.host_watermark.low_ratio, group.host_watermark.high_ratio = 0.8, 0.9
+            rank.transfers.add(
+                group_id=0,
+                pool_id="host",
+                pool_tier=2,
+                operation=2,
+                source_tier=1,
+                target_tier=2,
+                published_blocks=sequence[0],
+            )
+            rank.activity.running_requests.value = 1
+            rank.activity.waiting_requests.value = 0
+            rank.next_step_sequence = sequence[0]
+            return response
+
+        def infer(requests, **kwargs):
+            request = next(requests)
+            rpc_ids.append(request.id)
+            outputs = [
+                SimpleNamespace(name=name, datatype="INT32", shape=[1])
+                for name in (
+                    "prompt_token_num",
+                    "generated_ids",
+                    "prompt_cached_token_num",
+                )
+            ]
+            infer = SimpleNamespace(
+                parameters={},
+                outputs=outputs,
+                raw_output_contents=[
+                    struct.pack("<i", len(request.ids)),
+                    struct.pack("<i", 1),
+                    struct.pack("<i", 0),
+                ],
+            )
+            return iter(
+                [
+                    SimpleNamespace(
+                        error_message="",
+                        HasField=lambda field: True,
+                        infer_response=infer,
+                    )
+                ]
+            )
+
+        runner = CacheGridRunner.__new__(CacheGridRunner)
+        runner._grpc_stub = SimpleNamespace(ModelStreamInfer=infer)
+        runner.pressure_seed_count = 2
+        runner.cache_commit_tail_tokens = 1
+        runner.pressure_random_seed = 7
+        runner.pressure_client_concurrency = 2
+        runner.pressure_scheduler = "fifo"
+        runner.pressure_batch_size = 1
+        runner.pressure_request_rate = 4
+        runner.pressure_arrival = "constant"
+        runner.request_timeout = 2
+        runner._continuous_prompt_lock = Lock()
+        runner._set_prefill_batch_size = lambda count: self.fail("FIFO batch control")
+        generated = [0]
+
+        def exact(tokens, nonce):
+            generated[0] += 1
+            return "", [generated[0]] * tokens
+
+        runner.factory = SimpleNamespace(_exact_text_and_ids=exact)
+        original = cp.PressureSession
+
+        def session(*args, **kwargs):
+            return original(
+                *args,
+                **kwargs,
+                clock=clock,
+                sleep=clock.sleep,
+                executor_factory=InlineExecutor
+            )
+
+        dependencies = {
+            "rtp_llm.dash_sc.client": SimpleNamespace(
+                build_model_infer_request=lambda **kw: SimpleNamespace(
+                    id=kw["request_id"], ids=kw["input_ids"]
+                )
+            ),
+            "rtp_llm.dash_sc.codec": SimpleNamespace(
+                SamplingParams=lambda **kwargs: kwargs
+            ),
+        }
+        with patch.dict("sys.modules", dependencies), patch.object(
+            cp, "PressureSession", session
+        ), patch("time.monotonic", clock):
+            result = runner._run_full_pressure(
+                [dict(input_len=16, cache_len=0, batch_size=1)],
+                config(steady_s=1, measure_s=2, sample_period_s=0.5),
+                cp.ExecutionLimits(128, 2, 128, 64, 16),
+                SimpleNamespace(GetCachePressure=poll),
+                (0,),
+                events.append,
+            )
+        self.assertIsNone(result["failure"])
+        self.assertTrue(any(":fill:" in identity for identity in rpc_ids))
+        self.assertTrue(any(":measurement:" in identity for identity in rpc_ids))
+        self.assertTrue(all(request.max_step_records == 256 for request in polls))
+        self.assertGreater(polls[-1].after_step_sequence[0], 0)
+        self.assertIn(
+            "rank_offset_bounds_s",
+            next(e["raw"] for e in events if e["event"] == "pressure"),
+        )
 
 
 if __name__ == "__main__":

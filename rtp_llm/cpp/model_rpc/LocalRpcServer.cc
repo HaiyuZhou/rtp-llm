@@ -852,6 +852,17 @@ int64_t pressureNowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
+void profileStatusToProto(const ProfileStatus& value, ProfileStatusPB* pb) {
+    pb->set_supported(value.supported);
+    pb->set_state(value.state);
+    pb->set_trace_name(value.trace_name);
+    pb->set_stop_requested(value.stop_requested);
+    pb->set_collection_complete(value.collection_complete);
+    pb->set_export_complete(value.export_complete);
+    pb->set_collection_error(value.collection_error);
+    pb->set_export_error(value.export_error);
+    pb->set_file_name(value.file_name);
+}
 PressureTierPB pressureTier(Tier tier) {
     switch (tier) {
         case Tier::DEVICE:
@@ -1163,6 +1174,7 @@ grpc::Status LocalRpcServer::GetCachePressureInternal(grpc::ServerContext*      
         return {grpc::StatusCode::CANCELLED, "diagnostic request cancelled"};
     }
     auto result = engine_ ? engine_->getCachePressure() : unsupportedCachePressure();
+    profileStatusToProto(engine_ ? engine_->getProfileStatus() : ProfileStatus{}, record->mutable_profile());
     record->set_collect_duration_ns(pressureNowNs() - begin);
     response->set_coordinator_sent_ns(pressureNowNs());
     if (!result.ok()) {
@@ -1389,6 +1401,170 @@ grpc::Status LocalRpcServer::StartProfileInternal(grpc::ServerContext*          
                      request->start_step(),
                      request->num_steps());
     engine_->startTimelineProfiling(request->trace_name(), request->start_step(), request->num_steps());
+    return grpc::Status::OK;
+}
+
+grpc::Status LocalRpcServer::StopProfileInternal(grpc::ServerContext*                context,
+                                                 const StopProfileInternalRequestPB* request,
+                                                 StopProfileResponsePB*              response) {
+    return stopProfileLocal(
+        context,
+        request,
+        response,
+        std::min(context->deadline(),
+                 std::chrono::system_clock::now() + std::chrono::milliseconds(kPressureRpcTimeoutMs)));
+}
+
+grpc::Status LocalRpcServer::stopProfileLocal(grpc::ServerContext*                  context,
+                                              const StopProfileInternalRequestPB*   request,
+                                              StopProfileResponsePB*                response,
+                                              std::chrono::system_clock::time_point deadline) {
+    response->Clear();
+    auto* rank = response->add_ranks();
+    rank->set_world_rank(maga_init_params_.parallelism_config.world_rank);
+    rank->set_service_instance(pressure_instance_);
+    if (!engine_ || !engine_->getProfileStatus().supported) {
+        return {grpc::StatusCode::UNIMPLEMENTED, "profile cancellation unsupported"};
+    }
+    if (request->trace_name().empty() || request->trace_name().size() > 64) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "stop requires the configured trace identity (1..64 bytes)"};
+    }
+    if (context->IsCancelled() || std::chrono::system_clock::now() >= deadline) {
+        return {grpc::StatusCode::DEADLINE_EXCEEDED, "stop request deadline exceeded before acceptance"};
+    }
+    rank->set_accepted(engine_->stopTimelineProfiling(request->trace_name()));
+    if (!rank->accepted()) {
+        profileStatusToProto(engine_->getProfileStatus(), rank->mutable_profile());
+        return {grpc::StatusCode::FAILED_PRECONDITION, "profile trace identity mismatch"};
+    }
+    while (true) {
+        const auto status = engine_->getProfileStatus();
+        profileStatusToProto(status, rank->mutable_profile());
+        // A duplicate cleanup of the last finished trace never cancels a newer trace.
+        if (status.trace_name != request->trace_name() || status.collection_complete)
+            break;
+        if (context->IsCancelled() || std::chrono::system_clock::now() >= deadline) {
+            rank->set_error("stop accepted; owner-thread collection deadline exceeded");
+            break;
+        }
+        engine_->wakePressureControlProgress();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return grpc::Status::OK;
+}
+
+grpc::Status LocalRpcServer::StopProfile(grpc::ServerContext*        context,
+                                         const StopProfileRequestPB* request,
+                                         StopProfileResponsePB*      response) {
+    response->Clear();
+    StopProfileInternalRequestPB internal;
+    internal.set_trace_name(request->trace_name());
+    if (!request->enable_all_rank()) {
+        if (!request->target_ranks().empty()) {
+            return {grpc::StatusCode::INVALID_ARGUMENT, "target_ranks requires enable_all_rank"};
+        }
+        return StopProfileInternal(context, &internal, response);
+    }
+    const auto& topology = maga_init_params_.parallelism_config;
+    if (topology.tp_rank != 0) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "all-rank stop requires tp_rank 0"};
+    }
+    const int        base = topology.world_rank;
+    std::vector<int> ranks(request->target_ranks().begin(), request->target_ranks().end());
+    if (ranks.empty()) {
+        for (int i = 0; i < topology.tp_size; ++i)
+            ranks.push_back(base + i);
+    }
+    std::set<int> seen;
+    for (int rank : ranks) {
+        if (rank < base || rank >= base + topology.tp_size || !seen.insert(rank).second) {
+            return {grpc::StatusCode::INVALID_ARGUMENT, "duplicate or out-of-topology stop target"};
+        }
+    }
+    struct Pending {
+        grpc::ClientContext                                                     context;
+        StopProfileResponsePB                                                   response;
+        grpc::Status                                                            status;
+        std::shared_ptr<RpcService::Stub>                                       stub;
+        std::unique_ptr<grpc::ClientAsyncResponseReader<StopProfileResponsePB>> reader;
+        StopProfileRankPB*                                                      record;
+        int                                                                     rank;
+    };
+    const auto                            deadline = std::min(context->deadline(),
+                                   std::chrono::system_clock::now() + std::chrono::milliseconds(kPressureRpcTimeoutMs));
+    grpc::CompletionQueue                 queue;
+    std::vector<std::unique_ptr<Pending>> pending;
+    const auto&                           addresses = maga_init_params_.runtime_config.worker_grpc_addrs;
+    StopProfileRankPB*                    local     = nullptr;
+    for (int rank : ranks) {
+        auto* record = response->add_ranks();
+        record->set_world_rank(rank);
+        if (rank == topology.world_rank) {
+            local = record;
+            continue;
+        }
+        const int index = rank - base;
+        if (index >= addresses.size() || addresses[index].empty()) {
+            record->set_error("rank endpoint unavailable");
+            continue;
+        }
+        auto connection = pressure_rpc_pool_.getConnection(addresses[index]);
+        if (!connection.ok()) {
+            record->set_error(connection.status().ToString());
+            continue;
+        }
+        auto call    = std::make_unique<Pending>();
+        call->record = record;
+        call->rank   = rank;
+        call->stub   = connection.value().stub;
+        call->context.set_deadline(deadline);
+        call->reader = call->stub->AsyncStopProfileInternal(&call->context, internal, &queue);
+        call->reader->Finish(&call->response, &call->status, call.get());
+        pending.push_back(std::move(call));
+    }
+    if (local) {
+        // Give local handling the same bounded deadline as peers.
+        StopProfileResponsePB local_response;
+        const auto            status = stopProfileLocal(context, &internal, &local_response, deadline);
+        if (local_response.ranks_size())
+            *local = local_response.ranks(0);
+        if (!status.ok())
+            local->set_error(status.error_message());
+    }
+    bool cancelled = false;
+    for (size_t completed = 0; completed < pending.size();) {
+        void*      tag = nullptr;
+        bool       ok  = false;
+        const auto now = std::chrono::system_clock::now();
+        if (now >= deadline || context->IsCancelled()) {
+            if (!cancelled) {
+                for (auto& call : pending)
+                    call->context.TryCancel();
+                cancelled = true;
+            }
+            queue.Next(&tag, &ok);
+        } else {
+            // Internal responses wait for owner-thread collection, not merely
+            // acceptance. Delayed peer flags therefore still receive TP progress.
+            if (engine_)
+                engine_->wakePressureControlProgress();
+            if (queue.AsyncNext(&tag, &ok, std::min(deadline, now + std::chrono::milliseconds(10)))
+                != grpc::CompletionQueue::GOT_EVENT)
+                continue;
+        }
+        ++completed;
+        auto* call = static_cast<Pending*>(tag);
+        if (ok && call->status.ok() && call->response.ranks_size() == 1
+            && call->response.ranks(0).world_rank() == call->rank) {
+            *call->record = call->response.ranks(0);
+        } else {
+            call->record->set_error(call->status.ok() ? "invalid stop response" : call->status.error_message());
+        }
+    }
+    queue.Shutdown();
+    void* tag = nullptr;
+    bool  ok  = false;
+    while (queue.Next(&tag, &ok)) {}
     return grpc::Status::OK;
 }
 

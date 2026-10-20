@@ -114,5 +114,51 @@ TEST_P(EngineStopTest, StopWaitsForInFlightPrefillOnlyDispatch) {
 
 INSTANTIATE_TEST_SUITE_P(SerialAndParallel, EngineStopTest, ::testing::Values(0, 2));
 
+class ProfileEngineStopTest: public DeviceTestBase {};
+
+TEST_F(ProfileEngineStopTest, IdlePausedAndShutdownServiceCollectorOnOwnerWithoutForward) {
+    for (int mode = 0; mode < 3; ++mode) {
+        ModelConfig   model;
+        RuntimeConfig runtime;
+        KVCacheConfig cache;
+        auto          params               = createEngineInitParams(CustomConfig{}, model, runtime, cache);
+        params.runtime_config.warm_up      = false;
+        NormalExecutor::test_model_factory = [&](const GptModelInitParams&) {
+            return std::make_unique<MockModel>(model.vocab_size, [](const GptModelInputs&) {
+                ADD_FAILURE() << "idle profile cleanup must not run a forward";
+            });
+        };
+        auto engine                        = std::make_shared<NormalEngine>(params, nullptr, false);
+        NormalExecutor::test_model_factory = nullptr;
+        engine->startTimelineProfiling("idle_stop_window", 0, 20);
+        if (mode == 1)
+            engine->pause();
+        std::promise<void> started;
+        auto               ready = started.get_future();
+        engine->running_         = true;
+        engine->loop_thread_     = autil::Thread::createThread(
+            [&] {
+                engine->step_profiler_.startStep();
+                engine->step_profiler_.finishStep();
+                started.set_value();
+                engine->loop();
+            },
+            "idle_profile_test");
+        ready.wait();
+        if (mode != 2) {
+            EXPECT_TRUE(engine->stopTimelineProfiling("idle_stop_window"));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!engine->getProfileStatus().collection_complete && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            EXPECT_TRUE(engine->getProfileStatus().collection_complete);
+        }
+        EXPECT_TRUE(engine->stop().ok());
+        EXPECT_TRUE(engine->getProfileStatus().collection_complete);
+        EXPECT_TRUE(engine->getProfileStatus().collection_error.empty());
+        EXPECT_EQ(engine->step_profiler_.profiled_steps_, 1);
+    }
+}
+
 }  // namespace
 }  // namespace rtp_llm

@@ -708,10 +708,14 @@ void NormalEngine::loop() {
     while (running_) {
         auto status = step();
         if (!status.ok()) {
+            step_profiler_.requestStop(step_profiler_.status().trace_name);
+            step_profiler_.serviceControl();
             RTP_LLM_LOG_ERROR("step running error: %s", status.ToString().c_str());
             THROW_IF_STATUS_ERROR(trySaveStepError());
         }
     }
+    step_profiler_.requestStop(step_profiler_.status().trace_name);
+    step_profiler_.serviceControl();
 }
 
 absl::Status NormalEngine::trySaveStepError() const {
@@ -845,8 +849,10 @@ NormalEngine::enqueueMultiple(const std::vector<std::shared_ptr<GenerateInput>>&
 
 absl::Status NormalEngine::step() try {
     RTP_LLM_PROFILE_SCOPE("engine.normal.step_work");
+    step_profiler_.serviceControl();
     applyPressureControls();
-    while (pause_) {
+    while (pause_ && running_) {
+        step_profiler_.serviceControl();
         applyPressureControls();
         // wait 50ms if system paused.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -860,6 +866,7 @@ absl::Status NormalEngine::step() try {
             CHECK_AND_ASSIGN(streams, scheduler_->schedule());
         }
         applyPressureControls();
+        step_profiler_.serviceControl();
         if (parallelism_config.dp_size > 1) {
             RTP_LLM_PROFILE_SCOPE("engine.normal.may_add_fake_stream_work");
             mayAddFakeStream(streams);
@@ -901,6 +908,7 @@ absl::Status NormalEngine::step() try {
             step_profiler_.finishStep();
         }
     }
+    step_profiler_.serviceControl();
 
     // report step metrics
     // loop() is a no-sleep tight loop and with TP>1 every iteration enters
@@ -914,6 +922,8 @@ absl::Status NormalEngine::step() try {
 
     return status;
 } catch (const std::exception& exception) {
+    step_profiler_.requestStop(step_profiler_.status().trace_name);
+    step_profiler_.serviceControl();
     if (isTorchCudaOom(exception)) {
         dumpFatalTorchCudaOomDiagnostics(parallelism_config.local_rank, exception);
     }
@@ -1005,6 +1015,13 @@ void NormalEngine::applyPressureControls() {
 
 void NormalEngine::startTimelineProfiling(const std::string& trace_name, int start_step, int num_steps) {
     step_profiler_.configure(true, trace_name, start_step, num_steps);
+}
+
+bool NormalEngine::stopTimelineProfiling(const std::string& trace_name) {
+    const bool accepted = step_profiler_.requestStop(trace_name);
+    if (accepted && scheduler_)
+        scheduler_->wakeForControl();
+    return accepted;
 }
 
 bool NormalEngine::isMTPEagle() {

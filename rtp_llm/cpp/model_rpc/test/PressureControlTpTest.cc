@@ -54,6 +54,12 @@ public:
         std::this_thread::sleep_for(std::chrono::milliseconds(request->phase() == "expired" ? 1500 : 200));
         return LocalRpcServiceImpl::ControlPressureDiagnosticsInternal(context, request, response);
     }
+    grpc::Status StopProfileInternal(grpc::ServerContext*                context,
+                                     const StopProfileInternalRequestPB* request,
+                                     StopProfileResponsePB*              response) override {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        return LocalRpcServiceImpl::StopProfileInternal(context, request, response);
+    }
 };
 
 class PressureControlTpChild: public DeviceTestBase {};
@@ -84,7 +90,17 @@ TEST_F(PressureControlTpChild, DISABLED_RunRank) {
     executor->parallelism_config_.tp_size = 2;
     executor->parallelism_config_.tp_rank = rank;
     executor->tp_rank_                    = rank;
-    ASSERT_TRUE(engine->startLoop().ok());
+    engine->step_profiler_.configure(true, "tp_stop_window", 0, 20);
+    engine->running_ = true;
+    // Start a real collector on the engine worker before entering idle TP sync.
+    // Cancellation must not require any further execution steps.
+    engine->loop_thread_ = autil::Thread::createThread(
+        [&] {
+            engine->step_profiler_.startStep();
+            engine->step_profiler_.finishStep();
+            engine->loop();
+        },
+        "profile_tp_test");
     NormalExecutor::test_model_factory = nullptr;
 
     if (rank == 1) {
@@ -114,7 +130,28 @@ TEST_F(PressureControlTpChild, DISABLED_RunRank) {
         int port = 0;
         std::ifstream(base + ".port") >> port;
         PressureTpServer server(engine, rank, "127.0.0.1:" + std::to_string(port));
-        auto             control = [&](const std::string&                      session,
+        auto             stop_profile = [&](bool peer_only) {
+            StopProfileRequestPB request;
+            request.set_trace_name("tp_stop_window");
+            request.set_enable_all_rank(true);
+            if (peer_only)
+                request.add_target_ranks(1);
+            StopProfileResponsePB response;
+            grpc::ServerContext   context;
+            ASSERT_TRUE(server.StopProfile(&context, &request, &response).ok());
+            ASSERT_EQ(response.ranks_size(), peer_only ? 1 : 2);
+            for (const auto& rank : response.ranks()) {
+                EXPECT_TRUE(rank.accepted());
+                EXPECT_TRUE(rank.error().empty()) << rank.error();
+                EXPECT_TRUE(rank.profile().collection_complete());
+                EXPECT_TRUE(rank.profile().collection_error().empty());
+            }
+        };
+        stop_profile(true);
+        EXPECT_EQ(engine->getProfileStatus().state, "active");
+        stop_profile(false);
+        EXPECT_EQ(engine->step_profiler_.profiled_steps_, 1);
+        auto control = [&](const std::string&                      session,
                            PressureSessionControlRequestPB::Action action,
                            bool                                    peer_only,
                            const std::string&                      phase = "") {

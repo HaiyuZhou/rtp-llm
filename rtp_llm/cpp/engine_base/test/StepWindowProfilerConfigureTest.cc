@@ -72,4 +72,24 @@ TEST_F(StepWindowProfilerConfigureTest, ClampsNegativeStartStep) {
     EXPECT_EQ(profiler_.start_step_.load(), 0);
 }
 
+TEST_F(StepWindowProfilerConfigureTest, StopIsScopedAndCanDisarmBeforeStart) {
+    profiler_.configure(true, "sessionA_window0", 0, 20);
+    EXPECT_FALSE(profiler_.requestStop("sessionB_window0"));
+    EXPECT_TRUE(profiler_.enabled());
+    EXPECT_EQ(profiler_.status().state, "armed");
+    EXPECT_TRUE(profiler_.requestStop("sessionA_window0"));
+    EXPECT_FALSE(profiler_.enabled());
+    profiler_.serviceControl();
+    EXPECT_FALSE(profiler_.has_profiler_.load());
+    EXPECT_TRUE(profiler_.requestStop("sessionA_window0"));
+    EXPECT_EQ(profiler_.status().state, "finished");
+    EXPECT_TRUE(profiler_.status().collection_complete);
+    profiler_.configure(true, "sessionA_window0", 0, 20);
+    EXPECT_FALSE(profiler_.enabled());
+    profiler_.configure(true, "sessionB_window0", 0, 20);
+    EXPECT_TRUE(profiler_.requestStop("sessionA_window0"));
+    EXPECT_TRUE(profiler_.enabled());
+    EXPECT_EQ(profiler_.status().trace_name, "sessionB_window0");
+}
+
 }  // namespace rtp_llm

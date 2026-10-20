@@ -76,6 +76,12 @@ public:
                                                     PressureSessionControlResponsePB*);
 
     grpc::Status StartProfile(grpc::ServerContext* context, const StartProfileRequestPB* request, EmptyPB* response);
+    grpc::Status StopProfile(grpc::ServerContext*, const StopProfileRequestPB*, StopProfileResponsePB*);
+    grpc::Status StopProfileInternal(grpc::ServerContext*, const StopProfileInternalRequestPB*, StopProfileResponsePB*);
+    grpc::Status stopProfileLocal(grpc::ServerContext*,
+                                  const StopProfileInternalRequestPB*,
+                                  StopProfileResponsePB*,
+                                  std::chrono::system_clock::time_point deadline);
 
     grpc::Status
     StartProfileInternal(grpc::ServerContext* context, const StartProfileInternalRequestPB* request, EmptyPB* response);

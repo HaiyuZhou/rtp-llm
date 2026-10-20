@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include "rtp_llm/cpp/config/ConfigModules.h"
+#include "rtp_llm/cpp/engine_base/TorchProfiler.h"
 #include "rtp_llm/cpp/model_rpc/LocalRpcServer.h"
 #include "rtp_llm/cpp/model_rpc/LocalRpcServiceImpl.h"
 #include "rtp_llm/cpp/model_rpc/RpcErrorCode.h"
@@ -205,6 +206,13 @@ private:
 class PressureEngine: public FailingEngine {
 public:
     PressureEngine(): FailingEngine(EngineFailureMode::REJECT_ALL) {}
+    StepWindowProfiler profiler;
+    bool               stopTimelineProfiling(const std::string& trace) override {
+        return profiler.requestStop(trace);
+    }
+    ProfileStatus getProfileStatus() const override {
+        return profiler.status();
+    }
     ErrorResult<CachePressureSnapshot> getCachePressure() const override {
         ++snapshot_calls;
         return CachePressureSnapshot(snapshot);
@@ -242,6 +250,92 @@ public:
         local_server_ = server;
     }
 };
+
+TEST(LocalRpcServerProfileTest, ForwardedStopIsScopedIdempotentAndVisibleInDiagnosticStatus) {
+    auto engine = std::make_shared<PressureEngine>();
+    engine->profiler.configure(true, "session_window", 0, 20);
+    auto server = std::make_shared<TestLocalRpcServer>();
+    server->configurePressure(0);
+    server->setEngineForTest(engine);
+    PressureService       service(server);
+    StopProfileRequestPB  request;
+    StopProfileResponsePB response;
+    grpc::ServerContext   context;
+    request.set_trace_name("wrong_window");
+    EXPECT_EQ(service.StopProfile(&context, &request, &response).error_code(), grpc::StatusCode::FAILED_PRECONDITION);
+    EXPECT_TRUE(engine->profiler.enabled());
+    request.set_trace_name("session_window");
+    ASSERT_TRUE(service.StopProfile(&context, &request, &response).ok());
+    ASSERT_EQ(response.ranks_size(), 1);
+    EXPECT_TRUE(response.ranks(0).accepted());
+    EXPECT_TRUE(response.ranks(0).profile().collection_complete());
+    StopProfileInternalRequestPB internal;
+    internal.set_trace_name(request.trace_name());
+    EXPECT_TRUE(service.StopProfileInternal(&context, &internal, &response).ok());
+    EXPECT_TRUE(response.ranks(0).accepted());
+    CachePressureRequestPB  poll;
+    CachePressureResponsePB snapshot;
+    ASSERT_TRUE(service.GetCachePressure(&context, &poll, &snapshot).ok());
+    ASSERT_EQ(snapshot.ranks_size(), 1);
+    EXPECT_EQ(snapshot.ranks(0).profile().trace_name(), "session_window");
+    EXPECT_EQ(snapshot.ranks(0).profile().state(), "finished");
+    EXPECT_TRUE(snapshot.ranks(0).profile().stop_requested());
+    EXPECT_EQ(snapshot.ranks(0).service_instance(), response.ranks(0).service_instance());
+}
+
+TEST(LocalRpcServerProfileTest, UnsupportedAndInvalidTargetsDoNotAcknowledgeStop) {
+    auto server = std::make_shared<TestLocalRpcServer>();
+    server->configurePressure(0, 0, 2);
+    server->setEngineForTest(std::make_shared<FailingEngine>(EngineFailureMode::REJECT_ALL));
+    PressureService      service(server);
+    StopProfileRequestPB request;
+    request.set_trace_name("session_window");
+    StopProfileResponsePB response;
+    grpc::ServerContext   context;
+    EXPECT_EQ(service.StopProfile(&context, &request, &response).error_code(), grpc::StatusCode::UNIMPLEMENTED);
+    EXPECT_FALSE(response.ranks(0).accepted());
+    request.set_enable_all_rank(true);
+    request.add_target_ranks(1);
+    request.add_target_ranks(1);
+    EXPECT_EQ(service.StopProfile(&context, &request, &response).error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+}
+
+TEST(LocalRpcServerProfileTest, AcceptedStopTimeoutDoesNotClaimCollectionOrExport) {
+    TestLocalRpcServer server;
+    server.configurePressure(0);
+    auto engine = std::make_shared<PressureEngine>();
+    server.setEngineForTest(engine);
+    engine->profiler.configure(true, "session_window", 0, 20);
+    std::promise<void> started, release;
+    auto               ready = started.get_future();
+    auto               gate  = release.get_future();
+    std::thread        worker([&] {
+        engine->profiler.startStep();
+        engine->profiler.finishStep();
+        started.set_value();
+        gate.wait();
+        engine->profiler.serviceControl();
+    });
+    ready.wait();
+    StopProfileRequestPB request;
+    request.set_trace_name("session_window");
+    StopProfileResponsePB response;
+    grpc::ServerContext   context;
+    const auto            begin = std::chrono::steady_clock::now();
+    EXPECT_TRUE(server.StopProfile(&context, &request, &response).ok());
+    EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(2));
+    EXPECT_EQ(response.ranks_size(), 1);
+    if (response.ranks_size() == 1) {
+        EXPECT_TRUE(response.ranks(0).accepted());
+        EXPECT_FALSE(response.ranks(0).error().empty());
+        EXPECT_EQ(response.ranks(0).profile().state(), "stopping");
+        EXPECT_FALSE(response.ranks(0).profile().collection_complete());
+        EXPECT_FALSE(response.ranks(0).profile().export_complete());
+    }
+    release.set_value();
+    worker.join();
+    EXPECT_TRUE(engine->getProfileStatus().collection_complete);
+}
 
 class RecordingWriter: public LocalRpcServer::WriterInterface {
 public:

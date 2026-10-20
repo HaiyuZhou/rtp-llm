@@ -52,8 +52,12 @@ public:
             metrics_reporter_->report<RtpLLMEngineMetrics, RtpLLMEngineMetricsCollector>(nullptr, &collector);
         }
     }
-    bool updateEplbConfig(const EPLBConfig& config) override;
-    void startTimelineProfiling(const std::string& trace_name, int start_step, int num_steps) override;
+    bool          updateEplbConfig(const EPLBConfig& config) override;
+    void          startTimelineProfiling(const std::string& trace_name, int start_step, int num_steps) override;
+    bool          stopTimelineProfiling(const std::string& trace_name) override;
+    ProfileStatus getProfileStatus() const override {
+        return step_profiler_.status();
+    }
 
 private:
     void applyPressureControls();

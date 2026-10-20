@@ -37,6 +37,7 @@ cc_library(
     name = "profiler",
     hdrs = [
         "TorchProfiler.h",
+        "ProfileStatus.h",
     ],
     srcs = [
         "TorchProfiler.cc",

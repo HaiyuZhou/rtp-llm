@@ -2,6 +2,7 @@
 
 #include <utility>
 #include "rtp_llm/cpp/engine_base/PressureDiagnostics.h"
+#include "rtp_llm/cpp/engine_base/ProfileStatus.h"
 
 #include "absl/status/status.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
@@ -108,6 +109,12 @@ public:
         return false;
     }
     virtual void startTimelineProfiling(const std::string& trace_name, int start_step, int num_steps) {}
+    virtual bool stopTimelineProfiling(const std::string& trace_name) {
+        return false;
+    }
+    virtual ProfileStatus getProfileStatus() const {
+        return {};
+    }
 
     std::shared_ptr<KVCacheManager> getCacheManager() const;
 

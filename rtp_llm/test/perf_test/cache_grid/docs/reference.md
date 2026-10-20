@@ -632,3 +632,51 @@ with `p99_status=insufficient` below 1000 eligible intervals; above that thresho
 it is `estimated`. This threshold is a reporting heuristic, not a confidence
 guarantee. Reservoir sampling has sampling error and supplies no tail-error bound;
 20-step traces should be interpreted structurally, not as reliable tail estimates.
+
+### Thread-affine Kineto cancellation
+
+`StopProfile` accepts `trace_name`, `enable_all_rank`, and an optional
+`target_ranks` TP subset (the subset requires `enable_all_rank=true`). All-rank
+requests go to TP rank zero; `StopProfileInternal` only acts locally. Both RPCs
+are forwarded by `LocalRpcServiceImpl`. Use a distinct session-and-window trace
+identity within the existing 64-character `[A-Za-z0-9_-]` sanitized name limit;
+stop uses the exact configured identity, without sanitizing a different request
+into a match. Start's default three steps, maximum 1000 steps, and nonnegative
+start-step sanitization are unchanged.
+
+Each stop rank response contains `world_rank`, its independent `service_instance`,
+`accepted`, `profile`, and `error`. `accepted` means only that the matching
+cancellation request was accepted. A duplicate stop of the last finished trace
+is idempotent and cannot cancel a newer trace. A mismatched trace is rejected.
+A stopped window cannot be resurrected by a duplicate start. A different window
+can start after the prior collection/export has settled.
+
+`GetCachePressure.ranks[].profile` adds `supported`, `trace_name`, `state`,
+`stop_requested`, `collection_complete`, `export_complete`, `collection_error`,
+`export_error`, and `file_name`; ordinary worker status is unchanged. States are
+`armed`, `active`, `stopping`, and `finished`. `stopping` includes collection and
+pending asynchronous export. `finished` is terminal, including failures; inspect
+both error fields. Disarming before start finishes without creating a file.
+`collection_complete` means collection has returned, including a collector failure;
+it does not imply export. `export_complete` means the save returned and basic
+output-file checks passed, or no collector ever started. These checks are not a
+JSON parser or trace-validity verdict: the capture client must still parse the
+artifact and validate activities, step coverage, identities and completion tails.
+Failed/partial output files remain available for investigation.
+
+Stop RPCs observe owner-thread collection for at most one second, bounded by
+the incoming deadline. Partial failures are returned per rank. A timeout after
+acceptance retains `accepted=true`, incomplete status and an explicit error when
+the response can be delivered. A transport deadline can hide an acceptance;
+poll status and retry the same identity within the caller's cleanup budget.
+TP root continues bounded idle progress until internal owner-thread observations
+return, including delayed and peer-only cancellation. Request acceptance alone
+does not end that progress loop. No additional per-forward collective is added.
+
+The engine services cancellation at idle, pause, safe execution completion and
+loop shutdown boundaries without advancing profiling steps. Kineto collection
+and device drain stay on the thread that started collection. RPC handlers and
+wrong-thread destructors never disable Kineto. A stuck model call or collector
+cannot be force-stopped from RPC: status remains incomplete, the external caller
+must bound cleanup and apply existing service teardown policy. Async saver joins
+and Kineto teardown themselves are not forcibly interrupted by these RPC bounds.

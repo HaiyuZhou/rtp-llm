@@ -1,7 +1,24 @@
 #include "gtest/gtest.h"
 #include "rtp_llm/cpp/engine_base/schedulers/BatchDecodeScheduler.h"
+#include <future>
 
 namespace rtp_llm {
+
+TEST(BatchDecodeSchedulerModeTest, ControlWakeReturnsEmptyWithoutChangingBatchPolicy) {
+    RuntimeConfig runtime;
+    runtime.batch_decode_scheduler_config.batch_decode_scheduler_batch_size = 16;
+    BatchDecodeScheduler scheduler(runtime, nullptr, nullptr, 0, RoleType::PREFILL);
+    auto                 pending = std::async(std::launch::async, [&] { return scheduler.schedule(); });
+    EXPECT_EQ(pending.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    scheduler.wakeForControl();
+    ASSERT_EQ(pending.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto result = pending.get();
+    ASSERT_TRUE(result.ok());
+    EXPECT_TRUE(result.value().empty());
+    EXPECT_EQ(scheduler.batch_size_, 16);
+    EXPECT_EQ(scheduler.scheduler_type_, BatchDecodeScheduler::kBatchPrefill);
+    EXPECT_FALSE(scheduler.control_wakeup_);
+}
 
 TEST(BatchDecodeSchedulerModeTest, LegacyConstructorDefaultsToDecode) {
     RuntimeConfig runtime;

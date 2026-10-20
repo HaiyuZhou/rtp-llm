@@ -94,6 +94,6 @@ cc_library(
 cc_library(
     name = "pressure_diagnostics",
     hdrs = ["PressureDiagnostics.h"],
-    deps = ["//rtp_llm/cpp/cache/block_tree_cache", "//rtp_llm/cpp/utils:error_code"],
+    deps = ["//rtp_llm/cpp/cache/block_tree_cache", "//rtp_llm/cpp/utils:error_code", "//rtp_llm/cpp/normal_engine:pressure_step_recorder"],
     visibility = ["//visibility:public"],
 )

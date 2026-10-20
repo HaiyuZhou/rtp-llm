@@ -105,6 +105,16 @@ public:
         return local_server_->StartProfileInternal(context, request, response);
     }
 
+    ::grpc::Status ControlPressureDiagnostics(::grpc::ServerContext*                 context,
+                                              const PressureSessionControlRequestPB* request,
+                                              PressureSessionControlResponsePB*      response) override {
+        return local_server_->ControlPressureDiagnostics(context, request, response);
+    }
+    ::grpc::Status ControlPressureDiagnosticsInternal(::grpc::ServerContext*                 context,
+                                                      const PressureSessionControlRequestPB* request,
+                                                      PressureSessionControlResponsePB*      response) override {
+        return local_server_->ControlPressureDiagnosticsInternal(context, request, response);
+    }
     ::grpc::Status GetCachePressure(::grpc::ServerContext*        context,
                                     const CachePressureRequestPB* request,
                                     CachePressureResponsePB*      response) override {

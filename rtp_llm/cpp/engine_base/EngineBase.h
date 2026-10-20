@@ -69,6 +69,14 @@ public:
         return unsupportedCachePressure();
     }
 
+    virtual PressureStepPage getPressureSteps(const std::string&, uint64_t, size_t) const {
+        return {};
+    }
+    virtual ErrorResult<int64_t> controlPressureDiagnostics(const PressureSessionControl&,
+                                                            std::chrono::system_clock::time_point) {
+        return {kPressureDiagnosticsUnsupported, "pressure session diagnostics unsupported"};
+    }
+
     virtual KVCacheInfo getCacheStatusInfo(int64_t latest_version, bool need_cache_keys) = 0;
 
     virtual const ResourceContext& resourceContext() const {

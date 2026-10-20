@@ -41,6 +41,13 @@ public:
         dp_rank_        = dp_rank;
     }
     virtual ~BatchDecodeScheduler() = default;
+    void wakeForControl() override {
+        {
+            std::lock_guard<std::mutex> lock(lock_);
+            control_wakeup_ = true;
+        }
+        cond_.notify_all();
+    }
 
     // Reject inputs longer than the KV cache can hold; mark the stream errored so the caller
     // sees the failure via collectStreamOutput / pollStreamOutput. Mirrors FIFOScheduler.
@@ -229,9 +236,10 @@ public:
     absl::StatusOr<std::list<GenerateStreamPtr>> schedule() override {
         std::unique_lock<std::mutex> lock(lock_);
         cond_.wait_for(lock, std::chrono::seconds(30), [this] {
-            return waiting_streams_.size() >= batch_size_ || running_streams_.size() > 0
+            return control_wakeup_ || waiting_streams_.size() >= batch_size_ || running_streams_.size() > 0
                    || !loading_cache_streams_.empty() || (draining_mixed_modes_ && !waiting_streams_.empty());
         });
+        control_wakeup_ = false;
 
         // 统一通过状态机驱动各队列中 stream 的状态转移
         // LOADING_CACHE -> DONE/WAITING: error / load cache done
@@ -284,6 +292,7 @@ private:
     bool                         reorder_request_;
     uint32_t                     current_step_         = 0;
     bool                         draining_mixed_modes_ = false;
+    bool                         control_wakeup_       = false;
 
     std::shared_ptr<KVCacheManager> cache_manager_;
     kmonitor::MetricsReporterPtr    metrics_reporter_;

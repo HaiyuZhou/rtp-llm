@@ -218,6 +218,10 @@ GptModelInputShapeHints getModelInputShapeHints(const GptModelInputs& inputs) {
     shape_hints[GptModelInputIndex::tensorDeviceMap]          = static_cast<int64_t>(device_bits);
     shape_hints[GptModelInputIndex::kvCacheKernelBlockIdRank] = kernel_block_table.rank;
     shape_hints[GptModelInputIndex::kvCacheBlockIdRank]       = block_table.rank;
+    shape_hints[GptModelInputIndex::pressureStepId]           = inputs.pressure_step_id;
+    shape_hints[GptModelInputIndex::pressureContextBatch]     = inputs.pressure_context_batch;
+    shape_hints[GptModelInputIndex::pressureDecodeBatch]      = inputs.pressure_decode_batch;
+    shape_hints[GptModelInputIndex::pressureTokens]           = inputs.pressure_tokens;
     return shape_hints;
 }
 
@@ -342,6 +346,10 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         static_cast<size_t>(checkedHint(GptModelInputIndex::seqSizePerBlock, "seqSizePerBlock"));
     inputs.kernel_seq_size_per_block =
         static_cast<size_t>(checkedHint(GptModelInputIndex::kernelSeqSizePerBlock, "kernelSeqSizePerBlock"));
+    inputs.pressure_step_id       = checkedHint(GptModelInputIndex::pressureStepId, "pressureStepId");
+    inputs.pressure_context_batch = checkedHint(GptModelInputIndex::pressureContextBatch, "pressureContextBatch");
+    inputs.pressure_decode_batch  = checkedHint(GptModelInputIndex::pressureDecodeBatch, "pressureDecodeBatch");
+    inputs.pressure_tokens        = checkedHint(GptModelInputIndex::pressureTokens, "pressureTokens");
     if (inputs.skip_run) {
         inputs.kv_cache_group_tags.clear();
         inputs.kv_cache_block_id        = torch::Tensor();

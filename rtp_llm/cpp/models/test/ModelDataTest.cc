@@ -290,6 +290,10 @@ void checkGroupedTpRound(GptModelInputs&                 inputs,
         inputs.combo_tokens             = torch::tensor({7, 8}, torch::kInt32);
         inputs.input_lengths            = torch::tensor({1, 1}, torch::kInt32);
         inputs.sequence_lengths         = torch::tensor({4, 5}, torch::kInt32);
+        inputs.pressure_step_id         = empty_tables ? 0 : 17;
+        inputs.pressure_context_batch   = empty_tables ? 0 : 2;
+        inputs.pressure_decode_batch    = empty_tables ? 0 : 3;
+        inputs.pressure_tokens          = empty_tables ? 0 : 1234;
         inputs.kv_cache_block_id        = physical.clone();
         inputs.kv_cache_kernel_block_id = kernel.clone();
         inputs.kv_cache_group_types     = types.clone();
@@ -305,6 +309,10 @@ void checkGroupedTpRound(GptModelInputs&                 inputs,
     tpSyncModelInputs(inputs, config);
 
     EXPECT_EQ(inputs.kv_cache_group_tags, local_tags);
+    EXPECT_EQ(inputs.pressure_step_id, empty_tables ? 0 : 17);
+    EXPECT_EQ(inputs.pressure_context_batch, empty_tables ? 0 : 2);
+    EXPECT_EQ(inputs.pressure_decode_batch, empty_tables ? 0 : 3);
+    EXPECT_EQ(inputs.pressure_tokens, empty_tables ? 0 : 1234);
     std::vector<int64_t> local_to_root;
     for (const auto& tag : local_tags) {
         local_to_root.push_back(std::find(root_tags.begin(), root_tags.end(), tag) - root_tags.begin());
@@ -407,9 +415,9 @@ TEST(ModelInputTpSyncChild, DISABLED_RunRank) {
     EXPECT_THROW(tpSyncModelInputs(invalid, config), RTPException);
     invalid.kv_cache_group_tags.clear();
     EXPECT_THROW(tpSyncModelInputs(invalid, config), RTPException);
-    invalid.kv_cache_group_tags      = {"first", "second"};
-    invalid.kv_cache_block_id        = torch::zeros({2, 1, 1}, torch::kInt32);
-    invalid.kv_cache_update_mapping  = torch::tensor({2, 1, 2}, torch::kInt32).reshape({1, 3});
+    invalid.kv_cache_group_tags     = {"first", "second"};
+    invalid.kv_cache_block_id       = torch::zeros({2, 1, 1}, torch::kInt32);
+    invalid.kv_cache_update_mapping = torch::tensor({2, 1, 2}, torch::kInt32).reshape({1, 3});
     EXPECT_THROW(tpSyncModelInputs(invalid, config), RTPException);
     broadcaster.reset();
     ::alarm(0);

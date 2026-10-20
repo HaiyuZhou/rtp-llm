@@ -2,16 +2,24 @@ load("//:def.bzl", "copts")
 load("@arch_config//:arch_select.bzl", "torch_deps")
 
 cc_library(
+    name = "pressure_step_recorder",
+    hdrs = ["PressureStepRecorder.h"],
+    srcs = ["PressureStepRecorder.cc"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "normal_engine",
     hdrs = glob([
         "*.h",
         "speculative/*.h",
-    ]),
+    ], exclude = ["PressureStepRecorder.h"]),
     srcs = glob([
         "*.cc",
         "speculative/*.cc",
-    ]),
+    ], exclude = ["PressureStepRecorder.cc"]),
     deps = [
+        ":pressure_step_recorder",
         "//rtp_llm/cpp/config:role_types",
         "//rtp_llm/cpp/models:models",
         "//rtp_llm/cpp/models:logits_processor",

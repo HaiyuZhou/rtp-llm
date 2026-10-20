@@ -68,6 +68,12 @@ public:
     grpc::Status GetCachePressure(grpc::ServerContext*, const CachePressureRequestPB*, CachePressureResponsePB*);
     grpc::Status
     GetCachePressureInternal(grpc::ServerContext*, const CachePressureRequestPB*, CachePressureResponsePB*);
+    grpc::Status ControlPressureDiagnostics(grpc::ServerContext*,
+                                            const PressureSessionControlRequestPB*,
+                                            PressureSessionControlResponsePB*);
+    grpc::Status ControlPressureDiagnosticsInternal(grpc::ServerContext*,
+                                                    const PressureSessionControlRequestPB*,
+                                                    PressureSessionControlResponsePB*);
 
     grpc::Status StartProfile(grpc::ServerContext* context, const StartProfileRequestPB* request, EmptyPB* response);
 

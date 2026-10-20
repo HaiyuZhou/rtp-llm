@@ -31,6 +31,8 @@ enum class ParallelMode {
 // context batch is request for initial word, decoder batch is request for incremental word.
 // ids and lengths are int32_t
 struct GptModelInputs {
+    // Root-owned diagnostic metadata travels in the existing TP shape broadcast.
+    uint64_t      pressure_step_id{0}, pressure_context_batch{0}, pressure_decode_batch{0}, pressure_tokens{0};
     torch::Tensor engram_token_windows;
     torch::Tensor mm_features_spans;
     // input_lengths holds original input length for requests,

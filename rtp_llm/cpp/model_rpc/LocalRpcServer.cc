@@ -955,6 +955,171 @@ std::string LocalRpcServer::makePressureInstance() {
            + std::to_string(std::random_device{}());
 }
 
+namespace {
+grpc::Status validatePressureControl(const PressureSessionControlRequestPB& request) {
+    if (request.session_id().empty() || request.session_id().size() > 256 || request.phase().size() > 256
+        || request.action() < PressureSessionControlRequestPB::ENABLE
+        || request.action() > PressureSessionControlRequestPB::DISABLE
+        || request.recorder_capacity() > PressureStepRecorder::kMaxCapacity
+        || (request.action() != PressureSessionControlRequestPB::ENABLE && request.recorder_capacity())
+        || (request.action() == PressureSessionControlRequestPB::MARK_PHASE && request.phase().empty())) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "invalid pressure session control"};
+    }
+    return grpc::Status::OK;
+}
+}  // namespace
+
+grpc::Status LocalRpcServer::ControlPressureDiagnosticsInternal(grpc::ServerContext*                   context,
+                                                                const PressureSessionControlRequestPB* request,
+                                                                PressureSessionControlResponsePB*      response) {
+    response->Clear();
+    response->set_schema_version(1);
+    auto status = validatePressureControl(*request);
+    if (!status.ok()) {
+        return status;
+    }
+    auto* rank = response->add_ranks();
+    rank->set_world_rank(maga_init_params_.parallelism_config.world_rank);
+    rank->set_service_instance(pressure_instance_);
+    if (context->IsCancelled()) {
+        return {grpc::StatusCode::CANCELLED, "pressure control cancelled"};
+    }
+    PressureSessionControl control{request->session_id(),
+                                   static_cast<PressureControlAction>(request->action()),
+                                   request->phase(),
+                                   request->recorder_capacity()};
+    const auto             deadline = std::min(context->deadline(),
+                                   std::chrono::system_clock::now() + std::chrono::milliseconds(kPressureRpcTimeoutMs));
+    auto                   result   = engine_ ? engine_->controlPressureDiagnostics(control, deadline) :
+                                                ErrorResult<int64_t>(kPressureDiagnosticsUnsupported, "pressure diagnostics unsupported");
+    if (!result.ok()) {
+        rank->set_error(result.status().ToString());
+        auto code = grpc::StatusCode::FAILED_PRECONDITION;
+        if (result.status().code() == kPressureDiagnosticsUnsupported) {
+            code = grpc::StatusCode::UNIMPLEMENTED;
+        } else if (result.status().code() == ErrorCode::DEADLINE_EXCEEDED) {
+            code = grpc::StatusCode::DEADLINE_EXCEEDED;
+        }
+        return {code, result.status().ToString()};
+    }
+    rank->set_applied_monotonic_ns(result.value());
+    return grpc::Status::OK;
+}
+
+grpc::Status LocalRpcServer::ControlPressureDiagnostics(grpc::ServerContext*                   context,
+                                                        const PressureSessionControlRequestPB* request,
+                                                        PressureSessionControlResponsePB*      response) {
+    response->Clear();
+    response->set_schema_version(1);
+    auto status = validatePressureControl(*request);
+    if (!status.ok()) {
+        return status;
+    }
+    const auto& topology = maga_init_params_.parallelism_config;
+    if (topology.tp_rank != 0) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "pressure control fan-out requires tp_rank 0"};
+    }
+    const int        base = topology.world_rank - topology.tp_rank;
+    std::set<int>    seen;
+    std::vector<int> ranks(request->target_ranks().begin(), request->target_ranks().end());
+    if (ranks.empty()) {
+        for (int i = 0; i < topology.tp_size; ++i) {
+            ranks.push_back(base + i);
+        }
+    }
+    for (int rank : ranks) {
+        if (rank < base || rank >= base + topology.tp_size || !seen.insert(rank).second) {
+            return {grpc::StatusCode::INVALID_ARGUMENT, "duplicate or out-of-topology target rank"};
+        }
+    }
+    struct Pending {
+        grpc::ClientContext                                                                context;
+        PressureSessionControlResponsePB                                                   response;
+        grpc::Status                                                                       status;
+        std::shared_ptr<RpcService::Stub>                                                  stub;
+        std::unique_ptr<grpc::ClientAsyncResponseReader<PressureSessionControlResponsePB>> reader;
+        PressureSessionControlRankPB*                                                      record;
+        int                                                                                rank;
+    };
+    grpc::CompletionQueue                 queue;
+    std::vector<std::unique_ptr<Pending>> pending;
+    const auto                            deadline     = std::min(context->deadline(),
+                                   std::chrono::system_clock::now() + std::chrono::milliseconds(kPressureRpcTimeoutMs));
+    const auto&                           addresses    = maga_init_params_.runtime_config.worker_grpc_addrs;
+    PressureSessionControlRankPB*         local_record = nullptr;
+    // Launch peers before waiting for the local engine boundary. Every rank shares the deadline.
+    for (int rank : ranks) {
+        auto* record = response->add_ranks();
+        record->set_world_rank(rank);
+        if (rank == topology.world_rank) {
+            local_record = record;
+            continue;
+        }
+        const int index = rank - base;
+        if (index >= addresses.size() || addresses[index].empty()) {
+            record->set_error("rank endpoint unavailable");
+            continue;
+        }
+        auto connection = pressure_rpc_pool_.getConnection(addresses[index]);
+        if (!connection.ok()) {
+            record->set_error(connection.status().ToString());
+            continue;
+        }
+        auto call    = std::make_unique<Pending>();
+        call->record = record;
+        call->rank   = rank;
+        call->stub   = connection.value().stub;
+        call->context.set_deadline(deadline);
+        call->reader = call->stub->AsyncControlPressureDiagnosticsInternal(&call->context, *request, &queue);
+        call->reader->Finish(&call->response, &call->status, call.get());
+        pending.push_back(std::move(call));
+    }
+    grpc::Status local_status;
+    if (local_record) {
+        if (context->IsCancelled()) {
+            local_status = {grpc::StatusCode::CANCELLED, "pressure control cancelled"};
+        } else {
+            PressureSessionControl control{request->session_id(),
+                                           static_cast<PressureControlAction>(request->action()),
+                                           request->phase(),
+                                           request->recorder_capacity()};
+            auto                   result = engine_ ?
+                                                engine_->controlPressureDiagnostics(control, deadline) :
+                                                ErrorResult<int64_t>(kPressureDiagnosticsUnsupported, "pressure diagnostics unsupported");
+            local_record->set_service_instance(pressure_instance_);
+            if (result.ok()) {
+                local_record->set_applied_monotonic_ns(result.value());
+            } else {
+                local_status = {
+                    result.status().code() == kPressureDiagnosticsUnsupported ? grpc::StatusCode::UNIMPLEMENTED :
+                    result.status().code() == ErrorCode::DEADLINE_EXCEEDED    ? grpc::StatusCode::DEADLINE_EXCEEDED :
+                                                                                grpc::StatusCode::FAILED_PRECONDITION,
+                    result.status().ToString()};
+            }
+        }
+        if (!local_status.ok()) {
+            local_record->set_error(local_status.error_message());
+        }
+    }
+    for (size_t i = 0; i < pending.size(); ++i) {
+        void* tag = nullptr;
+        bool  ok  = false;
+        queue.Next(&tag, &ok);
+        auto* call = static_cast<Pending*>(tag);
+        if (ok && call->status.ok() && call->response.schema_version() == 1 && call->response.ranks_size() == 1
+            && call->response.ranks(0).world_rank() == call->rank) {
+            *call->record = call->response.ranks(0);
+        } else {
+            call->record->set_error(call->status.ok() ? "invalid rank response" : call->status.error_message());
+        }
+    }
+    queue.Shutdown();
+    void* tag = nullptr;
+    bool  ok  = false;
+    while (queue.Next(&tag, &ok)) {}
+    return ranks.size() == 1 && local_record ? local_status : grpc::Status::OK;
+}
+
 grpc::Status LocalRpcServer::GetCachePressureInternal(grpc::ServerContext*          context,
                                                       const CachePressureRequestPB* request,
                                                       CachePressureResponsePB*      response) {
@@ -985,6 +1150,52 @@ grpc::Status LocalRpcServer::GetCachePressureInternal(grpc::ServerContext*      
                 result.status().ToString()};
     }
     pressureSnapshotToProto(result.value(), record);
+    const auto cursor = request->after_step_sequence().find(rank);
+    auto       page =
+        engine_->getPressureSteps(request->session_id(),
+                                  cursor == request->after_step_sequence().end() ? 0 : cursor->second,
+                                  request->max_step_records() ? request->max_step_records() : kMaxPressureStepRecords);
+    record->set_step_history_available(page.available);
+    record->set_next_step_sequence(page.next_sequence);
+    record->set_step_records_lost(page.lost);
+    auto add_step = [&](const PressureStepRecord& step) {
+        auto* pb = record->add_steps();
+        pb->set_session_id(step.session_id);
+        pb->set_phase(step.phase);
+        pb->set_step_id(step.step_id);
+        pb->set_sequence(step.sequence);
+        pb->set_wall_start_ns(step.forward_enter_ns);
+        pb->set_wall_end_ns(step.forward_return_ns);
+        pb->set_cpu_start_ns(step.forward_enter_cpu_ns);
+        pb->set_cpu_end_ns(step.forward_return_cpu_ns);
+        pb->set_context_count(step.context_batch);
+        pb->set_decode_count(step.decode_batch);
+        pb->set_executed_tokens(step.tokens);
+        // NormalExecutor executes one token per decode batch row.
+        pb->set_context_tokens(step.tokens >= step.decode_batch ? step.tokens - step.decode_batch : 0);
+        pb->set_decode_tokens(step.decode_batch);
+        for (const auto& id : step.request_ids) {
+            pb->add_source_request_ids(id);
+        }
+        for (const auto id : step.stream_ids) {
+            pb->add_request_ids(id);
+        }
+        pb->set_completed(step.complete);
+        pb->set_preparation_begin_ns(step.begin_ns);
+        pb->set_forward_enter_ns(step.forward_enter_ns);
+        pb->set_forward_return_ns(step.forward_return_ns);
+        pb->set_end_ns(step.end_ns);
+    };
+    for (const auto& step : page.records) {
+        add_step(step);
+    }
+    if (page.available) {
+        record->mutable_activity()->mutable_running_requests()->set_value(
+            page.active ? page.active->context_batch + page.active->decode_batch : 0);
+    }
+    if (page.active) {
+        add_step(*page.active);
+    }
     record->set_collect_duration_ns(pressureNowNs() - begin);
     response->set_coordinator_sent_ns(pressureNowNs());
     return grpc::Status::OK;

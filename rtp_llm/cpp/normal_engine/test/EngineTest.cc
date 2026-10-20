@@ -33,6 +33,139 @@ class NormalEngineTest: public DeviceTestBase {
 public:
 };
 
+TEST_F(NormalEngineTest, testPressureControlsWakeIdleAndRecordActualGroupedForwards) {
+    ModelConfig   model;
+    RuntimeConfig runtime;
+    KVCacheConfig cache;
+    auto          params               = createEngineInitParams(CustomConfig{}, model, runtime, cache);
+    NormalExecutor::test_model_factory = [&](const GptModelInitParams&) {
+        return std::make_unique<MockModel>(model.vocab_size);
+    };
+    struct ResetFactory {
+        ~ResetFactory() {
+            NormalExecutor::test_model_factory = nullptr;
+        }
+    } reset;
+    NormalEngine engine(params, nullptr, false);
+    auto         control = [&](PressureSessionControl command) {
+        auto       result   = std::async(std::launch::async, [&] {
+            return engine.controlPressureDiagnostics(command,
+                                                     std::chrono::system_clock::now() + std::chrono::seconds(2));
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        bool       queued   = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> lock(engine.pressure_control_mutex_);
+                queued = !engine.pressure_controls_.empty();
+            }
+            if (queued)
+                break;
+            std::this_thread::yield();
+        }
+        EXPECT_TRUE(queued);
+        EXPECT_TRUE(engine.step().ok());
+        return result.get();
+    };
+    auto enabled = control({"session", PressureControlAction::ENABLE, "", 2});
+    ASSERT_TRUE(enabled.ok());
+    EXPECT_GT(enabled.value(), 0);
+    auto idle = engine.getPressureSteps("session", 0, 10);
+    EXPECT_TRUE(idle.available);
+    EXPECT_TRUE(idle.records.empty());
+    EXPECT_FALSE(idle.active);
+    ASSERT_TRUE(control({"session", PressureControlAction::MARK_PHASE, "measurement", 0}).ok());
+    int forwards = 0;
+    static_cast<NormalExecutor*>(engine.executor_.get())
+        ->setModel(std::make_unique<MockModel>(model.vocab_size, [&](const GptModelInputs& inputs) {
+            ++forwards;
+            auto active = engine.getPressureSteps("session", 999, 0);
+            ASSERT_TRUE(active.active);
+            EXPECT_EQ(active.active->step_id, forwards);
+            EXPECT_EQ(inputs.pressure_step_id, forwards);
+            EXPECT_EQ(active.active->request_ids,
+                      (std::vector<std::string>{"session:measurement:11", "session:measurement:12"}));
+            EXPECT_EQ(active.active->stream_ids, (std::vector<int64_t>{11, 12}));
+            EXPECT_EQ(active.active->phase, "measurement");
+            EXPECT_GT(active.active->forward_enter_cpu_ns, 0);
+        }));
+    std::vector<std::shared_ptr<GenerateInput>> queries;
+    for (int id : {11, 12}) {
+        auto query                             = std::make_shared<GenerateInput>();
+        query->request_id                      = id;
+        query->request_info.trace_id           = "session:measurement:" + std::to_string(id);
+        query->input_ids                       = torch::tensor({1, 2, 3}, torch::kInt32);
+        query->generate_config                 = std::make_shared<GenerateConfig>();
+        query->generate_config->max_new_tokens = 2;
+        queries.push_back(query);
+    }
+    auto enqueued = engine.enqueueMultiple(queries);
+    ASSERT_EQ(enqueued.first, (std::vector<bool>{true, true}));
+    ASSERT_TRUE(engine.step().ok());
+    auto first = engine.getPressureSteps("session", 0, 10);
+    ASSERT_EQ(first.records.size(), 1);
+    EXPECT_EQ(first.records[0].context_batch, 2);
+    EXPECT_EQ(first.records[0].decode_batch, 0);
+    EXPECT_EQ(first.records[0].tokens, 6);
+    EXPECT_LE(first.records[0].begin_ns, first.records[0].forward_enter_ns);
+    EXPECT_GE(first.records[0].forward_return_ns, first.records[0].forward_enter_ns);
+    EXPECT_GE(first.records[0].forward_return_cpu_ns, first.records[0].forward_enter_cpu_ns);
+    ASSERT_TRUE(engine.step().ok());
+    auto second = engine.getPressureSteps("session", 1, 10);
+    ASSERT_EQ(second.records.size(), 1);
+    EXPECT_EQ(second.records[0].decode_batch, 2);
+    EXPECT_EQ(second.records[0].context_batch, 0);
+    EXPECT_EQ(second.records[0].tokens, 2);
+    EXPECT_FALSE(engine.getPressureSteps("wrong", 0, 10).available);
+    EXPECT_FALSE(control({"wrong", PressureControlAction::DISABLE, "", 0}).ok());
+    EXPECT_TRUE(control({"session", PressureControlAction::DISABLE, "", 0}).ok());
+    EXPECT_TRUE(control({"session", PressureControlAction::DISABLE, "", 0}).ok());
+    EXPECT_EQ(forwards, 2);
+    EXPECT_EQ(engine.getPressureSteps("session", 2, 10).records.size(), 0);
+    auto expired = engine.controlPressureDiagnostics({"expired", PressureControlAction::ENABLE, "", 2},
+                                                     std::chrono::system_clock::now());
+    EXPECT_FALSE(expired.ok());
+    ASSERT_TRUE(engine.step().ok());
+    EXPECT_FALSE(engine.getPressureSteps("expired", 0, 10).available);
+    static_cast<NormalExecutor*>(engine.executor_.get())
+        ->setModel(std::make_unique<MockModel>(model.vocab_size, [&](const GptModelInputs& inputs) {
+            EXPECT_EQ(inputs.pressure_step_id, 0);
+            EXPECT_FALSE(engine.getPressureSteps("session", 2, 10).active);
+        }));
+    auto ordinary                             = std::make_shared<GenerateInput>();
+    ordinary->input_ids                       = torch::tensor({1, 2}, torch::kInt32);
+    ordinary->generate_config                 = std::make_shared<GenerateConfig>();
+    ordinary->generate_config->max_new_tokens = 1;
+    engine.enqueue(ordinary);
+    ASSERT_TRUE(engine.step().ok());
+    EXPECT_TRUE(engine.getPressureSteps("session", 2, 10).records.empty());
+}
+
+TEST_F(NormalEngineTest, testPressureControlAcknowledgesWhileRealLoopIsIdle) {
+    auto       engine  = createMockEngine(CustomConfig{});
+    const auto before  = pressureClockNs(CLOCK_MONOTONIC);
+    auto       enabled = engine->controlPressureDiagnostics({"idle", PressureControlAction::ENABLE, "", 2},
+                                                      std::chrono::system_clock::now() + std::chrono::seconds(1));
+    ASSERT_TRUE(enabled.ok());
+    EXPECT_GE(enabled.value(), before);
+    EXPECT_LE(enabled.value(), pressureClockNs(CLOCK_MONOTONIC));
+    EXPECT_TRUE(engine->getPressureSteps("idle", 0, 10).records.empty());
+    engine->pause();
+    EXPECT_TRUE(engine
+                    ->controlPressureDiagnostics({"idle", PressureControlAction::MARK_PHASE, "paused", 0},
+                                                 std::chrono::system_clock::now() + std::chrono::seconds(1))
+                    .ok());
+    EXPECT_TRUE(engine
+                    ->controlPressureDiagnostics({"idle", PressureControlAction::MARK_PHASE, "still-paused", 0},
+                                                 std::chrono::system_clock::now() + std::chrono::seconds(1))
+                    .ok());
+    engine->restart();
+    ASSERT_TRUE(engine
+                    ->controlPressureDiagnostics({"idle", PressureControlAction::DISABLE, "", 0},
+                                                 std::chrono::system_clock::now() + std::chrono::seconds(1))
+                    .ok());
+}
+
 TEST_F(NormalEngineTest, testExecutorDecodesCopyRowsUsingPayloadTags) {
     class CopyPayloadProcessor: public NormalBatchStreamProcessor {
     public:
@@ -286,14 +419,14 @@ TEST_F(NormalEngineTest, testDecodeWarmupUsesWarmupCacheTopology) {
 
 TEST_F(NormalEngineTest, testCacheManagerInitFailureDoesNotPublishPartialState) {
     ModelConfig model;
-    model.num_layers                   = 1;
-    model.attn_config.head_num         = 1;
-    model.attn_config.kv_head_num      = 1;
-    model.attn_config.size_per_head    = 1;
+    model.num_layers                          = 1;
+    model.attn_config.head_num                = 1;
+    model.attn_config.kv_head_num             = 1;
+    model.attn_config.size_per_head           = 1;
     model.attn_config.tokens_per_block        = 1;
     model.attn_config.kernel_tokens_per_block = 1;
-    model.kv_cache_spec_descs          = {{{"default", KVCacheSpecType::MultiHeadAttention}}};
-    const auto config                  = CacheConfigCreator::createWarmupConfig(model, {});
+    model.kv_cache_spec_descs                 = {{{"default", KVCacheSpecType::MultiHeadAttention}}};
+    const auto config                         = CacheConfigCreator::createWarmupConfig(model, {});
 
     auto            previous  = std::make_shared<KVCacheManager>(config, /*warmup=*/true);
     auto            candidate = std::make_shared<KVCacheManager>(config, /*warmup=*/true);

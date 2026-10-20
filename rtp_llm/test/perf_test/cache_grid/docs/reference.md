@@ -505,3 +505,60 @@ Missing fields are null and listed in `missing_metadata`, never invented hashes 
 passing completeness flags. Frozen session/config/limits/target inventory and raw
 baseline are recorded from the actual supervisor; raw pressure records retain clock
 bounds. The public CLI/config layer owns that metadata projection and opt-in checks.
+
+### Execution-step server contract
+
+`RpcService.ControlPressureDiagnostics` fans out ENABLE, MARK_PHASE, and DISABLE
+to the existing TP worker endpoints using `ControlPressureDiagnosticsInternal`.
+Only TP rank zero accepts the public method. Empty target lists select the whole
+TP group; duplicates and ranks outside that group are rejected. Each rank has its
+own `service_instance` and reports its actual engine-thread
+`applied_monotonic_ns`; these timestamps are not a simultaneous barrier. Peer
+errors remain in the response alongside successful ranks. The common RPC budget
+is at most one second. Expired queued controls are not applied later.
+
+Session IDs must be nonempty (at most 256 bytes). ENABLE defaults to 4096 retained
+completed forwards; `recorder_capacity` accepts 1 through 65536 (zero selects the
+current/default capacity). Repeated ENABLE with the same session and capacity is
+idempotent; a conflicting active session/capacity is rejected before mutation.
+MARK_PHASE requires the matching active session and a nonempty phase of at most
+256 bytes. DISABLE requires the matching session and is idempotent. Completed
+history remains readable after DISABLE until the next ENABLE resets it. A new
+session resets both root step IDs and each rank's completed sequence. Speculative
+executors return unsupported rather than empty success. Controls wake idle FIFO
+and batch-decode scheduling and are applied at engine boundaries, including pause.
+
+`GetCachePressure` returns step data only for its matching `session_id`.
+`step_history_available=false` means that no matching history exists. Completed
+records use an exclusive per-rank `after_step_sequence` cursor and are copied into
+pages capped at 1024 records; RPC `max_step_records=0` selects that cap.
+`step_records_lost=true` means that the requested next completed record was
+overwritten. Consumers must not bridge that gap. The separately stored active
+forward is projected as an additional `steps` entry with `completed=false` and
+`sequence=0`, regardless of cursor/page fullness. It never advances
+`next_step_sequence`. A matching idle sample has `running_requests=0`; during a
+forward this activity field is the synchronized context plus decode batch count.
+Waiting-request activity is currently unknown (wrapper absent).
+
+Only actual nonempty model forwards consume a step ID. Rank zero assigns a
+candidate after input gathering; existing TP shape hints carry its ID, context
+and decode batch counts, and executed token count. Empty TP loops and skipped
+forwards do not count. All enabled ranks record the root identity and metadata,
+including decode batches (which a prefill-only consumer must flag). The numeric
+`request_ids` are internal stream IDs. Rank zero additionally records exact client
+strings in `source_request_ids`, from authoritative dispatched StreamGroups and
+`GenerateStream::traceId()` (numeric fallback only if no trace exists). The Dash
+input-ID route preserves `ModelInferRequest.id` as that trace ID. Non-root ranks
+do not invent membership from their empty local stream lists; clients join their
+steps to root membership by session and step ID within compatible per-rank
+service-instance epochs, never by completion order.
+
+`preparation_begin_ns` is captured at executor entry. `forward_enter_ns` and
+`forward_return_ns` use `CLOCK_MONOTONIC`; `cpu_start_ns` and `cpu_end_ns` use
+`CLOCK_THREAD_CPUTIME_ID` on that same executor thread at the corresponding
+forward boundaries. Legacy `wall_start_ns`/`wall_end_ns` alias those forward
+boundaries. `end_ns` is the forward return boundary, not CUDA completion or output
+delivery. No diagnostic CUDA synchronization is added. `executed_tokens` is the
+root execution-token total; normal decode contributes one token per decode batch
+row and the remainder is `context_tokens`. Active copies are immutable. A thrown
+forward clears active state without publishing a successful completed record.

@@ -272,6 +272,7 @@ void NormalEngine::initExecutor(const EngineInitParams&                        p
             mla_ops_type_,
             [this]() { step_profiler_.startStep(); },
             [this]() { step_profiler_.finishStep(); }));
+        static_cast<NormalExecutor*>(executor_.get())->setPressureRecorder(pressure_recorder_);
     }
 }
 
@@ -844,7 +845,9 @@ NormalEngine::enqueueMultiple(const std::vector<std::shared_ptr<GenerateInput>>&
 
 absl::Status NormalEngine::step() try {
     RTP_LLM_PROFILE_SCOPE("engine.normal.step_work");
+    applyPressureControls();
     while (pause_) {
+        applyPressureControls();
         // wait 50ms if system paused.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -856,6 +859,7 @@ absl::Status NormalEngine::step() try {
             RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.schedule(reserve_step=%d)", reserve_step_);
             CHECK_AND_ASSIGN(streams, scheduler_->schedule());
         }
+        applyPressureControls();
         if (parallelism_config.dp_size > 1) {
             RTP_LLM_PROFILE_SCOPE("engine.normal.may_add_fake_stream_work");
             mayAddFakeStream(streams);
@@ -921,6 +925,76 @@ bool NormalEngine::updateEplbConfig(const EPLBConfig& config) {
         return executor_->updateEplbConfig(config);
     }
     return true;
+}
+
+PressureStepPage
+NormalEngine::getPressureSteps(const std::string& session_id, uint64_t after_sequence, size_t limit) const {
+    return pressure_recorder_->read(session_id, after_sequence, limit);
+}
+
+ErrorResult<int64_t> NormalEngine::controlPressureDiagnostics(const PressureSessionControl&         control,
+                                                              std::chrono::system_clock::time_point deadline) {
+    if (propose_params_) {
+        return {kPressureDiagnosticsUnsupported, "pressure step recording requires NormalExecutor"};
+    }
+    auto pending      = std::make_shared<PendingPressureControl>();
+    pending->control  = control;
+    pending->deadline = deadline;
+    auto result       = pending->result.get_future();
+    {
+        std::lock_guard<std::mutex> lock(pressure_control_mutex_);
+        if (pressure_controls_.size() >= 64) {
+            return {ErrorCode::CONCURRENCY_LIMIT_ERROR, "pressure control queue is full"};
+        }
+        pressure_controls_.push_back(pending);
+        pressure_controls_pending_.store(true, std::memory_order_release);
+    }
+    if (scheduler_) {
+        scheduler_->wakeForControl();
+    }
+    if (result.wait_until(deadline) != std::future_status::ready) {
+        return {ErrorCode::DEADLINE_EXCEEDED, "pressure control application deadline exceeded"};
+    }
+    return result.get();
+}
+
+void NormalEngine::applyPressureControls() {
+    if (!pressure_controls_pending_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::deque<std::shared_ptr<PendingPressureControl>> pending;
+    {
+        std::lock_guard<std::mutex> lock(pressure_control_mutex_);
+        pending.swap(pressure_controls_);
+        pressure_controls_pending_.store(false, std::memory_order_release);
+    }
+    for (auto& item : pending) {
+        if (std::chrono::system_clock::now() >= item->deadline) {
+            item->result.set_value({ErrorCode::DEADLINE_EXCEEDED, "pressure control expired before application"});
+            continue;
+        }
+        try {
+            const auto& control = item->control;
+            switch (control.action) {
+                case PressureControlAction::ENABLE:
+                    pressure_recorder_->enable(control.session_id, control.recorder_capacity);
+                    break;
+                case PressureControlAction::MARK_PHASE:
+                    pressure_recorder_->markPhase(control.session_id, control.phase);
+                    break;
+                case PressureControlAction::DISABLE:
+                    if (!pressure_recorder_->disable(control.session_id)) {
+                        throw std::invalid_argument("pressure disable session mismatch");
+                    }
+                    break;
+                default:
+                    throw std::invalid_argument("invalid pressure control action");
+            }
+            item->result.set_value(pressureClockNs(CLOCK_MONOTONIC));
+        } catch (const std::exception& error) {
+            item->result.set_value({ErrorCode::INVALID_PARAMS, error.what()});
+        }
+    }
 }
 
 void NormalEngine::startTimelineProfiling(const std::string& trace_name, int start_step, int num_steps) {

@@ -211,6 +211,30 @@ public:
     }
     mutable int           snapshot_calls = 0;
     CachePressureSnapshot snapshot;
+    PressureStepRecorder  recorder{2};
+    PressureStepPage      getPressureSteps(const std::string& session, uint64_t after, size_t limit) const override {
+        return recorder.read(session, after, limit);
+    }
+    ErrorResult<int64_t> controlPressureDiagnostics(const PressureSessionControl& control,
+                                                    std::chrono::system_clock::time_point) override {
+        try {
+            switch (control.action) {
+                case PressureControlAction::ENABLE:
+                    recorder.enable(control.session_id, control.recorder_capacity);
+                    break;
+                case PressureControlAction::MARK_PHASE:
+                    recorder.markPhase(control.session_id, control.phase);
+                    break;
+                case PressureControlAction::DISABLE:
+                    if (!recorder.disable(control.session_id))
+                        return {ErrorCode::INVALID_PARAMS, "session mismatch"};
+                    break;
+            }
+            return pressureClockNs(CLOCK_MONOTONIC);
+        } catch (const std::exception& error) {
+            return {ErrorCode::INVALID_PARAMS, error.what()};
+        }
+    }
 };
 class PressureService: public LocalRpcServiceImpl {
 public:
@@ -1203,6 +1227,14 @@ TEST(PressureRpcTest, FanoutUsesOnlyInternalMethodAndChecksReturnedIdentity) {
 
 class TimeoutPressureService: public RpcService::Service {
 public:
+    grpc::Status ControlPressureDiagnosticsInternal(grpc::ServerContext* context,
+                                                    const PressureSessionControlRequestPB*,
+                                                    PressureSessionControlResponsePB*) override {
+        while (!context->IsCancelled()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return {grpc::StatusCode::CANCELLED, "deadline"};
+    }
     grpc::Status GetCachePressureInternal(grpc::ServerContext* context,
                                           const CachePressureRequestPB*,
                                           CachePressureResponsePB*) override {
@@ -1233,6 +1265,150 @@ TEST(PressureRpcTest, PeerDeadlineRetainsSuccessfulRankAndBoundsWait) {
     EXPECT_TRUE(response.ranks(0).error().empty());
     EXPECT_FALSE(response.ranks(1).error().empty());
     EXPECT_GE(response.ranks(1).coordinator_receive_ns(), response.ranks(1).coordinator_send_ns());
+    grpc_server->Shutdown();
+}
+
+TEST(PressureRpcTest, ControlWrappersValidateAndKeepActiveProjectionAcrossCursors) {
+    auto server = std::make_shared<TestLocalRpcServer>();
+    server->configurePressure(0);
+    auto engine = std::make_shared<PressureEngine>();
+    server->setEngineForTest(engine);
+    PressureService                  service(server);
+    grpc::ServerContext              context;
+    PressureSessionControlRequestPB  control;
+    PressureSessionControlResponsePB ack;
+    EXPECT_EQ(service.ControlPressureDiagnostics(&context, &control, &ack).error_code(),
+              grpc::StatusCode::INVALID_ARGUMENT);
+    control.set_session_id("s");
+    control.set_action(PressureSessionControlRequestPB::ENABLE);
+    control.set_recorder_capacity(65537);
+    EXPECT_EQ(service.ControlPressureDiagnosticsInternal(&context, &control, &ack).error_code(),
+              grpc::StatusCode::INVALID_ARGUMENT);
+    control.set_recorder_capacity(2);
+    ASSERT_TRUE(service.ControlPressureDiagnostics(&context, &control, &ack).ok());
+    ASSERT_EQ(ack.ranks_size(), 1);
+    EXPECT_GT(ack.ranks(0).applied_monotonic_ns(), 0);
+    EXPECT_FALSE(ack.ranks(0).service_instance().empty());
+    control.set_action(PressureSessionControlRequestPB::MARK_PHASE);
+    control.set_recorder_capacity(0);
+    control.set_phase("measurement");
+    ASSERT_TRUE(service.ControlPressureDiagnosticsInternal(&context, &control, &ack).ok());
+    PressureStepRecord step;
+    step.step_id              = 1;
+    step.context_batch        = 2;
+    step.tokens               = 8;
+    step.begin_ns             = 10;
+    step.forward_enter_ns     = 20;
+    step.forward_enter_cpu_ns = 5;
+    step.request_ids          = {"s:measurement:1", "s:measurement:2"};
+    step.stream_ids           = {101, 102};
+    engine->recorder.begin(step);
+    CachePressureRequestPB request;
+    request.set_session_id("s");
+    (*request.mutable_after_step_sequence())[0] = 99;
+    request.set_max_step_records(1);
+    CachePressureResponsePB response;
+    ASSERT_TRUE(service.GetCachePressure(&context, &request, &response).ok());
+    const auto& rank = response.ranks(0);
+    EXPECT_TRUE(rank.step_history_available());
+    ASSERT_EQ(rank.steps_size(), 1);
+    EXPECT_FALSE(rank.steps(0).completed());
+    EXPECT_EQ(rank.steps(0).sequence(), 0);
+    EXPECT_EQ(rank.next_step_sequence(), 99);
+    EXPECT_EQ(rank.steps(0).source_request_ids(0), "s:measurement:1");
+    EXPECT_EQ(rank.steps(0).request_ids(0), 101);
+    EXPECT_EQ(rank.steps(0).preparation_begin_ns(), 10);
+    EXPECT_EQ(rank.steps(0).wall_start_ns(), 20);
+    EXPECT_EQ(rank.steps(0).executed_tokens(), 8);
+    EXPECT_EQ(rank.activity().running_requests().value(), 2);
+    step.complete          = true;
+    step.forward_return_ns = step.end_ns = 40;
+    step.forward_return_cpu_ns           = 15;
+    engine->recorder.append(step);
+    (*request.mutable_after_step_sequence())[0] = 0;
+    ASSERT_TRUE(service.GetCachePressureInternal(&context, &request, &response).ok());
+    EXPECT_TRUE(response.ranks(0).steps(0).completed());
+    EXPECT_EQ(response.ranks(0).steps(0).cpu_end_ns(), 15);
+    EXPECT_EQ(response.ranks(0).activity().running_requests().value(), 0);
+    EXPECT_EQ(response.ranks(0).next_step_sequence(), 1);
+    request.set_session_id("other");
+    ASSERT_TRUE(service.GetCachePressureInternal(&context, &request, &response).ok());
+    EXPECT_FALSE(response.ranks(0).step_history_available());
+    EXPECT_EQ(response.ranks(0).steps_size(), 0);
+    EXPECT_FALSE(response.ranks(0).has_activity());
+    control.set_action(PressureSessionControlRequestPB::DISABLE);
+    control.set_session_id("other");
+    EXPECT_EQ(service.ControlPressureDiagnostics(&context, &control, &ack).error_code(),
+              grpc::StatusCode::FAILED_PRECONDITION);
+    control.set_session_id("s");
+    ASSERT_TRUE(service.ControlPressureDiagnostics(&context, &control, &ack).ok());
+    ASSERT_TRUE(service.ControlPressureDiagnosticsInternal(&context, &control, &ack).ok());
+}
+
+TEST(PressureRpcTest, ControlDeadlineRetainsSuccessfulRankAndUnsupportedIsExplicit) {
+    TimeoutPressureService service;
+    grpc::ServerBuilder    builder;
+    int                    port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(&service);
+    auto grpc_server = builder.BuildAndStart();
+    ASSERT_TRUE(grpc_server);
+    TestLocalRpcServer coordinator;
+    coordinator.configurePressure(0, 0, 2, {"", "127.0.0.1:" + std::to_string(port)});
+    coordinator.setEngineForTest(std::make_shared<PressureEngine>());
+    PressureSessionControlRequestPB request;
+    request.set_session_id("deadline");
+    request.set_action(PressureSessionControlRequestPB::ENABLE);
+    PressureSessionControlResponsePB response;
+    grpc::ServerContext              context;
+    const auto                       begin = std::chrono::steady_clock::now();
+    ASSERT_TRUE(coordinator.ControlPressureDiagnostics(&context, &request, &response).ok());
+    EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(3));
+    ASSERT_EQ(response.ranks_size(), 2);
+    EXPECT_TRUE(response.ranks(0).error().empty());
+    EXPECT_GT(response.ranks(0).applied_monotonic_ns(), 0);
+    EXPECT_FALSE(response.ranks(1).error().empty());
+    EXPECT_EQ(response.ranks(1).applied_monotonic_ns(), 0);
+    coordinator.configurePressure(0);
+    coordinator.setEngineForTest(std::make_shared<FailingEngine>(EngineFailureMode::REJECT_ALL));
+    EXPECT_EQ(coordinator.ControlPressureDiagnostics(&context, &request, &response).error_code(),
+              grpc::StatusCode::UNIMPLEMENTED);
+    EXPECT_EQ(coordinator.ControlPressureDiagnosticsInternal(&context, &request, &response).error_code(),
+              grpc::StatusCode::UNIMPLEMENTED);
+    grpc_server->Shutdown();
+}
+
+TEST(PressureRpcTest, ControlFanoutUsesInternalWrapperAndPreservesMissingRank) {
+    auto peer = std::make_shared<TestLocalRpcServer>();
+    peer->configurePressure(1, 1, 3);
+    auto peer_engine = std::make_shared<PressureEngine>();
+    peer->setEngineForTest(peer_engine);
+    PressureService     service(peer);
+    grpc::ServerBuilder builder;
+    int                 port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(&service);
+    auto grpc_server = builder.BuildAndStart();
+    ASSERT_TRUE(grpc_server);
+    TestLocalRpcServer server;
+    server.configurePressure(0, 0, 3, {"", "127.0.0.1:" + std::to_string(port), ""});
+    server.setEngineForTest(std::make_shared<PressureEngine>());
+    grpc::ServerContext             context;
+    PressureSessionControlRequestPB request;
+    request.set_session_id("fanout");
+    request.set_action(PressureSessionControlRequestPB::ENABLE);
+    PressureSessionControlResponsePB response;
+    ASSERT_TRUE(server.ControlPressureDiagnostics(&context, &request, &response).ok());
+    ASSERT_EQ(response.ranks_size(), 3);
+    EXPECT_GT(response.ranks(0).applied_monotonic_ns(), 0);
+    EXPECT_GT(response.ranks(1).applied_monotonic_ns(), 0);
+    EXPECT_NE(response.ranks(0).service_instance(), response.ranks(1).service_instance());
+    EXPECT_FALSE(response.ranks(2).error().empty());
+    EXPECT_TRUE(peer_engine->recorder.enabled());
+    request.add_target_ranks(1);
+    request.add_target_ranks(1);
+    EXPECT_EQ(server.ControlPressureDiagnostics(&context, &request, &response).error_code(),
+              grpc::StatusCode::INVALID_ARGUMENT);
     grpc_server->Shutdown();
 }
 

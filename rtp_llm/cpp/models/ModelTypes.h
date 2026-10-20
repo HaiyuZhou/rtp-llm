@@ -133,6 +133,10 @@ enum GptModelInputIndex : size_t {
     mmFeaturesSpans,
     engramTokenWindowRows,
     engramTokenWindowWidth,
+    pressureStepId,
+    pressureContextBatch,
+    pressureDecodeBatch,
+    pressureTokens,
     gptModelInputLength,
 };
 

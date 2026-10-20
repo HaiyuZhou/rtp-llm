@@ -22,6 +22,7 @@ public:
     virtual std::pair<std::vector<bool>, std::vector<GenerateStreamPtr>>
     enqueueGroup(const std::vector<GenerateStreamPtr>& streams)     = 0;
     virtual absl::StatusOr<std::list<GenerateStreamPtr>> schedule() = 0;
+    virtual void                                         wakeForControl() {}
 
     // Conservative-KV scheduling variant for async execution. The async path
     // schedules step N+1 before step N's specUpdate has run, so seq_len is not

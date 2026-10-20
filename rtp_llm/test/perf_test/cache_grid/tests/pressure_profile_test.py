@@ -21,6 +21,144 @@ from rtp_llm.test.perf_test.cache_grid.runner.pressure_profile import (
 
 
 class NsightPressureTest(unittest.TestCase):
+    def boundary_trace(self, *, marker=True, forward=True, count=5, corrupt=None):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
+            normalize_nsys,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.sqlite"
+            nsys_fixture(path, step_ids=range(1, count + 1))
+            with sqlite3.connect(path) as db:
+                if marker:
+                    db.execute(
+                        "UPDATE NVTX_EVENTS SET start=NULL WHERE text='pressure.step/1'"
+                    )
+                    db.execute(
+                        "UPDATE NVTX_EVENTS SET end=NULL WHERE text=?",
+                        (f"pressure.step/{count}",),
+                    )
+                if forward:
+                    db.execute(
+                        "UPDATE NVTX_EVENTS SET start=NULL,end=1101 WHERE text='executor.model_forward' AND start=1001"
+                    )
+                    db.execute(
+                        "UPDATE NVTX_EVENTS SET start=?,end=NULL WHERE text='executor.model_forward' AND start=?",
+                        (count * 1000 - 1, count * 1000 + 1),
+                    )
+                if corrupt == "identity":
+                    db.execute(
+                        "UPDATE NVTX_EVENTS SET uint64Value=NULL WHERE text='pressure.step/1'"
+                    )
+                if corrupt == "duplicate":
+                    db.execute(
+                        "INSERT INTO NVTX_EVENTS SELECT * FROM NVTX_EVENTS WHERE text='pressure.step/1'"
+                    )
+                if corrupt == "correlation":
+                    db.execute(
+                        "UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET correlationId=999 WHERE correlationId=2"
+                    )
+                if corrupt == "internal_marker":
+                    db.execute(
+                        "UPDATE NVTX_EVENTS SET end=NULL WHERE text='pressure.step/3'"
+                    )
+                if corrupt == "internal_forward":
+                    db.execute(
+                        "UPDATE NVTX_EVENTS SET end=NULL WHERE text='executor.model_forward' AND start=3001"
+                    )
+            sidecar = [
+                dict(step_id=i, context_batch=1, complete=True)
+                for i in range(1, count + 1)
+            ]
+            return normalize_nsys(path, {0: sidecar, 1: sidecar})
+
+    def test_incomplete_leading_and_trailing_steps_preserve_internal_pairs(self):
+        result = self.boundary_trace()
+        self.assertTrue(result["trace_valid"], result)
+        for rank in result["ranks"].values():
+            self.assertEqual(rank["observed_step_ids"], [2, 3, 4])
+            self.assertGreaterEqual(rank["usable_pairs"], 1)
+            self.assertEqual(rank["exclusions"]["1"], "incomplete_step_boundary")
+            self.assertEqual(rank["exclusions"]["5"], "incomplete_step_boundary")
+        partial = [
+            e
+            for e in result["events"]
+            if e["kind"] == "step" and e["step_id"] in (1, 5)
+        ]
+        self.assertEqual(len(partial), 4)
+        self.assertTrue(all(not e["complete"] for e in partial))
+
+    def test_incomplete_boundary_forwards_do_not_count_complete_step_markers(self):
+        result = self.boundary_trace(marker=False)
+        self.assertTrue(result["trace_valid"], result)
+        for rank in result["ranks"].values():
+            self.assertEqual(rank["observed_step_ids"], [2, 3, 4])
+            self.assertEqual(rank["exclusions"]["1"], "incomplete_forward_boundary")
+            self.assertEqual(rank["exclusions"]["5"], "incomplete_forward_boundary")
+        self.assertEqual(
+            len(
+                [
+                    e
+                    for e in result["events"]
+                    if e["kind"] == "stage" and not e["complete"]
+                ]
+            ),
+            4,
+        )
+        self.assertTrue(all(g["step_id"] not in (1, 5) for g in result["gpu_gaps"]))
+
+    def test_trailing_open_marker_without_sidecar_preserves_complete_pair(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
+            normalize_nsys,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.sqlite"
+            nsys_fixture(path)
+            with sqlite3.connect(path) as db:
+                for rank in (0, 1):
+                    tid = (1 << 48) | ((629566 + rank) << 24) | (629566 + rank)
+                    db.execute(
+                        "INSERT INTO NVTX_EVENTS VALUES(?,?,?,?,?,?)",
+                        (4000, None, "pressure.step/4", None, tid, rank),
+                    )
+            result = normalize_nsys(path, {0: steps(), 1: steps()})
+            self.assertTrue(result["trace_valid"], result)
+            for rank in result["ranks"].values():
+                self.assertEqual(rank["usable_step_ids"], [2, 3])
+                self.assertEqual(rank["usable_pairs"], 1)
+                self.assertEqual(rank["exclusions"]["4"], "incomplete_step_boundary")
+
+    def test_incomplete_only_or_without_internal_pair_remains_invalid(self):
+        for marker in (False, True):
+            for count in (2, 3):
+                result = self.boundary_trace(marker=marker, count=count)
+                self.assertFalse(result["trace_valid"], result)
+                self.assertIn("no_complete_internal_step_pair", result["reasons"])
+                for rank in result["ranks"].values():
+                    self.assertEqual(rank["usable_pairs"], 0)
+                    self.assertNotIn(1, rank["observed_step_ids"])
+                    self.assertNotIn(count, rank["observed_step_ids"])
+
+    def test_incomplete_internal_ranges_are_not_treated_as_capture_edges(self):
+        for fault, reason in (
+            ("internal_marker", "incomplete_internal_step_marker"),
+            ("internal_forward", "missing_or_ambiguous_model_forward"),
+        ):
+            result = self.boundary_trace(corrupt=fault)
+            self.assertFalse(result["trace_valid"], result)
+            self.assertIn(reason, result["reasons"])
+
+    def test_boundaries_do_not_hide_identity_or_internal_correlation_failures(self):
+        for fault, reason in (
+            ("identity", "missing_explicit_rank_metadata"),
+            ("duplicate", "invalid_step_identity"),
+            ("correlation", "missing_model_compute_correlation"),
+        ):
+            result = self.boundary_trace(corrupt=fault)
+            self.assertFalse(result["trace_valid"], result)
+            self.assertIn(reason, result["reasons"])
+
     def capture(self, fault=None):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             CoverageAssessment,
@@ -184,7 +322,7 @@ class NsightPressureTest(unittest.TestCase):
             )
 
 
-def nsys_fixture(path):
+def nsys_fixture(path, step_ids=(1, 2, 3)):
     # Nsight 2025.6.3 column projection. Preserve NVIDIA's encoded PID/TID join.
     with sqlite3.connect(path) as db:
         db.executescript(
@@ -203,7 +341,7 @@ def nsys_fixture(path):
         for rank in (0, 1):
             pid = (1 << 48) | ((629566 + rank) << 24)
             tid = pid | (629566 + rank)
-            for step in (1, 2, 3):
+            for step in step_ids:
                 start = step * 1000
                 db.execute(
                     "INSERT INTO NVTX_EVENTS VALUES(?,?,?,?,?,?)",

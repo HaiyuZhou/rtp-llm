@@ -123,9 +123,14 @@ def normalize_nsys(path, steps_by_rank):
         return dict(trace_valid=False, reasons=["invalid_nsys_export"], error=repr(exc))
 
 
+def _complete_range(start, end):
+    return isinstance(start, int) and isinstance(end, int) and end > start
+
+
 def _normalize(rows, steps_by_rank):
     strings = {r["id"]: r["value"] for r in rows["StringIds"]}
     reasons, events, markers = set(), [], {}
+    all_markers, boundary_exclusions = {}, {}
     processes = {}
     for row in rows["NVTX_EVENTS"]:
         name = row["text"] or strings.get(row["textId"], "")
@@ -137,11 +142,8 @@ def _normalize(rows, steps_by_rank):
             continue
         rank = int(rank)
         step = int(name.split("/", 1)[1])
-        if rank not in steps_by_rank or step <= 0 or (rank, step) in markers:
+        if rank not in steps_by_rank or step <= 0 or (rank, step) in all_markers:
             reasons.add("invalid_step_identity")
-            continue
-        if row["end"] is None or row["end"] <= row["start"]:
-            reasons.add("incomplete_step_marker")
             continue
         pid = row["globalTid"] & 0xFFFFFFFFFF000000
         if rank in processes and processes[rank] != pid:
@@ -149,7 +151,10 @@ def _normalize(rows, steps_by_rank):
         if any(r != rank and p == pid for r, p in processes.items()):
             reasons.add("ambiguous_rank_process")
         processes[rank] = pid
-        markers[rank, step] = row
+        all_markers[rank, step] = row
+        complete = _complete_range(row["start"], row["end"])
+        if complete:
+            markers[rank, step] = row
         events.append(
             dict(
                 kind="step",
@@ -159,8 +164,21 @@ def _normalize(rows, steps_by_rank):
                 start_ns=row["start"],
                 end_ns=row["end"],
                 global_tid=row["globalTid"],
+                complete=complete,
             )
         )
+    rank_edges = {}
+    for rank in steps_by_rank:
+        ids = [step for r, step in all_markers if r == rank]
+        if ids:
+            rank_edges[rank] = min(ids), max(ids)
+    for identity in all_markers.keys() - markers.keys():
+        rank, step = identity
+        if step in rank_edges[rank]:
+            boundary_exclusions[identity] = "incomplete_step_boundary"
+        else:
+            reasons.add("incomplete_internal_step_marker")
+            boundary_exclusions[identity] = "incomplete_internal_step_marker"
     calls = {}
     by_thread = defaultdict(list)
     for (rank, step), marker in markers.items():
@@ -260,11 +278,7 @@ def _normalize(rows, steps_by_rank):
     # evidence, without comparing any export time to server CLOCK_MONOTONIC.
     for row in rows["NVTX_EVENTS"]:
         name = row["text"] or strings.get(row["textId"], "")
-        if (
-            row["end"] is not None
-            and row["end"] > row["start"]
-            and not name.startswith("pressure.step/")
-        ):
+        if not name.startswith("pressure.step/"):
             events.append(
                 dict(
                     kind="stage",
@@ -272,6 +286,7 @@ def _normalize(rows, steps_by_rank):
                     start_ns=row["start"],
                     end_ns=row["end"],
                     global_tid=row["globalTid"],
+                    complete=_complete_range(row["start"], row["end"]),
                 )
             )
     rank_results = {}
@@ -280,17 +295,28 @@ def _normalize(rows, steps_by_rank):
         if event["kind"] == "kernel" and "step_id" in event:
             work_by_step[event["rank"], event["step_id"]].append(event)
     forwards = defaultdict(list)
+    incomplete_forwards = defaultdict(list)
     gathers = defaultdict(list)
     for event in events:
         if event["kind"] == "stage" and event["name"].startswith(
             "executor.model_forward"
         ):
-            forwards[event["global_tid"]].append(event)
-        if event["kind"] == "stage" and event["name"] == "executor.gather_model_input":
+            target = forwards if event["complete"] else incomplete_forwards
+            target[event["global_tid"]].append(event)
+        if (
+            event["kind"] == "stage"
+            and event["name"] == "executor.gather_model_input"
+            and event["complete"]
+        ):
             gathers[event["global_tid"]].append(event)
     for rank, steps in steps_by_rank.items():
         sidecar = {int(s["step_id"]): s for s in steps}
-        observed, usable, excluded = [], [], {}
+        observed, usable = [], []
+        excluded = {
+            str(step): reason
+            for (r, step), reason in boundary_exclusions.items()
+            if r == rank
+        }
         first = min((step for r, step in markers if r == rank), default=None)
         for (r, step), marker in markers.items():
             if r != rank:
@@ -302,6 +328,43 @@ def _normalize(rows, steps_by_rank):
                 if (f["start_ns"] <= marker["start"] <= marker["end"] <= f["end_ns"])
                 or (marker["start"] <= f["start_ns"] <= f["end_ns"] <= marker["end"])
             ]
+            if not scopes:
+                # Only a first/last step can be explained by a clipped enclosing
+                # forward. Require its known endpoint near that step; an unrelated
+                # open range must not hide missing internal forward evidence.
+                leading, trailing = rank_edges[rank]
+                prior_ends = [
+                    m["end"] for (r, s), m in markers.items() if r == rank and s < step
+                ]
+                next_starts = [
+                    m["start"]
+                    for (r, s), m in markers.items()
+                    if r == rank and s > step
+                ]
+                partial = [
+                    f
+                    for f in incomplete_forwards[marker["globalTid"]]
+                    if (
+                        step == leading
+                        and f["start_ns"] is None
+                        and isinstance(f["end_ns"], int)
+                        and marker["start"]
+                        <= f["end_ns"]
+                        <= min(next_starts, default=float("inf"))
+                    )
+                    or (
+                        step == trailing
+                        and f["end_ns"] is None
+                        and isinstance(f["start_ns"], int)
+                        and max(prior_ends, default=-float("inf"))
+                        <= f["start_ns"]
+                        <= marker["end"]
+                    )
+                ]
+                if len(partial) == 1:
+                    excluded[str(step)] = "incomplete_forward_boundary"
+                    boundary_exclusions[rank, step] = "incomplete_forward_boundary"
+                    continue
             if len(scopes) != 1:
                 reasons.add("missing_or_ambiguous_model_forward")
                 work = []
@@ -351,7 +414,13 @@ def _normalize(rows, steps_by_rank):
     gaps = []
     gpu_ids = {id(g): len(events) + index for index, g in enumerate(gpu)}
     compute = sorted(
-        (g for g in gpu if g["kind"] == "kernel" and "step_id" in g),
+        (
+            g
+            for g in gpu
+            if g["kind"] == "kernel"
+            and "step_id" in g
+            and (g["rank"], g["step_id"]) not in boundary_exclusions
+        ),
         key=lambda g: g["start_ns"],
     )
     waiting, completed = defaultdict(list), {}

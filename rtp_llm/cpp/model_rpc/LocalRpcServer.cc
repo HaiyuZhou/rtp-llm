@@ -1054,6 +1054,8 @@ grpc::Status LocalRpcServer::ControlPressureDiagnostics(grpc::ServerContext*    
         PressureSessionControlRankPB*                                                      record;
         int                                                                                rank;
     };
+    // Do not reuse channels attached to a completion queue drained by an earlier request.
+    RPCPool                               pressure_rpc_pool;
     grpc::CompletionQueue                 queue;
     std::vector<std::unique_ptr<Pending>> pending;
     const auto                            deadline     = std::min(context->deadline(),
@@ -1073,7 +1075,7 @@ grpc::Status LocalRpcServer::ControlPressureDiagnostics(grpc::ServerContext*    
             record->set_error("rank endpoint unavailable");
             continue;
         }
-        auto connection = pressure_rpc_pool_.getConnection(addresses[index]);
+        auto connection = pressure_rpc_pool.getConnection(addresses[index]);
         if (!connection.ok()) {
             record->set_error(connection.status().ToString());
             continue;
@@ -1273,6 +1275,8 @@ grpc::Status LocalRpcServer::GetCachePressure(grpc::ServerContext*          cont
         CachePressureRankPB*                                                      record;
         int                                                                       rank;
     };
+    // Keep channel ownership paired with this request's completion queue.
+    RPCPool                               pressure_rpc_pool;
     grpc::CompletionQueue                 queue;
     std::vector<std::unique_ptr<Pending>> pending;
     const auto                            deadline = std::min(context->deadline(),
@@ -1303,7 +1307,7 @@ grpc::Status LocalRpcServer::GetCachePressure(grpc::ServerContext*          cont
             record->set_coordinator_receive_ns(pressureNowNs());
             continue;
         }
-        auto connection = pressure_rpc_pool_.getConnection(addresses[index]);
+        auto connection = pressure_rpc_pool.getConnection(addresses[index]);
         if (!connection.ok()) {
             record->set_error(connection.status().ToString());
             record->set_coordinator_receive_ns(pressureNowNs());
@@ -1492,8 +1496,10 @@ grpc::Status LocalRpcServer::StopProfile(grpc::ServerContext*        context,
         StopProfileRankPB*                                                      record;
         int                                                                     rank;
     };
-    const auto                            deadline = std::min(context->deadline(),
+    const auto deadline = std::min(context->deadline(),
                                    std::chrono::system_clock::now() + std::chrono::milliseconds(kPressureRpcTimeoutMs));
+    // Keep channel ownership paired with this request's completion queue.
+    RPCPool                               pressure_rpc_pool;
     grpc::CompletionQueue                 queue;
     std::vector<std::unique_ptr<Pending>> pending;
     const auto&                           addresses = maga_init_params_.runtime_config.worker_grpc_addrs;
@@ -1510,7 +1516,7 @@ grpc::Status LocalRpcServer::StopProfile(grpc::ServerContext*        context,
             record->set_error("rank endpoint unavailable");
             continue;
         }
-        auto connection = pressure_rpc_pool_.getConnection(addresses[index]);
+        auto connection = pressure_rpc_pool.getConnection(addresses[index]);
         if (!connection.ok()) {
             record->set_error(connection.status().ToString());
             continue;

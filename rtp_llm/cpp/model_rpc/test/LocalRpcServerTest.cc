@@ -1329,6 +1329,60 @@ TEST(PressureRpcTest, FanoutUsesOnlyInternalMethodAndChecksReturnedIdentity) {
     grpc_server->Shutdown();
 }
 
+TEST(PressureRpcTest, RepeatedThreePeerControlAndSnapshotPreserveTransportProgress) {
+    std::vector<std::shared_ptr<TestLocalRpcServer>> peers;
+    std::vector<std::unique_ptr<PressureService>>    services;
+    std::vector<std::unique_ptr<grpc::Server>>       servers;
+    std::vector<std::string>                         addresses(1, "");
+    for (int rank = 1; rank < 4; ++rank) {
+        auto peer = std::make_shared<TestLocalRpcServer>();
+        peer->configurePressure(rank, rank, 4);
+        peer->setEngineForTest(std::make_shared<PressureEngine>());
+        services.push_back(std::make_unique<PressureService>(peer));
+        grpc::ServerBuilder builder;
+        int                 port = 0;
+        builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+        builder.RegisterService(services.back().get());
+        servers.push_back(builder.BuildAndStart());
+        ASSERT_NE(servers.back(), nullptr);
+        addresses.push_back("127.0.0.1:" + std::to_string(port));
+        peers.push_back(std::move(peer));
+    }
+    TestLocalRpcServer coordinator;
+    coordinator.configurePressure(0, 0, 4, addresses);
+    coordinator.setEngineForTest(std::make_shared<PressureEngine>());
+    for (int iteration = 0; iteration < 16; ++iteration) {
+        SCOPED_TRACE(iteration);
+        PressureSessionControlRequestPB control;
+        control.set_session_id("repeated-transport");
+        control.set_action(PressureSessionControlRequestPB::ENABLE);
+        PressureSessionControlResponsePB acknowledgement;
+        grpc::ServerContext              control_context;
+        ASSERT_TRUE(coordinator.ControlPressureDiagnostics(&control_context, &control, &acknowledgement).ok());
+        ASSERT_EQ(acknowledgement.ranks_size(), 4);
+        for (int rank = 0; rank < 4; ++rank) {
+            EXPECT_TRUE(acknowledgement.ranks(rank).error().empty())
+                << "control rank " << rank << ": " << acknowledgement.ranks(rank).error();
+        }
+        CachePressureRequestPB request;
+        request.set_session_id("repeated-transport");
+        CachePressureResponsePB response;
+        grpc::ServerContext     context;
+        const auto              begin = std::chrono::steady_clock::now();
+        ASSERT_TRUE(coordinator.GetCachePressure(&context, &request, &response).ok());
+        EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::milliseconds(500));
+        ASSERT_EQ(response.ranks_size(), 4);
+        for (int rank = 0; rank < 4; ++rank) {
+            EXPECT_EQ(response.ranks(rank).world_rank(), rank);
+            EXPECT_TRUE(response.ranks(rank).error().empty())
+                << "snapshot rank " << rank << ": " << response.ranks(rank).error();
+        }
+    }
+    for (auto& server : servers) {
+        server->Shutdown();
+    }
+}
+
 class TimeoutPressureService: public RpcService::Service {
 public:
     grpc::Status ControlPressureDiagnosticsInternal(grpc::ServerContext* context,

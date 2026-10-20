@@ -80,6 +80,24 @@ def _write_cache_grid_result(
 
 
 class MeasurementContractTest(unittest.TestCase):
+    def test_diagnostic_only_result_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "result.json"
+            _write_cache_grid_result(path, _make_observations(1))
+            path.write_text(
+                json.dumps(
+                    dict(
+                        execution_mode="full_pressure_diagnostic_v1",
+                        metrics=[],
+                        window=dict(measurement_requests=1, request_throughput=1),
+                    )
+                )
+            )
+            with self.assertRaisesRegex(
+                ValueError, "expected cache-grid result schema"
+            ):
+                load_observations([path])
+
     def test_server_contract_allows_both_client_transports(self):
         rows = _make_observations(2)
         with tempfile.TemporaryDirectory() as tmpdir:

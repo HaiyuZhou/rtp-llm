@@ -1764,6 +1764,8 @@ class CacheGridRunner:
         target_ranks,
         sink,
         controller=None,
+        *,
+        evidence_manifest=None,
     ):
         """Internal opt-in entry; CLI validation/wiring is owned by the caller.
 
@@ -1778,6 +1780,11 @@ class CacheGridRunner:
             ActivitySample,
             decode_pressure_response,
             raw_pressure_record,
+        )
+        from .pressure_results import (
+            MANIFEST_PROJECTION,
+            PressureEvidence,
+            PressureWriter,
         )
 
         cases = tuple(dict(case) for case in pending)
@@ -1895,7 +1902,16 @@ class CacheGridRunner:
                 cursors[rank.world_rank] = rank.next_step_sequence
             return PressurePoll(decoded.samples, raw, tuple(activity))
 
-        return PressureSession(
+        manifest = {key: None for key in MANIFEST_PROJECTION}
+        manifest.update(evidence_manifest or {})
+        manifest["missing_metadata"] = [
+            key for key in MANIFEST_PROJECTION if manifest[key] is None
+        ]
+        writer = PressureWriter(self.result_dir, manifest)
+        evidence = PressureEvidence(
+            writer, sink, profile_requested=controller is not None
+        )
+        session = PressureSession(
             config,
             session_id=session_id,
             limits=limits,
@@ -1908,13 +1924,20 @@ class CacheGridRunner:
             make_payload=make_payload,
             request=request,
             poll=poll,
-            sink=sink,
+            sink=evidence,
             set_batch=self._set_prefill_batch_size,
             controller=controller,
             rate=self.pressure_request_rate,
             poisson=self.pressure_arrival == "poisson",
             random_seed=self.pressure_random_seed,
-        ).run()
+        )
+        try:
+            return session.run()
+        except BaseException as exc:
+            evidence.abort(repr(exc))
+            raise
+        finally:
+            writer.close()
 
     def _continuous_metric(self, case, runs):
         total_len = int(case["input_len"])

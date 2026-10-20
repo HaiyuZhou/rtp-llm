@@ -1,10 +1,13 @@
 """Bounded continuous request supply, without engine imports."""
 
+import json
 import struct
+import tempfile
 import time
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
+from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -1049,6 +1052,9 @@ class RunnerIntegrationTest(unittest.TestCase):
 
         runner = CacheGridRunner.__new__(CacheGridRunner)
         runner._grpc_stub = SimpleNamespace(ModelStreamInfer=infer)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        runner.result_dir = Path(directory.name)
         runner.pressure_seed_count = 2
         runner.cache_commit_tail_tokens = 1
         runner.pressure_random_seed = 7
@@ -1100,6 +1106,10 @@ class RunnerIntegrationTest(unittest.TestCase):
                 events.append,
             )
         self.assertIsNone(result["failure"])
+        evidence = json.loads((runner.result_dir / "pressure/summary.json").read_text())
+        self.assertEqual(evidence["metrics"], [])
+        self.assertGreater(evidence["window"]["measurement_requests"], 0)
+        self.assertTrue((runner.result_dir / "pressure/requests.jsonl").exists())
         self.assertTrue(any(":fill:" in identity for identity in rpc_ids))
         self.assertTrue(any(":measurement:" in identity for identity in rpc_ids))
         self.assertTrue(all(request.max_step_records == 256 for request in polls))

@@ -421,3 +421,33 @@ without waiting indefinitely. Transport deadlines bound RPC worker lifetime;
 Python cannot forcibly stop arbitrary token-generation code, so late preparation
 is barred from dispatch. `CancellableRequestHandle(..., on_done=callback)` provides
 the supervisor wakeup without exposing its executor or future.
+# Incremental full-pressure diagnostic evidence
+
+The internal full-pressure runner writes `pressure/manifest.json`, raw
+`cache_samples.jsonl`, supervisor `steps.jsonl`, terminal `requests.jsonl`, and
+an atomic `summary.json`. Files are flushed on each event and close. An interrupted
+run retains evidence with manifest `complete=false`; complete means the summary
+was written, not that execution or pressure passed. These diagnostic files have no
+cache-grid schema envelope and never populate exact-reuse `metrics[]` or formula fits.
+
+Measurement uses the dispatch cohort in `[t0,t1)`. A late completion belongs to that
+cohort and increments crossing requests, but contributes no in-window throughput.
+Throughput counts actual completions (including failures) per window second;
+success throughput counts only successful completions. Terminal cancellations
+count cohort membership without inventing completion timestamps. Transport cancel
+acceptance is recorded independently and does not prove server completion. Support,
+seed, fill and padding (including warmup padding) never enter formal window metrics.
+
+Execution validity, measurement pressure validity, profile/support pressure validity,
+reuse validity and trace validity are separate fields. Baseline trace validity is
+null with `not_applicable`; capture validation remains pending until profiler
+integration. Raw errors and raw request timing/reuse fields remain available for
+offline exact analysis; online aggregation retains counters and outstanding jobs only.
+
+Production callers must supply `evidence_manifest` to `_run_full_pressure` with
+`code_hash`, `profile_hash`, `grid_hash`, `resolved_settings`, `input_identity`,
+`epoch`, `clock_bounds`, and `control_times` projected from their resolved inputs.
+Missing fields are null and listed in `missing_metadata`, never invented hashes or
+passing completeness flags. Frozen session/config/limits/target inventory and raw
+baseline are recorded from the actual supervisor; raw pressure records retain clock
+bounds. The public CLI/config layer owns that metadata projection and opt-in checks.

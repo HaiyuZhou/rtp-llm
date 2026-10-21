@@ -467,7 +467,8 @@ def assessment_reasons(event, key):
     assessment = event.get(key)
     if not isinstance(assessment, dict):
         return [key + "_evidence_missing"]
-    reasons = list(assessment.get("reasons", []))
+    reason_field = "epoch_reasons" if key == "pressure" else "reasons"
+    reasons = list(assessment.get(reason_field, []))
     if assessment.get("valid") is not True and not reasons:
         reasons.append(key + "_invalid")
     return reasons

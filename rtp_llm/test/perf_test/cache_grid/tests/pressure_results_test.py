@@ -249,7 +249,7 @@ class PressureResultsTest(unittest.TestCase):
                     cancelled=0,
                     pending=0,
                 ),
-                pressure=dict(valid=True, reasons=[]),
+                pressure=dict(valid=True, epoch_reasons=[]),
                 migration=dict(valid=True, reasons=[]),
             ),
             **changes,
@@ -312,7 +312,9 @@ class PressureResultsTest(unittest.TestCase):
     def test_pressure_failure_does_not_rewrite_execution_or_migration(self):
         summary, _ = self.artifacts(
             finished=self.finished(
-                pressure=dict(valid=False, reasons=["unknown_activity", "sample_gap"])
+                pressure=dict(
+                    valid=False, epoch_reasons=["unknown_activity", "sample_gap"]
+                )
             )
         )
         self.assertTrue(summary["validity"]["execution_valid"])
@@ -323,6 +325,48 @@ class PressureResultsTest(unittest.TestCase):
             summary["validity_reasons"]["full_pressure_valid"],
             ["unknown_activity", "sample_gap"],
         )
+
+    def test_serialized_coverage_assessment_retains_epoch_failure_reasons(self):
+        from dataclasses import asdict
+
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            CoverageAssessment,
+        )
+
+        for reasons in (
+            ("counter_reset",),
+            ("inventory_discontinuity",),
+            ("counter_reset", "inventory_discontinuity"),
+        ):
+            with self.subTest(reasons=reasons):
+                pressure = asdict(
+                    CoverageAssessment(
+                        epoch_valid=False,
+                        max_segments_per_target=4096,
+                        ratio=0,
+                        longest_invalid_s=60,
+                        valid=False,
+                        intervals=(),
+                        epoch_reasons=reasons,
+                    )
+                )
+                summary, manifest = self.artifacts(
+                    finished=self.finished(pressure=pressure)
+                )
+                self.assertFalse(summary["validity"]["full_pressure_valid"])
+                self.assertFalse(summary["validity"]["formal_acceptance_valid"])
+                self.assertTrue(summary["validity"]["execution_valid"])
+                self.assertTrue(summary["validity"]["formal_config_valid"])
+                self.assertTrue(summary["validity"]["bidirectional_migration_valid"])
+                for artifact in (summary, manifest):
+                    self.assertEqual(
+                        artifact["validity_reasons"]["full_pressure_valid"],
+                        list(reasons),
+                    )
+                    self.assertEqual(
+                        artifact["validity_reasons"]["formal_acceptance_valid"],
+                        list(reasons),
+                    )
 
     def test_manual_plan_stays_nonformal_after_all_seeds_complete(self):
         summary, _ = self.artifacts(
@@ -547,7 +591,7 @@ class PressureResultsTest(unittest.TestCase):
                     cancelled=1,
                     pending=1,
                 ),
-                pressure=dict(valid=False, reasons=["pressure_gap"]),
+                pressure=dict(valid=False, epoch_reasons=["pressure_gap"]),
                 migration=dict(
                     valid=False, reasons=["missing_d2h:0:0", "missing_h2d_load:0:0"]
                 ),

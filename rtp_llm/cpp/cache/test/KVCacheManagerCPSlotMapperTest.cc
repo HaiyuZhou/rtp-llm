@@ -53,6 +53,43 @@ protected:
     }
 };
 
+TEST_F(KVCacheManagerCPSlotMapperTest, PressureGeometryMatchesGlobalRequestTokensAndPhysicalCapacity) {
+    for (const bool sharded : {false, true}) {
+        SCOPED_TRACE(sharded);
+        auto              config = makeTestConfig(/*block_num=*/64, /*seq_size_per_block=*/512);
+        ParallelismConfig par;
+        par.role_type                          = RoleType::PREFILL;
+        par.tp_rank                            = 0;
+        par.tp_size                            = 4;
+        par.prefill_cp_config.method           = CPRotateMethod::ALL_GATHER;
+        par.prefill_cp_config.prefill_cp_size  = 4;
+        par.prefill_cp_config.kv_cache_sharded = sharded;
+        auto manager = std::make_shared<KVCacheManager>(config, /*warmup=*/true, nullptr, KVCacheConfig{}, par);
+        ASSERT_TRUE(manager->init());
+        const auto initial = manager->getCachePressure();
+        ASSERT_TRUE(initial.ok()) << initial.status().ToString();
+        ASSERT_EQ(initial.value().groups.size(), 1u);
+        const auto& group = initial.value().groups.front();
+        ASSERT_EQ(group.group_type, CacheGroupType::FULL);
+        ASSERT_EQ(group.device_pool_ids.size(), 1u);
+        const auto pool_id = group.device_pool_ids.front();
+        const auto pool    = std::find_if(initial.value().pools.begin(),
+                                       initial.value().pools.end(),
+                                       [&](const auto& value) { return value.pool_id == pool_id; });
+        ASSERT_NE(pool, initial.value().pools.end());
+        EXPECT_EQ(pool->total_blocks, 63u);
+        EXPECT_EQ(group.block_tokens, sharded ? 2048u : 512u);
+
+        auto resource = makeResource(1, config);
+        auto tokens   = makeTokenIds(1, 8192, 512);
+        ASSERT_TRUE(manager->malloc(MallocInfo{resource, tokens}).success);
+        const size_t expected_blocks = sharded ? 4u : 16u;
+        EXPECT_EQ(resource->blocksNum(0, "default"), expected_blocks);
+        EXPECT_EQ((8192u + group.block_tokens - 1) / group.block_tokens, expected_blocks);
+        manager->free(FreeInfo{resource, tokens});
+    }
+}
+
 TEST_F(KVCacheManagerCPSlotMapperTest, DecodeTpReplicatesFullPagesWhilePrefillCpShardsThem) {
     ModelConfig model;
     model.num_layers                          = 1;

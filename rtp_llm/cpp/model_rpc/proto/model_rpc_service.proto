@@ -1113,6 +1113,8 @@ message PressureGroupPB {
     // Cumulative DEVICE high-watermark transitions; excludes HOST and DISK.
     uint64 watermark_trigger_count = 9;
     repeated string group_tags = 10;
+    // Global request-token span per physical owner block, including CP policy.
+    // Pool capacity/occupancy remain physical block counts.
     uint64 block_tokens = 11;
     uint64 payload_bytes = 12;
     uint64 storage_bytes = 13;

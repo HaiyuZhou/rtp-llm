@@ -35,7 +35,15 @@ ErrorResult<CachePressureSnapshot> KVCacheManager::getCachePressure() const {
     if (!block_tree_cache_) {
         return unsupportedCachePressure();
     }
-    return block_tree_cache_->pressureSnapshot();
+    auto snapshot = block_tree_cache_->pressureSnapshot();
+    if (cp_slot_mapper_) {
+        for (auto& group : snapshot.groups) {
+            if (!group.group_tags.empty()) {
+                group.block_tokens = cp_slot_mapper_->logicalSeqSizePerBlock(config_, group.group_tags.front());
+            }
+        }
+    }
+    return snapshot;
 }
 
 class KVCacheAllocationWaitState {

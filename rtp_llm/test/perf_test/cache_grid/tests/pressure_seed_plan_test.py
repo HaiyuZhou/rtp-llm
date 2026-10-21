@@ -172,6 +172,33 @@ class SeedPlannerTest(unittest.TestCase):
         )
         return build_seed_plan(samples, targets, **(settings | overrides))
 
+    def test_cp4_global_owner_geometry_is_used_once_for_physical_blocks(self):
+        first = owner(capacity=22584, available=9838, block_tokens=2048)
+        first = replace(
+            first,
+            pools=(
+                replace(first.pools[0], low_ratio=0.82),
+                replace(first.pools[1], capacity=9838),
+            ),
+            ownership=PressureOwnership(2, 0, (0, 1, 2, 3), 2),
+        )
+        samples = tuple(
+            replace(first, rank=rank, instance=f"instance-{rank}") for rank in range(4)
+        )
+        plan = self.plan(
+            samples=samples,
+            cases=(dict(input_len=69632, cache_len=65536, batch_size=1),),
+        )
+        group = plan.groups[0]
+        self.assertEqual(group.seed_blocks, 32)
+        self.assertEqual(group.gpu_family_capacity, 705)
+        self.assertEqual(group.gpu_low_families, 578)
+        self.assertEqual(group.host_families, 307)
+        self.assertEqual((plan.seed_count, plan.global_maximum_families), (706, 885))
+        self.assertEqual(group.device_pools[0].capacity_blocks, 22584)
+        self.assertEqual(group.device_pools[0].block_tokens, 2048)
+        self.assertEqual(group.device_pools[0].geometry_source, "owner_group")
+
     def test_shared_owner_capacity_is_counted_once_and_auditable(self):
         plan = self.plan()
         self.assertIsInstance(plan, SeedPlan)

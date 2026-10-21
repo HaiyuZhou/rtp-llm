@@ -90,7 +90,7 @@ seed_count = max_g minimum[g]
 要求 seed_count <= min_g maximum[g]
 ```
 
-所有 g 都是必需 FULL owner group；p 是其去重的 device pool。block token span 按 live RPC 几何解释，不能把字节或 device 块数直接当 host 块数。当前 schema1 在 group 上报告 token 几何，plan 的各 pool 保留 `geometry_source=owner_group`。manifest 保存每项输入和上下界，可逐项复算。高/低水位及 FULL 可达性另由冻结目标校验；边界不相交就停止并报告限制 group，不自动缩短复用长度或削弱压力门槛。
+所有 g 都是必需 FULL owner group；p 是其去重的 device pool。block token span 按 live RPC 几何解释，不能把字节或 device 块数直接当 host 块数。当前 schema1 在 group 上报告 token 几何，plan 的各 pool 保留 `geometry_source=owner_group`。其中 `block_tokens` 已由 manager 根据实际 CP policy 转为全局请求 token 跨度，capacity/occupancy 仍是 owner 物理块数。CP4 block round-robin 的物理 512-token block 对应 2048 全局 tokens，65536-token family 占 32 owner blocks；不能再除一次 CP，也不能相加四个 TP 视图。manifest 保存每项输入和上下界，可逐项复算。高/低水位及 FULL 可达性另由冻结目标校验；边界不相交就停止并报告限制 group，不自动缩短复用长度或削弱压力门槛。
 
 本 production grid 的 R=65536，commit tail=4096，因此 seed 输入为 69632。正式 grid 必须实际包含至少 32768 的 cache_len；仅把 seed 初始化变长不能代替真实复用工作集。fill 使用独立唯一 family，目标默认 `100*1024=102400`，按 alignment 向上对齐；其一次性后缀不计入可复用 seed bank。fill 加 1 个输出 token 必须通过单请求预算，不允许悄悄缩短。
 
@@ -167,7 +167,7 @@ python3 tools/cache_perf run \
 
 此配置验证真实请求、阶段、清理与产物，结果必须 non-formal。smoke 的 R 仍至少 32768，seed 输入 36864；因此 sequence 上限从旧 smoke 的 32768 调整到 65536，host 从 128 调整到 512 MiB，以容纳两 family，而保留 128 强制 GPU pool、2-way limits、16K fill。实际 host 可保留块仍由 live snapshot 决定。
 
-仅用于解释的离线算例：若 owner 报告 device capacity=127、block span=512、low=.82，且 host available=72，则每 family=64 blocks，GPU=1、LOW=1、HOST=1，上界为 2；手工 2 family 可保留。72 是算例，不能用 512 MiB 静态推断 live host 预算，也不能把这些 smoke 数字用于 production。即使执行、压力和迁移均通过，formal_config_valid 仍必须 false。
+仅用于解释的非 CP 离线算例：若 owner 报告 device capacity=127、全局 block span=512、low=.82，且 host available=72，则每 family=64 blocks，GPU=1、LOW=1、HOST=1，上界为 2；手工 2 family 可保留。CP4 下全局 span 若为2048，则同一32768-token family占16 blocks，必须按新的 live 几何重算。72 是算例，不能用 512 MiB 静态推断 live host 预算，也不能把这些 smoke 数字用于 production。即使执行、压力和迁移均通过，formal_config_valid 仍必须 false。
 
 ## 8. 产物与四个正式门槛
 

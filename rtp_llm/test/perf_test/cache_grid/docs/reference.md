@@ -533,7 +533,13 @@ The earlier 127-block Flash result came from forced `test_block_num=128` smoke,
 not a production-capacity measurement. Host retention uses live available blocks
 after non-reclaimable occupancy; token-to-block conversion follows reported
 geometry, not byte size. Schema 1 reports geometry on the owner group, retained
-as `geometry_source=owner_group` on each plan pool.
+as `geometry_source=owner_group` on each plan pool. The manager reports
+`block_tokens` in global request tokens using the resolved CP policy, while pool
+capacity and occupancy stay in physical owner blocks. For CP4 block round-robin,
+a physical 512-token block spans 2048 global request tokens: a 65536-token family
+uses 32 owner blocks. Do not divide by CP again or multiply the TP views. This
+exact planner geometry differs from the conservative physical admission bound
+above.
 
 For each required FULL owner group g and deduplicated device pool p:
 

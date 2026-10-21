@@ -24,6 +24,7 @@ from .pressure_diagnostics import (
     select_targets,
     validate_inventory,
 )
+from .pressure_seed_plan import SeedPlan
 
 
 class RequestHandle(Protocol):
@@ -147,6 +148,8 @@ class ExecutionLimits:
 
     available_kv_blocks is the conservative simultaneous request budget after
     non-reclaimable reservations, not total configured cache capacity.
+    When supplied, owner_kv_budgets replaces the single-pool projection with
+    (owner/group/pool identity, available blocks, tokens per block) per pool.
     """
 
     model_tokens: int
@@ -154,23 +157,65 @@ class ExecutionLimits:
     batch_tokens: int
     available_kv_blocks: int
     block_tokens: int
+    owner_kv_budgets: tuple[tuple[str, int, int], ...] = ()
 
     def __post_init__(self):
-        if any(type(v) is not int or v <= 0 for v in vars(self).values()):
+        if (
+            any(
+                type(value) is not int or value <= 0
+                for value in (
+                    self.model_tokens,
+                    self.admission_requests,
+                    self.batch_tokens,
+                    self.block_tokens,
+                )
+            )
+            or type(self.available_kv_blocks) is not int
+            or self.available_kv_blocks < 0
+        ):
             raise ValueError("execution limits must be positive integers")
+        if type(self.owner_kv_budgets) is not tuple or any(
+            type(budget) is not tuple
+            or len(budget) != 3
+            or not isinstance(budget[0], str)
+            or not budget[0]
+            or type(budget[1]) is not int
+            or budget[1] < 0
+            or type(budget[2]) is not int
+            or budget[2] <= 0
+            for budget in self.owner_kv_budgets
+        ):
+            raise ValueError("invalid immutable owner KV budgets")
 
     def concurrency_for(self, input_tokens):
         if type(input_tokens) is not int or not 0 < input_tokens < self.model_tokens:
-            raise ValueError("request exceeds model token limit including output")
-        count = min(
-            self.admission_requests,
-            self.batch_tokens // (input_tokens + 1),
-            self.available_kv_blocks
-            // math.ceil((input_tokens + 1) / self.block_tokens),
+            raise ValueError(
+                f"input_tokens={input_tokens} plus one output exceeds "
+                f"model token limit={self.model_tokens}"
+            )
+        tokens = input_tokens + 1
+        if tokens > self.batch_tokens:
+            raise ValueError(
+                f"input_tokens={input_tokens} plus one output exceeds "
+                f"batch token limit={self.batch_tokens}"
+            )
+        count = min(self.admission_requests, self.batch_tokens // tokens)
+        budgets = self.owner_kv_budgets or (
+            ("service", self.available_kv_blocks, self.block_tokens),
         )
-        if count < 1:
-            raise ValueError("request exceeds admission/token/KV budget")
+        for name, available, block_tokens in budgets:
+            blocks = (tokens + block_tokens - 1) // block_tokens
+            if blocks > available:
+                raise ValueError(
+                    f"{name}: KV admission requires {blocks} blocks "
+                    f"for input_tokens={input_tokens} plus one output; "
+                    f"available_blocks={available} block_tokens={block_tokens}"
+                )
+            count = min(count, available // blocks)
         return count
+
+    def require_request(self, input_tokens: int) -> None:
+        self.concurrency_for(input_tokens)
 
 
 class PressurePhases:
@@ -248,8 +293,7 @@ class PressureSession:
         scheduler,
         batch_size,
         max_input_tokens,
-        seed_count,
-        seed_input_tokens,
+        seed_plan: SeedPlan,
         make_payload,
         request,
         poll,
@@ -265,6 +309,9 @@ class PressureSession:
         executor_factory=ThreadPoolExecutor,
     ):
         self.config, self.limits = config, limits
+        self.seed_plan = seed_plan
+        seed_count = seed_plan.seed_count
+        seed_input_tokens = seed_plan.seed_input_tokens
         self.arrivals = ArrivalClock(rate, poisson, random_seed)
         if scheduler not in ("fifo", "batch_decode"):
             raise ValueError("unknown scheduler")
@@ -274,9 +321,9 @@ class PressureSession:
             raise ValueError("positive batch size required")
         if scheduler == "fifo" and batch_size != 1:
             raise ValueError("FIFO has no fixed batch")
-        formal_limit = limits.concurrency_for(max_input_tokens)
-        if concurrency > formal_limit or batch_size > concurrency:
-            raise ValueError("formal concurrency exceeds frozen execution limits")
+        limits.require_request(max_input_tokens)
+        if batch_size > concurrency:
+            raise ValueError("fixed batch size exceeds client concurrency")
         self.fill_batch = min(
             concurrency, limits.concurrency_for(config.fill_input_tokens)
         )
@@ -795,6 +842,7 @@ class PressureSession:
                 "frozen",
                 config=asdict(self.config),
                 limits=asdict(self.limits),
+                seed_plan=asdict(self.seed_plan),
                 targets=[asdict(t) for t in self.coverage.targets],
                 raw_baseline=baseline.raw,
             )

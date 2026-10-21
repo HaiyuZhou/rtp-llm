@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
@@ -17,6 +17,7 @@ from rtp_llm.test.perf_test.cache_grid.runner import continuous_pressure as cp
 from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
     resolve_pressure_config,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import SeedPlan
 
 
 def config(**changes):
@@ -32,6 +33,23 @@ def config(**changes):
     )
     values.update(changes)
     return resolve_pressure_config(values)
+
+
+def seed_plan(seed_count=0, input_tokens=16, fill_tokens=16, client_inflight=4):
+    return SeedPlan(
+        source="manual",
+        seed_count=seed_count,
+        grid_reuse_tokens=0,
+        reusable_tokens=input_tokens - 1,
+        commit_tail_tokens=1,
+        seed_input_tokens=input_tokens,
+        fill_target_tokens=fill_tokens,
+        fill_input_tokens=fill_tokens,
+        client_inflight=client_inflight,
+        formal_config_valid=False,
+        nonformal_reasons=("manual_seed_count",),
+        groups=(),
+    )
 
 
 class PhaseTest(unittest.TestCase):
@@ -64,6 +82,23 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(limits.concurrency_for(33), 2)
         with self.assertRaises(ValueError):
             limits.concurrency_for(128)
+
+    def test_live_pool_admission_keeps_each_owner_geometry(self):
+        limits = cp.ExecutionLimits(
+            262144,
+            1,
+            200000,
+            400,
+            512,
+            owner_kv_budgets=(
+                ("owner=0 group=1 pool=wide", 2, 65536),
+                ("owner=0 group=2 pool=narrow", 400, 512),
+            ),
+        )
+        self.assertIsNone(limits.require_request(102400))
+        self.assertEqual(limits.concurrency_for(102400), 1)
+        with self.assertRaisesRegex(ValueError, "owner=0 group=1 pool=wide.*KV"):
+            limits.require_request(150000)
 
 
 class FakeClock:
@@ -212,8 +247,7 @@ class LifecycleTest(unittest.TestCase):
             scheduler=scheduler,
             batch_size=3 if scheduler == "batch_decode" else 1,
             max_input_tokens=16,
-            seed_count=seed_count,
-            seed_input_tokens=16,
+            seed_plan=seed_plan(seed_count),
             make_payload=payload,
             request=request,
             poll=poll,
@@ -658,8 +692,7 @@ class LifecycleTest(unittest.TestCase):
             scheduler="fifo",
             batch_size=1,
             max_input_tokens=16,
-            seed_count=0,
-            seed_input_tokens=16,
+            seed_plan=seed_plan(client_inflight=2),
             make_payload=lambda kind, i: {"input_ids": [1] * 16},
             request=request,
             poll=poll,
@@ -777,8 +810,7 @@ class WarmupCutoffTest(unittest.TestCase):
             scheduler=scheduler,
             batch_size=1,
             max_input_tokens=16,
-            seed_count=2 if kind == "seed" else 0,
-            seed_input_tokens=16,
+            seed_plan=seed_plan(2 if kind == "seed" else 0, client_inflight=2),
             make_payload=payload,
             request=request,
             poll=poll,
@@ -1095,6 +1127,426 @@ class TransportRegistrationTest(unittest.TestCase):
 
 
 class RunnerIntegrationTest(unittest.TestCase):
+    def _startup_runner(self, directory, **changes):
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            CacheGridRunner,
+        )
+
+        tokenizer = SimpleNamespace(
+            encode=lambda text: [sum(map(ord, word)) for word in text.split()]
+        )
+        options = dict(
+            pressure_mode="continuous",
+            pressure_scheduler="fifo",
+            pressure_client_concurrency=16,
+            pressure_request_rate=4,
+            pressure_config=config(
+                fill_input_tokens=102400,
+                steady_s=0.2,
+                measure_s=0.3,
+                sample_period_s=0.1,
+            ),
+            request_transport="dashsc_input_ids",
+            expected_block_size=512,
+            cache_commit_tail_tokens=4096,
+            grid_metadata={"generator": {"cache_alignment": 4096}},
+            run_config={
+                "full_pressure_startup": dict(
+                    dp_size=1,
+                    exclusive_service=True,
+                    target_ranks=[0, 1],
+                    model_tokens=262144,
+                    admission_requests=1,
+                    batch_tokens=200000,
+                    block_tokens=512,
+                    test_block_num=0,
+                )
+            },
+        )
+        options.update(changes)
+        runner = CacheGridRunner(
+            123,
+            tokenizer,
+            [dict(case_id=7, input_len=135168, cache_len=131072, batch_size=1)],
+            directory,
+            **options,
+        )
+        self.addCleanup(runner._close_resources)
+        runner._pressure_epoch_dir = Path(directory) / "epoch"
+        runner._pressure_epoch_dir.mkdir()
+        return runner
+
+    def _startup_pressure(self, clock, sequence, *, startup=False, fault=None):
+        from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2 as pb
+
+        response = pb.CachePressureResponsePB(schema_version=1, requested_ranks=[0, 1])
+        owner = response.ranks.add(
+            world_rank=0,
+            service_instance="owner-instance",
+            sequence=sequence,
+            sampled_monotonic_ns=int(clock() * 1e9),
+        )
+        owner.ownership.mode = pb.PressureOwnershipPB.SHARED_TP
+        owner.ownership.owner_world_rank.value = 0
+        owner.ownership.participant_world_ranks.extend([0, 1])
+        owner.ownership.publication_scope = pb.PressureOwnershipPB.ALL_PARTICIPANTS
+        owner.pools.add(
+            pool_id="gpu",
+            pool_name="device",
+            tier=1,
+            total_blocks=300,
+            free_blocks=300 if startup else 30,
+            available_blocks=300,
+            used_blocks=0 if startup else 270,
+            block_size_bytes=4096,
+        )
+        owner.pools.add(
+            pool_id="host",
+            pool_name="host",
+            tier=2,
+            total_blocks=2048,
+            free_blocks=1024,
+            available_blocks=1024,
+            used_blocks=0 if startup else 600,
+            published_host_blocks=0 if startup else 600,
+            block_size_bytes=4096,
+        )
+        group = owner.groups.add(
+            group_id=0,
+            group_type=1,
+            device_pool_ids=["gpu"],
+            group_tags=["device"],
+            block_tokens=512,
+            payload_bytes=4096,
+            storage_bytes=4096,
+            watermark_trigger_count=0 if startup else sequence,
+        )
+        group.host_pool_id.value = "host"
+        group.device_watermark.low_ratio, group.device_watermark.high_ratio = 0.8, 0.9
+        group.host_watermark.low_ratio, group.host_watermark.high_ratio = 0.8, 0.9
+        owner.transfers.add(
+            group_id=0,
+            pool_id="host",
+            pool_tier=2,
+            operation=2,
+            source_tier=1,
+            target_tier=2,
+            published_blocks=0 if startup else sequence,
+        )
+        owner.activity.running_requests.value = 1
+        owner.activity.waiting_requests.value = 0
+        owner.step_history_available = True
+        peer = response.ranks.add()
+        peer.CopyFrom(owner)
+        peer.world_rank, peer.service_instance = 1, "participant-instance"
+        for pool in peer.pools:
+            pool.available_blocks = 1
+            pool.used_blocks = pool.published_host_blocks = 0
+        if startup:
+            if fault == "missing_full":
+                owner.groups[0].group_type = peer.groups[0].group_type = 2
+            elif fault == "available_overflow":
+                owner.pools[0].available_blocks = 301
+            elif fault == "missing_owner_pool":
+                del owner.pools[0]
+            elif fault == "infeasible":
+                owner.pools[1].available_blocks = 0
+        return response
+
+    def _run_startup_epoch(self, runner, fault=None):
+        from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2 as pb
+        from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2_grpc as rpc
+
+        clock, observations, submissions, sessions = FakeClock(), [], [], []
+        original = cp.PressureSession
+
+        def poll(request, timeout):
+            startup = not request.session_id
+            if startup:
+                self.assertEqual(observations, [])
+                self.assertIsNone(runner._pressure_seed_plan)
+                self.assertEqual(runner._continuous_seed_ids, [])
+            else:
+                self.assertIsNotNone(runner._pressure_seed_plan)
+            observations.append("startup" if startup else "poll")
+            response = self._startup_pressure(
+                clock, len(observations), startup=startup, fault=fault
+            )
+            if not startup and not any(
+                ":fill:" in identity for identity, _ in submissions
+            ):
+                for rank in response.ranks:
+                    rank.pools[0].used_blocks = rank.pools[1].published_host_blocks = 0
+                    rank.groups[0].watermark_trigger_count = 0
+                    rank.transfers[0].published_blocks = 0
+            return response
+
+        def probe():
+            self.assertEqual(observations, ["startup"])
+            self.assertIsNotNone(runner._pressure_seed_plan)
+            self.assertEqual(runner._continuous_seed_ids, [])
+            observations.append("probe")
+
+        def control(request, timeout):
+            response = pb.PressureSessionControlResponsePB(schema_version=1)
+            for rank, instance in ((0, "owner-instance"), (1, "participant-instance")):
+                response.ranks.add(
+                    world_rank=rank,
+                    service_instance=instance,
+                    applied_monotonic_ns=int(clock() * 1e9),
+                )
+            return response
+
+        def post(stub, ids, timeout, request_id, *, register_call, before_dispatch):
+            self.assertIs(sessions[0].seed_plan, runner._pressure_seed_plan)
+            self.assertEqual(observations[:2], ["startup", "probe"])
+            identity = before_dispatch()
+            submissions.append((identity, ids))
+            return dict(success=True, input_len=len(ids), output_len=1)
+
+        def session(*args, **kwargs):
+            instance = original(
+                *args,
+                **kwargs,
+                clock=clock,
+                sleep=clock.sleep,
+                executor_factory=InlineExecutor,
+            )
+            sessions.append(instance)
+            return instance
+
+        runner._probe_reuse_granularity = probe
+        with patch.object(
+            rpc,
+            "RpcServiceStub",
+            return_value=SimpleNamespace(
+                GetCachePressure=poll, ControlPressureDiagnostics=control
+            ),
+        ), patch.object(cp, "PressureSession", session), patch(
+            "time.monotonic", clock
+        ), patch(
+            "rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner._post_prefill_ids",
+            side_effect=post,
+        ):
+            result = runner._run_full_pressure_epoch("epoch")
+        return result, submissions, sessions
+
+    def test_startup_plan_is_frozen_before_requests_and_reproducible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(directory)
+            self.assertIsNone(runner.pressure_seed_count)
+            result, submissions, sessions = self._run_startup_epoch(runner)
+            self.assertEqual(result, [])
+            self.assertTrue(submissions)
+            manifest = json.loads(
+                (runner._pressure_epoch_dir / "pressure/manifest.json").read_text()
+            )
+            plan = manifest["seed_plan"]
+            self.assertEqual(plan["source"], "automatic")
+            self.assertEqual(plan["seed_count"], 2)
+            self.assertEqual(plan["seed_input_tokens"], 135168)
+            self.assertEqual(plan["fill_input_tokens"], 102400)
+            self.assertTrue(plan["formal_config_valid"])
+            self.assertEqual(len(plan["groups"]), 1)
+            group = plan["groups"][0]
+            self.assertEqual(
+                group["participants"],
+                [[0, "owner-instance"], [1, "participant-instance"]],
+            )
+            self.assertEqual(group["host_pool"]["available_blocks"], 1024)
+            lower = (
+                min(
+                    p["capacity_blocks"] // p["seed_blocks"]
+                    for p in group["device_pools"]
+                )
+                + 1
+            )
+            upper = (
+                min(p["low_blocks"] // p["seed_blocks"] for p in group["device_pools"])
+                + group["host_pool"]["available_blocks"]
+                // group["host_pool"]["seed_blocks"]
+            )
+            self.assertEqual((lower, upper), (2, 4))
+            self.assertEqual(plan["seed_count"], lower)
+            self.assertEqual(manifest["frozen"]["seed_plan"], plan)
+            self.assertEqual(
+                plan, json.loads(json.dumps(asdict(runner._pressure_seed_plan)))
+            )
+            raw = json.loads(
+                (runner._pressure_epoch_dir / "startup_pressure.json").read_text()
+            )
+            self.assertEqual(manifest["startup_pressure"], raw)
+            self.assertEqual(sessions[0].limits.concurrency_for(135168), 1)
+            self.assertEqual(sessions[0].sender.limit, 16)
+            seeds = [ids for identity, ids in submissions if ":seed:" in identity]
+            self.assertEqual([len(ids) for ids in seeds], [135168, 135168])
+            fills = [ids for identity, ids in submissions if ":fill:" in identity]
+            self.assertTrue(fills)
+            self.assertTrue(all(len(ids) == 102400 for ids in fills))
+            formal = [
+                ids
+                for identity, ids in submissions
+                if ":steady:" in identity or ":measurement:" in identity
+            ]
+            self.assertTrue(formal)
+            self.assertTrue(
+                all(
+                    any(ids[:131072] == seed[:131072] for seed in seeds)
+                    for ids in formal
+                )
+            )
+            self.assertTrue(
+                all(
+                    any(
+                        ids[131072] != seed[131072]
+                        for seed in seeds
+                        if ids[:131072] == seed[:131072]
+                    )
+                    for ids in formal
+                )
+            )
+
+    def test_manual_startup_plan_records_nonformal_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(directory, pressure_seed_count=1)
+            self._run_startup_epoch(runner)
+            manifest = json.loads(
+                (runner._pressure_epoch_dir / "pressure/manifest.json").read_text()
+            )
+            self.assertEqual(manifest["seed_plan"]["source"], "manual")
+            self.assertEqual(manifest["seed_plan"]["seed_count"], 1)
+            self.assertFalse(manifest["seed_plan"]["formal_config_valid"])
+            self.assertEqual(
+                manifest["seed_plan"]["nonformal_reasons"], ["manual_seed_count"]
+            )
+
+    def test_small_manual_grid_still_uses_frozen_32k_seed_span(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(directory, pressure_seed_count=1)
+            runner.cases[0].update(input_len=20480, cache_len=16384)
+            _, submissions, _ = self._run_startup_epoch(runner)
+            self.assertEqual(runner._pressure_seed_plan.seed_input_tokens, 36864)
+            self.assertEqual(
+                runner._pressure_seed_plan.nonformal_reasons,
+                ("manual_seed_count", "grid_reuse_below_32768"),
+            )
+            seeds = [ids for identity, ids in submissions if ":seed:" in identity]
+            self.assertEqual([len(ids) for ids in seeds], [36864])
+            formal = [
+                ids
+                for identity, ids in submissions
+                if ":steady:" in identity or ":measurement:" in identity
+            ]
+            self.assertTrue(formal)
+            self.assertTrue(
+                all(
+                    len(ids) == 20480
+                    and ids[:16384] == seeds[0][:16384]
+                    and ids[16384] != seeds[0][16384]
+                    for ids in formal
+                )
+            )
+
+    def test_aligned_fill_is_never_shortened_to_configured_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(
+                directory, grid_metadata={"generator": {"cache_alignment": 65536}}
+            )
+            _, submissions, sessions = self._run_startup_epoch(runner)
+            self.assertEqual(runner.pressure_config.fill_input_tokens, 102400)
+            self.assertEqual(sessions[0].config.fill_input_tokens, 131072)
+            self.assertEqual(sessions[0].seed_plan.fill_input_tokens, 131072)
+            fills = [ids for identity, ids in submissions if ":fill:" in identity]
+            self.assertTrue(fills)
+            self.assertTrue(all(len(ids) == 131072 for ids in fills))
+
+    def test_each_epoch_discards_previous_live_plan_before_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(directory)
+            self._run_startup_epoch(runner)
+            previous = runner._pressure_seed_plan
+            runner._pressure_epoch_dir = Path(directory) / "next-epoch"
+            runner._pressure_epoch_dir.mkdir()
+            self._run_startup_epoch(runner)
+            self.assertIsNot(runner._pressure_seed_plan, previous)
+
+    def test_invalid_startup_evidence_fails_before_any_submission(self):
+        for fault, reason in (
+            ("missing_full", "FULL"),
+            ("missing_owner_pool", "pool"),
+            ("available_overflow", "occupancy"),
+            ("infeasible", "owner_rank=0.*minimum=2 maximum=0"),
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                runner = self._startup_runner(directory)
+                with self.assertRaisesRegex(ValueError, reason):
+                    self._run_startup_epoch(runner, fault)
+                self.assertEqual(runner._continuous_seed_ids, [])
+                self.assertFalse(
+                    (runner._pressure_epoch_dir / "pressure/requests.jsonl").exists()
+                )
+                self.assertTrue(
+                    (runner._pressure_epoch_dir / "startup_pressure.json").exists()
+                )
+
+    def test_formal_grid_below_32k_fails_before_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(directory)
+            runner.cases = [
+                dict(case_id=8, input_len=20480, cache_len=16384, batch_size=1)
+            ]
+            with self.assertRaisesRegex(ValueError, "32768"):
+                self._run_startup_epoch(runner)
+            self.assertEqual(runner._continuous_seed_ids, [])
+
+    def test_request_shape_admission_names_each_violated_constraint(self):
+        for shape, field, value, reason in (
+            ("fill", "model_tokens", 102400, "model"),
+            ("fill", "batch_tokens", 102400, "batch.*token"),
+            ("fill", "available", 200, "owner=0 group=0 pool=gpu.*KV"),
+            ("seed", "model_tokens", 135168, "model"),
+            ("formal.*case_id=7", "model_tokens", 150000, "model"),
+        ):
+            with self.subTest(
+                shape=shape, field=field
+            ), tempfile.TemporaryDirectory() as directory:
+                runner = self._startup_runner(directory)
+                if field == "available":
+                    original = self._startup_pressure
+
+                    def pressure(*args, **kwargs):
+                        response = original(*args, **kwargs)
+                        response.ranks[0].pools[0].available_blocks = value
+                        return response
+
+                    with patch.object(self, "_startup_pressure", side_effect=pressure):
+                        with self.assertRaisesRegex(ValueError, shape + ".*" + reason):
+                            self._run_startup_epoch(runner)
+                else:
+                    runner.run_config["full_pressure_startup"][field] = value
+                    if shape.startswith("formal"):
+                        runner.cases[0]["input_len"] = 180224
+                    with self.assertRaisesRegex(ValueError, shape + ".*" + reason):
+                        self._run_startup_epoch(runner)
+                self.assertEqual(runner._continuous_seed_ids, [])
+                self.assertFalse(
+                    (runner._pressure_epoch_dir / "pressure/requests.jsonl").exists()
+                )
+
+    def test_preload_constructor_requires_fifo_and_positive_integer_smoke_count(self):
+        for changes in (
+            dict(pressure_scheduler="batch_decode"),
+            dict(pressure_batch_size=2),
+            dict(pressure_seed_count=0),
+            dict(pressure_seed_count=True),
+            dict(pressure_seed_count=1.5),
+        ):
+            with self.subTest(
+                changes=changes
+            ), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(ValueError):
+                    self._startup_runner(directory, **changes)
+
     def test_latest_epoch_is_atomic_and_retains_preflight_failure(self):
         from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
             CacheGridRunner,
@@ -1504,7 +1956,7 @@ class RunnerIntegrationTest(unittest.TestCase):
                 **kwargs,
                 clock=clock,
                 sleep=clock.sleep,
-                executor_factory=InlineExecutor
+                executor_factory=InlineExecutor,
             )
 
         dependencies = {
@@ -1589,6 +2041,7 @@ class RunnerIntegrationTest(unittest.TestCase):
                 ),
                 (0, 1),
                 events.append,
+                seed_plan=seed_plan(client_inflight=2),
                 evidence_manifest=dict(
                     control_times=dict(capacity_send_s=1),
                     epoch={"0": "actual-wire", "1": "peer-wire"},

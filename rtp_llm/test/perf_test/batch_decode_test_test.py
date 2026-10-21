@@ -3049,9 +3049,7 @@ class FullPressurePublicTest(unittest.TestCase):
             self.assertIsNone(
                 runner.run_config["workload"]["cache_pressure_seed_count"]
             )
-            with self.assertRaisesRegex(
-                ValueError, "automatic seed count requires.*live"
-            ):
+            with self.assertRaisesRegex(TypeError, "seed_plan"):
                 runner._run_full_pressure(
                     runner.cases, self.settings(), None, None, [0], None
                 )
@@ -3064,7 +3062,7 @@ class FullPressurePublicTest(unittest.TestCase):
             ("pressure_arrival", "poisson"),
             ("pressure_random_seed", 7),
             ("pressure_batch_size", 2),
-            ("pressure_scheduler", "fifo"),
+            ("pressure_scheduler", "batch_decode"),
         ):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 runner = self.runner(directory)
@@ -3072,7 +3070,7 @@ class FullPressurePublicTest(unittest.TestCase):
                 runner._close_resources()
                 same = self.runner(directory)
                 same._close_resources()
-                with self.assertRaisesRegex(ValueError, "incompatible|run_config"):
+                with self.assertRaisesRegex(ValueError, "incompatible|run_config|FIFO"):
                     resumed = self.runner(directory, **{name: changed})
                     resumed._close_resources()
 
@@ -3190,7 +3188,7 @@ class FullPressurePublicTest(unittest.TestCase):
             tier=1,
             total_blocks=100,
             used_blocks=90,
-            available_blocks=70,
+            available_blocks=80,
             active_blocks=30,
         )
         rank.pools.add(
@@ -3199,8 +3197,11 @@ class FullPressurePublicTest(unittest.TestCase):
             total_blocks=100,
             used_blocks=30,
             published_host_blocks=25,
+            available_blocks=100,
         )
-        group = rank.groups.add(group_id=0, group_type=1, device_pool_ids=["gpu"])
+        group = rank.groups.add(
+            group_id=0, group_type=1, device_pool_ids=["gpu"], block_tokens=512
+        )
         group.host_pool_id.value = "host"
         group.device_watermark.low_ratio = 0.8
         group.device_watermark.high_ratio = 0.9
@@ -3214,14 +3215,16 @@ class FullPressurePublicTest(unittest.TestCase):
         )
         options = dict(
             pressure_mode="continuous",
+            pressure_scheduler="fifo",
             pressure_config=self.settings(),
             request_transport="dashsc_input_ids",
             expected_block_size=4096,
+            grid_metadata={"generator": {"cache_alignment": 4096}},
             run_config=dict(
                 full_pressure_startup=dict(
-                    model_tokens=16384,
+                    model_tokens=65536,
                     admission_requests=2,
-                    batch_tokens=32768,
+                    batch_tokens=131072,
                     block_tokens=512,
                     target_ranks=[0],
                     dp_size=1,
@@ -3299,7 +3302,7 @@ class FullPressurePublicTest(unittest.TestCase):
                 runner, "_run_full_pressure", return_value={"failure": None}
             ):
                 stub.return_value.GetCachePressure.return_value = response
-                with self.assertRaisesRegex(ValueError, "concurrency"):
+                with self.assertRaisesRegex(ValueError, "seed.*KV admission"):
                     runner.run()
                 probe.assert_not_called()
 
@@ -3320,7 +3323,7 @@ class FullPressurePublicTest(unittest.TestCase):
                     runner.run()
                 cases, config, limits = run.call_args.args[:3]
                 self.assertEqual(len(cases), 1)
-                self.assertEqual(limits.available_kv_blocks, 70)
+                self.assertEqual(limits.available_kv_blocks, 80)
                 self.assertEqual(limits.block_tokens, 512)
                 manifest = run.call_args.kwargs["evidence_manifest"]
                 self.assertEqual(manifest["epoch"]["0"], "service-one")

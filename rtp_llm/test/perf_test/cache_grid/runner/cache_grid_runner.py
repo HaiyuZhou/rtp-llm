@@ -997,7 +997,7 @@ class CacheGridRunner:
         pressure_scheduler: str = "batch_decode",
         pressure_batch_size: int = 1,
         pressure_client_concurrency: int = 2,
-        pressure_seed_count: int | None = 4,
+        pressure_seed_count: int | None = None,
         pressure_request_rate: float = 0.0,
         pressure_arrival: str = "constant",
         pressure_random_seed: int = 0,
@@ -1030,6 +1030,8 @@ class CacheGridRunner:
         nsys_tail_seconds: float = 0.1,
     ):
         self.port = port
+        if pressure_config is None and pressure_seed_count is None:
+            pressure_seed_count = 4
         self.pressure_config = pressure_config
         if pressure_config is not None:
             from dataclasses import asdict
@@ -1040,6 +1042,8 @@ class CacheGridRunner:
             startup = (run_config or {}).get("full_pressure_startup", {})
             if pressure_mode != "continuous":
                 raise ValueError("pressure preload requires continuous mode")
+            if pressure_scheduler != "fifo" or pressure_batch_size != 1:
+                raise ValueError("pressure preload requires FIFO and batch size 1")
             if measure_runs is not None:
                 raise ValueError(
                     "pressure time window conflicts with explicit count/runs"
@@ -1127,6 +1131,7 @@ class CacheGridRunner:
         self.pressure_request_rate = pressure_request_rate
         self.pressure_arrival = pressure_arrival
         self.pressure_random_seed = pressure_random_seed
+        self._pressure_seed_plan = None
         self._continuous_seed_ids: List[List[int]] = []
         self._continuous_seed_records: List[Dict[str, Any]] = []
         self._continuous_summary: Dict[str, Any] | None = None
@@ -1149,7 +1154,7 @@ class CacheGridRunner:
                     raise ValueError(
                         "automatic seed count requires full-pressure preload"
                     )
-            elif isinstance(pressure_seed_count, bool) or pressure_seed_count <= 0:
+            elif type(pressure_seed_count) is not int or pressure_seed_count <= 0:
                 raise ValueError("continuous pressure seed count must be positive")
             if not math.isfinite(pressure_request_rate) or pressure_request_rate < 0:
                 raise ValueError(
@@ -1851,6 +1856,7 @@ class CacheGridRunner:
         sink,
         controller=None,
         *,
+        seed_plan,
         evidence_manifest=None,
     ):
         """Internal opt-in entry; CLI validation/wiring is owned by the caller.
@@ -1859,9 +1865,6 @@ class CacheGridRunner:
         endpoint. limits must project resolved server admission/model/token/KV
         bounds, never guesses based on the requested workload.
         """
-        if self.pressure_seed_count is None:
-            raise ValueError("automatic seed count requires a resolved live seed plan")
-
         from google.protobuf.json_format import MessageToDict
 
         from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2
@@ -1979,9 +1982,8 @@ class CacheGridRunner:
                     requested_steps=config.profile_steps,
                     **capture_options,
                 )
-        max_cache = max(int(case["cache_len"]) for case in cases)
-        seed_count = self.pressure_seed_count if max_cache else 0
-        seed_tokens = max_cache + self.cache_commit_tail_tokens if max_cache else 1
+        seed_count = seed_plan.seed_count
+        seed_tokens = seed_plan.seed_input_tokens
         self._continuous_seed_ids = [None] * seed_count
         producer_lock = threading.Lock()
         rng = random.Random(self.pressure_random_seed)
@@ -2049,7 +2051,9 @@ class CacheGridRunner:
             nonce = f"{session_id}_{job_id}"
             with producer_lock:
                 if kind in ("seed", "fill"):
-                    tokens = seed_tokens if kind == "seed" else config.fill_input_tokens
+                    tokens = (
+                        seed_tokens if kind == "seed" else seed_plan.fill_input_tokens
+                    )
                     with self._continuous_prompt_lock:
                         _, ids = self.factory._exact_text_and_ids(
                             tokens, f"diagnostic_{kind}_{nonce}_"
@@ -2237,6 +2241,7 @@ class CacheGridRunner:
 
         manifest = {key: None for key in MANIFEST_PROJECTION}
         manifest.update(evidence_manifest or {})
+        manifest["seed_plan"] = asdict(seed_plan)
         manifest["missing_metadata"] = [
             key for key in MANIFEST_PROJECTION if manifest[key] is None
         ]
@@ -2258,8 +2263,7 @@ class CacheGridRunner:
             scheduler=self.pressure_scheduler,
             batch_size=self.pressure_batch_size,
             max_input_tokens=max(int(c["input_len"]) for c in cases),
-            seed_count=seed_count,
-            seed_input_tokens=seed_tokens,
+            seed_plan=seed_plan,
             make_payload=make_payload,
             request=request,
             poll=poll,
@@ -3093,7 +3097,7 @@ class CacheGridRunner:
             raise
 
     def _run_full_pressure_epoch(self, epoch_id):
-        from dataclasses import asdict
+        from dataclasses import asdict, replace
 
         import grpc
 
@@ -3106,10 +3110,13 @@ class CacheGridRunner:
             raw_pressure_record,
             select_targets,
         )
+        from .pressure_seed_plan import build_seed_plan
 
         startup = self.run_config["full_pressure_startup"]
         ranks = tuple(startup["target_ranks"])
         # A root checkpoint guards the workload only; each epoch reruns every phase.
+        self._pressure_seed_plan = None
+        self._continuous_seed_ids = []
         self._results.clear()
         self._save(complete=False)
         with grpc.insecure_channel(f"127.0.0.1:{self.port + 1}") as channel:
@@ -3126,42 +3133,57 @@ class CacheGridRunner:
             )
             decoded = decode_pressure_response(response, sent, received, ranks)
             targets = select_targets(decoded.samples, ranks)
-            available = []
-            owner_pools = {
-                (target.owner_rank, owner_id)
-                for target in targets
-                for local_id, owner_id in target.pool_mapping
-                if local_id in target.device_pool_ids
-            }
-            for rank in response.ranks:
-                required = {
-                    pool_id
-                    for owner_rank, pool_id in owner_pools
-                    if owner_rank == rank.world_rank
-                }
-                for pool in rank.pools:
-                    if pool.pool_id in required:
-                        if pool.available_blocks > pool.total_blocks:
-                            raise ValueError("invalid live available KV blocks")
-                        available.append(int(pool.available_blocks))
+            seed_plan = build_seed_plan(
+                decoded.samples,
+                targets,
+                cases=tuple(self.cases),
+                cache_alignment=self.grid_metadata["generator"]["cache_alignment"],
+                commit_tail_tokens=self.cache_commit_tail_tokens,
+                client_inflight=self.pressure_client_concurrency,
+                manual_seed_count=self.pressure_seed_count,
+                fill_target_tokens=self.pressure_config.fill_input_tokens,
+                test_block_num=startup.get("test_block_num", 0),
+            )
+            self._pressure_seed_plan = seed_plan
+            effective_config = replace(
+                self.pressure_config, fill_input_tokens=seed_plan.fill_input_tokens
+            )
+            owner_kv_budgets = tuple(
+                (
+                    f"owner={group.owner_rank} group={group.owner_group_id} "
+                    f"pool={pool.pool_id}",
+                    pool.available_blocks,
+                    pool.block_tokens,
+                )
+                for group in seed_plan.groups
+                for pool in group.device_pools
+            )
             limits = ExecutionLimits(
                 model_tokens=startup["model_tokens"],
                 admission_requests=startup["admission_requests"],
                 batch_tokens=startup["batch_tokens"],
-                available_kv_blocks=min(available),
+                available_kv_blocks=min(pool[1] for pool in owner_kv_budgets),
                 block_tokens=startup["block_tokens"],
+                owner_kv_budgets=owner_kv_budgets,
             )
-            for tokens in [
-                self.pressure_config.fill_input_tokens,
-                self.expected_block_size + self.cache_commit_tail_tokens,
-                2 * self.expected_block_size,
-                *[int(case["input_len"]) for case in self.cases],
-            ]:
-                limits.concurrency_for(tokens)
-            if self.pressure_client_concurrency > limits.concurrency_for(
-                max(int(case["input_len"]) for case in self.cases)
-            ):
-                raise ValueError("formal concurrency exceeds frozen execution limits")
+            shapes = [
+                ("fill", seed_plan.fill_input_tokens),
+                ("seed", seed_plan.seed_input_tokens),
+                *[
+                    (f"formal case_id={case['case_id']}", int(case["input_len"]))
+                    for case in self.cases
+                ],
+                (
+                    "reuse probe seed",
+                    self.expected_block_size + self.cache_commit_tail_tokens,
+                ),
+                ("reuse probe hit", 2 * self.expected_block_size),
+            ]
+            for shape, tokens in shapes:
+                try:
+                    limits.require_request(tokens)
+                except ValueError as exc:
+                    raise ValueError(f"{shape} input_tokens={tokens}: {exc}") from exc
             source_root = Path(__file__).parent
             source_files = sorted(source_root.glob("*.py")) + sorted(
                 (source_root.parent / "config").glob("*.py")
@@ -3197,7 +3219,7 @@ class CacheGridRunner:
                 profile_hash=profile_hash,
                 grid_hash=grid_hash,
                 resolved_settings=dict(
-                    self.run_config, pressure=asdict(self.pressure_config)
+                    self.run_config, pressure=asdict(effective_config)
                 ),
                 input_identity=dict(
                     grid_hash=grid_hash,
@@ -3214,6 +3236,8 @@ class CacheGridRunner:
                 },
                 control_times=dict(capacity_send_s=sent, capacity_receive_s=received),
                 startup_pressure=raw,
+                startup_targets=[asdict(target) for target in targets],
+                seed_plan=asdict(seed_plan),
                 epoch_id=epoch_id,
             )
             logging.info("full pressure epoch evidence: %s", self._pressure_epoch_dir)
@@ -3221,11 +3245,12 @@ class CacheGridRunner:
             self._pressure_preflight_complete = True
             result = self._run_full_pressure(
                 self.cases,
-                self.pressure_config,
+                effective_config,
                 limits,
                 stub,
                 ranks,
                 None,
+                seed_plan=seed_plan,
                 evidence_manifest=manifest,
             )
             if result.get("failure"):

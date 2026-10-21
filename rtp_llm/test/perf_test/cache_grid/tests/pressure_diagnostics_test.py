@@ -808,6 +808,31 @@ class MigrationTest(unittest.TestCase):
         evaluator.add((*current[:3], stale), 11)
         self.assertFalse(evaluator.assess_migration(10, 20).valid)
 
+    def test_counter_reset_after_missing_participant_invalidates_prior_evidence(self):
+        for complete in (True, False):
+            with self.subTest(complete=complete):
+                evaluator = self.evaluator(participants=4)
+                evaluator.add(migration_page(10, participants=4), 10)
+                evaluator.add(migration_page(11, 7, 5, participants=4), 11)
+                self.assertTrue(evaluator.assess_migration(10, 20).valid)
+                evaluator.add(
+                    migration_page(12, 10, 8, participants=4)[:3],
+                    12,
+                    complete=complete,
+                )
+                # Rejected pages cannot add intervals or advance adjacency.
+                self.assertEqual(
+                    evaluator.assess_migration(10, 20).groups[0].d2h_intervals,
+                    ((10, 11),),
+                )
+                evaluator.add(migration_page(13, 9, 7, participants=4), 13)
+                result = evaluator.assess_migration(10, 20)
+                self.assertFalse(result.epoch_valid)
+                self.assertFalse(result.valid)
+                self.assertIn("counter_reset", result.reasons)
+                self.assertEqual(result.groups[0].d2h_intervals, ((10, 11),))
+                self.assertEqual(result.groups[0].h2d_intervals, ((10, 11),))
+
     def test_counter_decrease_invalidates_existing_migration_evidence(self):
         evaluator = self.evaluator()
         evaluator.add(migration_page(10), 10)

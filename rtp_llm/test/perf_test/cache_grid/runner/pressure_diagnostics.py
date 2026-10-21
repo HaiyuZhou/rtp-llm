@@ -983,6 +983,9 @@ class PressureCoverage:
             validate_inventory(select_targets(samples, self.ranks), self.targets)
         except ValueError:
             self.reasons.add("inventory_discontinuity")
+            # Rejected pages still contain observed cumulative counters. Retain
+            # them for reset detection without establishing certified adjacency.
+            self.last_seen.update((sample.rank, sample) for sample in samples)
             # A failed/missing poll breaks adjacency; changed service identity
             # invalidates this epoch and requires new pre-fill baselines.
             if any(

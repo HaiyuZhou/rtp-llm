@@ -635,6 +635,51 @@ class CachePerfPipelineTest(unittest.TestCase):
             [1048576, 2097152],
         )
 
+    def test_bazel_runfiles_prefix_differences_can_be_merged(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.unified_pipeline import (
+            validate_merge_inputs,
+        )
+
+        paths = []
+        suffix = "pip_gpu_cuda13_torch_xgrammar/site-packages/xgrammar:/usr/lib64"
+        for name, shard in (("a", "shard_00"), ("b", "shard_01")):
+            dest = self.root / name
+            dest.mkdir()
+            path = dest / "cache_grid_results.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "profile": {
+                            "schema_version": 1,
+                            "engine": {"model_type": "qwen_2"},
+                        },
+                        "run_config": {
+                            "engine": {
+                                "environment": {
+                                    "LD_LIBRARY_PATH": (
+                                        f"/tmp/bazel-out/{shard}.runfiles/{suffix}"
+                                    )
+                                }
+                            }
+                        },
+                    }
+                )
+            )
+            paths.append(path)
+
+        records, _ = validate_merge_inputs(paths)
+        self.assertEqual(len(records), 2)
+
+        changed = json.loads(paths[1].read_text())
+        changed["run_config"]["engine"]["environment"]["LD_LIBRARY_PATH"] = changed[
+            "run_config"
+        ]["engine"]["environment"]["LD_LIBRARY_PATH"].replace(
+            "site-packages/xgrammar", "site-packages/xgrammar_v2"
+        )
+        paths[1].write_text(json.dumps(changed))
+        with self.assertRaisesRegex(ValueError, "effective run_config differs"):
+            validate_merge_inputs(paths)
+
     def test_pipeline_does_not_accept_profiler_mode(self):
         args = cli.parser().parse_args(self.argv("--profile-backend", "nsys"))
         with self.assertRaisesRegex(ValueError, "formal measurements"):

@@ -96,10 +96,10 @@ def validate_merge_inputs(paths):
     # Unknown effective differences are rejected, rather than guessed equivalent.
     if len(configs) > 1 and any(c != configs[0] for c in configs[1:]):
 
-        def strip_capacity(value):
+        def strip_capacity(value, key=None):
             if isinstance(value, dict):
                 return {
-                    k: strip_capacity(v)
+                    k: strip_capacity(v, k)
                     for k, v in value.items()
                     if k not in CAPACITY_KEYS | {"measure_runs", "cache_measure_runs"}
                 }
@@ -115,6 +115,14 @@ def validate_merge_inputs(paths):
                     else:
                         cleaned.append(v)
                 return cleaned
+            if isinstance(value, str) and key == "LD_LIBRARY_PATH":
+                normalized = []
+                for entry in value.split(os.pathsep):
+                    marker = ".runfiles/"
+                    if marker in entry:
+                        entry = f"<bazel-runfiles>/{entry.partition(marker)[2]}"
+                    normalized.append(entry)
+                return os.pathsep.join(normalized)
             return value
 
         effective = [strip_capacity(c) for c in configs]

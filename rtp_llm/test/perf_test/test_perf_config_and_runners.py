@@ -16,10 +16,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from rtp_llm.test.perf_test.batch_decode_test import _run_decode, _run_prefill
-from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
-    CacheGridRunner,
-)
+from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import CacheGridRunner
 from rtp_llm.test.perf_test.dataclass import PerfTestConfig, TableType
+from rtp_llm.test.perf_test.perf_config import _apply_engine_env
 from rtp_llm.test.perf_test.perf_config import prepare_config as _prepare_config
 from rtp_llm.test.perf_test.perf_utils import (
     auto_generate_bs_list as _auto_generate_bs_list,
@@ -50,6 +49,26 @@ def _make_args(**overrides):
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
+
+
+class TestApplyEngineEnv(unittest.TestCase):
+    def test_preserves_run_under_library_prefix(self):
+        configured = "/toolset/lib:/cuda/lib:/usr/lib"
+        inherited = f"/runfiles/cudnn/lib:/runfiles/torch/lib:{configured}"
+        with patch.dict(os.environ, {"LD_LIBRARY_PATH": inherited}):
+            names = _apply_engine_env([f"LD_LIBRARY_PATH={configured}"])
+            self.assertEqual(names, ["LD_LIBRARY_PATH"])
+            self.assertEqual(os.environ["LD_LIBRARY_PATH"], inherited)
+
+    def test_replaces_different_library_path(self):
+        with patch.dict(os.environ, {"LD_LIBRARY_PATH": "/previous/lib"}):
+            _apply_engine_env(["LD_LIBRARY_PATH=/configured/lib"])
+            self.assertEqual(os.environ["LD_LIBRARY_PATH"], "/configured/lib")
+
+    def test_other_environment_values_still_override(self):
+        with patch.dict(os.environ, {"PERF_PROFILE_RUNS": "1"}):
+            _apply_engine_env(["PERF_PROFILE_RUNS=2"])
+            self.assertEqual(os.environ["PERF_PROFILE_RUNS"], "2")
 
 
 # ---------------------------------------------------------------------------
@@ -484,9 +503,7 @@ class TestOfflineBenchConfig(unittest.TestCase):
     def test_validate_num_return_sequences(self):
         from rtp_llm.test.perf_test.offline_runner import OfflineBenchConfig
 
-        with self.assertRaisesRegex(
-            ValueError, "num_return_sequences must be >= 1"
-        ):
+        with self.assertRaisesRegex(ValueError, "num_return_sequences must be >= 1"):
             OfflineBenchConfig(num_return_sequences=0).validate()
 
 
@@ -500,9 +517,7 @@ class TestOfflineFailurePolicy(unittest.TestCase):
     def test_rejects_zero_successful_requests(self):
         from rtp_llm.test.perf_test.offline_runner import OfflineMetrics
 
-        metrics = OfflineMetrics(
-            total_submitted=2, success_requests=0, fail_requests=2
-        )
+        metrics = OfflineMetrics(total_submitted=2, success_requests=0, fail_requests=2)
         with self.assertRaisesRegex(RuntimeError, "no requests succeeded"):
             metrics.raise_if_all_requests_failed()
 
@@ -1577,10 +1592,7 @@ class TestOfflineBenchMain(unittest.TestCase):
     def test_all_failed_requests_raise_from_entry_point_and_stop_server(self):
         import rtp_llm.test.perf_test.offline_bench_test as offline_bench
         import rtp_llm.test.perf_test.offline_runner as offline_runner_module
-        from rtp_llm.test.perf_test.offline_runner import (
-            OfflineMetrics,
-            OfflineRunner,
-        )
+        from rtp_llm.test.perf_test.offline_runner import OfflineMetrics, OfflineRunner
 
         server = MagicMock(port=12345)
         failed_metrics = OfflineMetrics(

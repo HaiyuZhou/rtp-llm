@@ -390,6 +390,17 @@ def _apply_engine_env(engine_env: List[str]) -> List[str]:
     names: List[str] = []
     for item in engine_env:
         name, value = _parse_name_value(item, "--engine_env")
+        current = os.environ.get(name)
+        if (
+            name == "LD_LIBRARY_PATH"
+            and value
+            and current
+            and (current == value or current.endswith(os.pathsep + value))
+        ):
+            # Bazel applies the profile env before --run_under. Preserve any
+            # wheel directories that the wrapper prepended to that same value.
+            names.append(name)
+            continue
         os.environ[name] = value
         names.append(name)
     return sorted(set(names))

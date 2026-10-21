@@ -22,3 +22,12 @@ sh_test(
     data = ["nvidia_wheel_env.sh"],
     env = {"GPU_COUNT": "0"},
 )
+
+sh_test(
+    name = "cache_perf_collect_env_test",
+    srcs = ["cache_perf_collect_env_test.sh"],
+    data = [
+        "cache_perf_collect_env.sh",
+        "//rtp_llm/test/perf_test:requirements_plotly_lock.txt",
+    ],
+)

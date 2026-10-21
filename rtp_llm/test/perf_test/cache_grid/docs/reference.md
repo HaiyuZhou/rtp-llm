@@ -960,6 +960,29 @@ the diagnostic matrix; toolchain smoke and parser fixtures are not that acceptan
 
 ### Validated runtime acceptance
 
+Current production acceptance (2026-10-21): DeepSeek-V4-Flash passed the
+live-capacity automatic-seed FIFO run on L20D GPUs `0,5,6,7`, using the checked-in
+production profile with 65536 MiB runtime reserve and no `test_block_num`.
+Source `15cab2c2c9` includes CP-aware owner geometry: physical capacity 23278
+blocks per associated FULL device pool, 9838 live host blocks, global token span
+2048. Reusable 65536-token families use 32 owner blocks; the independently
+recalculated feasible interval is [728,903], and exactly 728 automatic seeds
+completed with a 16-request bound and rolling replenishment.
+
+The 60s measurement had coverage 1.0 / longest invalid 0s; required owner0/FULL1
+published 1866 D2H blocks and 3168 H2D LOAD endpoint blocks wholly inside the
+window. Execution, FULL pressure, formal configuration, bidirectional migration
+and aggregate formal acceptance all passed independent raw-artifact audit.
+Artifacts: `/data0/zhouhaiyu.zhy/tmp/dsv4-fifo-pressure-formal-20261021-attempt4/`,
+epoch `b4f511dfee334cf58f439f105e4753ce`; audit receipts and every failed attempt
+are under `/data0/zhouhaiyu.zhy/tmp/task8-acceptance-20261021/`.
+The corrected reduced smoke (attempt3) completed lifecycle/cleanup and remains
+non-formal; the earlier production attempt3 is rejected because its old 512-token
+CP geometry understated the required seed count, despite self-reported true
+gates. See the [Chinese acceptance record](continuous_full_pressure_acceptance_zh.md)
+for exact commands, hashes, all retries, fixes, independent values and the
+unreproduced cold-start phase-control timeout limitation.
+
 Historical reduced-capacity evidence only: these runs predate automatic seed
 planning and measurement-window bidirectional qualification. The first three are
 forced small-pool smoke; none certifies this capability's production acceptance.

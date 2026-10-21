@@ -73,6 +73,7 @@ fi
 if [ -n "$torch_lib_dir" ]; then
     prefix="$torch_lib_dir:$prefix"
 fi
+export RTP_LLM_RUN_UNDER_LIBRARY_PATH="$prefix"
 export LD_LIBRARY_PATH="$prefix${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # CI lanes previously wrapped every test with --run_under=//rtp_llm/test/utils:gpu_lock;

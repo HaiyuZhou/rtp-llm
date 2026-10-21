@@ -52,16 +52,47 @@ def _make_args(**overrides):
 
 
 class TestApplyEngineEnv(unittest.TestCase):
+    _RUN_UNDER_LIBRARY_PATH = "RTP_LLM_RUN_UNDER_LIBRARY_PATH"
+
     def test_preserves_run_under_library_prefix(self):
         configured = "/toolset/lib:/cuda/lib:/usr/lib"
         inherited = f"/runfiles/cudnn/lib:/runfiles/torch/lib:{configured}"
-        with patch.dict(os.environ, {"LD_LIBRARY_PATH": inherited}):
+        with patch.dict(
+            os.environ,
+            {
+                "LD_LIBRARY_PATH": inherited,
+                self._RUN_UNDER_LIBRARY_PATH: "",
+            },
+        ):
             names = _apply_engine_env([f"LD_LIBRARY_PATH={configured}"])
             self.assertEqual(names, ["LD_LIBRARY_PATH"])
             self.assertEqual(os.environ["LD_LIBRARY_PATH"], inherited)
 
+    def test_restores_explicit_run_under_library_path_after_reexec(self):
+        injected = "/runfiles/cudnn/lib:/runfiles/torch/lib"
+        configured = "/toolset/lib:/cuda/lib:/runfiles/cudnn/lib"
+        with patch.dict(
+            os.environ,
+            {
+                "LD_LIBRARY_PATH": "/jit/reexec/lib",
+                self._RUN_UNDER_LIBRARY_PATH: injected,
+            },
+        ):
+            names = _apply_engine_env([f"LD_LIBRARY_PATH={configured}"])
+            self.assertEqual(names, ["LD_LIBRARY_PATH"])
+            self.assertEqual(
+                os.environ["LD_LIBRARY_PATH"],
+                "/runfiles/cudnn/lib:/runfiles/torch/lib:/toolset/lib:/cuda/lib",
+            )
+
     def test_replaces_different_library_path(self):
-        with patch.dict(os.environ, {"LD_LIBRARY_PATH": "/previous/lib"}):
+        with patch.dict(
+            os.environ,
+            {
+                "LD_LIBRARY_PATH": "/previous/lib",
+                self._RUN_UNDER_LIBRARY_PATH: "",
+            },
+        ):
             _apply_engine_env(["LD_LIBRARY_PATH=/configured/lib"])
             self.assertEqual(os.environ["LD_LIBRARY_PATH"], "/configured/lib")
 

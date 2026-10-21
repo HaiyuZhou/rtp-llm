@@ -391,6 +391,14 @@ def _apply_engine_env(engine_env: List[str]) -> List[str]:
     for item in engine_env:
         name, value = _parse_name_value(item, "--engine_env")
         current = os.environ.get(name)
+        run_under_library_path = os.environ.get("RTP_LLM_RUN_UNDER_LIBRARY_PATH", "")
+        if name == "LD_LIBRARY_PATH" and run_under_library_path:
+            entries = (run_under_library_path + os.pathsep + value).split(os.pathsep)
+            os.environ[name] = os.pathsep.join(
+                dict.fromkeys(entry for entry in entries if entry)
+            )
+            names.append(name)
+            continue
         if (
             name == "LD_LIBRARY_PATH"
             and value

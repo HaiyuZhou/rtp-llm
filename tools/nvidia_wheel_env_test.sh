@@ -15,19 +15,28 @@ actual=$(
     RUNFILES_DIR="$target_runfiles" \
     TEST_SRCDIR="" \
     LD_LIBRARY_PATH="/sentinel" \
-        bash "$wrapper" bash -c 'printf "%s" "$LD_LIBRARY_PATH"'
+        bash "$wrapper" bash -c 'printf "%s|%s" "$LD_LIBRARY_PATH" "$RTP_LLM_RUN_UNDER_LIBRARY_PATH"'
 )
+actual_library_path="${actual%%|*}"
+actual_run_under_path="${actual#*|}"
 
 expected_prefix="${torch_lib_dir}:${cudnn_lib_dir}:"
-if [[ "$actual" != "$expected_prefix"* ]]; then
+if [[ "$actual_library_path" != "$expected_prefix"* ]]; then
     echo "wheel paths from RUNFILES_DIR were not prepended to LD_LIBRARY_PATH" >&2
     echo "expected prefix: $expected_prefix" >&2
-    echo "actual: $actual" >&2
+    echo "actual: $actual_library_path" >&2
     exit 1
 fi
 
-if [[ ":$actual:" != *":/sentinel:"* ]]; then
-    echo "existing LD_LIBRARY_PATH was not preserved: $actual" >&2
+if [[ ":$actual_library_path:" != *":/sentinel:"* ]]; then
+    echo "existing LD_LIBRARY_PATH was not preserved: $actual_library_path" >&2
+    exit 1
+fi
+
+if [[ "$actual_run_under_path" != "$expected_prefix"* ]]; then
+    echo "wrapper-injected paths were not recorded separately" >&2
+    echo "expected prefix: $expected_prefix" >&2
+    echo "actual: $actual_run_under_path" >&2
     exit 1
 fi
 
@@ -44,13 +53,22 @@ actual=$(
     RUNFILES_DIR="" \
     TEST_SRCDIR="" \
     LD_LIBRARY_PATH="/sentinel" \
-        bash "$wrapper_launcher" bash -c 'printf "%s" "$LD_LIBRARY_PATH"'
+        bash "$wrapper_launcher" bash -c 'printf "%s|%s" "$LD_LIBRARY_PATH" "$RTP_LLM_RUN_UNDER_LIBRARY_PATH"'
 )
+actual_library_path="${actual%%|*}"
+actual_run_under_path="${actual#*|}"
 
 expected_prefix="${wrapper_torch_lib_dir}:${wrapper_cudnn_lib_dir}:"
-if [[ "$actual" != "$expected_prefix"* ]]; then
+if [[ "$actual_library_path" != "$expected_prefix"* ]]; then
     echo "wheel paths from the wrapper runfiles were not prepended to LD_LIBRARY_PATH" >&2
     echo "expected prefix: $expected_prefix" >&2
-    echo "actual: $actual" >&2
+    echo "actual: $actual_library_path" >&2
+    exit 1
+fi
+
+if [[ "$actual_run_under_path" != "$expected_prefix"* ]]; then
+    echo "wrapper runfiles paths were not recorded separately" >&2
+    echo "expected prefix: $expected_prefix" >&2
+    echo "actual: $actual_run_under_path" >&2
     exit 1
 fi

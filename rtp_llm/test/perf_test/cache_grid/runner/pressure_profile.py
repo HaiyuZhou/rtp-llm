@@ -352,17 +352,16 @@ def validate_kineto(trace, steps, requested_steps):
     )
 
 
-def analyze_kineto_files(paths, steps, requested_steps, deadline):
+def _analyze_profile(request, deadline):
     """Exec a fresh interpreter; timeout kills and reaps it before returning."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return dict(ranks={}, reasons=["profile_analysis_timeout"])
     environment = dict(os.environ)
     environment["PYTHONPATH"] = os.pathsep.join(sys.path)
-    request = dict(paths=paths, steps=steps, requested_steps=requested_steps)
     try:
         completed = subprocess.run(
-            [sys.executable, "-m", __package__ + ".pressure_kineto_worker"],
+            [sys.executable, "-m", __package__ + ".pressure_profile_worker"],
             input=json.dumps(request),
             text=True,
             capture_output=True,
@@ -375,6 +374,21 @@ def analyze_kineto_files(paths, steps, requested_steps, deadline):
         return dict(ranks={}, reasons=["profile_analysis_timeout"])
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         return dict(ranks={}, reasons=["profile_analysis_failed"], error=repr(exc))
+
+
+def analyze_kineto_files(paths, steps, requested_steps, deadline):
+    return _analyze_profile(
+        dict(
+            backend="kineto", paths=paths, steps=steps, requested_steps=requested_steps
+        ),
+        deadline,
+    )
+
+
+def analyze_nsys_file(path, steps, output, deadline):
+    return _analyze_profile(
+        dict(backend="nsys", path=str(path), steps=steps, output=str(output)), deadline
+    )
 
 
 class KinetoCapture:
@@ -665,6 +679,7 @@ class NsightCapture(KinetoCapture):
         if self.report.exists() or self.sqlite.exists():
             raise FileExistsError(self.output)
         self.capture_begin_s = self.capture_end_s = None
+        self.capture_ready_s = None
         self.command_record = dict(backend="nsys", trace_name=trace_name)
         super().__init__(
             start_capture=self._start_capture,
@@ -693,6 +708,7 @@ class NsightCapture(KinetoCapture):
             "--cpuctxsw=process-tree",
             "--output=" + str(self.output),
         )
+        self.capture_ready_s = time.monotonic()
 
     def consume(self, event):
         if event.get("event") != "pressure":
@@ -731,7 +747,7 @@ class NsightCapture(KinetoCapture):
         self.controller.cancel.wait(
             max(
                 0,
-                min(self.capture_begin_s + self.duration_s, self.deadline)
+                min(self.capture_ready_s + self.duration_s, self.deadline)
                 - time.monotonic(),
             )
         )
@@ -765,7 +781,6 @@ class NsightCapture(KinetoCapture):
             return dict(
                 trace_valid=False, pressure_valid=False, reasons=["profile_not_started"]
             )
-        finish_deadline = time.monotonic() + 5
         try:
             result = self.controller.result(5)
         except TimeoutError:
@@ -779,35 +794,21 @@ class NsightCapture(KinetoCapture):
             reasons.add("profile_control_failed")
         if self.evictions:
             reasons.add("profile_step_history_overflow")
-        parsed = Future()
         snapshot = {
             rank: list(records.values()) for rank, records in self.steps.items()
         }
-
-        def parse():
-            try:
-                normalized = normalize_nsys(self.sqlite, snapshot)
-                path = self.output.with_suffix(".normalized.json")
-                with path.open("x") as stream:
-                    json.dump(normalized, stream, allow_nan=False)
-                normalized["normalized_file"] = str(path)
-                normalized["normalized_event_count"] = len(normalized.pop("events", []))
-                gaps = normalized.pop("gpu_gaps", [])
-                normalized["gpu_gap_count"] = len(gaps)
-                normalized["gpu_gap_attribution"] = (
-                    "unavailable_cross_stream_dependency_and_os_evidence"
-                )
-                parsed.set_result(normalized)
-            except BaseException as exc:
-                parsed.set_exception(exc)
-
-        threading.Thread(target=parse, name="pressure-nsys-parse", daemon=True).start()
-        try:
-            normalized = parsed.result(max(0, finish_deadline - time.monotonic()))
-        except BaseException as exc:
-            normalized = dict(
-                trace_valid=False, reasons=["nsys_analysis_failed"], error=repr(exc)
-            )
+        analysis_started = time.monotonic()
+        normalized = analyze_nsys_file(
+            self.sqlite,
+            snapshot,
+            self.output.with_suffix(".normalized.json"),
+            self.deadline,
+        )
+        normalized.setdefault("trace_valid", False)
+        normalized["analysis_remaining_budget_s"] = max(
+            0, self.deadline - analysis_started
+        )
+        normalized["analysis_wall_elapsed_s"] = time.monotonic() - analysis_started
         reasons.update(normalized.get("reasons", []))
         pressure = None
         if (
@@ -831,6 +832,7 @@ class NsightCapture(KinetoCapture):
             pressure_valid=pressure["valid"] if pressure else False,
             trace_name=self.trace_name,
             backend="nsys",
+            capture_ready_s=self.capture_ready_s,
             duration_s=self.duration_s,
             operation_timeout_s=dict(self.controller.timeouts),
             nsys_commands=list(self.command_record.get("nsys_commands", [])),

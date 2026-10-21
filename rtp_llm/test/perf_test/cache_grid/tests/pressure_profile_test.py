@@ -17,6 +17,7 @@ from rtp_llm.test.perf_test.cache_grid.runner.pressure_profile import (
     NsightCapture,
     ProfileController,
     analyze_kineto_files,
+    analyze_nsys_file,
     classify_gpu_gap,
     run_nsys_window,
     validate_kineto,
@@ -24,6 +25,135 @@ from rtp_llm.test.perf_test.cache_grid.runner.pressure_profile import (
 
 
 class NsightPressureTest(unittest.TestCase):
+    def test_clock_repair_rejects_missing_ambiguous_invalid_metadata_and_work(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
+            normalize_nsys,
+        )
+
+        faults = (
+            "DROP TABLE TARGET_INFO_SESSION_START_TIME; DROP TABLE ANALYSIS_DETAILS;",
+            "INSERT INTO TARGET_INFO_SESSION_START_TIME VALUES(1000000);",
+            "UPDATE ANALYSIS_DETAILS SET stopTime=stopTime+1;",
+            "UPDATE NVTX_EVENTS SET end=end+10000 WHERE start>1000000;",
+            "DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE correlationId=5;",
+        )
+        for fault in faults:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "trace.sqlite"
+                nsys_fixture(path, step_ids=range(1, 6))
+                with sqlite3.connect(path) as db:
+                    db.executescript(
+                        """
+                        CREATE TABLE TARGET_INFO_SESSION_START_TIME(systemClockNs INTEGER);
+                        INSERT INTO TARGET_INFO_SESSION_START_TIME VALUES(1000000);
+                        CREATE TABLE ANALYSIS_DETAILS(startTime INTEGER,stopTime INTEGER,duration INTEGER);
+                        INSERT INTO ANALYSIS_DETAILS VALUES(1000000,1006000,6000);
+                        UPDATE NVTX_EVENTS SET start=start+1000000,end=end+1000000 WHERE start>=5000;
+                    """
+                        + fault
+                    )
+                records = [
+                    dict(step_id=i, context_batch=1, complete=True) for i in range(1, 6)
+                ]
+                result = normalize_nsys(path, {0: records, 1: records})
+                self.assertFalse(result["trace_valid"], result)
+
+    def test_metadata_clock_repair_preserves_raw_and_excludes_only_boundary(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
+            normalize_nsys,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.sqlite"
+            nsys_fixture(path, step_ids=range(1, 6))
+            records = [
+                dict(step_id=i, context_batch=1, complete=True) for i in range(1, 6)
+            ]
+            with sqlite3.connect(path) as db:
+                db.executescript(
+                    """
+                    CREATE TABLE TARGET_INFO_SESSION_START_TIME(systemClockNs INTEGER);
+                    INSERT INTO TARGET_INFO_SESSION_START_TIME VALUES(1000000);
+                    CREATE TABLE ANALYSIS_DETAILS(startTime INTEGER,stopTime INTEGER,duration INTEGER);
+                    INSERT INTO ANALYSIS_DETAILS VALUES(1000000,1006000,6000);
+                    UPDATE NVTX_EVENTS SET start=start+1000000,end=end+1000000 WHERE start>=5000;
+                """
+                )
+            result = normalize_nsys(path, {0: records, 1: records})
+            self.assertTrue(result["trace_valid"], result["reasons"])
+            self.assertEqual(result["ranks"]["0"]["usable_step_ids"], [2, 3, 4])
+            self.assertEqual(
+                result["ranks"]["0"]["exclusions"]["5"], "clock_repaired_boundary"
+            )
+            marker = next(
+                e for e in result["events"] if e["kind"] == "step" and e["step_id"] == 5
+            )
+            self.assertEqual(marker["clock_conversion"]["raw_start_ns"], 1005000)
+            self.assertEqual(marker["start_ns"], 5000)
+            with sqlite3.connect(path) as db:
+                db.execute(
+                    "UPDATE NVTX_EVENTS SET start=start+1000000,end=end+1000000 WHERE start>=3000 AND start<4000"
+                )
+            result = normalize_nsys(path, {0: records, 1: records})
+            self.assertFalse(result["trace_valid"])
+            self.assertIn("internal_nvtx_clock_discontinuity", result["reasons"])
+
+    def test_duration_starts_after_slow_start_ack_and_keeps_deadline(self):
+        now = [100.0]
+
+        def command(*args):
+            now[0] += 5
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = NsightCapture(
+                command=command,
+                duration_s=10,
+                trace_name="pressure_fixture",
+                directory=directory,
+                ranks=(0,),
+                instances={0: "a"},
+                session_id="s",
+                timeout_s=20,
+                command_timeout_s=10,
+            )
+            capture.deadline = 120
+            capture.controller.cancel = Mock()
+            with patch("time.monotonic", side_effect=lambda: now[0]):
+                capture._start_capture()
+                capture._wait()
+                capture.controller.cancel.wait.assert_called_with(10)
+                capture.deadline = 107
+                capture._wait()
+                capture.controller.cancel.wait.assert_called_with(2)
+            self.assertEqual(capture.capture_begin_s, 100)
+
+    def test_nsys_analysis_timeout_reaps_and_retains_explicit_partial(self):
+        original = subprocess.Popen
+        children = []
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "trace.sqlite"
+            raw.write_bytes(b"raw evidence")
+            output = Path(directory) / "trace.normalized.json"
+            partial = output.with_suffix(".partial.json")
+
+            def slow_worker(command, **kwargs):
+                code = (
+                    "import pathlib,time; pathlib.Path("
+                    + repr(str(partial))
+                    + ").write_text('{'); time.sleep(10)"
+                )
+                child = original([sys.executable, "-c", code], **kwargs)
+                children.append(child)
+                return child
+
+            with patch("subprocess.Popen", side_effect=slow_worker):
+                result = analyze_nsys_file(raw, {}, output, time.monotonic() + 0.2)
+            self.assertEqual(result["reasons"], ["profile_analysis_timeout"])
+            self.assertIsNotNone(children[0].returncode)
+            self.assertTrue(raw.is_file())
+            self.assertEqual(partial.read_text(), "{")
+            self.assertFalse(output.exists())
+
     def boundary_trace(self, *, marker=True, forward=True, count=5, corrupt=None):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
             normalize_nsys,
@@ -162,7 +292,7 @@ class NsightPressureTest(unittest.TestCase):
             self.assertFalse(result["trace_valid"], result)
             self.assertIn(reason, result["reasons"])
 
-    def capture(self, fault=None):
+    def capture(self, fault=None, expired=False):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             CoverageAssessment,
         )
@@ -197,11 +327,22 @@ class NsightPressureTest(unittest.TestCase):
         for rank in (0, 1):
             capture.steps[rank].update((s["step_id"], s) for s in steps())
         capture.controller.result(2)
+        if expired:
+            capture.deadline = time.monotonic() - 1
         coverage = Mock()
         coverage.assess.return_value = CoverageAssessment(
             True, 4096, 0.9, 3, True, (), ()
         )
         return capture.finish(coverage), calls, capture, coverage
+
+    def test_expired_capture_budget_cannot_start_nsys_analysis(self):
+        with patch("subprocess.run") as run:
+            result, _, capture, _ = self.capture(expired=True)
+        run.assert_not_called()
+        self.assertFalse(result["trace_valid"], result)
+        self.assertIn("profile_analysis_timeout", result["reasons"])
+        self.assertTrue(capture.report.is_file())
+        self.assertTrue(capture.sqlite.is_file())
 
     def test_capture_is_duration_based_with_separate_export_and_pressure_bounds(self):
         result, calls, capture, coverage = self.capture()

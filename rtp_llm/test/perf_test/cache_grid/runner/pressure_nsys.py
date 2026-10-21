@@ -46,6 +46,8 @@ _REQUIRED = {
     },
 }
 _OPTIONAL = {
+    "TARGET_INFO_SESSION_START_TIME": {"systemClockNs"},
+    "ANALYSIS_DETAILS": {"startTime", "stopTime", "duration"},
     "CUPTI_ACTIVITY_KIND_DRIVER": _REQUIRED["CUPTI_ACTIVITY_KIND_RUNTIME"],
     "CUPTI_ACTIVITY_KIND_MEMCPY": {
         "start",
@@ -118,6 +120,7 @@ def normalize_nsys(path, steps_by_rank):
                 for t in (*_REQUIRED, *_OPTIONAL)
                 if t in tables
             }
+        _normalize_nvtx_clocks(rows)
         return _normalize(rows, steps_by_rank)
     except (sqlite3.Error, OSError, TypeError, ValueError, KeyError) as exc:
         return dict(trace_valid=False, reasons=["invalid_nsys_export"], error=repr(exc))
@@ -125,6 +128,44 @@ def normalize_nsys(path, steps_by_rank):
 
 def _complete_range(start, end):
     return isinstance(start, int) and isinstance(end, int) and end > start
+
+
+def _normalize_nvtx_clocks(rows):
+    session = rows.get("TARGET_INFO_SESSION_START_TIME", [])
+    details = rows.get("ANALYSIS_DETAILS", [])
+    if not session and not details:
+        return
+    if len(session) != 1 or len(details) != 1:
+        raise ValueError("ambiguous_capture_clock_metadata")
+    origin = session[0]["systemClockNs"]
+    start, stop, duration = (
+        details[0][key] for key in ("startTime", "stopTime", "duration")
+    )
+    if (
+        not all(isinstance(value, int) for value in (origin, start, stop, duration))
+        or duration <= 0
+        or origin <= duration
+        or start != origin
+        or stop - start != duration
+    ):
+        raise ValueError("inconsistent_capture_clock_metadata")
+    for row in rows["NVTX_EVENTS"]:
+        begin, end = row["start"], row["end"]
+        if not _complete_range(begin, end):
+            continue
+        if origin <= begin < end <= stop:
+            # This installed exporter leaves some boundary NVTX ranges in its
+            # system-clock domain. Metadata proves the translation, not magnitude.
+            row["clock_conversion"] = dict(
+                raw_start_ns=begin,
+                raw_end_ns=end,
+                offset_ns=origin,
+                duration_ns=duration,
+                source="TARGET_INFO_SESSION_START_TIME.systemClockNs+ANALYSIS_DETAILS",
+            )
+            row["start"], row["end"] = begin - origin, end - origin
+        elif begin > duration or end > duration:
+            raise ValueError("nvtx_outside_capture_clock_domains")
 
 
 def _normalize(rows, steps_by_rank):
@@ -165,6 +206,11 @@ def _normalize(rows, steps_by_rank):
                 end_ns=row["end"],
                 global_tid=row["globalTid"],
                 complete=complete,
+                **(
+                    {"clock_conversion": row["clock_conversion"]}
+                    if "clock_conversion" in row
+                    else {}
+                ),
             )
         )
     rank_edges = {}
@@ -287,6 +333,11 @@ def _normalize(rows, steps_by_rank):
                     end_ns=row["end"],
                     global_tid=row["globalTid"],
                     complete=_complete_range(row["start"], row["end"]),
+                    **(
+                        {"clock_conversion": row["clock_conversion"]}
+                        if "clock_conversion" in row
+                        else {}
+                    ),
                 )
             )
     rank_results = {}
@@ -382,9 +433,22 @@ def _normalize(rows, steps_by_rank):
                 reasons.add("missing_step_sidecar")
                 continue
             observed.append(step)
+            clock_repaired = "clock_conversion" in marker or any(
+                "clock_conversion" in scope for scope in scopes
+            )
+            if clock_repaired and step not in rank_edges[rank]:
+                reasons.add("internal_nvtx_clock_discontinuity")
             if not work:
                 reasons.add("missing_model_compute_correlation")
                 excluded[str(step)] = "missing_model_compute_correlation"
+            elif clock_repaired:
+                reason = (
+                    "clock_repaired_boundary"
+                    if step in rank_edges[rank]
+                    else "internal_nvtx_clock_discontinuity"
+                )
+                excluded[str(step)] = reason
+                boundary_exclusions[rank, step] = reason
             elif (
                 not record.get("complete")
                 or not record.get("context_batch")
@@ -491,6 +555,10 @@ def _normalize(rows, steps_by_rank):
         ranks=rank_results,
         time_unit="ns",
         time_domain="nsys_export",
+        capture_clock={
+            "session": rows.get("TARGET_INFO_SESSION_START_TIME", []),
+            "analysis": rows.get("ANALYSIS_DETAILS", []),
+        },
         events=events + gpu,
         gpu_gaps=gaps,
         optional_tables_present=sorted(set(rows) & set(_OPTIONAL)),

@@ -1053,6 +1053,13 @@ py_test(
     deps = [":perf_test_lib"],
 )
 
+py_test(
+    name = "run_request_test",
+    main = "cache_grid/tests/run_request_test.py",
+    srcs = ["cache_grid/tests/run_request_test.py"],
+    deps = [":perf_test_lib"],
+)
+
 py_binary(
     name = "generate_cache_grid",
     main = "cache_grid/runner/generate_cache_grid.py",

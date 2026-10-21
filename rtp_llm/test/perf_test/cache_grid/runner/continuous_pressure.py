@@ -139,10 +139,6 @@ class CancellableRequestHandle:
         return worker_cancelled
 
 
-def padding_needed(submitted: int, scheduler: str, batch_size: int) -> int:
-    return (-submitted) % batch_size if scheduler == "batch_decode" else 0
-
-
 @dataclass(frozen=True)
 class ExecutionLimits:
     """Verified service limits, in tokens and per-request physical KV blocks.
@@ -316,24 +312,16 @@ class PressureSession:
         seed_count = seed_plan.seed_count
         seed_input_tokens = seed_plan.seed_input_tokens
         self.arrivals = ArrivalClock(rate, poisson, random_seed)
-        if scheduler not in ("fifo", "batch_decode"):
-            raise ValueError("unknown scheduler")
+        if scheduler != "fifo":
+            raise ValueError("continuous full-pressure preload is FIFO-only")
+        if batch_size != 1 or type(batch_size) is not int:
+            raise ValueError("FIFO full-pressure preload has no fixed batch")
         if type(concurrency) is not int or concurrency < 1:
             raise ValueError("positive concurrency required")
-        if type(batch_size) is not int or batch_size < 1:
-            raise ValueError("positive batch size required")
-        if scheduler == "fifo" and batch_size != 1:
-            raise ValueError("FIFO has no fixed batch")
         limits.require_request(max_input_tokens)
-        if batch_size > concurrency:
-            raise ValueError("fixed batch size exceeds client concurrency")
+        limits.require_request(seed_input_tokens)
         self.fill_batch = min(
             concurrency, limits.concurrency_for(config.fill_input_tokens)
-        )
-        self.seed_batch = (
-            min(concurrency, limits.concurrency_for(seed_input_tokens))
-            if seed_count
-            else 0
         )
         if type(seed_count) is not int or seed_count < 0:
             raise ValueError("invalid seed count")
@@ -353,7 +341,7 @@ class PressureSession:
             poll,
             sink,
         )
-        self.set_batch, self.controller = set_batch, controller
+        self.controller = controller
         self.diagnostics_control = diagnostics_control
         self.control_jobs = []
         self.clock, self.sleep, self.executor_factory = clock, sleep, executor_factory
@@ -362,8 +350,15 @@ class PressureSession:
         self.wakeup = threading.Event()
         self.jobs = {}
         self.job_id = self.sequence = self.formal_submitted = 0
-        self.padding_submitted = 0
-        self.warmup_batch = None
+        self.job_kinds = {}
+        self.cancel_requested = set()
+        self.seed_submitted = 0
+        self.seed_completed = 0
+        self.seed_failed = 0
+        self.seed_cancelled = 0
+        self.max_seed_pending = 0
+        self.seed_started = self.seed_finished = None
+        self.seed_deadline = float("inf")
         self.fill_sent = 0
         self.closed = False
         self.supply_deadline = float("inf")
@@ -383,6 +378,8 @@ class PressureSession:
         with self.lock:
             record = dict(event=event, session_id=self.session_id, **values)
             self.sink(record)
+            if event == "phase":
+                self.last_emitted_phase = values["phase"]
             if self.controller and hasattr(self.controller, "consume"):
                 self.controller.consume(record)
             if event == "phase" and self.diagnostics_control:
@@ -477,6 +474,8 @@ class PressureSession:
         with self.lock:
             now = self.clock()
             previous = self.state.phase
+            if self.state.phase == "seed" and now >= self.seed_deadline:
+                self.fail("seed_timeout")
             if (
                 self.profile_started
                 and self.profile_pending
@@ -510,29 +509,17 @@ class PressureSession:
         with self.lock:
             self._advance()
             phase = self.state.phase if kind == "formal" else kind
-            batch = self.warmup_batch
-            warmup_tail = (
-                self.state.phase == "drain"
-                and batch is not None
-                and kind == batch["kind"]
-                and 0 < batch["submitted"] < batch["size"]
-            )
             if (
                 self.closed
                 or self.clock() >= self.supply_deadline
-                or (
-                    kind != "padding"
-                    and self.state.phase == "drain"
-                    and not warmup_tail
-                )
+                or self.state.phase == "drain"
+                or (kind == "seed" and self.state.phase != "seed")
                 or (
                     kind == "formal"
                     and phase not in ("steady", "measurement", "support")
                 )
             ):
                 raise DispatchClosed()
-            if warmup_tail:
-                phase = "padding"
             ids = payload["input_ids"]
             expected = (
                 self.config.fill_input_tokens
@@ -550,6 +537,7 @@ class PressureSession:
             identity = f"{self.session_id}:{phase}:{sequence}"
             record = dict(
                 job_id=job_id,
+                kind=kind,
                 sequence=sequence,
                 phase=phase,
                 request_id=identity,
@@ -563,16 +551,10 @@ class PressureSession:
             )
             if scheduled is not None:
                 record["schedule_lag_s"] = max(0, now - self.formal_origin - scheduled)
-            if warmup_tail:
-                record["padding_for"] = kind
             self.jobs[job_id] = record
             self.last_dispatch = now
             if kind == "formal":
                 self.formal_submitted += 1
-            elif kind == "padding":
-                self.padding_submitted += 1
-            elif batch is not None and kind == batch["kind"]:
-                batch["submitted"] += 1
             self.emit("dispatch", **record)
             return identity
 
@@ -598,14 +580,21 @@ class PressureSession:
             ),
         )
         if accepted:
+            self.job_kinds[job_id] = kind
             self.job_id += 1
         return accepted
 
     def _collect(self):
         for job_id, result in self.sender.collect():
+            kind = self.job_kinds.pop(job_id, None)
+            cancelled = job_id in self.cancel_requested
+            self.cancel_requested.discard(job_id)
             with self.lock:
                 record = self.jobs.pop(job_id, None)
             if record is None:
+                if kind == "seed" and not cancelled:
+                    self.seed_failed += 1
+                    self.fail("request_failed")
                 if not result.get("not_dispatched"):
                     self.fail("request_failed")
                     self.emit(
@@ -627,16 +616,18 @@ class PressureSession:
             )
             if result.get("success"):
                 self.last_execution_progress = max(self.last_execution_progress, now)
-            if not (
+            success = (
                 result.get("success")
                 and result.get("input_len") == record["input_len"]
                 and result.get("output_len") == 1
-            ):
-                self.fail(
-                    "padding_failed"
-                    if record["phase"] == "padding"
-                    else "request_failed"
-                )
+            )
+            if kind == "seed":
+                if success:
+                    self.seed_completed += 1
+                elif not cancelled:
+                    self.seed_failed += 1
+            if not success and not cancelled:
+                self.fail("request_failed")
 
     def _consume_poll(self, evidence):
         with self.lock:
@@ -771,36 +762,81 @@ class PressureSession:
             self.sleep(delay)
 
     def _batch(self, kind, count):
-        if self.scheduler == "batch_decode":
-            self._configure_batch(count)
         if self.state.phase == "drain":
             return
-        with self.lock:
-            self.warmup_batch = (
-                dict(kind=kind, size=count, submitted=0)
-                if self.scheduler == "batch_decode"
-                else None
-            )
         for _ in range(count):
             self._submit(kind)
         while self.sender.pending and self.state.phase != "drain":
             self._tick()
             self._pause()
 
-    def _configure_batch(self, count):
+    def _seed_result(self):
+        return dict(
+            planned=self.seed_count,
+            submitted=self.seed_submitted,
+            completed=self.seed_completed,
+            failed=self.seed_failed,
+            cancelled=self.seed_cancelled,
+            pending=sum(kind == "seed" for kind in self.job_kinds.values()),
+            max_inflight=self.max_seed_pending,
+            elapsed_s=(
+                (self.seed_finished - self.seed_started)
+                if self.seed_started is not None and self.seed_finished is not None
+                else 0.0
+            ),
+        )
+
+    def _run_seed_phase(self) -> dict:
+        self.seed_started = self.clock()
+        self.seed_deadline = self.seed_started + self.config.seed_timeout_s
+        self.state.phase, self.state.entered = "seed", self.seed_started
+        if self.seed_count:
+            self.emit("phase", phase="seed", at_s=self.seed_started)
+        while self.seed_completed + self.seed_failed < self.seed_count:
+            self._advance()
+            while (
+                self.state.phase == "seed"
+                and self.seed_submitted < self.seed_count
+                and len(self.sender.pending) < self.sender.limit
+            ):
+                self._advance()
+                if self.state.phase != "seed" or not self._submit("seed"):
+                    break
+                self.seed_submitted += 1
+                self.max_seed_pending = max(
+                    self.max_seed_pending, len(self.sender.pending)
+                )
+            self._tick()
+            if self.state.phase == "drain":
+                break
+            if self.seed_completed == self.seed_count:
+                break
+            self._pause()
+        self.seed_finished = self.clock()
+        return self._seed_result()
+
+    def _start_fill(self):
+        # Rebase after the last seed completion. A pre-existing asynchronous poll
+        # may have sampled seed transfers; consume it before taking this snapshot.
+        if self.seed_count:
+            if self.poll_future is not None:
+                evidence = self.poll_future.result(timeout=self.config.sample_period_s)
+                self.poll_future = None
+                self._consume_poll(evidence)
+            baseline = self.poll(self.config.sample_period_s)
+            self._consume_poll(baseline)
+            if self.state.phase == "drain":
+                return
+            if not baseline.sample_complete:
+                raise RuntimeError("post-seed pressure inventory is incomplete")
+            self.coverage = PressureCoverage(tuple(baseline.samples), self.config)
+            self.emit("fill_baseline", at_s=self.clock(), raw_baseline=baseline.raw)
         now = self.clock()
-        if self.state.phase == "fill":
-            remaining = min(
-                self.state.entered + self.config.fill_timeout_s - now,
-                self.last_progress + self.config.fill_no_progress_s - now,
-            )
-        else:
-            remaining = self.state.entered + self.config.steady_timeout_s - now
-        if remaining <= 0:
-            self.fail("pressure_not_reached")
-            return
-        self.set_batch(count, timeout=remaining)
-        self._advance()
+        self.state.phase, self.state.entered = "fill", now
+        self.last_progress = self.last_execution_progress = now
+        self.progress, self.ready = None, False
+        self.fill_sent = 0
+        self.emit("phase", phase="fill", at_s=now)
 
     def run(self):
         self.state = PressurePhases(self.config, self.clock())
@@ -858,16 +894,16 @@ class PressureSession:
             )
             self._record_pressure(baseline)
             self.next_poll = self.clock()
-            if self.seed_count:
-                self.emit("phase", phase="seed", at_s=self.clock())
-            for start in range(0, self.seed_count, self.seed_batch or 1):
-                if self.state.phase == "drain":
-                    break
-                self._batch("seed", min(self.seed_batch, self.seed_count - start))
-            self.state.entered = self.clock()
-            self.last_progress = self.clock()
-            if self.state.phase != "drain":
-                self.emit("phase", phase="fill", at_s=self.clock())
+            seed = self._run_seed_phase()
+            if (
+                self.state.phase != "drain"
+                and seed["completed"] == seed["planned"]
+                and seed["failed"] == 0
+                and seed["pending"] == 0
+            ):
+                self._start_fill()
+            elif self.state.phase != "drain":
+                self.fail("seed_incomplete")
             while self.state.phase == "fill":
                 self._tick()
                 if self.state.phase == "drain":
@@ -894,8 +930,6 @@ class PressureSession:
                     if self.state.phase != "drain":
                         self._pause()
             if self.state.phase == "steady":
-                if self.scheduler == "batch_decode":
-                    self._configure_batch(self.batch_size)
                 self.formal_origin = self.clock()
                 due = self.arrivals.next_offset()
                 while self.state.phase in ("steady", "measurement", "support"):
@@ -934,7 +968,10 @@ class PressureSession:
                 )
             if not profile_result.get("trace_valid"):
                 self.state.fail("profile_invalid")
+        seed = self._seed_result()
+        self.emit("seed_summary", **seed)
         result = dict(
+            seed=seed,
             failure=self.state.failure,
             measurement_start=self.state.measurement_start,
             measurement_end=self.state.measurement_end,
@@ -957,7 +994,8 @@ class PressureSession:
     def _drain(self):
         self.state.phase = "drain"
         started = self.clock()
-        self.emit("phase", phase="drain", at_s=started)
+        if getattr(self, "last_emitted_phase", None) != "drain":
+            self.emit("phase", phase="drain", at_s=started)
         self.support_end = started
         deadline = min(self.supply_deadline, started + self.config.drain_timeout_s)
         self.supply_deadline = deadline
@@ -968,16 +1006,14 @@ class PressureSession:
             except Exception as exc:
                 self.fail("profile_stop_failed")
                 self.emit("error", error=repr(exc), at_s=self.clock())
-        # Dispatch count is frozen by the phase lock: late formal workers cannot
-        # become measurement members or change the fixed batch's tail size.
-        with self.lock:
-            tail = padding_needed(
-                self.formal_submitted, self.scheduler, self.batch_size
-            )
+        # A failed seed cannot make progress into another phase. Request
+        # cancellation immediately, then use the bounded drain to reap it.
+        if self.state.failure and any(
+            kind == "seed" for kind in self.job_kinds.values()
+        ):
+            self._cancel_pending()
         while self.clock() < deadline:
             self._collect()
-            if tail and self._submit("padding"):
-                tail -= 1
             if hasattr(self, "coverage"):
                 self._tick()
             edge = (
@@ -986,39 +1022,35 @@ class PressureSession:
                 else self.state.measurement_end
             )
             edge_pending = edge is not None and self.last_poll_s <= edge
-            if not self.sender.pending and not tail and not edge_pending:
+            if not self.sender.pending and not edge_pending:
                 break
             self._pause()
         with self.lock:
             self.closed = True
-        if self.sender.pending or tail:
+        if self.sender.pending:
             self.fail("drain_timeout")
-            for job_id, handle in list(self.sender.pending.items()):
-                cancelled = handle.cancel()
-                self.emit(
-                    "cancellation",
-                    job_id=job_id,
-                    at_s=self.clock(),
-                    accepted=cancelled,
-                    dispatch=self.jobs.get(job_id),
-                )
+            self._cancel_pending()
             self._collect()
-        if padding_needed(
-            self.formal_submitted + self.padding_submitted,
-            self.scheduler,
-            self.batch_size,
-        ):
-            self.fail("padding_failed")
-        batch = self.warmup_batch
-        if batch is not None and batch["submitted"] % batch["size"]:
-            self.emit(
-                "error",
-                reason="padding_failed",
-                stage=batch["kind"],
-                submitted=batch["submitted"],
-                batch_size=batch["size"],
-                at_s=self.clock(),
-            )
-            self.fail("padding_failed")
         if self.poll_future is not None:
             self.poll_future.cancel()
+
+    def _cancel_pending(self):
+        for job_id, handle in list(self.sender.pending.items()):
+            if job_id in self.cancel_requested:
+                continue
+            self.cancel_requested.add(job_id)
+            if self.job_kinds.get(job_id) == "seed":
+                self.seed_cancelled += 1
+            error = None
+            try:
+                accepted = handle.cancel()
+            except Exception as exc:
+                accepted, error = False, repr(exc)
+            self.emit(
+                "cancellation",
+                job_id=job_id,
+                at_s=self.clock(),
+                accepted=accepted,
+                error=error,
+                dispatch=self.jobs.get(job_id),
+            )

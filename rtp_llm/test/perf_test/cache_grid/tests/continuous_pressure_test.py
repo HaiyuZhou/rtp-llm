@@ -24,6 +24,7 @@ from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import SeedPlan
 
 def config(**changes):
     values = dict(
+        seed_timeout_s=30,
         fill_timeout_s=120,
         fill_max_requests=1000,
         fill_no_progress_s=30,
@@ -63,8 +64,6 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(state.advance(65, profile_pending=True), "support")
         self.assertEqual(state.advance(125, profile_pending=True), "drain")
         self.assertEqual(state.failure, "profile_timeout")
-        self.assertEqual(cp.padding_needed(6, "batch_decode", 4), 2)
-        self.assertEqual(cp.padding_needed(6, "fifo", 4), 0)
 
     def test_timeouts_and_existing_failure(self):
         state = cp.PressurePhases(config(), started_s=0)
@@ -186,13 +185,14 @@ class LifecycleTest(unittest.TestCase):
         cfg=None,
         controller=None,
         scheduler="fifo",
-        fail_padding=False,
         poll_transform=None,
         payload_hook=None,
         seed_count=0,
         rate=3,
         control=None,
-        diagnostics_control=None
+        diagnostics_control=None,
+        concurrency=4,
+        batch_size=1,
     ):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             GroupSample,
@@ -205,7 +205,7 @@ class LifecycleTest(unittest.TestCase):
 
         def sample(sequence):
             group = GroupSample(
-                0, "FULL", ("gpu",), "host", int(sequence > 1), int(sequence > 1)
+                0, "FULL", ("gpu",), "host", max(0, sequence - 1), max(0, sequence - 1)
             )
             return RankSample(
                 0,
@@ -233,7 +233,7 @@ class LifecycleTest(unittest.TestCase):
         def request(payload, register, before):
             identity = before(payload)
             return dict(
-                success=not (fail_padding and ":padding:" in identity),
+                success=True,
                 input_len=16,
                 output_len=1,
             )
@@ -247,11 +247,11 @@ class LifecycleTest(unittest.TestCase):
             cfg or config(measure_s=3, steady_s=1, sample_period_s=0.5),
             session_id="session",
             limits=cp.ExecutionLimits(128, 8, 256, 64, 16),
-            concurrency=4,
+            concurrency=concurrency,
             scheduler=scheduler,
-            batch_size=3 if scheduler == "batch_decode" else 1,
+            batch_size=batch_size,
             max_input_tokens=16,
-            seed_plan=seed_plan(seed_count),
+            seed_plan=seed_plan(seed_count, client_inflight=concurrency),
             startup_targets=select_targets((sample(0),), (0,)),
             make_payload=payload,
             request=request,
@@ -425,20 +425,14 @@ class LifecycleTest(unittest.TestCase):
         self.assertIn("support_pressure", result)
         self.assertAlmostEqual(controller.stops[0][1], controller.started + 3, places=2)
 
-    def test_fixed_batch_tail_is_padded_and_failure_recorded(self):
-        result, events, batches, _ = self.run_session(
-            scheduler="batch_decode", fail_padding=True
-        )
-        formal = [
-            e
-            for e in events
-            if e["event"] == "dispatch"
-            and e["phase"] in ("steady", "measurement", "support", "padding")
-        ]
-        self.assertEqual(len(formal) % 3, 0)
-        self.assertIn(3, batches)
-        self.assertTrue(any(e["phase"] == "padding" for e in formal))
-        self.assertEqual(result["failure"], "padding_failed")
+    def test_preload_rejects_fixed_batch_schedulers_before_any_request(self):
+        with self.assertRaisesRegex(ValueError, "FIFO-only"):
+            self.run_session(scheduler="batch_decode")
+        for batch_size in (2, True, 1.0):
+            with self.subTest(batch_size=batch_size), self.assertRaisesRegex(
+                ValueError, "no fixed batch"
+            ):
+                self.run_session(batch_size=batch_size)
 
     def test_fill_time_and_no_progress_budgets(self):
         for settings in (dict(fill_timeout_s=1), dict(fill_no_progress_s=1)):
@@ -449,13 +443,35 @@ class LifecycleTest(unittest.TestCase):
                 self.assertEqual(result["failure"], "pressure_not_reached")
                 self.assertLess(state.clock(), 4)
 
-    def test_seed_batches_are_bounded_and_baseline_precedes_sends(self):
-        result, events, batches, _ = self.run_session(
-            seed_count=7, scheduler="batch_decode"
+    def test_seed_transfers_cannot_satisfy_fill_evidence(self):
+        def seed_only_transfers(evidence, count, clock):
+            sample = evidence.samples[0]
+            group = replace(
+                sample.groups[0],
+                triggers=int(count > 1),
+                gpu_host_published=int(count > 1),
+            )
+            return replace(evidence, samples=(replace(sample, groups=(group,)),))
+
+        result, events, _, session = self.run_session(
+            seed_count=1,
+            cfg=config(fill_max_requests=2),
+            poll_transform=seed_only_transfers,
         )
+        self.assertEqual(result["failure"], "pressure_not_reached")
+        self.assertEqual(result["seed"]["completed"], 1)
+        self.assertFalse(
+            any(e.get("phase") in ("steady", "measurement") for e in events)
+        )
+        self.assertEqual(session.coverage.baselines[0].groups[0].triggers, 1)
+
+    def test_seed_count_is_exact_and_baseline_precedes_sends(self):
+        result, events, batches, _ = self.run_session(seed_count=7)
         self.assertIsNone(result["failure"])
         self.assertEqual(events[0]["event"], "frozen")
-        self.assertEqual(batches[:2], [4, 3])
+        self.assertEqual(batches, [])
+        self.assertEqual(result["seed"]["submitted"], 7)
+        self.assertEqual(result["seed"]["completed"], 7)
         self.assertEqual(
             sum(e["event"] == "dispatch" and e["phase"] == "seed" for e in events), 7
         )
@@ -614,31 +630,19 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(result["failure"], "supervisor_failed")
         self.assertFalse(any(e["event"] == "dispatch" for e in events))
 
-    def test_padding_preparation_cannot_silently_cross_drain_deadline(self):
-        def delay(kind, sequence, clock):
-            if kind == "padding":
-                clock.now += 100
-
-        result, _, _, _ = self.run_session(scheduler="batch_decode", payload_hook=delay)
-        self.assertIsNotNone(result["failure"])
-
-    def test_blocked_scheduler_control_obeys_remaining_fill_budget(self):
-        budgets = []
-
-        def control(count, *, timeout):
-            budgets.append(timeout)
-            raise TimeoutError("bounded scheduler acknowledgement")
-
-        result, events, _, _ = self.run_session(
-            scheduler="batch_decode", cfg=config(fill_timeout_s=0.2), control=control
+    def test_fifo_never_invokes_fixed_batch_control(self):
+        result, _, _, _ = self.run_session(
+            control=lambda *args, **kwargs: self.fail("FIFO scheduler control")
         )
-        self.assertEqual(result["failure"], "supervisor_failed")
-        self.assertEqual(len(budgets), 1)
-        self.assertGreater(budgets[0], 0)
-        self.assertLessEqual(budgets[0], 0.2)
-        self.assertFalse(any(e["event"] == "dispatch" for e in events))
+        self.assertIsNone(result["failure"])
 
     def test_blocked_rpc_is_cancelled_at_drain_without_boundary_drain(self):
+        self.run_blocked_rpc(seed_count=0)
+
+    def test_blocked_seed_rpc_is_cancelled_and_reaped_before_finished(self):
+        self.run_blocked_rpc(seed_count=2)
+
+    def run_blocked_rpc(self, *, seed_count):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             GroupSample,
             PoolSample,
@@ -687,6 +691,7 @@ class LifecycleTest(unittest.TestCase):
         sequence[0] = 0
         session = cp.PressureSession(
             config(
+                seed_timeout_s=0.03,
                 sample_period_s=0.01,
                 steady_s=0.02,
                 measure_s=0.03,
@@ -699,7 +704,7 @@ class LifecycleTest(unittest.TestCase):
             scheduler="fifo",
             batch_size=1,
             max_input_tokens=16,
-            seed_plan=seed_plan(client_inflight=2),
+            seed_plan=seed_plan(seed_count, client_inflight=2),
             startup_targets=startup_targets,
             make_payload=lambda kind, i: {"input_ids": [1] * 16},
             request=request,
@@ -710,13 +715,148 @@ class LifecycleTest(unittest.TestCase):
         began = time.monotonic()
         result = session.run()
         self.assertLess(time.monotonic() - began, 1)
-        self.assertEqual(result["failure"], "drain_timeout")
+        self.assertEqual(
+            result["failure"], "seed_timeout" if seed_count else "drain_timeout"
+        )
         self.assertEqual(len(cancels), 2)
-        self.assertTrue(all(t >= result["measurement_end"] for t in cancels))
+        if seed_count:
+            self.assertEqual(result["seed"]["submitted"], 2)
+            self.assertEqual(result["seed"]["cancelled"], 2)
+            self.assertEqual(result["seed"]["completed"], 2)
+            self.assertEqual(result["seed"]["pending"], 0)
+            self.assertEqual(session.sender.pending, {})
+            self.assertFalse(any(e.get("phase") == "fill" for e in events))
+        else:
+            self.assertTrue(all(t >= result["measurement_end"] for t in cancels))
         self.assertEqual(sum(e["event"] == "cancellation" for e in events), 2)
         self.assertTrue(
             any(e["event"] == "phase" and e["phase"] == "measurement" for e in events)
+            == (not seed_count)
         )
+
+
+class SeedLifecycleTest(unittest.TestCase):
+    def run_seed(self, *, mode="rolling", count=20, cfg=None, payload_hook=None):
+        handles, reaped = [], []
+
+        class Handle:
+            def __init__(self, executor, work, on_done=None):
+                self.family = len(handles)
+                self.cancel_calls = 0
+                self.result_value = work(lambda call: None)
+                handles.append(self)
+
+            def done(self):
+                if self.family >= count:
+                    return True
+                if self.cancel_calls:
+                    return mode != "reject_cancel"
+                if mode in ("timeout", "reject_cancel", "cancel_raises"):
+                    return False
+                if mode == "failure":
+                    return self.family == 0
+                return self.family == 0 or len(handles) > 16
+
+            def result(self):
+                reaped.append(self.family)
+                if self.family < count and (mode == "failure" or self.cancel_calls):
+                    return dict(success=False, input_len=16, output_len=1)
+                return self.result_value
+
+            def cancel(self):
+                self.cancel_calls += 1
+                if mode == "cancel_raises":
+                    raise RuntimeError("transport cancellation failed")
+                return mode != "reject_cancel"
+
+        def payload(kind, family, clock):
+            if kind == "seed" and family == 16 and mode == "rolling":
+                self.assertEqual(
+                    reaped, [0], "replacement waited for the initial window"
+                )
+            if payload_hook:
+                payload_hook(kind, family, clock)
+
+        with patch.object(cp, "CancellableRequestHandle", Handle):
+            result, events, batches, session = LifecycleTest().run_session(
+                seed_count=count,
+                concurrency=16,
+                payload_hook=payload,
+                cfg=cfg or config(seed_timeout_s=0.2, drain_timeout_s=0.1),
+            )
+        return result, events, session, handles
+
+    def test_one_completion_replenishes_before_fifteen_initial_requests_drain(self):
+        result, events, session, handles = self.run_seed()
+        self.assertIsNone(result["failure"])
+        self.assertEqual(session.max_seed_pending, 16)
+        self.assertEqual(result["seed"]["planned"], 20)
+        self.assertEqual(result["seed"]["submitted"], 20)
+        self.assertEqual(result["seed"]["completed"], 20)
+        self.assertEqual(result["seed"]["failed"], 0)
+        self.assertEqual(result["seed"]["cancelled"], 0)
+        self.assertEqual(result["seed"]["pending"], 0)
+        self.assertEqual(result["seed"]["max_inflight"], 16)
+        self.assertFalse(any(e.get("phase") == "padding" for e in events))
+        self.assertEqual(events[-1]["seed"], result["seed"])
+        phases = [e["phase"] for e in events if e["event"] == "phase"]
+        self.assertEqual(phases, ["seed", "fill", "steady", "measurement", "drain"])
+
+    def test_seed_timeout_cancels_every_accepted_handle_and_never_enters_fill(self):
+        result, events, _, handles = self.run_seed(mode="timeout")
+        self.assertEqual(result["failure"], "seed_timeout")
+        self.assertEqual(result["seed"]["submitted"], 16)
+        self.assertEqual(result["seed"]["completed"], 0)
+        self.assertEqual(result["seed"]["cancelled"], 16)
+        self.assertEqual(result["seed"]["pending"], 0)
+        self.assertTrue(all(handle.cancel_calls == 1 for handle in handles))
+        self.assertFalse(any(e.get("phase") == "fill" for e in events))
+        self.assertIsNone(result["measurement_start"])
+
+    def test_seed_failure_stops_replacements_and_cancels_other_accepted_work(self):
+        result, events, _, handles = self.run_seed(mode="failure")
+        self.assertEqual(result["failure"], "request_failed")
+        self.assertEqual(result["seed"]["submitted"], 16)
+        self.assertEqual(result["seed"]["failed"], 1)
+        self.assertEqual(result["seed"]["cancelled"], 15)
+        self.assertEqual(result["seed"]["pending"], 0)
+        self.assertTrue(all(handle.cancel_calls == 1 for handle in handles[1:]))
+        self.assertFalse(any(e.get("phase") == "fill" for e in events))
+
+    def test_rejected_or_raising_cancel_is_attempted_once_for_every_seed(self):
+        for mode, pending in (("reject_cancel", 16), ("cancel_raises", 0)):
+            with self.subTest(mode=mode):
+                result, events, _, handles = self.run_seed(mode=mode)
+                self.assertEqual(result["failure"], "seed_timeout")
+                self.assertEqual(result["seed"]["cancelled"], 16)
+                self.assertEqual(result["seed"]["pending"], pending)
+                self.assertTrue(all(handle.cancel_calls == 1 for handle in handles))
+                self.assertEqual(sum(e["event"] == "cancellation" for e in events), 16)
+                self.assertFalse(any(e.get("phase") == "fill" for e in events))
+
+    def test_seed_budget_is_independent_of_fill_budget(self):
+        def delay(kind, family, clock):
+            if kind == "seed" and family == 0:
+                clock.now += 2
+
+        result, events, _, _ = self.run_seed(
+            cfg=config(seed_timeout_s=5, fill_timeout_s=1, fill_no_progress_s=1),
+            payload_hook=delay,
+        )
+        self.assertIsNone(result["failure"])
+        self.assertGreaterEqual(result["seed"]["elapsed_s"], 2)
+        fill = next(e for e in events if e["event"] == "phase" and e["phase"] == "fill")
+        self.assertGreaterEqual(fill["at_s"], 3)
+
+    def test_seed_input_preparation_cannot_dispatch_after_seed_deadline(self):
+        def delay(kind, family, clock):
+            if kind == "seed":
+                clock.now += 1
+
+        result, events, _, _ = self.run_seed(payload_hook=delay)
+        self.assertEqual(result["failure"], "seed_timeout")
+        self.assertFalse(any(e["event"] == "dispatch" for e in events))
+        self.assertFalse(any(e.get("phase") == "fill" for e in events))
 
 
 from rtp_llm.test.perf_test.cache_grid.runner.continuous_pressure import (
@@ -727,13 +867,7 @@ from rtp_llm.test.perf_test.cache_grid.runner.continuous_pressure import (
 
 
 class WarmupCutoffTest(unittest.TestCase):
-    def run_cutoff(
-        self,
-        kind="fill",
-        scheduler="batch_decode",
-        preparation_fails=False,
-        past_drain=False,
-    ):
+    def run_cutoff(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             GroupSample,
             PoolSample,
@@ -741,8 +875,7 @@ class WarmupCutoffTest(unittest.TestCase):
         )
 
         clock = FakeClock()
-        first_sent, crossed, batch_complete = Event(), Event(), Event()
-        cancellation, second_attempted = Event(), Event()
+        first_sent, crossed = Event(), Event()
         events, dispatched, cancelled, batches = [], [], [], []
         sample_sequence = [0]
 
@@ -765,42 +898,26 @@ class WarmupCutoffTest(unittest.TestCase):
             return cp.PressurePoll((sample,), {})
 
         def payload(request_kind, job_id):
-            self.assertEqual(request_kind, kind)
+            self.assertEqual(request_kind, "fill")
             if job_id == 1:
                 if not first_sent.wait(2):
                     raise AssertionError("first request never actually dispatched")
                 clock.now = 1.21
                 crossed.set()
-                if preparation_fails:
-                    raise RuntimeError("second preparation failed")
-                if past_drain and not cancellation.wait(2):
-                    raise AssertionError("drain did not cancel the partial batch")
             return {"input_ids": [job_id + 1] * 16}
 
         def request(payload, register, before):
-            try:
-                identity = before(payload)
-            finally:
-                if payload["input_ids"][0] == 2:
-                    second_attempted.set()
+            identity = before(payload)
             dispatched.append(identity)
             if len(dispatched) == 1:
                 first_sent.set()
-            else:
-                batch_complete.set()
 
             class Call:
                 def cancel(self):
                     cancelled.append(identity)
-                    batch_complete.set()
-                    cancellation.set()
                     return True
 
             register(Call())
-            if scheduler == "batch_decode" and not batch_complete.wait(2):
-                raise AssertionError(
-                    "partial scheduler batch was neither completed nor cancelled"
-                )
             return dict(success=True, input_len=16, output_len=1)
 
         def sleep(seconds):
@@ -817,10 +934,10 @@ class WarmupCutoffTest(unittest.TestCase):
             session_id="partial",
             limits=cp.ExecutionLimits(128, 2, 128, 64, 16),
             concurrency=2,
-            scheduler=scheduler,
+            scheduler="fifo",
             batch_size=1,
             max_input_tokens=16,
-            seed_plan=seed_plan(2 if kind == "seed" else 0, client_inflight=2),
+            seed_plan=seed_plan(client_inflight=2),
             startup_targets=startup_targets,
             make_payload=payload,
             request=request,
@@ -831,59 +948,16 @@ class WarmupCutoffTest(unittest.TestCase):
             sleep=sleep,
         )
         result = session.run()
-        if past_drain:
-            self.assertTrue(second_attempted.wait(2))
         self.assertTrue(first_sent.is_set())
         self.assertTrue(crossed.is_set())
-        if preparation_fails:
-            self.assertIn(result["failure"], ("pressure_not_reached", "request_failed"))
-        else:
-            self.assertEqual(result["failure"], "pressure_not_reached")
+        self.assertEqual(result["failure"], "pressure_not_reached")
         return events, dispatched, cancelled, batches, session
 
-    def test_delayed_fill_preparation_completes_actual_partial_batch(self):
-        events, dispatched, cancelled, batches, session = self.run_cutoff()
-        self.assertEqual(batches, [2])
-        self.assertEqual(dispatched, ["partial:fill:0", "partial:padding:1"])
-        self.assertEqual(cancelled, [])
-        self.assertEqual(session.formal_submitted, 0)
-        self.assertEqual(session.padding_submitted, 0)
-        padding = next(
-            e for e in events if e["event"] == "dispatch" and e["phase"] == "padding"
-        )
-        self.assertEqual(padding["padding_for"], "fill")
-
-    def test_delayed_seed_preparation_completes_actual_partial_batch(self):
-        events, dispatched, cancelled, batches, _ = self.run_cutoff(kind="seed")
-        self.assertEqual(batches, [2])
-        self.assertEqual(dispatched, ["partial:seed:0", "partial:padding:1"])
-        self.assertEqual(cancelled, [])
-
     def test_fifo_never_dispatches_warmup_padding(self):
-        _, dispatched, cancelled, batches, _ = self.run_cutoff(scheduler="fifo")
+        _, dispatched, cancelled, batches, _ = self.run_cutoff()
         self.assertEqual(dispatched, ["partial:fill:0"])
         self.assertEqual(batches, [])
         self.assertEqual(cancelled, [])
-
-    def test_failed_preparation_reports_incomplete_actual_tail(self):
-        events, dispatched, cancelled, _, _ = self.run_cutoff(preparation_fails=True)
-        self.assertEqual(dispatched, ["partial:fill:0"])
-        self.assertEqual(cancelled, ["partial:fill:0"])
-        failure = next(
-            e
-            for e in events
-            if e["event"] == "error" and e.get("reason") == "padding_failed"
-        )
-        self.assertEqual(
-            (failure["stage"], failure["submitted"], failure["batch_size"]),
-            ("fill", 1, 2),
-        )
-
-    def test_warmup_tail_cannot_dispatch_after_drain_deadline(self):
-        events, dispatched, cancelled, _, _ = self.run_cutoff(past_drain=True)
-        self.assertEqual(dispatched, ["partial:fill:0"])
-        self.assertEqual(cancelled, ["partial:fill:0"])
-        self.assertTrue(any(e.get("reason") == "padding_failed" for e in events))
 
 
 class BoundedSenderTest(unittest.TestCase):

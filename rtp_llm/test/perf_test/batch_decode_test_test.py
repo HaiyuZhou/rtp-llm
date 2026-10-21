@@ -553,6 +553,7 @@ class BatchDecodeTest(unittest.TestCase):
         flags = [
             "--cache_pressure_mode=continuous",
             "--cache_pressure_preload",
+            "--cache_pressure_seed_timeout=30",
             "--cache_pressure_fill_timeout=20",
             "--cache_pressure_fill_max_requests=50",
             "--cache_pressure_fill_no_progress=10",
@@ -3162,6 +3163,7 @@ class FullPressurePublicTest(unittest.TestCase):
 
         return resolve_pressure_config(
             dict(
+                seed_timeout_s=30,
                 fill_timeout_s=20,
                 fill_max_requests=50,
                 fill_no_progress_s=10,

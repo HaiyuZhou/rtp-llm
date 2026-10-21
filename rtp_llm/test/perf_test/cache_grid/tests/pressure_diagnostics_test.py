@@ -18,6 +18,7 @@ from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
 
 def settings(**changes):
     values = dict(
+        seed_timeout_s=30,
         fill_timeout_s=120,
         fill_max_requests=1000,
         fill_no_progress_s=30,

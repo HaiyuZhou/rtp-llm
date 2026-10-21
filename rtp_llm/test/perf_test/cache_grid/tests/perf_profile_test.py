@@ -29,8 +29,47 @@ def _minimal_profile(**overrides):
 
 
 class ValidateProfileTest(unittest.TestCase):
+    def test_seed_timeout_is_required_positive_finite_and_overridable(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            resolve_pressure_config,
+        )
+
+        values = dict(
+            seed_timeout_s=30,
+            fill_timeout_s=20,
+            fill_max_requests=10,
+            fill_no_progress_s=5,
+            fill_input_tokens=512,
+            gpu_tolerance_blocks=2,
+            activity_timeout_s=10,
+            drain_timeout_s=10,
+            capture_timeout_s=60,
+        )
+        self.assertEqual(resolve_pressure_config(values).seed_timeout_s, 30)
+        for invalid in (0, -1, True, float("nan"), float("inf"), -float("inf")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                resolve_pressure_config(dict(values, seed_timeout_s=invalid))
+        missing = dict(values)
+        del missing["seed_timeout_s"]
+        with self.assertRaisesRegex(ValueError, "seed_timeout_s"):
+            resolve_pressure_config(missing)
+        profile = _minimal_profile(cache_grid=dict(pressure=values))
+        self.assertEqual(
+            pressure_settings(
+                profile, SimpleNamespace(pressure_seed_timeout=45)
+            ).seed_timeout_s,
+            45,
+        )
+        self.assertEqual(
+            pressure_settings(
+                profile, SimpleNamespace(cache_pressure_seed_timeout=60), direct=True
+            ).seed_timeout_s,
+            60,
+        )
+
     def test_pressure_fill_defaults_without_mutating_profile_and_allows_overrides(self):
         values = dict(
+            seed_timeout_s=30,
             fill_timeout_s=20,
             fill_max_requests=10,
             fill_no_progress_s=5,
@@ -59,6 +98,7 @@ class ValidateProfileTest(unittest.TestCase):
 
     def test_pressure_settings_use_explicit_zero_and_reject_unknown_or_nan(self):
         values = dict(
+            seed_timeout_s=30,
             fill_timeout_s=20,
             fill_max_requests=10,
             fill_no_progress_s=5,

@@ -11,6 +11,7 @@ from dataclasses import dataclass, fields, replace
 
 @dataclass(frozen=True)
 class PressureConfig:
+    seed_timeout_s: float
     fill_timeout_s: float
     fill_max_requests: int
     fill_no_progress_s: float

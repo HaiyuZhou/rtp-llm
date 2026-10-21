@@ -41,6 +41,7 @@ SCHEMA_VERSION = 1
 
 # CLI spelling, immutable PressureConfig field, parser type.
 PRESSURE_OPTIONS = (
+    ("seed-timeout", "seed_timeout_s", float),
     ("fill-timeout", "fill_timeout_s", float),
     ("fill-max-requests", "fill_max_requests", int),
     ("fill-no-progress", "fill_no_progress_s", float),

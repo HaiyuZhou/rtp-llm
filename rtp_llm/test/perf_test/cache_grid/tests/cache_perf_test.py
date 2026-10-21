@@ -204,6 +204,7 @@ class CachePerfTest(unittest.TestCase):
         profile = load_profile(self.profile)
         profile["engine"]["seq_size_per_block"] = 512
         profile["cache_grid"]["pressure"] = dict(
+            seed_timeout_s=30,
             fill_timeout_s=120,
             fill_max_requests=1000,
             fill_no_progress_s=30,

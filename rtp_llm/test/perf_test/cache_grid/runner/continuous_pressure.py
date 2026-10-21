@@ -221,6 +221,7 @@ class PressurePoll:
     activity: tuple = ()
     step_page_full: bool = False
     step_history_complete: bool = True
+    sample_complete: bool = True
 
 
 class DispatchClosed(Exception):
@@ -608,12 +609,14 @@ class PressureSession:
         if not self._record_pressure(evidence):
             self.fail("diagnostics_poll_failed")
             return
-        self.coverage.add(evidence.samples, now)
+        self.coverage.add(evidence.samples, now, complete=evidence.sample_complete)
         self.ready = False
         if not self.coverage.epoch_valid:
             self.fail("pressure_epoch_invalid")
             return
-        if len(evidence.samples) == len(self.coverage.ranks):
+        if evidence.sample_complete and len(evidence.samples) == len(
+            self.coverage.ranks
+        ):
             try:
                 validate_inventory(
                     select_targets(evidence.samples, self.coverage.ranks),
@@ -772,6 +775,8 @@ class PressureSession:
             try:
                 if baseline.raw.get("diagnostics_error"):
                     raise RuntimeError(baseline.raw["diagnostics_error"])
+                if not baseline.sample_complete:
+                    raise RuntimeError("initial pressure inventory is incomplete")
                 self.coverage = PressureCoverage(tuple(baseline.samples), self.config)
                 # Validate reachability before sending any requests.
                 for sample in baseline.samples:

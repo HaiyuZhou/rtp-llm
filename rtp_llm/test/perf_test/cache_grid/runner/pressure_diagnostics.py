@@ -280,7 +280,7 @@ def _shared_layout(sample):
     return tuple(sorted(result))
 
 
-def select_targets(
+def _local_targets(
     samples: tuple[RankSample, ...], ranks: tuple[int, ...]
 ) -> tuple[PressureTarget, ...]:
     if not ranks or len(set(ranks)) != len(ranks):
@@ -319,6 +319,13 @@ def select_targets(
         if not full:
             raise ValueError("rank has no FULL groups")
         result.extend(sorted(full, key=lambda target: target.group_id))
+    return tuple(result)
+
+
+def select_targets(
+    samples: tuple[RankSample, ...], ranks: tuple[int, ...]
+) -> tuple[PressureTarget, ...]:
+    result = _local_targets(samples, ranks)
     by_rank = {sample.rank: sample for sample in samples}
     frozen = []
     for target in result:
@@ -525,6 +532,8 @@ def decode_pressure_response(
     client_send_s: float,
     client_receive_s: float,
     expected_ranks: tuple[int, ...],
+    *,
+    complete: bool = True,
 ) -> DecodedPressure:
     """Decode schema-1 protobuf fields; wrapper/message presence is mandatory."""
     if response.schema_version != 1:
@@ -671,7 +680,12 @@ def decode_pressure_response(
             )
         )
     result = tuple(samples)
-    select_targets(result, expected_ranks)
+    if complete:
+        select_targets(result, expected_ranks)
+    else:
+        # Runtime partial pages retain local evidence. The coverage accumulator
+        # compares its ownership/layout/counters with the full frozen inventory.
+        _local_targets(result, expected_ranks)
     return DecodedPressure(response.SerializeToString(), result)
 
 
@@ -845,7 +859,7 @@ class PressureCoverage:
             if key[0] == rank:
                 del self.open_segments[key]
 
-    def add(self, samples, now):
+    def add(self, samples, now, *, complete=True):
         _number(now, "now", inclusive=True)
         if not self.epoch_valid:
             return
@@ -886,6 +900,12 @@ class PressureCoverage:
                 self.epoch_valid = False
                 self.reasons.add("sequence_reset")
         if not self.epoch_valid:
+            for rank in self.ranks:
+                self._break(rank)
+            return
+        if not complete:
+            self.reasons.add("incomplete_sample")
+            self.last_seen.update((sample.rank, sample) for sample in samples)
             for rank in self.ranks:
                 self._break(rank)
             return

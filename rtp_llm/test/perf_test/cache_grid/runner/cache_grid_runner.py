@@ -2149,9 +2149,10 @@ class CacheGridRunner:
                 if len(observed_ranks) != len(target_ranks) or any(
                     rank.error for rank in response.ranks
                 ):
+                    concrete_samples = ()
                     if payload_ranks:
-                        # Validate concrete payloads with the shared decoder. This
-                        # view never becomes coverage or changes the frozen targets.
+                        # Preserve concrete evidence for frozen inventory/reset
+                        # checks, without asserting a complete shared scope.
                         available = model_rpc_service_pb2.CachePressureResponsePB()
                         available.CopyFrom(response)
                         available.ClearField("ranks")
@@ -2161,12 +2162,21 @@ class CacheGridRunner:
                             copied.CopyFrom(rank)
                             copied.ClearField("error")
                             available.requested_ranks.append(rank.world_rank)
-                        decode_pressure_response(
-                            available, sent, received, tuple(available.requested_ranks)
-                        )
+                        concrete_samples = decode_pressure_response(
+                            available,
+                            sent,
+                            received,
+                            tuple(available.requested_ranks),
+                            complete=False,
+                        ).samples
                     raw["sampling_error"] = "missing rank or failed rank sample"
                     # A partial page provides no complete coverage or cursor boundary.
-                    return PressurePoll((), raw, step_history_complete=False)
+                    return PressurePoll(
+                        concrete_samples,
+                        raw,
+                        step_history_complete=False,
+                        sample_complete=False,
+                    )
                 decoded = decode_pressure_response(
                     response, sent, received, tuple(target_ranks)
                 )

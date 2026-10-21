@@ -1140,6 +1140,25 @@ class RunnerIntegrationTest(unittest.TestCase):
     def test_empty_rank_transport_error_remains_recoverable(self):
         self._runner_case("empty_transport_error")
 
+    def test_shared_owner_partial_pages_remain_unknown(self):
+        for fault in ("transient_missing", "transient_error", "empty_transport_error"):
+            with self.subTest(fault=fault):
+                self._runner_case(fault, shared=True)
+
+    def test_shared_owner_initial_error_cannot_establish_inventory(self):
+        self._runner_case("initial_error", shared=True)
+
+    def test_shared_owner_partial_pages_validate_concrete_corruption(self):
+        for fault in (
+            "missing_corrupt",
+            "error_corrupt",
+            "missing_reset",
+            "missing_layout",
+            "missing_scope",
+        ):
+            with self.subTest(fault=fault):
+                self._runner_case(fault, shared=True)
+
     def test_measurement_loss_recovers_for_cleanup_but_fails_coverage(self):
         self._runner_case("measurement_loss")
 
@@ -1329,6 +1348,21 @@ class RunnerIntegrationTest(unittest.TestCase):
             if fault == "poll_instance":
                 peer.service_instance = "restarted-peer"
             measuring = any(control.phase == "measurement" for control in controls)
+            if fault == "initial_error":
+                peer.error = "initial peer deadline"
+            if (
+                fault in ("missing_reset", "missing_layout", "missing_scope")
+                and measuring
+                and not corrupt_polls
+            ):
+                corrupt_polls.append(len(polls) - 1)
+                if fault == "missing_reset":
+                    rank.transfers[0].published_blocks = 0
+                elif fault == "missing_layout":
+                    rank.pools[0].total_blocks += 1
+                else:
+                    rank.ownership.publication_scope = 1
+                del response.ranks[-1]
             if (
                 fault in ("missing_corrupt", "error_corrupt")
                 and measuring
@@ -1595,6 +1629,8 @@ class RunnerIntegrationTest(unittest.TestCase):
             return
         if fault:
             self.assertIsNotNone(result["failure"])
+            if fault in ("missing_reset", "missing_layout", "missing_scope"):
+                self.assertEqual(result["failure"], "pressure_epoch_invalid")
             evidence = json.loads(
                 (runner.result_dir / "pressure/summary.json").read_text()
             )

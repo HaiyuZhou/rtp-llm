@@ -230,6 +230,26 @@ class SharedOwnershipTest(unittest.TestCase):
             evaluator.add((observed,), 2)
             self.assertFalse(evaluator.epoch_valid)
 
+    def test_incomplete_page_preserves_counter_reference_without_coverage(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        baseline = decode_pressure_response(shared_wire(0, True), 0, 0, (0, 1)).samples
+        current = decode_pressure_response(shared_wire(1), 1, 1, (0, 1)).samples
+        evaluator = PressureCoverage(baseline, configured())
+        evaluator.add(current, 1, complete=False)
+        self.assertTrue(evaluator.epoch_valid)
+        self.assertEqual(evaluator.last_seen[0], current[0])
+        later = dataclasses.replace(
+            current[0],
+            sequence=current[0].sequence + 1,
+            groups=(dataclasses.replace(current[0].groups[0], triggers=0),),
+        )
+        evaluator.add((later,), 2, complete=False)
+        self.assertFalse(evaluator.epoch_valid)
+        self.assertIn("counter_reset", evaluator.reasons)
+
     def test_owner_clock_boundary_and_missing_stale_peer_never_gain_coverage(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             PressureCoverage,

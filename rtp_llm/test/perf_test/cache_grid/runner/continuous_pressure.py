@@ -997,6 +997,11 @@ class PressureSession:
                     self.state.measurement_start, self.state.measurement_end
                 )
             )
+            result["migration"] = asdict(
+                self.coverage.assess_migration(
+                    self.state.measurement_start, self.state.measurement_end
+                )
+            )
         if self.support_started is not None and self.support_end > self.support_started:
             result["support_pressure"] = asdict(
                 self.coverage.assess(self.support_started, self.support_end)

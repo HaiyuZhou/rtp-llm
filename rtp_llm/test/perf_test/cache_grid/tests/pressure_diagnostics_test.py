@@ -6,6 +6,7 @@ from types import SimpleNamespace as NS
 from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
     GroupSample,
     PoolSample,
+    PressureCoverage,
     RankSample,
     decode_pressure_response,
     group_valid,
@@ -581,6 +582,314 @@ class PressurePredicateTest(unittest.TestCase):
             mutate(message)
             with self.subTest(mutate=mutate), self.assertRaises(ValueError):
                 decode_pressure_response(message, 1.0, 1.1, (0,))
+
+
+def migration_page(t, d2h=0, h2d=0, *, participants=1, bounds=(0, 0), operation=2):
+    """Decode cumulative settlement endpoints, including both physical views."""
+    message = wire() if participants == 1 else shared_wire(t, True)
+    if participants > 2:
+        message.ranks.extend(
+            copy.deepcopy(message.ranks[1]) for _ in range(participants - 2)
+        )
+    message.requested_ranks = list(range(participants))
+    for i, item in enumerate(message.ranks):
+        item.world_rank = i
+        item.service_instance = f"instance-{i}"
+        item.sequence = t + 2
+        item.sampled_monotonic_ns = int((t + i * 100) * 1e9)
+        item.groups[0].watermark_trigger_count = 1
+        if participants > 1:
+            item.ownership.participant_world_ranks = list(range(participants))
+        item.transfers = []
+        for op, source, target, count in ((operation, 1, 2, d2h), (1, 2, 1, h2d)):
+            for pool in item.pools:
+                item.transfers.append(
+                    PB(
+                        group_id=0,
+                        pool_id=pool.pool_id,
+                        pool_tier=pool.tier,
+                        operation=op,
+                        source_tier=source,
+                        target_tier=target,
+                        copied_blocks=count,
+                        copied_bytes=count * 4096,
+                        published_blocks=count,
+                        published_bytes=count * 4096,
+                        failed_operations=0,
+                    )
+                )
+    return decode_pressure_response(
+        message, t + bounds[0], t + bounds[1], tuple(range(participants))
+    ).samples
+
+
+class MigrationTest(unittest.TestCase):
+    def evaluator(self, *, participants=1, max_segments=4096):
+        return PressureCoverage(
+            migration_page(9, participants=participants), configured(), max_segments
+        )
+
+    def test_settled_store_or_evict_and_load_qualify_each_direction(self):
+        for operation in (2, 3):
+            with self.subTest(operation=operation):
+                evaluator = PressureCoverage(
+                    (migration_page(9, operation=operation)[0],), configured()
+                )
+                evaluator.add(migration_page(10, operation=operation), 10)
+                evaluator.add(migration_page(11, 7, 5, operation=operation), 11)
+                assessment = evaluator.assess_migration(10, 20)
+                self.assertTrue(assessment.valid)
+                self.assertEqual(assessment.reasons, ())
+                self.assertTrue(all(group.valid for group in assessment.groups))
+                self.assertEqual(len(assessment.groups), 1)
+                group = assessment.groups[0]
+                self.assertEqual(group.d2h_intervals, ((10, 11),))
+                self.assertEqual(group.h2d_intervals, ((10, 11),))
+
+    def test_d2h_alone_cannot_qualify_migration(self):
+        evaluator = self.evaluator()
+        evaluator.add(migration_page(10), 10)
+        evaluator.add(migration_page(11, 7, 0), 11)
+        result = evaluator.assess_migration(10, 20)
+        self.assertFalse(result.valid)
+        self.assertEqual(result.reasons, ("missing_h2d_load:0:0",))
+
+    def test_h2d_alone_cannot_qualify_migration(self):
+        evaluator = self.evaluator()
+        evaluator.add(migration_page(10), 10)
+        evaluator.add(migration_page(11, 0, 7), 11)
+        result = evaluator.assess_migration(10, 20)
+        self.assertFalse(result.valid)
+        self.assertEqual(result.reasons, ("missing_d2h:0:0",))
+
+    def test_copy_or_bytes_without_publication_cannot_qualify(self):
+        evaluator = self.evaluator()
+        evaluator.add(migration_page(10), 10)
+        current = migration_page(11, 7, 5)[0]
+        current = dataclasses.replace(
+            current,
+            counters=tuple(
+                (key, 0 if key[0] == "published_blocks" else value)
+                for key, value in current.counters
+            ),
+        )
+        evaluator.add((current,), 11)
+        self.assertFalse(evaluator.assess_migration(10, 20).valid)
+
+    def test_failed_or_cancelled_copy_does_not_substitute_for_publication(self):
+        evaluator = self.evaluator()
+        evaluator.add(migration_page(10), 10)
+        current = migration_page(11, 7, 5)[0]
+        current = dataclasses.replace(
+            current,
+            counters=tuple(
+                (
+                    key,
+                    (
+                        0
+                        if key[0] in ("published_blocks", "published_bytes")
+                        else 2 if key[0] == "failed_operations" else value
+                    ),
+                )
+                for key, value in current.counters
+            ),
+        )
+        evaluator.add((current,), 11)
+        self.assertFalse(evaluator.assess_migration(10, 20).valid)
+
+    def test_publication_in_wrong_operation_or_endpoint_is_rejected(self):
+        for direction in ("d2h", "h2d"):
+            for mutation in ("wrong_operation", "source_pool_only"):
+                with self.subTest(direction=direction, mutation=mutation):
+
+                    def mutate(sample):
+                        counters = []
+                        for key, value in sample.counters:
+                            if len(key) == 6 and key[0] == "published_blocks":
+                                matches = (key[4], key[5]) == (
+                                    (1, 2) if direction == "d2h" else (2, 1)
+                                )
+                                if matches and mutation == "wrong_operation":
+                                    key = (
+                                        *key[:3],
+                                        1 if direction == "d2h" else 3,
+                                        *key[4:],
+                                    )
+                                elif matches and key[2] == (
+                                    "host" if direction == "d2h" else "gpu"
+                                ):
+                                    value = 0
+                            counters.append((key, value))
+                        return dataclasses.replace(sample, counters=tuple(counters))
+
+                    evaluator = PressureCoverage(
+                        (mutate(migration_page(9)[0]),), configured()
+                    )
+                    evaluator.add((mutate(migration_page(10)[0]),), 10)
+                    evaluator.add((mutate(migration_page(11, 7, 5)[0]),), 11)
+                    result = evaluator.assess_migration(10, 20)
+                    self.assertTrue(result.epoch_valid)
+                    self.assertFalse(result.valid)
+
+    def test_outer_uncertainty_crossing_measurement_start_is_rejected(self):
+        evaluator = self.evaluator()
+        evaluator.add(migration_page(10, bounds=(-0.2, 0.2)), 10.2)
+        evaluator.add(migration_page(11, 7, 5, bounds=(-0.1, 0.1)), 11.1)
+        result = evaluator.assess_migration(10, 20)
+        self.assertTrue(result.epoch_valid)
+        self.assertFalse(result.valid)
+
+    def test_outer_uncertainty_crossing_measurement_end_is_rejected(self):
+        evaluator = self.evaluator()
+        evaluator.add(migration_page(19, bounds=(-0.1, 0.1)), 19.1)
+        evaluator.add(migration_page(20, 7, 5, bounds=(-0.2, 0.2)), 20.2)
+        self.assertFalse(evaluator.assess_migration(10, 20).valid)
+
+    def test_pre_and_post_window_publications_do_not_qualify(self):
+        for left, right in ((8, 9), (20, 21)):
+            with self.subTest(left=left):
+                baseline = migration_page(left - 1)
+                evaluator = PressureCoverage(baseline, configured())
+                evaluator.add(migration_page(left), left)
+                evaluator.add(migration_page(right, 7, 5), right)
+                self.assertFalse(evaluator.assess_migration(10, 20).valid)
+
+    def test_every_independent_owner_group_requires_both_directions(self):
+        def page(t, peer_h2d):
+            owner = migration_page(t, t - 10, t - 10)[0]
+            peer = dataclasses.replace(migration_page(t, t - 10, peer_h2d)[0], rank=1)
+            return owner, peer
+
+        evaluator = PressureCoverage(page(10, 0), configured())
+        evaluator.add(page(11, 0), 11)
+        evaluator.add(page(12, 0), 12)
+        result = evaluator.assess_migration(10, 20)
+        self.assertFalse(result.valid)
+        self.assertEqual(len(result.groups), 2)
+        self.assertEqual(result.reasons, ("missing_h2d_load:1:0",))
+
+    def test_four_shared_tp_views_yield_one_owner_group_without_summing(self):
+        evaluator = self.evaluator(participants=4)
+        evaluator.add(migration_page(10, participants=4), 10)
+        evaluator.add(migration_page(11, 7, 5, participants=4), 11)
+        result = evaluator.assess_migration(10, 20)
+        self.assertTrue(result.valid)
+        self.assertEqual(len(result.groups), 1)
+        self.assertEqual(
+            (result.groups[0].owner_rank, result.groups[0].owner_group_id), (0, 0)
+        )
+        self.assertEqual(result.groups[0].d2h_evidence[0].after_blocks, 7)
+        self.assertEqual(result.groups[0].h2d_evidence[0].after_blocks, 5)
+
+    def test_participant_publication_cannot_replace_owner_publication(self):
+        evaluator = self.evaluator(participants=4)
+        evaluator.add(migration_page(10, participants=4), 10)
+        current = migration_page(11, 7, 5, participants=4)
+        owner = migration_page(11, participants=4)[0]
+        evaluator.add((owner, *current[1:]), 11)
+        self.assertFalse(evaluator.assess_migration(10, 20).valid)
+
+    def test_missing_shared_participant_breaks_delta_adjacency(self):
+        for complete in (True, False):
+            with self.subTest(complete=complete):
+                evaluator = self.evaluator(participants=4)
+                evaluator.add(migration_page(10, participants=4), 10)
+                evaluator.add(
+                    migration_page(11, 7, 5, participants=4)[:3], 11, complete=complete
+                )
+                evaluator.add(migration_page(12, 7, 5, participants=4), 12)
+                self.assertFalse(evaluator.assess_migration(10, 20).valid)
+
+    def test_stale_shared_participant_cannot_certify_owner_increment(self):
+        evaluator = self.evaluator(participants=4)
+        evaluator.add(migration_page(10, participants=4), 10)
+        current = migration_page(11, 7, 5, participants=4)
+        stale = dataclasses.replace(current[3], offset_bounds=(-3, 0))
+        evaluator.add((*current[:3], stale), 11)
+        self.assertFalse(evaluator.assess_migration(10, 20).valid)
+
+    def test_counter_decrease_invalidates_existing_migration_evidence(self):
+        evaluator = self.evaluator()
+        evaluator.add(migration_page(10), 10)
+        evaluator.add(migration_page(11, 7, 5), 11)
+        evaluator.add(migration_page(12, 6, 5), 12)
+        result = evaluator.assess_migration(10, 20)
+        self.assertFalse(result.epoch_valid)
+        self.assertFalse(result.valid)
+        self.assertIn("counter_reset", result.reasons)
+
+    def test_instance_layout_and_participant_changes_invalidate_evidence(self):
+        mutations = (
+            lambda s: dataclasses.replace(s, instance="restarted"),
+            lambda s: dataclasses.replace(
+                s, pools=(dataclasses.replace(s.pools[0], capacity=101), s.pools[1])
+            ),
+            lambda s: dataclasses.replace(
+                s, ownership=dataclasses.replace(s.ownership, participants=(0, 1))
+            ),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                evaluator = self.evaluator(participants=4)
+                evaluator.add(migration_page(10, participants=4), 10)
+                evaluator.add(migration_page(11, 7, 5, participants=4), 11)
+                current = migration_page(12, 7, 5, participants=4)
+                evaluator.add((mutate(current[0]), *current[1:]), 12)
+                result = evaluator.assess_migration(10, 20)
+                self.assertFalse(result.epoch_valid)
+                self.assertFalse(result.valid)
+                self.assertIn("inventory_discontinuity", result.reasons)
+
+    def test_missing_boundary_and_gap_never_certify_a_delta(self):
+        for missing in (True, False):
+            with self.subTest(missing=missing):
+                evaluator = self.evaluator()
+                evaluator.add(migration_page(10), 10)
+                if missing:
+                    evaluator.add((), 11)
+                evaluator.add(migration_page(13, 7, 5), 13)
+                self.assertFalse(evaluator.assess_migration(10, 20).valid)
+
+    def test_sparse_endpoint_zero_baseline_is_explicit_and_window_bounded(self):
+        baseline = dataclasses.replace(
+            migration_page(9)[0], counters=((("trigger", 0), 1),)
+        )
+        evaluator = PressureCoverage((baseline,), configured())
+        first = migration_page(10)[0]
+        evaluator.add(
+            (dataclasses.replace(first, counters=((("trigger", 0), 1),)),), 10
+        )
+        evaluator.add(migration_page(11, 7, 5), 11)
+        result = evaluator.assess_migration(10, 20)
+        self.assertTrue(result.valid)
+        evidence = result.groups[0].d2h_evidence[0]
+        self.assertEqual(evidence.source, "published_blocks")
+        self.assertEqual((evidence.before_blocks, evidence.after_blocks), (0, 7))
+        self.assertEqual(
+            evidence.zero_baseline_endpoints,
+            (("published_blocks", 0, "host", 2, 1, 2),),
+        )
+        self.assertEqual(
+            evidence.endpoint_deltas,
+            ((("published_blocks", 0, "host", 2, 1, 2), 0, 7),),
+        )
+
+    def test_history_overflow_fails_closed_even_with_retained_directions(self):
+        evaluator = self.evaluator(max_segments=1)
+        evaluator.add(migration_page(10), 10)
+        evaluator.add(migration_page(11, 7, 5), 11)
+        evaluator.add(migration_page(12, 8, 6), 12)
+        result = evaluator.assess_migration(10, 20)
+        self.assertFalse(result.valid)
+        self.assertIn("history_overflow", result.reasons)
+        self.assertEqual(result.groups[0].d2h_intervals, ((11, 12),))
+        self.assertEqual(len(result.groups[0].d2h_evidence), 1)
+
+    def test_invalid_windows_are_rejected(self):
+        evaluator = self.evaluator()
+        for start, end in ((10, 10), (20, 10), (float("nan"), 20)):
+            with self.subTest(start=start, end=end), self.assertRaises(ValueError):
+                evaluator.assess_migration(start, end)
 
 
 class CoverageTest(unittest.TestCase):

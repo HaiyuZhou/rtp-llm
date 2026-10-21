@@ -468,6 +468,115 @@ class LifecycleTest(unittest.TestCase):
         )
         self.assertEqual(session.coverage.baselines[0].groups[0].triggers, 1)
 
+    def test_terminal_migration_serializes_window_local_owner_publications(self):
+        def transfers(evidence, count, clock):
+            sample = evidence.samples[0]
+            return replace(
+                evidence,
+                samples=(
+                    replace(
+                        sample,
+                        counters=(
+                            (("published_blocks", 0, "host", 2, 1, 2), count),
+                            (("published_blocks", 0, "gpu", 1, 2, 1), count),
+                        ),
+                    ),
+                ),
+            )
+
+        result, events, _, session = self.run_session(poll_transform=transfers)
+        self.assertIsNone(result["failure"])
+        self.assertTrue(result["migration"]["valid"])
+        self.assertEqual(result["migration"]["reasons"], ())
+        self.assertEqual(len(result["migration"]["groups"]), 1)
+        group = result["migration"]["groups"][0]
+        self.assertEqual(group["d2h_evidence"][0]["source"], "published_blocks")
+        for direction in ("d2h", "h2d"):
+            for start, end in group[f"{direction}_intervals"]:
+                self.assertGreaterEqual(start, result["measurement_start"])
+                self.assertLessEqual(end, result["measurement_end"])
+        self.assertGreater(session.last_poll_s, result["measurement_end"])
+        self.assertEqual(events[-1]["migration"], result["migration"])
+        json.dumps(result, allow_nan=False)
+
+    def test_preload_and_fill_publications_cannot_satisfy_measurement_migration(self):
+        def seed_only(evidence, count, clock):
+            sample = evidence.samples[0]
+            published = int(count > 1)
+            return replace(
+                evidence,
+                samples=(
+                    replace(
+                        sample,
+                        counters=(
+                            (("published_blocks", 0, "host", 2, 1, 2), published),
+                            (("published_blocks", 0, "gpu", 1, 2, 1), published),
+                        ),
+                    ),
+                ),
+            )
+
+        result, _, _, session = self.run_session(seed_count=1, poll_transform=seed_only)
+        self.assertIsNone(result["failure"])
+        self.assertEqual(
+            dict(session.coverage.baselines[0].counters)[
+                ("published_blocks", 0, "host", 2, 1, 2)
+            ],
+            1,
+        )
+        self.assertTrue(result["pressure"]["valid"])
+        self.assertFalse(result["migration"]["valid"])
+        self.assertEqual(
+            result["migration"]["reasons"], ("missing_d2h:0:0", "missing_h2d_load:0:0")
+        )
+
+    def test_support_only_publications_do_not_satisfy_measurement_migration(self):
+        phase, published = ["seed"], [0]
+
+        class Controller:
+            def start(self, now):
+                pass
+
+            def pending(self, now):
+                return True
+
+            def stop(self, reason, now):
+                pass
+
+        def control(action, current, timeout):
+            if action == "phase":
+                phase[0] = current
+
+        def support_only(evidence, count, clock):
+            if phase[0] == "support":
+                published[0] += 1
+            sample = evidence.samples[0]
+            return replace(
+                evidence,
+                samples=(
+                    replace(
+                        sample,
+                        counters=(
+                            (("published_blocks", 0, "host", 2, 1, 2), published[0]),
+                            (("published_blocks", 0, "gpu", 1, 2, 1), published[0]),
+                        ),
+                    ),
+                ),
+            )
+
+        result, events, _, _ = self.run_session(
+            poll_transform=support_only,
+            diagnostics_control=control,
+            controller=Controller(),
+            cfg=config(
+                measure_s=2, steady_s=1, capture_timeout_s=4, sample_period_s=0.5
+            ),
+        )
+        self.assertTrue(any(e.get("phase") == "support" for e in events))
+        self.assertGreater(published[0], 0)
+        self.assertFalse(result["migration"]["valid"])
+        self.assertEqual(result["migration"]["groups"][0]["d2h_intervals"], ())
+
     def test_seed_count_is_exact_and_baseline_precedes_sends(self):
         result, events, batches, _ = self.run_session(seed_count=7)
         self.assertIsNone(result["failure"])

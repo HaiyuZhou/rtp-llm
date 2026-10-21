@@ -762,6 +762,19 @@ def confirmed_segment(start_server, end_server, offset_low, offset_high):
     return (start, end) if end > start else None
 
 
+def possible_event_segment(
+    start_server: float,
+    end_server: float,
+    start_bounds: tuple[float, float],
+    end_bounds: tuple[float, float],
+) -> Interval:
+    """Outer envelope of a cumulative increment between two sampled points."""
+    return (
+        start_server + min(start_bounds[0], end_bounds[0]),
+        end_server + max(start_bounds[1], end_bounds[1]),
+    )
+
+
 def _wire_offset_bounds(response, rank, client_send, client_receive):
     """Client minus rank clock; fan-out composes both transport uncertainties."""
     received = getattr(response, "coordinator_received_ns", 0)
@@ -847,6 +860,35 @@ class CoverageAssessment:
     epoch_reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MigrationPublicationEvidence:
+    interval: Interval
+    before_blocks: int
+    after_blocks: int
+    endpoint_deltas: tuple[tuple[tuple, int, int], ...]
+    zero_baseline_endpoints: tuple[tuple, ...] = ()
+    source: str = "published_blocks"
+
+
+@dataclass(frozen=True)
+class MigrationGroupAssessment:
+    owner_rank: int
+    owner_group_id: int
+    d2h_intervals: tuple[Interval, ...]
+    h2d_intervals: tuple[Interval, ...]
+    valid: bool
+    d2h_evidence: tuple[MigrationPublicationEvidence, ...] = ()
+    h2d_evidence: tuple[MigrationPublicationEvidence, ...] = ()
+
+
+@dataclass(frozen=True)
+class MigrationAssessment:
+    epoch_valid: bool
+    groups: tuple[MigrationGroupAssessment, ...]
+    valid: bool
+    reasons: tuple[str, ...]
+
+
 class PressureCoverage:
     """Bounded streaming sampled evidence, shared by all diagnostic windows.
 
@@ -864,6 +906,18 @@ class PressureCoverage:
         self.previous = {}
         self.last_seen = {}
         self.segments = {(t.rank, t.group_id): [] for t in self.targets}
+        self.owner_groups = tuple(
+            sorted(
+                {(target.owner_rank, target.owner_group_id) for target in self.targets}
+            )
+        )
+        self.migration_intervals = {
+            (*key, direction): []
+            for key in self.owner_groups
+            for direction in ("d2h", "h2d")
+        }
+        self.migration_evidence = {key: [] for key in self.migration_intervals}
+        self.migration_history_overflow = False
         self.open_segments = {}
         self.max_segments = max_segments
         self.reasons = set()
@@ -940,6 +994,7 @@ class PressureCoverage:
             for rank in self.ranks:
                 self._break(rank)
             return
+        adjacent = {}
         for sample in samples:
             rank = sample.rank
             bounds = sample.offset_bounds or (
@@ -1020,6 +1075,8 @@ class PressureCoverage:
                     previous = None
             if not self.epoch_valid:
                 continue
+            if previous:
+                adjacent[rank] = (*previous, sample, bounds)
             for target in (t for t in self.targets if t.rank == rank):
                 key = (rank, target.group_id)
                 try:
@@ -1058,6 +1115,116 @@ class PressureCoverage:
                             self.segments[key].pop(0)
                             self.reasons.add("history_overflow")
             self.previous[rank] = sample, bounds
+        if self.epoch_valid:
+            self._record_migration(adjacent)
+
+    def _record_migration(self, adjacent):
+        for owner_rank, owner_group_id in self.owner_groups:
+            target = next(
+                target
+                for target in self.targets
+                if (target.owner_rank, target.owner_group_id)
+                == (owner_rank, owner_group_id)
+            )
+            # A complete page alone is insufficient: every declared participant
+            # must have fresh, clock-compatible adjacent samples in this poll.
+            if any(rank not in adjacent for rank, _ in target.participants):
+                continue
+            old, old_bounds, current, bounds = adjacent[owner_rank]
+            interval = possible_event_segment(
+                old.server_s, current.server_s, old_bounds, bounds
+            )
+            old_counters = dict(old.counters)
+            group = next(g for g in current.groups if g.group_id == owner_group_id)
+            for direction in ("d2h", "h2d"):
+                endpoints = []
+                for key, value in current.counters:
+                    if len(key) != 6 or key[:2] != ("published_blocks", owner_group_id):
+                        continue
+                    _, _, pool_id, operation, source, destination = key
+                    if direction == "d2h":
+                        matches = (
+                            pool_id == group.host_pool_id
+                            and operation in (2, 3)
+                            and (source, destination) == (1, 2)
+                        )
+                    else:
+                        matches = (
+                            pool_id in group.device_pool_ids
+                            and operation == 1
+                            and (source, destination) == (2, 1)
+                        )
+                    if matches:
+                        endpoints.append((key, old_counters.get(key, 0), value))
+                before = sum(before for _, before, _ in endpoints)
+                after = sum(after for _, _, after in endpoints)
+                if after <= before:
+                    continue
+                key = owner_rank, owner_group_id, direction
+                self.migration_intervals[key].append(interval)
+                self.migration_evidence[key].append(
+                    MigrationPublicationEvidence(
+                        interval,
+                        before,
+                        after,
+                        tuple(sorted(endpoints)),
+                        tuple(
+                            sorted(
+                                endpoint
+                                for endpoint, _, _ in endpoints
+                                if endpoint not in old_counters
+                            )
+                        ),
+                    )
+                )
+                if len(self.migration_intervals[key]) > self.max_segments:
+                    self.migration_intervals[key].pop(0)
+                    self.migration_evidence[key].pop(0)
+                    self.migration_history_overflow = True
+                    self.reasons.add("history_overflow")
+
+    def assess_migration(self, start: float, end: float) -> MigrationAssessment:
+        coverage([], start, end)
+        reasons = set(self.reasons) if not self.epoch_valid else set()
+        if self.migration_history_overflow:
+            reasons.add("history_overflow")
+        groups = []
+        for owner_rank, owner_group_id in self.owner_groups:
+            evidence = {}
+            for direction in ("d2h", "h2d"):
+                evidence[direction] = tuple(
+                    item
+                    for item in self.migration_evidence[
+                        (owner_rank, owner_group_id, direction)
+                    ]
+                    if start <= item.interval[0] and item.interval[1] <= end
+                )
+            d2h = tuple(item.interval for item in evidence["d2h"])
+            h2d = tuple(item.interval for item in evidence["h2d"])
+            if not d2h:
+                reasons.add(f"missing_d2h:{owner_rank}:{owner_group_id}")
+            if not h2d:
+                reasons.add(f"missing_h2d_load:{owner_rank}:{owner_group_id}")
+            groups.append(
+                MigrationGroupAssessment(
+                    owner_rank,
+                    owner_group_id,
+                    d2h,
+                    h2d,
+                    bool(d2h and h2d),
+                    evidence["d2h"],
+                    evidence["h2d"],
+                )
+            )
+        valid = (
+            self.epoch_valid
+            and not self.migration_history_overflow
+            and bool(groups)
+            and all(group.valid for group in groups)
+        )
+        return MigrationAssessment(
+            self.epoch_valid, tuple(groups), valid, tuple(sorted(reasons))
+        )
 
     def _target_valid(self, target, owner, samples):
         local = next(s for s in samples if s.rank == target.rank)

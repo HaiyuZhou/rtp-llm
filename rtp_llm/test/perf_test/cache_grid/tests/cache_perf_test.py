@@ -23,6 +23,33 @@ from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import build_se
 
 
 class CachePerfTest(unittest.TestCase):
+    def test_production_launch_reserves_fp8_cp_workspace_before_cache_sizing(self):
+        config = Path(__file__).resolve().parents[1] / "config"
+        self.profile = config / "continuous_full_pressure_dsv4.production.example.jsonc"
+        self.grid = config / "continuous_full_pressure_grid.production.example.json"
+        plan = cli.build_plan(
+            self.args(extra=["--pressure-mode=continuous", "--pressure-preload"]), {}
+        )
+        snapshot = json.loads(plan["artifacts"]["profile.snapshot.json"])
+        engine = snapshot["engine"]
+        # Flash has 64 heads, head_dim=512 and index_head_dim=128. CP's two
+        # FP32 gather/restore regions dominate BF16 Q: 40 GiB for these limits.
+        cp_size = engine["tp_size"]
+        q_rows = (
+            (engine["max_seq_len"] + cp_size - 1)
+            // cp_size
+            * engine["max_context_batch_size"]
+        )
+        q_bytes = q_rows * 64 * 512 * 2
+        cp_bytes = 2 * q_rows * cp_size * (4 * 512 + 4 * 128) * 4
+        workspace_bytes = max(q_bytes, cp_bytes)
+        reserve_bytes = (
+            snapshot["engine_args"]["--reserver_runtime_mem_mb"] * 1024 * 1024
+        )
+        # Leave another 16 GiB for forward intermediates beyond that union;
+        # the L20D native 5% floor alone is only about 13.4 GiB total.
+        self.assertGreaterEqual(reserve_bytes, workspace_bytes + 16 * 1024**3)
+
     def test_production_pressure_example_is_automatic_formal_candidate(self):
         config = Path(__file__).resolve().parents[1] / "config"
         self.profile = config / "continuous_full_pressure_dsv4.production.example.jsonc"

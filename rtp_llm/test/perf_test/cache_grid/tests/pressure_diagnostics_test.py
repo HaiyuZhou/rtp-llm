@@ -71,6 +71,8 @@ def wire():
         pool_id="gpu",
         tier=1,
         total_blocks=100,
+        free_blocks=0,
+        available_blocks=0,
         used_blocks=90,
         pending_release_blocks=0,
         published_host_blocks=0,
@@ -79,6 +81,8 @@ def wire():
         pool_id="host",
         tier=2,
         total_blocks=100,
+        free_blocks=0,
+        available_blocks=0,
         used_blocks=30,
         pending_release_blocks=0,
         published_host_blocks=25,
@@ -398,6 +402,29 @@ class PressurePredicateTest(unittest.TestCase):
                 (0,),
             )
 
+    def test_live_free_and_available_blocks_are_projected(self):
+        message = wire()
+        message.ranks[0].pools[0].total_blocks = 128
+        message.ranks[0].pools[0].free_blocks = 17
+        message.ranks[0].pools[0].available_blocks = 23
+        sample = decode_pressure_response(message, 1.0, 1.1, (0,)).samples[0]
+        self.assertEqual(sample.pools[0].capacity, 128)
+        self.assertEqual(sample.pools[0].free, 17)
+        self.assertEqual(sample.pools[0].available, 23)
+        before = select_targets((sample,), (0,))
+        message.ranks[0].pools[0].free_blocks = 19
+        message.ranks[0].pools[0].available_blocks = 24
+        after = decode_pressure_response(message, 1.0, 1.1, (0,)).samples
+        validate_inventory(select_targets(after, (0,)), before)
+
+    def test_live_free_and_available_cannot_exceed_capacity(self):
+        for field in ("free_blocks", "available_blocks"):
+            with self.subTest(field=field):
+                message = wire()
+                setattr(message.ranks[0].pools[0], field, 101)
+                with self.assertRaisesRegex(ValueError, "invalid physical occupancy"):
+                    decode_pressure_response(message, 1.0, 1.1, (0,))
+
     def test_real_wire_endpoint_projection_and_raw_evidence(self):
         message = wire()
         decoded = decode_pressure_response(message, 1.0, 1.1, (0,))
@@ -491,6 +518,8 @@ class PressurePredicateTest(unittest.TestCase):
                     pool_id="disk",
                     tier=3,
                     total_blocks=100,
+                    free_blocks=0,
+                    available_blocks=0,
                     used_blocks=0,
                     pending_release_blocks=0,
                     published_host_blocks=0,
@@ -499,6 +528,8 @@ class PressurePredicateTest(unittest.TestCase):
                     pool_id="swa",
                     tier=1,
                     total_blocks=100,
+                    free_blocks=0,
+                    available_blocks=0,
                     used_blocks=0,
                     pending_release_blocks=0,
                     published_host_blocks=0,

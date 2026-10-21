@@ -45,6 +45,8 @@ class PoolSample:
     pool_name: str = ""
     tier: int = 0
     block_size_bytes: int = 0
+    free: int = 0
+    available: int = 0
 
 
 @dataclass(frozen=True)
@@ -163,7 +165,14 @@ def _pool_map(pools):
     result = {}
     for pool in pools:
         _id(pool.pool_id)
-        for name in ("capacity", "used", "pending_release", "host_resident"):
+        for name in (
+            "capacity",
+            "used",
+            "pending_release",
+            "host_resident",
+            "free",
+            "available",
+        ):
             _integer(getattr(pool, name), name)
         # HOST/DISK and observe-only groups may disable eviction with {0, 0}.
         # Enabled, ordered thresholds are required only by the FULL GPU gate.
@@ -171,9 +180,11 @@ def _pool_map(pools):
         _number(pool.high_ratio, "high_ratio", inclusive=True)
         if max(pool.low_ratio, pool.high_ratio) > 1:
             raise ValueError("watermark ratios must be <= 1")
-        if (
-            not 0 <= pool.pending_release <= pool.used <= pool.capacity
-            or pool.host_resident > pool.used
+        if not (
+            0 <= pool.pending_release <= pool.used <= pool.capacity
+            and 0 <= pool.free <= pool.capacity
+            and 0 <= pool.available <= pool.capacity
+            and pool.host_resident <= pool.used
         ):
             raise ValueError("invalid physical occupancy")
         if pool.pool_id in result and result[pool.pool_id] != pool:
@@ -651,6 +662,8 @@ def decode_pressure_response(
                     getattr(pool, "pool_name", ""),
                     pool.tier,
                     getattr(pool, "block_size_bytes", 0),
+                    pool.free_blocks,
+                    pool.available_blocks,
                 )
             )
         _integer(rank.sampled_monotonic_ns, "sampled_monotonic_ns")

@@ -29,6 +29,26 @@ LOCAL_PLATFORM_CONFIGS = {
     "x86_64": "cuda13",
     "aarch64": "cuda13_arm",
 }
+AONE_RESOURCE_CONFIGS = {
+    "daily": ("cicd", "daily_aone_bazel_cache", "daily_aone_bazel_remote"),
+    "online": ("cicd", "online_aone_bazel_cache", "online_aone_bazel_remote"),
+}
+GPU_PLATFORMS = {
+    "SM100_ARM_CU13": "cuda13_arm",
+    "SM103_CU13": "cuda13",
+    "L20_CU13": "cuda13",
+    "L20D_DEV": "cuda13",
+}
+
+
+def resolve_gpu_platform(gpu_type: str) -> str:
+    try:
+        return GPU_PLATFORMS[gpu_type]
+    except KeyError as error:
+        supported = ", ".join(sorted(GPU_PLATFORMS))
+        raise ValueError(
+            f"unsupported GPU type {gpu_type!r}; supported GPU types: {supported}"
+        ) from error
 
 
 @dataclass(frozen=True)
@@ -219,6 +239,132 @@ def build_local_plan(
         commands={"run": command},
         process_env=process_env,
         summary=summary,
+    )
+
+
+def build_aone_plan(
+    args: argparse.Namespace,
+    *,
+    repo: Path,
+    run_id: str | None = None,
+    inherited: Mapping[str, str] | None = None,
+) -> OrchestrationPlan:
+    platform_config = resolve_gpu_platform(args.gpu_type)
+    try:
+        resource_configs = AONE_RESOURCE_CONFIGS[args.resource]
+    except KeyError as error:
+        supported = ", ".join(sorted(AONE_RESOURCE_CONFIGS))
+        raise ValueError(
+            f"unsupported resource {args.resource!r}; supported resources: {supported}"
+        ) from error
+    configs = (platform_config, *resource_configs)
+    resolved = resolve_run_request(
+        args.model_json,
+        args.engine_json,
+        args.grid_json,
+        args.engine_env_json,
+        args.runtime_env_json,
+    )
+    paths = make_run_paths(
+        args,
+        repo=repo,
+        mode="aone",
+        run_id=run_id if run_id is not None else uuid.uuid4().hex,
+        model_label=resolved.model["label"],
+    )
+    assert paths.generated_dir is not None
+    input_bundle = ci.build_input_artifacts(
+        to_prepare_namespace(
+            resolved,
+            inputs_dir=paths.inputs_dir,
+            configs=configs,
+            bazel=args.bazel,
+        )
+    )
+    ci_plan = ci.build_plan_artifacts(
+        input_bundle["profile_payload"],
+        input_bundle["grid_payload"],
+        grid_bytes=input_bundle["artifacts"][ci.GRID_NAME],
+        output_dir=paths.generated_dir,
+        package=paths.generated_dir.relative_to(repo.resolve()).as_posix(),
+        gpu_type=args.gpu_type,
+        gpu_count=resolved.gpu_count,
+        shard_count=None,
+        measure_runs=resolved.grid["measure_runs"],
+        profile_source=str(paths.inputs_dir / ci.PROFILE_NAME),
+        grid_source=str(paths.inputs_dir / ci.GRID_NAME),
+    )
+    request_cases = dedupe_cache_grid_cases(
+        input_bundle["grid_payload"]["cases"], resolved.grid["cache_alignment"]
+    )
+    artifacts = {
+        paths.inputs_dir / name: content
+        for name, content in input_bundle["artifacts"].items()
+    }
+    artifacts.update(
+        {
+            paths.generated_dir / name: content
+            for name, content in ci_plan["artifacts"].items()
+        }
+    )
+    build_jobs = (
+        args.build_jobs if args.build_jobs is not None else max(1, os.cpu_count() or 1)
+    )
+    common = [f"--config={value}" for value in configs]
+    build_command = [
+        args.bazel,
+        "build",
+        ci_plan["suite_target"],
+        *common,
+        f"--jobs={build_jobs}",
+        "--remote_download_outputs=minimal",
+        "--keep_going",
+        *args.bazel_arg,
+    ]
+    test_command = [
+        args.bazel,
+        "test",
+        ci_plan["suite_target"],
+        *common,
+        "--strategy=TestRunner=remote",
+        f"--jobs={args.max_parallel}",
+        "--test_timeout=7000",
+        "--test_output=errors",
+        "--keep_going",
+        "--remote_download_outputs=all",
+        "--nocache_test_results",
+        "--run_under=//rtp_llm/test/utils:gpu_lock",
+        *args.bazel_arg,
+    ]
+    commands = {"build": build_command, "test": test_command}
+    process_env = dict(os.environ if inherited is None else inherited)
+    process_env.update(resolved.runtime_env)
+    summary = {
+        "mode": "aone-run",
+        "result_root": str(paths.result_root),
+        "inputs_dir": str(paths.inputs_dir),
+        "generated_dir": str(paths.generated_dir),
+        "effective_case_count": len(request_cases),
+        "gpu_type": args.gpu_type,
+        "gpu_count": resolved.gpu_count,
+        "resource": args.resource,
+        "shard_count": ci_plan["shard_count"],
+        "build_jobs": build_jobs,
+        "max_parallel": args.max_parallel,
+        "engine_env": resolved.engine_env,
+        "runtime_env": resolved.runtime_env,
+        "commands": commands,
+    }
+    return OrchestrationPlan(
+        mode="aone-run",
+        paths=paths,
+        resolved=resolved,
+        request_cases=request_cases,
+        artifacts=artifacts,
+        commands=commands,
+        process_env=process_env,
+        summary=summary,
+        ci_plan=ci_plan,
     )
 
 

@@ -38,6 +38,226 @@ class CachePerfOrchestratorTest(unittest.TestCase):
         values.update(updates)
         return argparse.Namespace(**values)
 
+    def aone_args(self, **updates):
+        values = dict(
+            mode="aone-run",
+            resource="daily",
+            gpu_type="SM103_CU13",
+            build_jobs=None,
+            max_parallel=1,
+        )
+        values.update(updates)
+        return self.local_args(**values)
+
+    def test_aone_plan_expands_resource_and_separates_concurrency(self):
+        args = self.aone_args(build_jobs=64, max_parallel=2)
+        plan = orchestrator.build_aone_plan(
+            args, repo=self.repo, run_id="unit", inherited={}
+        )
+        common = [
+            "--config=cuda13",
+            "--config=cicd",
+            "--config=daily_aone_bazel_cache",
+            "--config=daily_aone_bazel_remote",
+        ]
+        self.assertEqual(
+            plan.commands["build"],
+            [
+                "bazelisk",
+                "build",
+                plan.ci_plan["suite_target"],
+                *common,
+                "--jobs=64",
+                "--remote_download_outputs=minimal",
+                "--keep_going",
+            ],
+        )
+        self.assertEqual(
+            plan.commands["test"],
+            [
+                "bazelisk",
+                "test",
+                plan.ci_plan["suite_target"],
+                *common,
+                "--strategy=TestRunner=remote",
+                "--jobs=2",
+                "--test_timeout=7000",
+                "--test_output=errors",
+                "--keep_going",
+                "--remote_download_outputs=all",
+                "--nocache_test_results",
+                "--run_under=//rtp_llm/test/utils:gpu_lock",
+            ],
+        )
+        self.assertEqual(plan.ci_plan["gpu_count"], 1)
+        self.assertEqual(plan.mode, "aone-run")
+        self.assertEqual(plan.summary["effective_case_count"], len(plan.request_cases))
+
+    def test_aone_plan_maps_supported_pools_and_online_resource(self):
+        for gpu_type, platform in (
+            ("SM100_ARM_CU13", "cuda13_arm"),
+            ("SM103_CU13", "cuda13"),
+            ("L20_CU13", "cuda13"),
+            ("L20D_DEV", "cuda13"),
+        ):
+            with self.subTest(gpu_type=gpu_type):
+                plan = orchestrator.build_aone_plan(
+                    self.aone_args(resource="online", gpu_type=gpu_type),
+                    repo=self.repo,
+                    run_id="pool",
+                    inherited={},
+                )
+                expected = [
+                    f"--config={platform}",
+                    "--config=cicd",
+                    "--config=online_aone_bazel_cache",
+                    "--config=online_aone_bazel_remote",
+                ]
+                for command in plan.commands.values():
+                    self.assertEqual(command[3:7], expected)
+                profile = json.loads(
+                    plan.artifacts[plan.paths.inputs_dir / "profile.json"]
+                )
+                self.assertEqual(
+                    profile["bazel"]["configs"],
+                    [
+                        platform,
+                        "cicd",
+                        "online_aone_bazel_cache",
+                        "online_aone_bazel_remote",
+                    ],
+                )
+                self.assertEqual(plan.ci_plan["gpu_type"], gpu_type)
+
+    def test_aone_plan_rejects_unknown_gpu_pool_before_artifacts(self):
+        with patch.object(orchestrator.ci, "build_input_artifacts") as inputs:
+            with self.assertRaisesRegex(ValueError, "supported GPU types"):
+                orchestrator.build_aone_plan(
+                    self.aone_args(gpu_type="UNKNOWN_CU13"),
+                    repo=self.repo,
+                    run_id="bad",
+                )
+        inputs.assert_not_called()
+        self.assertEqual(list(self.repo.iterdir()), [])
+
+    def test_aone_plan_rejects_unknown_resource(self):
+        with self.assertRaisesRegex(ValueError, "supported resources"):
+            orchestrator.build_aone_plan(
+                self.aone_args(resource="unknown"), repo=self.repo, run_id="bad"
+            )
+        self.assertEqual(list(self.repo.iterdir()), [])
+
+    def test_aone_plan_defaults_build_jobs_to_available_cpus(self):
+        for cpu_count, expected in (
+            (8, "--jobs=8"),
+            (None, "--jobs=1"),
+            (0, "--jobs=1"),
+        ):
+            with self.subTest(cpu_count=cpu_count), patch.object(
+                orchestrator.os, "cpu_count", return_value=cpu_count
+            ):
+                plan = orchestrator.build_aone_plan(
+                    self.aone_args(), repo=self.repo, run_id="cpus", inherited={}
+                )
+                self.assertIn(expected, plan.commands["build"])
+                self.assertIn("--jobs=1", plan.commands["test"])
+
+    def test_aone_plan_derives_gpu_count_from_topology_and_keeps_env_ownership(self):
+        inherited = {"PATH": "/bin", "CC": "old-gcc", "API_TOKEN": "inherited-only"}
+        args = self.aone_args(
+            model_json='{"type":"qwen_2","checkpoint":"/models/qwen",'
+            '"topology":{"tp":2,"dp":2,"pp":2,"ep":4}}',
+            engine_env_json='{"MODEL_SETTING":"00123"}',
+            runtime_env_json='{"CC":"/usr/bin/gcc"}',
+        )
+        plan = orchestrator.build_aone_plan(
+            args, repo=self.repo, run_id="env", inherited=inherited
+        )
+        self.assertEqual(plan.ci_plan["gpu_count"], 8)
+        self.assertEqual(
+            plan.process_env,
+            {
+                "PATH": "/bin",
+                "CC": "/usr/bin/gcc",
+                "API_TOKEN": "inherited-only",
+            },
+        )
+        self.assertEqual(inherited["CC"], "old-gcc")
+        build_file = plan.artifacts[plan.paths.generated_dir / "BUILD.bazel"].decode()
+        self.assertIn("gpu_count = 8", build_file)
+        self.assertIn('"WORLD_SIZE": "8"', build_file)
+        self.assertIn('"MODEL_SETTING": "00123"', build_file)
+        self.assertIn('"CC": "/usr/bin/gcc"', build_file)
+        self.assertNotIn("inherited-only", b"".join(plan.artifacts.values()).decode())
+
+    def test_aone_plan_is_write_free_and_assigns_each_effective_case_once(self):
+        args = self.aone_args(bazel_arg=["--jobs=7", "--remote_timeout=45m"])
+        with patch.object(Path, "mkdir") as mkdir, patch.object(
+            Path, "open", side_effect=AssertionError("planning must not open files")
+        ), patch.object(Path, "write_bytes") as write_bytes, patch.object(
+            Path, "write_text"
+        ) as write_text, patch.object(
+            orchestrator.subprocess, "run"
+        ) as run:
+            plan = orchestrator.build_aone_plan(
+                args, repo=self.repo, run_id="dry", inherited={}
+            )
+        mkdir.assert_not_called()
+        write_bytes.assert_not_called()
+        write_text.assert_not_called()
+        run.assert_not_called()
+        assigned = [
+            case_id for shard in plan.ci_plan["shards"] for case_id in shard["case_ids"]
+        ]
+        self.assertEqual(sorted(assigned), plan.ci_plan["case_ids"])
+        self.assertEqual(len(assigned), len(set(assigned)))
+        self.assertEqual(
+            sorted(case["case_id"] for case in plan.request_cases), sorted(assigned)
+        )
+        self.assertEqual(plan.commands["build"][-2:], args.bazel_arg)
+        self.assertEqual(plan.commands["test"][-2:], args.bazel_arg)
+        self.assertEqual(list(self.repo.iterdir()), [])
+        self.assertEqual(
+            {path.parent for path in plan.artifacts},
+            {
+                plan.paths.inputs_dir,
+                plan.paths.generated_dir,
+            },
+        )
+        self.assertEqual(
+            plan.ci_plan["suite_target"], "//cache_grid_aone_generated_qwen_dry:all"
+        )
+        self.assertEqual(
+            plan.ci_plan["profile_source"], str(plan.paths.inputs_dir / "profile.json")
+        )
+        self.assertEqual(
+            plan.ci_plan["grid_source"], str(plan.paths.inputs_dir / "grid.json")
+        )
+        for shard in plan.ci_plan["shards"]:
+            payload = json.loads(
+                plan.artifacts[plan.paths.generated_dir / shard["grid_file"]]
+            )
+            self.assertEqual(
+                [case["case_id"] for case in payload["cases"]], shard["case_ids"]
+            )
+
+    def test_aone_plan_automatically_shards_large_grid_independent_of_parallelism(self):
+        args = self.aone_args(
+            engine_json='{"max_seq_len":1302,"seq_size_per_block":1,"args":{"act_type":"BF16"}}',
+            grid_json='{"cache_alignment":1,"compute_step":[1],"fixed_cache_len":0,"max_cases":1400}',
+            max_parallel=1,
+        )
+        plan = orchestrator.build_aone_plan(
+            args, repo=self.repo, run_id="large", inherited={}
+        )
+        self.assertEqual(len(plan.request_cases), 1301)
+        self.assertEqual(plan.ci_plan["shard_count"], 2)
+        self.assertIn("--jobs=1", plan.commands["test"])
+        assigned = [
+            case_id for shard in plan.ci_plan["shards"] for case_id in shard["case_ids"]
+        ]
+        self.assertEqual(sorted(assigned), list(range(1301)))
+
     def test_local_plan_uses_one_bazel_run_without_test_timeout(self):
         plan = orchestrator.build_local_plan(
             self.local_args(),

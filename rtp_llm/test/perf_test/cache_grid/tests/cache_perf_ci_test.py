@@ -5,6 +5,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
+from rtp_llm.test.perf_test.cache_grid.config import grid_config
 from rtp_llm.test.perf_test.cache_grid.runner import cache_perf_ci as ci
 
 
@@ -194,6 +195,146 @@ class CachePerfCiTest(unittest.TestCase):
         self.assertIn('"PERF_PROFILE_RUNS": "0"', build)
         environment = first["artifacts"][ci.ENV_NAME].decode()
         self.assertIn("export PERF_PROFILE_RUNS=0", environment)
+
+    def test_in_memory_grid_validation_preserves_explicit_case_contract(self):
+        grid = json.loads(self.grid.read_text())
+        self.assertEqual(grid_config.parse_cache_grid_cases(grid), grid["cases"])
+        invalid_grids = [
+            (None, "JSON object"),
+            ({**grid, "schema_version": True}, "schema_version=2"),
+            ({**grid, "generator": {}}, "cache_alignment"),
+            ({**grid, "cases": {}}, "must be a list"),
+            ({**grid, "cases": []}, "contains no cases"),
+            ({**grid, "cases": [None]}, "must be an object"),
+            ({**grid, "cases": [grid["cases"][0]] * 2}, "duplicate cache grid case"),
+            (
+                {
+                    **grid,
+                    "cases": [grid["cases"][0], {**grid["cases"][1], "case_id": 0}],
+                },
+                "duplicate cache grid case_id",
+            ),
+        ]
+        missing_cases = dict(grid)
+        del missing_cases["cases"]
+        invalid_grids.append((missing_cases, "explicit cases"))
+        for payload, message in invalid_grids:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    grid_config.parse_cache_grid_cases(payload)
+
+    def test_automatic_shards_use_five_seconds_for_all_three_runs(self):
+        self.assertEqual(ci.automatic_shard_count(1), 1)
+        self.assertEqual(ci.automatic_shard_count(1200), 1)
+        self.assertEqual(ci.automatic_shard_count(1201), 2)
+        for count in (0, -1):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(ValueError, "effective case count"):
+                    ci.automatic_shard_count(count)
+
+    def test_in_memory_plan_auto_shards_after_physical_dedupe(self):
+        profile = json.loads(self.profile.read_text())
+        grid = json.loads(self.grid.read_text())
+        grid["generator"]["cache_alignment"] = 1024
+        grid["cases"] = [
+            {"case_id": 0, "batch_size": 1, "input_len": 4096, "cache_len": 1024},
+            {"case_id": 1, "batch_size": 1, "input_len": 4096, "cache_len": 1025},
+        ]
+        plan = ci.build_plan_artifacts(
+            profile,
+            grid,
+            grid_bytes=ci._encoded(grid),
+            output_dir=self.repo / "generated",
+            package="generated",
+            gpu_type="SM100_ARM_CU13",
+            gpu_count=4,
+            shard_count=None,
+            measure_runs=3,
+        )
+        self.assertEqual(plan["shard_count"], 1)
+        self.assertEqual(plan["deduplicated_case_ids"], [1])
+        self.assertEqual(plan["case_ids"], [0])
+
+    def test_in_memory_auto_shards_count_effective_cases_at_budget_boundary(self):
+        profile = json.loads(self.profile.read_text())
+        grid = json.loads(self.grid.read_text())
+        grid["cases"] = [
+            {"case_id": i, "batch_size": 1, "input_len": 4096 + i, "cache_len": 1024}
+            for i in range(1200)
+        ]
+        grid["cases"].append({**grid["cases"][0], "case_id": 1200, "cache_len": 1025})
+        for measure_runs in (1, 3, 9):
+            with self.subTest(measure_runs=measure_runs):
+                plan = ci.build_plan_artifacts(
+                    profile,
+                    grid,
+                    grid_bytes=ci._encoded(grid),
+                    output_dir=self.repo / "generated",
+                    package="generated",
+                    gpu_type="SM100_ARM_CU13",
+                    gpu_count=4,
+                    shard_count=None,
+                    measure_runs=measure_runs,
+                )
+                self.assertEqual(plan["shard_count"], 1)
+                self.assertEqual(plan["source_case_count"], 1201)
+                self.assertEqual(len(plan["case_ids"]), 1200)
+                self.assertEqual(plan["deduplicated_case_ids"], [1200])
+
+        grid["cases"][-1] = {
+            "case_id": 1200,
+            "batch_size": 1,
+            "input_len": 5296,
+            "cache_len": 1024,
+        }
+        plan = ci.build_plan_artifacts(
+            profile,
+            grid,
+            grid_bytes=ci._encoded(grid),
+            output_dir=self.repo / "generated",
+            package="generated",
+            gpu_type="SM100_ARM_CU13",
+            gpu_count=4,
+            shard_count=None,
+            measure_runs=3,
+        )
+        self.assertEqual(plan["shard_count"], 2)
+        self.assertEqual(plan["deduplicated_case_ids"], [])
+        self.assertEqual(
+            sorted(
+                case_id for shard in plan["shards"] for case_id in shard["case_ids"]
+            ),
+            list(range(1201)),
+        )
+
+    def test_in_memory_plan_matches_manual_wrapper_without_reading_or_writing(self):
+        expected = ci.create_plan(self.args(), repo=self.repo)
+        profile = json.loads(self.profile.read_text())
+        grid_bytes = self.grid.read_bytes()
+        grid = json.loads(grid_bytes)
+        self.profile.unlink()
+        self.grid.unlink()
+        plan = ci.build_plan_artifacts(
+            profile,
+            grid,
+            grid_bytes=grid_bytes,
+            output_dir=self.repo / "generated",
+            package="generated",
+            gpu_type="SM100_ARM_CU13",
+            gpu_count=4,
+            shard_count=3,
+            measure_runs=None,
+            profile_source=str(self.profile),
+            grid_source=str(self.grid),
+            estimated_total_seconds=18000,
+            startup_seconds=0,
+            target_seconds=6900,
+        )
+        self.assertEqual(plan, expected)
+        self.assertEqual(plan["shard_count"], 3)
+        self.assertEqual(plan["measure_runs"], 2)
+        self.assertEqual(list(self.repo.iterdir()), [])
+        self.assertEqual(grid, json.loads(grid_bytes))
 
     def test_plan_rejects_shared_seed_and_too_many_shards(self):
         profile = json.loads(self.profile.read_text())

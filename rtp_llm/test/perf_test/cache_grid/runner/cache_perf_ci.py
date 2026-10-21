@@ -14,6 +14,11 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
+from rtp_llm.test.perf_test.cache_grid.config.grid_config import (
+    dedupe_cache_grid_cases,
+    parse_cache_grid_cases,
+    resolve_cache_block_size,
+)
 from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     fingerprint,
     load_profile,
@@ -27,6 +32,8 @@ from rtp_llm.test.perf_test.cache_grid.runner.generate_cache_grid import build_g
 SCHEMA_VERSION = 1
 AONE_MAX_ACTION_SECONDS = 7200
 CI_TEST_TIMEOUT_SECONDS = 7000
+CASE_SECONDS = 5
+ACTION_WORKLOAD_SECONDS = 6000
 PLAN_NAME = "cache_perf_ci_plan.json"
 BUILD_NAME = "BUILD.bazel"
 ENV_NAME = "environment.sh"
@@ -301,6 +308,15 @@ def case_weight(case: Dict[str, Any]) -> int:
     )
 
 
+def automatic_shard_count(effective_case_count: int) -> int:
+    """Budget five seconds per complete case, including all three runs."""
+    if effective_case_count <= 0:
+        raise ValueError("effective case count must be positive")
+    return max(
+        1, math.ceil(effective_case_count * CASE_SECONDS / ACTION_WORKLOAD_SECONDS)
+    )
+
+
 def split_cases(
     cases: Sequence[Dict[str, Any]], shard_count: int
 ) -> List[Tuple[List[Dict[str, Any]], int]]:
@@ -385,45 +401,56 @@ def _environment_file(env: Dict[str, str]) -> bytes:
     return ("\n".join(lines) + "\n").encode()
 
 
-def create_plan(args: argparse.Namespace, *, repo: Path) -> Dict[str, Any]:
-    from rtp_llm.test.perf_test.cache_grid.runner.cache_perf import load_cases
-
-    if args.gpu_count <= 0:
+def build_plan_artifacts(
+    profile: Dict[str, Any],
+    grid_payload: Dict[str, Any],
+    *,
+    grid_bytes: bytes,
+    output_dir: Path,
+    package: str,
+    gpu_type: str,
+    gpu_count: int,
+    shard_count: int | None,
+    measure_runs: int | None,
+    profile_source: str = "<generated>",
+    grid_source: str = "<generated>",
+    estimated_total_seconds: int | None = None,
+    startup_seconds: int = 0,
+    target_seconds: int | None = None,
+) -> Dict[str, Any]:
+    """Build validated CI plan artifacts without reading or writing paths."""
+    if gpu_count <= 0:
         raise ValueError("--gpu-count must be positive")
-    if not re.fullmatch(r"[A-Za-z0-9_+.-]+", args.gpu_type):
+    if not re.fullmatch(r"[A-Za-z0-9_+.-]+", gpu_type):
         raise ValueError("--gpu-type contains unsupported characters")
-    if args.estimated_total_seconds is not None and args.estimated_total_seconds <= 0:
+    if estimated_total_seconds is not None and estimated_total_seconds <= 0:
         raise ValueError("--estimated-total-seconds must be positive")
-    if args.startup_seconds < 0:
+    if startup_seconds < 0:
         raise ValueError("--startup-seconds cannot be negative")
-    if args.startup_seconds and args.estimated_total_seconds is None:
+    if startup_seconds and estimated_total_seconds is None:
         raise ValueError("--startup-seconds requires --estimated-total-seconds")
     if (
-        args.estimated_total_seconds is not None
-        and args.startup_seconds >= args.estimated_total_seconds
+        estimated_total_seconds is not None
+        and startup_seconds >= estimated_total_seconds
     ):
         raise ValueError("--startup-seconds must be below --estimated-total-seconds")
-    if args.target_seconds is not None and args.target_seconds <= 0:
+    if target_seconds is not None and target_seconds <= 0:
         raise ValueError("--target-seconds must be positive")
-    if (
-        args.target_seconds is not None
-        and args.target_seconds >= CI_TEST_TIMEOUT_SECONDS
-    ):
+    if target_seconds is not None and target_seconds >= CI_TEST_TIMEOUT_SECONDS:
         raise ValueError(
             f"--target-seconds must be below the configured "
             f"{CI_TEST_TIMEOUT_SECONDS}s test timeout (AOne maximum: "
             f"{AONE_MAX_ACTION_SECONDS}s)"
         )
-    if args.target_seconds is not None and args.estimated_total_seconds is None:
+    if target_seconds is not None and estimated_total_seconds is None:
         raise ValueError("--target-seconds requires --estimated-total-seconds")
 
-    output_dir, package = _validate_output_dir(args.output_dir, repo)
-    profile = load_profile(args.profile)
+    validate_profile(profile)
     _reject_shared_seed(profile)
     cards = profile_cards(profile)
-    if cards is not None and cards != args.gpu_count:
+    if cards is not None and cards != gpu_count:
         raise ValueError(
-            f"--gpu-count={args.gpu_count} conflicts with profile topology ({cards})"
+            f"--gpu-count={gpu_count} conflicts with profile topology ({cards})"
         )
     env = profile_environment(profile)
     if "WORLD_SIZE" in env:
@@ -437,16 +464,18 @@ def create_plan(args: argparse.Namespace, *, repo: Path) -> Dict[str, Any]:
             or not world_size.is_integer()
         ):
             raise ValueError("profile WORLD_SIZE must be a positive integer")
-        if int(world_size) != args.gpu_count:
+        if int(world_size) != gpu_count:
             raise ValueError(
-                f"--gpu-count={args.gpu_count} conflicts with profile WORLD_SIZE="
+                f"--gpu-count={gpu_count} conflicts with profile WORLD_SIZE="
                 f"{env['WORLD_SIZE']}"
             )
-    grid_payload, cases = load_cases(args.grid)
+    cases = parse_cache_grid_cases(grid_payload)
+    cases = dedupe_cache_grid_cases(cases, resolve_cache_block_size(grid_payload))
     source_case_ids = sorted(case["case_id"] for case in grid_payload["cases"])
     effective_case_ids = sorted(case["case_id"] for case in cases)
-    partitions = split_cases(cases, args.shards)
-    measure_runs = args.runs
+    if shard_count is None:
+        shard_count = automatic_shard_count(len(cases))
+    partitions = split_cases(cases, shard_count)
     if measure_runs is None:
         measure_runs = int(profile.get("cache_grid", {}).get("measure_runs", 3))
     if measure_runs <= 0:
@@ -474,10 +503,10 @@ def create_plan(args: argparse.Namespace, *, repo: Path) -> Dict[str, Any]:
         content = _encoded(payload)
         artifacts[filename] = content
         estimated_seconds = None
-        if args.estimated_total_seconds is not None:
-            workload_seconds = args.estimated_total_seconds - args.startup_seconds
+        if estimated_total_seconds is not None:
+            workload_seconds = estimated_total_seconds - startup_seconds
             estimated_seconds = (
-                args.startup_seconds + workload_seconds * weight / total_weight
+                startup_seconds + workload_seconds * weight / total_weight
             )
         shards.append(
             {
@@ -491,33 +520,33 @@ def create_plan(args: argparse.Namespace, *, repo: Path) -> Dict[str, Any]:
                 "estimated_seconds": estimated_seconds,
             }
         )
-    if args.target_seconds is not None:
+    if target_seconds is not None:
         longest = max(shard["estimated_seconds"] for shard in shards)
-        if longest > args.target_seconds:
+        if longest > target_seconds:
             raise ValueError(
                 f"estimated longest shard is {math.ceil(longest)}s, above "
-                f"--target-seconds={args.target_seconds}; increase --shards"
+                f"--target-seconds={target_seconds}; increase --shards"
             )
 
     plan = {
         "schema_version": SCHEMA_VERSION,
         "package": package,
         "suite_target": f"//{package}:all",
-        "profile_source": str(args.profile.resolve()),
+        "profile_source": profile_source,
         "profile_snapshot_sha256": _sha(artifacts["profile.snapshot.json"]),
         "profile_fingerprint": fingerprint(profile),
-        "grid_source": str(args.grid.resolve()),
-        "grid_sha256": _sha(args.grid.read_bytes()),
+        "grid_source": grid_source,
+        "grid_sha256": _sha(grid_bytes),
         "source_case_count": len(source_case_ids),
         "case_ids": effective_case_ids,
         "deduplicated_case_ids": sorted(set(source_case_ids) - set(effective_case_ids)),
         "shard_count": len(shards),
-        "gpu_type": args.gpu_type,
-        "gpu_count": args.gpu_count,
+        "gpu_type": gpu_type,
+        "gpu_count": gpu_count,
         "measure_runs": measure_runs,
-        "estimated_total_seconds": args.estimated_total_seconds,
-        "startup_seconds": args.startup_seconds,
-        "target_seconds": args.target_seconds,
+        "estimated_total_seconds": estimated_total_seconds,
+        "startup_seconds": startup_seconds,
+        "target_seconds": target_seconds,
         "shards": shards,
     }
     artifacts[PLAN_NAME] = _encoded(plan)
@@ -526,6 +555,29 @@ def create_plan(args: argparse.Namespace, *, repo: Path) -> Dict[str, Any]:
     plan["output_dir"] = str(output_dir)
     plan["artifacts"] = artifacts
     return plan
+
+
+def create_plan(args: argparse.Namespace, *, repo: Path) -> Dict[str, Any]:
+    """Load low-level CLI inputs and retain workspace path validation."""
+    output_dir, package = _validate_output_dir(args.output_dir, repo)
+    profile = load_profile(args.profile)
+    grid_bytes = args.grid.read_bytes()
+    return build_plan_artifacts(
+        profile,
+        json.loads(grid_bytes),
+        grid_bytes=grid_bytes,
+        output_dir=output_dir,
+        package=package,
+        gpu_type=args.gpu_type,
+        gpu_count=args.gpu_count,
+        shard_count=args.shards,
+        measure_runs=args.runs,
+        profile_source=str(args.profile.resolve()),
+        grid_source=str(args.grid.resolve()),
+        estimated_total_seconds=args.estimated_total_seconds,
+        startup_seconds=args.startup_seconds,
+        target_seconds=args.target_seconds,
+    )
 
 
 def write_plan(plan: Dict[str, Any]) -> None:

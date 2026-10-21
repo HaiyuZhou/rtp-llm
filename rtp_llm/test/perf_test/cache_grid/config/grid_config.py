@@ -30,10 +30,8 @@ def resolve_cache_block_size(grid_payload: Any) -> int:
     return value
 
 
-def load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
-    """Load current explicit grids without generating or filling case fields."""
-    with open(path, encoding="utf-8") as stream:
-        config = json.load(stream)
+def parse_cache_grid_cases(config: Any) -> List[Dict[str, int]]:
+    """Validate explicit grid cases without generating or filling case fields."""
     resolve_cache_block_size(config)
     if type(config.get("schema_version")) is not int or config["schema_version"] != 2:
         raise ValueError("cache grid requires schema_version=2")
@@ -58,8 +56,14 @@ def load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
         seen_ids.add(case["case_id"])
         cases.append(case)
     if not cases:
-        raise ValueError(f"cache grid {path} contains no cases")
+        raise ValueError("cache grid contains no cases")
     return cases
+
+
+def load_cache_grid_cases(path: str) -> List[Dict[str, int]]:
+    """Load and validate an explicit grid from disk."""
+    with open(path, encoding="utf-8") as stream:
+        return parse_cache_grid_cases(json.load(stream))
 
 
 def dedupe_cache_grid_cases(

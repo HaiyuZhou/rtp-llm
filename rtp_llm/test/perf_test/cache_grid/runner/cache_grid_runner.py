@@ -928,11 +928,13 @@ def _post_prefill_ids(
             register_call(responses)
         values: Dict[str, Any] = {}
         output_len = 0
+        received_inference = False
         for response in responses:
             if response.error_message:
                 raise RuntimeError(response.error_message)
             if not response.HasField("infer_response"):
                 continue
+            received_inference = True
             infer = response.infer_response
             for name in (
                 "engine_cost_time_us",
@@ -954,6 +956,8 @@ def _post_prefill_ids(
                     values[output.name] = struct.unpack_from("<i", raw)[0]
                 elif output.datatype == "FP64" and len(raw) >= 8:
                     values[output.name] = struct.unpack_from("<d", raw)[0]
+        if not received_inference:
+            raise RuntimeError("Dash-SC stream ended without an inference response")
         wall_ms = (time.perf_counter() - started) * 1000.0
         return {
             "success": True,

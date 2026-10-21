@@ -1275,6 +1275,33 @@ class CancellableRequestHandleTest(unittest.TestCase):
 
 
 class TransportRegistrationTest(unittest.TestCase):
+    def test_empty_or_non_inference_stream_is_not_a_successful_request(self):
+        from rtp_llm.dash_sc.proto.predict_v2_pb2 import ModelStreamInferResponse
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            _post_prefill_ids,
+        )
+
+        dependencies = {
+            "rtp_llm.dash_sc.client": SimpleNamespace(
+                build_model_infer_request=lambda **kwargs: kwargs
+            ),
+            "rtp_llm.dash_sc.codec": SimpleNamespace(
+                SamplingParams=lambda **kwargs: kwargs
+            ),
+        }
+        for responses in ([], [ModelStreamInferResponse()]):
+            with self.subTest(responses=len(responses)), patch.dict(
+                "sys.modules", dependencies
+            ):
+                result = _post_prefill_ids(
+                    SimpleNamespace(ModelStreamInfer=lambda *a, **k: iter(responses)),
+                    [1, 2],
+                    2,
+                    "empty-stream",
+                )
+            self.assertFalse(result["success"])
+            self.assertIn("inference response", result["error"])
+
     def test_closed_dispatch_propagates_without_sending(self):
         from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
             _post_prefill_ids,
@@ -1300,6 +1327,7 @@ class TransportRegistrationTest(unittest.TestCase):
         stub.ModelStreamInfer.assert_not_called()
 
     def test_dispatch_hook_sets_identity_immediately_before_rpc(self):
+        from rtp_llm.dash_sc.proto.predict_v2_pb2 import ModelStreamInferResponse
         from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
             _post_prefill_ids,
         )
@@ -1318,7 +1346,13 @@ class TransportRegistrationTest(unittest.TestCase):
         def invoke(requests, **kwargs):
             self.assertEqual(next(requests).id, "session:support:9")
             order.append("rpc")
-            return iter(())
+            response = ModelStreamInferResponse()
+            response.infer_response.parameters["prompt_token_num"].int64_param = 1
+            response.infer_response.outputs.add(
+                name="generated_ids", datatype="INT32", shape=[1]
+            )
+            response.infer_response.raw_output_contents.append(struct.pack("<i", 7))
+            return iter((response,))
 
         dependencies = {
             "rtp_llm.dash_sc.client": SimpleNamespace(build_model_infer_request=build),
@@ -1380,7 +1414,7 @@ class TransportRegistrationTest(unittest.TestCase):
             result = _post_prefill_ids(
                 stub, [1, 2], 17, "registered", register_call=register_call
             )
-        self.assertTrue(result["success"])
+        self.assertFalse(result["success"])
         self.assertEqual(stub.ModelStreamInfer.call_args.kwargs["timeout"], 17)
 
 

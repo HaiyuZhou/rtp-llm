@@ -1614,6 +1614,21 @@ class RunnerIntegrationTest(unittest.TestCase):
             result = runner._run_full_pressure_epoch("epoch")
         return result, submissions, sessions
 
+    def test_direct_runner_rejects_malformed_smoke_marker_before_grid_combination(self):
+        for value in (0, "", None, [], {}, 1, "false"):
+            for smoke_grid in (False, True):
+                with self.subTest(
+                    value=value, smoke_grid=smoke_grid
+                ), tempfile.TemporaryDirectory() as directory:
+                    options = dict(profile={"cache_grid": {"explicit_smoke": value}})
+                    if smoke_grid:
+                        options["grid_metadata"] = dict(
+                            kind="explicit_cache_grid_smoke",
+                            generator=dict(cache_alignment=4096),
+                        )
+                    with self.assertRaisesRegex(ValueError, "explicit_smoke.*boolean"):
+                        self._startup_runner(directory, **options)
+
     def test_explicit_smoke_remains_nonformal_through_runtime_artifacts(self):
         for source in ("profile", "grid"):
             with self.subTest(
@@ -2415,7 +2430,7 @@ class RunnerIntegrationTest(unittest.TestCase):
                 ),
                 (0, 1),
                 events.append,
-                seed_plan=seed_plan(client_inflight=2),
+                seed_plan=seed_plan(1, client_inflight=2),
                 startup_targets=startup_targets,
                 evidence_manifest=dict(
                     control_times=dict(capacity_send_s=1),

@@ -424,18 +424,30 @@ NONFORMAL_REASON_ORDER = (
 )
 
 
+def seed_plan_reasons(plan):
+    count = plan.get("seed_count")
+    return [] if type(count) is int and count > 0 else ["seed_plan_count_invalid"]
+
+
 def seed_outcome_reasons(seed, plan):
     """Validate terminal accounting against both the frozen and accepted work."""
+    plan_reasons = seed_plan_reasons(plan)
     if seed is None:
-        return ["seed_outcome_missing"]
+        return plan_reasons + ["seed_outcome_missing"]
     names = ("planned", "submitted", "completed", "failed", "cancelled", "pending")
     if not isinstance(seed, dict):
-        return ["seed_outcome_invalid"]
+        return plan_reasons + ["seed_outcome_invalid"]
     valid_counts = {
         name for name in names if type(seed.get(name)) is int and seed[name] >= 0
     }
-    reasons = [] if len(valid_counts) == len(names) else ["seed_outcome_invalid"]
-    if "planned" in valid_counts and seed["planned"] != plan.get("seed_count"):
+    reasons = plan_reasons.copy()
+    if len(valid_counts) != len(names):
+        reasons.append("seed_outcome_invalid")
+    if (
+        not plan_reasons
+        and "planned" in valid_counts
+        and seed["planned"] != plan["seed_count"]
+    ):
         reasons.append("seed_plan_outcome_mismatch")
     if {"planned", "submitted"} <= valid_counts and seed["planned"] != seed[
         "submitted"
@@ -478,6 +490,7 @@ class PressureEvidence:
         self.pending = {}
         self.window = None
         self.duration = None
+        self.frozen_processed = False
         self.execution_failed = False
         self.execution_reasons = []
         previous = writer.manifest.get("classification", {})
@@ -502,6 +515,7 @@ class PressureEvidence:
     def _classification(self, plan):
         self.formal_config_eligible &= plan.get("formal_config_valid") is True
         self.nonformal_reasons.extend(plan.get("nonformal_reasons", []))
+        self.nonformal_reasons.extend(seed_plan_reasons(plan))
         # Retain frozen inputs even if an upstream screening reason was omitted.
         for condition, reason in (
             (plan.get("source") == "manual", "manual_seed_count"),
@@ -602,6 +616,7 @@ class PressureEvidence:
                     classification=self._classification(plan),
                 )
                 self.writer._atomic("manifest.json", self.writer.manifest)
+                self.frozen_processed = True
             elif kind == "phase" and event["phase"] == "measurement":
                 self.window = RequestWindow(
                     event["at_s"], event["at_s"] + self.duration
@@ -656,6 +671,8 @@ class PressureEvidence:
                 self.pending.clear()
                 failure = event.get("failure")
                 profile_failure = bool(failure and failure.startswith("profile"))
+                if not self.frozen_processed:
+                    self._execution_failure("frozen_event_missing")
                 plan = self.writer.manifest.get("seed_plan", {})
                 seed = deepcopy(event.get("seed"))
                 seed_reasons = seed_outcome_reasons(seed, plan)

@@ -1034,6 +1034,11 @@ class CacheGridRunner:
             pressure_seed_count = 4
         self.pressure_config = pressure_config
         if pressure_config is not None:
+            explicit_smoke = (
+                (profile or {}).get("cache_grid", {}).get("explicit_smoke", False)
+            )
+            if type(explicit_smoke) is not bool:
+                raise ValueError("cache_grid.explicit_smoke must be a boolean")
             from dataclasses import asdict
 
             from .pressure_diagnostics import resolve_pressure_config

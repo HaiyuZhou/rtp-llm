@@ -374,6 +374,110 @@ class PressureResultsTest(unittest.TestCase):
                 self.assertEqual(manifest["seed_outcome"], seed)
                 self.assertEqual(summary["seed_outcome"], seed)
 
+    def test_frozen_seed_count_requires_a_positive_integer(self):
+        for count, terminal_count in (
+            (True, 1),
+            (1.0, 1),
+            (0, 0),
+            (False, 0),
+            (-1, 0),
+            (None, 2),
+        ):
+            with self.subTest(count=count):
+                seed = dict(
+                    planned=terminal_count,
+                    submitted=terminal_count,
+                    completed=terminal_count,
+                    failed=0,
+                    cancelled=0,
+                    pending=0,
+                )
+                summary, manifest = self.artifacts(
+                    plan=self.plan(seed_count=count), finished=self.finished(seed=seed)
+                )
+                self.assertFalse(summary["validity"]["execution_valid"])
+                self.assertFalse(summary["validity"]["formal_config_valid"])
+                self.assertFalse(summary["validity"]["formal_acceptance_valid"])
+                self.assertTrue(summary["validity"]["full_pressure_valid"])
+                self.assertTrue(summary["validity"]["bidirectional_migration_valid"])
+                self.assertIn(
+                    "seed_plan_count_invalid",
+                    summary["validity_reasons"]["execution_valid"],
+                )
+                self.assertIn(
+                    "seed_plan_count_invalid",
+                    summary["validity_reasons"]["formal_config_valid"],
+                )
+                self.assertEqual(manifest["seed_plan"]["seed_count"], count)
+                self.assertEqual(manifest["seed_outcome"], seed)
+
+    def test_invalid_plan_count_preserves_independent_seed_failure_reasons(self):
+        summary, _ = self.artifacts(
+            plan=self.plan(seed_count=True),
+            finished=self.finished(
+                seed=dict(
+                    planned=2,
+                    submitted=2,
+                    completed=0,
+                    failed=1,
+                    cancelled=1,
+                    pending=1,
+                )
+            ),
+        )
+        for reason in (
+            "seed_plan_count_invalid",
+            "seed_planned_completed_mismatch",
+            "seed_failed",
+            "seed_cancelled",
+            "seed_pending",
+        ):
+            self.assertIn(reason, summary["validity_reasons"]["execution_valid"])
+
+    def test_finished_requires_a_successfully_processed_frozen_event(self):
+        for initial_frozen, failed_event in (
+            (False, False),
+            (True, False),
+            (False, True),
+        ):
+            with self.subTest(
+                initial_frozen=initial_frozen, failed_event=failed_event
+            ), tempfile.TemporaryDirectory() as directory:
+                manifest = dict(seed_plan=self.plan())
+                if initial_frozen:
+                    manifest["frozen"] = dict(
+                        event="frozen", seed_plan=self.plan(), session_id="old"
+                    )
+                writer = PressureWriter(Path(directory), manifest)
+                sink = PressureEvidence(writer)
+                if failed_event:
+                    with self.assertRaises(KeyError):
+                        sink(
+                            dict(
+                                event="frozen",
+                                seed_plan=self.plan(),
+                                session_id="s",
+                                config={},
+                            )
+                        )
+                sink(self.finished())
+                writer.close()
+                root = Path(directory) / "pressure"
+                for name in ("manifest.json", "summary.json"):
+                    artifact = json.loads((root / name).read_text())
+                    self.assertFalse(artifact["validity"]["execution_valid"])
+                    self.assertFalse(artifact["validity"]["formal_acceptance_valid"])
+                    self.assertTrue(artifact["validity"]["formal_config_valid"])
+                    self.assertTrue(artifact["validity"]["full_pressure_valid"])
+                    self.assertTrue(
+                        artifact["validity"]["bidirectional_migration_valid"]
+                    )
+                    self.assertIn(
+                        "frozen_event_missing",
+                        artifact["validity_reasons"]["execution_valid"],
+                    )
+                    self.assertEqual(artifact["seed_outcome"], self.finished()["seed"])
+
     def test_missing_seed_and_migration_evidence_fail_closed(self):
         event = self.finished()
         del event["seed"]

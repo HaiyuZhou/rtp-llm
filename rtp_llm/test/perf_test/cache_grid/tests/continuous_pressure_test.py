@@ -193,6 +193,7 @@ class LifecycleTest(unittest.TestCase):
         diagnostics_control=None,
         concurrency=4,
         batch_size=1,
+        request_observer=None,
     ):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             GroupSample,
@@ -232,6 +233,8 @@ class LifecycleTest(unittest.TestCase):
 
         def request(payload, register, before):
             identity = before(payload)
+            if request_observer:
+                request_observer(identity)
             return dict(
                 success=True,
                 input_len=16,
@@ -736,7 +739,15 @@ class LifecycleTest(unittest.TestCase):
 
 
 class SeedLifecycleTest(unittest.TestCase):
-    def run_seed(self, *, mode="rolling", count=20, cfg=None, payload_hook=None):
+    def run_seed(
+        self,
+        *,
+        mode="rolling",
+        count=20,
+        cfg=None,
+        payload_hook=None,
+        request_observer=None,
+    ):
         handles, reaped = [], []
 
         class Handle:
@@ -782,6 +793,7 @@ class SeedLifecycleTest(unittest.TestCase):
                 seed_count=count,
                 concurrency=16,
                 payload_hook=payload,
+                request_observer=request_observer,
                 cfg=cfg or config(seed_timeout_s=0.2, drain_timeout_s=0.1),
             )
         return result, events, session, handles
@@ -857,6 +869,58 @@ class SeedLifecycleTest(unittest.TestCase):
         self.assertEqual(result["failure"], "seed_timeout")
         self.assertFalse(any(e["event"] == "dispatch" for e in events))
         self.assertFalse(any(e.get("phase") == "fill" for e in events))
+
+    def test_seed_dispatch_preparation_cannot_cross_transport_deadline(self):
+        original_admission = cp.ExecutionLimits.concurrency_for
+        original_sha256 = cp.hashlib.sha256
+        original_emit = cp.PressureSession.emit
+        for stage in ("admission", "hash", "event"):
+            with self.subTest(stage=stage):
+                clocks, sends = [], []
+
+                def payload(kind, family, clock):
+                    if kind == "seed":
+                        self.assertEqual(clock(), 1.0)
+                        clocks.append(clock)
+
+                def admission(limits, input_tokens):
+                    result = original_admission(limits, input_tokens)
+                    if stage == "admission" and clocks:
+                        clocks[0].now = 2.0
+                    return result
+
+                def sha256(value):
+                    result = original_sha256(value)
+                    if stage == "hash" and clocks:
+                        clocks[0].now = 2.0
+                    return result
+
+                def emit(session, event, **values):
+                    original_emit(session, event, **values)
+                    if stage == "event" and event == "dispatch":
+                        clocks[0].now = 2.0
+
+                with patch.object(
+                    cp.ExecutionLimits, "concurrency_for", admission
+                ), patch.object(cp.hashlib, "sha256", sha256), patch.object(
+                    cp.PressureSession, "emit", emit
+                ):
+                    result, events, session, handles = self.run_seed(
+                        count=1, payload_hook=payload, request_observer=sends.append
+                    )
+                self.assertEqual(sends, [])
+                self.assertEqual(result["failure"], "seed_timeout")
+                self.assertEqual(result["seed"]["submitted"], 1)
+                self.assertEqual(result["seed"]["completed"], 0)
+                self.assertEqual(result["seed"]["failed"], 1)
+                self.assertEqual(result["seed"]["pending"], 0)
+                self.assertEqual(session.sender.pending, {})
+                self.assertFalse(any(e.get("phase") == "fill" for e in events))
+                if stage == "event":
+                    completion = next(e for e in events if e["event"] == "completion")
+                    self.assertEqual(completion["result"], {"not_dispatched": True})
+                else:
+                    self.assertFalse(any(e["event"] == "dispatch" for e in events))
 
 
 from rtp_llm.test.perf_test.cache_grid.runner.continuous_pressure import (

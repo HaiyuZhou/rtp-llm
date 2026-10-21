@@ -531,6 +531,15 @@ class PressureSession:
             ):
                 raise ValueError("generated input violates frozen token bound")
             self.limits.concurrency_for(len(ids))
+            input_sha256 = hashlib.sha256(
+                struct.pack(f"<{len(ids)}i", *ids)
+            ).hexdigest()
+            metadata = {k: v for k, v in payload.items() if k != "input_ids"}
+            # Validation and hashing can consume the remaining seed budget.
+            # Prepare them before allocating or publishing a dispatch record.
+            if kind == "seed" and self.clock() >= self.seed_deadline:
+                self.fail("seed_timeout")
+                raise DispatchClosed()
             now = self.clock()
             sequence = self.sequence
             self.sequence += 1
@@ -544,10 +553,8 @@ class PressureSession:
                 dispatched_s=now,
                 scheduled_offset_s=scheduled,
                 input_len=len(ids),
-                input_sha256=hashlib.sha256(
-                    struct.pack(f"<{len(ids)}i", *ids)
-                ).hexdigest(),
-                metadata={k: v for k, v in payload.items() if k != "input_ids"},
+                input_sha256=input_sha256,
+                metadata=metadata,
             )
             if scheduled is not None:
                 record["schedule_lag_s"] = max(0, now - self.formal_origin - scheduled)
@@ -556,6 +563,12 @@ class PressureSession:
             if kind == "formal":
                 self.formal_submitted += 1
             self.emit("dispatch", **record)
+            # A durable sink/controller can also cross the deadline. The caller
+            # may start transport only after this final permission check. If a
+            # record was already published, collection retains not_dispatched.
+            if kind == "seed" and self.clock() >= self.seed_deadline:
+                self.fail("seed_timeout")
+                raise DispatchClosed()
             return identity
 
     def _submit(self, kind, scheduled=None):

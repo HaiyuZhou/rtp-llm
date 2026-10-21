@@ -632,6 +632,237 @@ class CachePerfOrchestratorTest(unittest.TestCase):
         self.assertFalse(first.parent.exists())
         self.assertEqual(existing.read_bytes(), b"keep")
 
+    @patch.object(orchestrator.subprocess, "run")
+    @patch.object(orchestrator.ci, "collect_results")
+    @patch.object(orchestrator.unified_pipeline, "run")
+    def test_execute_aone_builds_tests_collects_and_reports(
+        self, pipeline, collect, run
+    ):
+        plan = orchestrator.build_aone_plan(
+            self.aone_args(runtime_env_json='{"CC":"/usr/bin/gcc"}'),
+            repo=self.repo,
+            run_id="ok",
+            inherited={"INHERITED": "keep"},
+        )
+        events = []
+
+        def launch(command, **kwargs):
+            events.append(command[1])
+            self.assertEqual(command, plan.commands[command[1]])
+            self.assertEqual(
+                kwargs,
+                {"cwd": orchestrator.REPO, "env": plan.process_env, "check": False},
+            )
+            for path, content in plan.artifacts.items():
+                self.assertEqual(path.read_bytes(), content)
+            self.assertFalse(plan.paths.result_root.exists())
+            return CompletedProcess(command, 0)
+
+        def collect_outputs(args, *, repo):
+            events.append("collect")
+            self.assertEqual(repo, orchestrator.REPO)
+            self.assertEqual(
+                args.plan, plan.paths.generated_dir / "cache_perf_ci_plan.json"
+            )
+            self.assertEqual(args.result_root, plan.paths.result_root)
+            self.assertIsNone(args.bazel_testlogs)
+            self.assertFalse(args.partial)
+            self.assertFalse(args.skip_fit)
+            return {"missing_shards": []}, 0
+
+        def report(args):
+            events.append("pipeline")
+            self.assertTrue(args.skip_test)
+            self.assertFalse(args.partial)
+            self.assertFalse(args.skip_fit)
+            self.assertEqual(args.result_root, plan.paths.result_root)
+            self.assertEqual(args.cards, 1)
+            return 0
+
+        run.side_effect = launch
+        collect.side_effect = collect_outputs
+        pipeline.side_effect = report
+        self.assertEqual(orchestrator.execute_aone_plan(plan), 0)
+        self.assertEqual(events, ["build", "test", "collect", "pipeline"])
+        state = json.loads((plan.paths.result_root / "cache_perf_run.json").read_text())
+        self.assertEqual(state["schema_version"], 1)
+        self.assertEqual(state["mode"], "aone-run")
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["commands"], plan.commands)
+        self.assertEqual(state["summary"], plan.summary)
+        self.assertEqual(
+            state["paths"],
+            {
+                "inputs": str(plan.paths.inputs_dir),
+                "generated": str(plan.paths.generated_dir),
+                "results": str(plan.paths.result_root),
+            },
+        )
+        self.assertEqual(
+            state["stages"],
+            {
+                "build": {"returncode": 0},
+                "test": {"returncode": 0},
+                "collect": {"returncode": 0, "missing_shards": []},
+                "pipeline": {"returncode": 0},
+            },
+        )
+
+    @patch.object(orchestrator.subprocess, "run")
+    @patch.object(orchestrator.ci, "collect_results")
+    @patch.object(orchestrator.unified_pipeline, "run")
+    def test_execute_aone_stops_after_build_failure(self, pipeline, collect, run):
+        plan = orchestrator.build_aone_plan(
+            self.aone_args(), repo=self.repo, run_id="buildfail"
+        )
+        run.return_value = CompletedProcess([], 7)
+        self.assertEqual(orchestrator.execute_aone_plan(plan), 7)
+        self.assertEqual(run.call_count, 1)
+        collect.assert_not_called()
+        pipeline.assert_not_called()
+        state = json.loads((plan.paths.result_root / "cache_perf_run.json").read_text())
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["stages"], {"build": {"returncode": 7}})
+
+    @patch.object(orchestrator.subprocess, "run")
+    @patch.object(orchestrator.ci, "collect_results")
+    @patch.object(orchestrator.unified_pipeline, "run")
+    def test_execute_aone_partial_collect_preserves_test_failure(
+        self, pipeline, collect, run
+    ):
+        plan = orchestrator.build_aone_plan(
+            self.aone_args(), repo=self.repo, run_id="partial"
+        )
+        run.side_effect = [CompletedProcess([], 0), CompletedProcess([], 9)]
+        collect.return_value = ({"missing_shards": ["shard_01"]}, 0)
+        pipeline.return_value = 0
+        self.assertEqual(orchestrator.execute_aone_plan(plan), 9)
+        self.assertTrue(collect.call_args.args[0].partial)
+        namespace = pipeline.call_args.args[0]
+        self.assertTrue(namespace.partial)
+        self.assertTrue(namespace.skip_fit)
+        self.assertTrue(namespace.skip_test)
+        self.assertIsNone(namespace.oss_destination)
+        for name in (
+            "formula_output_dir",
+            "svg_output",
+            "cold_svg_output",
+            "html_output",
+        ):
+            self.assertIsNone(getattr(namespace, name))
+        state = json.loads((plan.paths.result_root / "cache_perf_run.json").read_text())
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["stages"]["test"]["returncode"], 9)
+        self.assertEqual(state["stages"]["collect"]["missing_shards"], ["shard_01"])
+
+    def test_execute_aone_collect_failures_preserve_exit_priority_and_state(self):
+        for test_code, collect_code, raises, expected in (
+            (9, 0, True, 9),
+            (0, 0, True, 1),
+            (9, 6, False, 9),
+            (0, 6, False, 6),
+        ):
+            with self.subTest(
+                test_code=test_code, collect_code=collect_code, raises=raises
+            ):
+                plan = orchestrator.build_aone_plan(
+                    self.aone_args(),
+                    repo=self.repo,
+                    run_id=f"collect-{test_code}-{collect_code}-{raises}",
+                )
+                with patch.object(orchestrator.subprocess, "run") as run, patch.object(
+                    orchestrator.ci, "collect_results"
+                ) as collect, patch.object(
+                    orchestrator.unified_pipeline, "run"
+                ) as pipeline:
+                    run.side_effect = [
+                        CompletedProcess([], 0),
+                        CompletedProcess([], test_code),
+                    ]
+                    if raises:
+                        collect.side_effect = ValueError(
+                            "no cache-grid results were collected"
+                        )
+                    else:
+                        collect.return_value = (
+                            {"missing_shards": ["shard_00"]},
+                            collect_code,
+                        )
+                    self.assertEqual(orchestrator.execute_aone_plan(plan), expected)
+                pipeline.assert_not_called()
+                self.assertEqual(collect.call_args.args[0].partial, test_code != 0)
+                state = json.loads(
+                    (plan.paths.result_root / "cache_perf_run.json").read_text()
+                )
+                self.assertEqual(state["status"], "failed")
+                self.assertEqual(state["commands"], plan.commands)
+                self.assertEqual(
+                    state["stages"]["collect"]["returncode"], 1 if raises else 6
+                )
+                if raises:
+                    self.assertIn(
+                        "no cache-grid results", state["stages"]["collect"]["error"]
+                    )
+                self.assertNotIn("pipeline", state["stages"])
+
+    def test_execute_aone_pipeline_failures_preserve_exit_priority_and_state(self):
+        for test_code, pipeline_code, raises, expected in (
+            (9, 0, True, 9),
+            (0, 0, True, 1),
+            (9, 23, False, 9),
+            (0, 23, False, 23),
+        ):
+            with self.subTest(
+                test_code=test_code, pipeline_code=pipeline_code, raises=raises
+            ):
+                plan = orchestrator.build_aone_plan(
+                    self.aone_args(),
+                    repo=self.repo,
+                    run_id=f"pipeline-{test_code}-{pipeline_code}-{raises}",
+                )
+                with patch.object(orchestrator.subprocess, "run") as run, patch.object(
+                    orchestrator.ci, "collect_results"
+                ) as collect, patch.object(
+                    orchestrator.unified_pipeline, "run"
+                ) as pipeline:
+                    run.side_effect = [
+                        CompletedProcess([], 0),
+                        CompletedProcess([], test_code),
+                    ]
+                    collect.return_value = ({"missing_shards": []}, 0)
+                    if raises:
+                        pipeline.side_effect = RuntimeError("report failed")
+                    else:
+                        pipeline.return_value = pipeline_code
+                    self.assertEqual(orchestrator.execute_aone_plan(plan), expected)
+                state = json.loads(
+                    (plan.paths.result_root / "cache_perf_run.json").read_text()
+                )
+                self.assertEqual(state["status"], "failed")
+                self.assertEqual(
+                    state["stages"]["pipeline"]["returncode"], 1 if raises else 23
+                )
+                if raises:
+                    self.assertIn("report failed", state["stages"]["pipeline"]["error"])
+
+    def test_write_run_state_replaces_complete_json_atomically(self):
+        path = self.repo / "results" / "cache_perf_run.json"
+        state = {"status": "running", "label": "中文"}
+        orchestrator.write_run_state(path, state)
+        replacement = {"status": "complete", "stages": {"test": {"returncode": 0}}}
+        replace = orchestrator.os.replace
+
+        def publish(source, destination):
+            self.assertEqual(json.loads(path.read_text()), state)
+            self.assertEqual(json.loads(source.read_text()), replacement)
+            self.assertEqual(source.parent, destination.parent)
+            replace(source, destination)
+
+        with patch.object(orchestrator.os, "replace", side_effect=publish):
+            orchestrator.write_run_state(path, replacement)
+        self.assertEqual(json.loads(path.read_text()), replacement)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
     def test_write_artifacts_rejects_dangling_symlink_before_writes(self):
         first = self.repo / "new" / "snapshot.json"
         link = self.repo / "link.json"

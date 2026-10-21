@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import platform
 import re
@@ -425,3 +426,88 @@ def execute_local_plan(plan: OrchestrationPlan) -> int:
     return unified_pipeline.run(
         postprocess_namespace(result_dir=plan.paths.result_root, partial=False)
     )
+
+
+def collect_namespace(plan: OrchestrationPlan, *, partial: bool) -> argparse.Namespace:
+    assert plan.paths.generated_dir is not None
+    return argparse.Namespace(
+        plan=plan.paths.generated_dir / ci.PLAN_NAME,
+        bazel_testlogs=None,
+        result_root=plan.paths.result_root,
+        partial=partial,
+        batch_size=1,
+        cards=plan.resolved.gpu_count,
+        estimator="median",
+        skip_fit=partial,
+        formula_output_dir=None,
+        svg_output=None,
+        cold_svg_output=None,
+        html_output=None,
+        oss_destination=None,
+    )
+
+
+def write_run_state(path: Path, state: Dict[str, Any]) -> None:
+    """Publish a complete stage manifest with an atomic same-directory rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(state, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(temporary, path)
+
+
+def execute_aone_plan(plan: OrchestrationPlan) -> int:
+    """Collect available test outputs while preserving the earliest stage failure."""
+    state = {
+        "schema_version": 1,
+        "mode": "aone-run",
+        "status": "running",
+        "paths": {
+            "inputs": str(plan.paths.inputs_dir),
+            "generated": str(plan.paths.generated_dir),
+            "results": str(plan.paths.result_root),
+        },
+        "commands": plan.commands,
+        "stages": {},
+        "summary": plan.summary,
+    }
+    state_path = plan.paths.result_root / "cache_perf_run.json"
+    write_artifacts(plan.artifacts)
+
+    build = subprocess.run(
+        plan.commands["build"], cwd=REPO, env=plan.process_env, check=False
+    )
+    state["stages"]["build"] = {"returncode": build.returncode}
+    if build.returncode:
+        state["status"] = "failed"
+        write_run_state(state_path, state)
+        return build.returncode
+
+    test = subprocess.run(
+        plan.commands["test"], cwd=REPO, env=plan.process_env, check=False
+    )
+    state["stages"]["test"] = {"returncode": test.returncode}
+    collect_args = collect_namespace(plan, partial=test.returncode != 0)
+    collect_code = 0
+    pipeline_code = 0
+    try:
+        collect_manifest, collect_code = ci.collect_results(collect_args, repo=REPO)
+        state["stages"]["collect"] = {
+            "returncode": collect_code,
+            "missing_shards": collect_manifest["missing_shards"],
+        }
+    except Exception as error:
+        collect_code = 1
+        state["stages"]["collect"] = {"returncode": 1, "error": repr(error)}
+    if collect_code == 0:
+        try:
+            pipeline_code = unified_pipeline.run(ci.pipeline_namespace(collect_args))
+            state["stages"]["pipeline"] = {"returncode": pipeline_code}
+        except Exception as error:
+            pipeline_code = 1
+            state["stages"]["pipeline"] = {"returncode": 1, "error": repr(error)}
+    result = test.returncode or collect_code or pipeline_code
+    state["status"] = "complete" if result == 0 else "failed"
+    write_run_state(state_path, state)
+    return result

@@ -3066,6 +3066,25 @@ class CacheGridRunner:
             raise
 
     def _run_full_pressure_public(self):
+        epoch_id = uuid.uuid4().hex
+        self._pressure_epoch_dir = self.result_dir / "pressure_epochs" / epoch_id
+        self._pressure_epoch_dir.mkdir(parents=True, exist_ok=False)
+        self._write_json_atomic(
+            self.result_dir / "pressure_latest.json",
+            dict(epoch_id=epoch_id, directory=str(self._pressure_epoch_dir)),
+        )
+        self._pressure_preflight_complete = False
+        try:
+            return self._run_full_pressure_epoch(epoch_id)
+        except BaseException as exc:
+            if not self._pressure_preflight_complete:
+                self._write_json_atomic(
+                    self._pressure_epoch_dir / "preflight_failure.json",
+                    dict(epoch_id=epoch_id, error=repr(exc)),
+                )
+            raise
+
+    def _run_full_pressure_epoch(self, epoch_id):
         from dataclasses import asdict
 
         import grpc
@@ -3082,9 +3101,6 @@ class CacheGridRunner:
 
         startup = self.run_config["full_pressure_startup"]
         ranks = tuple(startup["target_ranks"])
-        epoch_id = uuid.uuid4().hex
-        self._pressure_epoch_dir = self.result_dir / "pressure_epochs" / epoch_id
-        self._pressure_epoch_dir.mkdir(parents=True, exist_ok=False)
         # A root checkpoint guards the workload only; each epoch reruns every phase.
         self._results.clear()
         self._save(complete=False)
@@ -3192,15 +3208,9 @@ class CacheGridRunner:
                 startup_pressure=raw,
                 epoch_id=epoch_id,
             )
-            (self.result_dir / "pressure_latest.json").write_text(
-                json.dumps(
-                    dict(epoch_id=epoch_id, directory=str(self._pressure_epoch_dir)),
-                    indent=2,
-                )
-                + "\n"
-            )
             logging.info("full pressure epoch evidence: %s", self._pressure_epoch_dir)
             self._probe_reuse_granularity()
+            self._pressure_preflight_complete = True
             result = self._run_full_pressure(
                 self.cases,
                 self.pressure_config,

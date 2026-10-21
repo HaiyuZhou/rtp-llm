@@ -25,6 +25,53 @@ from rtp_llm.test.perf_test.cache_grid.runner.pressure_profile import (
 
 
 class NsightPressureTest(unittest.TestCase):
+    def test_internal_kernel_requires_unique_launch(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
+            normalize_nsys,
+        )
+
+        faults = (
+            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL SELECT start+1,end-1,globalPid,99999,deviceId,contextId,streamId,demangledName FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE correlationId=2;",
+            "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME SELECT start+1,end-1,globalTid,correlationId,nameId FROM CUPTI_ACTIVITY_KIND_RUNTIME WHERE correlationId=2;",
+            "UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET start=2001 WHERE correlationId=2;",
+            "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME SELECT 2000,2001,globalTid,99999,nameId FROM CUPTI_ACTIVITY_KIND_RUNTIME WHERE correlationId=2; INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL SELECT start+1,end-1,globalPid,99999,deviceId,contextId,streamId,demangledName FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE correlationId=2;",
+        )
+        for fault in faults:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "trace.sqlite"
+                nsys_fixture(path)
+                with sqlite3.connect(path) as db:
+                    db.executescript(fault)
+                result = normalize_nsys(path, {0: steps(), 1: steps()})
+                self.assertFalse(result["trace_valid"], result["reasons"])
+
+    def test_nested_launch_and_non_forward_async_kernel(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
+            normalize_nsys,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.sqlite"
+            nsys_fixture(path)
+            with sqlite3.connect(path) as db:
+                db.executescript(
+                    """
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_DRIVER AS SELECT start+1 AS start,end-1 AS end,globalTid,correlationId,nameId FROM CUPTI_ACTIVITY_KIND_RUNTIME;
+                    UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET start=start-15;
+                    INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME SELECT 1500,1520,globalTid,99999,nameId FROM CUPTI_ACTIVITY_KIND_RUNTIME WHERE correlationId=2;
+                    INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL SELECT 2015,2050,globalPid,99999,deviceId,contextId,streamId,demangledName FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE correlationId=2;
+                """
+                )
+            result = normalize_nsys(path, {0: steps(), 1: steps()})
+            self.assertTrue(result["trace_valid"], result["reasons"])
+            extra = [
+                e
+                for e in result["events"]
+                if e.get("correlation") == 99999 and e["kind"] == "kernel"
+            ]
+            self.assertEqual(len(extra), 2)
+            self.assertTrue(all(e.get("association") == "non_forward" for e in extra))
+
     def test_clock_repair_rejects_missing_ambiguous_invalid_metadata_and_work(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
             normalize_nsys,
@@ -211,6 +258,15 @@ class NsightPressureTest(unittest.TestCase):
                     db.execute(
                         "UPDATE NVTX_EVENTS SET end=NULL WHERE text='executor.model_forward' AND start=3001"
                     )
+                if corrupt == "boundary_launch":
+                    db.execute(
+                        "UPDATE CUPTI_ACTIVITY_KIND_RUNTIME SET start=?,end=? WHERE correlationId=?",
+                        (count * 1000 + 1, count * 1000 + 2, count),
+                    )
+                    db.execute(
+                        "UPDATE NVTX_EVENTS SET start=? WHERE text='executor.model_forward' AND end IS NULL",
+                        (count * 1000 + 5,),
+                    )
             sidecar = [
                 dict(step_id=i, context_batch=1, complete=True)
                 for i in range(1, count + 1)
@@ -251,6 +307,10 @@ class NsightPressureTest(unittest.TestCase):
             4,
         )
         self.assertTrue(all(g["step_id"] not in (1, 5) for g in result["gpu_gaps"]))
+
+    def test_clipped_forward_does_not_excuse_launch_before_its_known_start(self):
+        result = self.boundary_trace(marker=False, corrupt="boundary_launch")
+        self.assertFalse(result["trace_valid"], result["reasons"])
 
     def test_trailing_open_marker_without_sidecar_preserves_complete_pair(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (
@@ -518,6 +578,53 @@ def nsys_fixture(path, step_ids=(1, 2, 3)):
 
 
 class PressureProfileTest(unittest.TestCase):
+    def test_two_markers_cannot_own_the_same_launch(self):
+        trace = actual_trace()
+        marker = copy.deepcopy(trace["traceEvents"][4])
+        marker["name"] = "pressure.step/4"
+        trace["traceEvents"].append(marker)
+        result = validate_kineto(
+            trace, steps() + [dict(step_id=4, context_batch=1, complete=True)], 3
+        )
+        self.assertFalse(result["trace_valid"], result)
+
+    def test_reused_correlation_cannot_borrow_another_steps_kernel(self):
+        trace = actual_trace()
+        trace["traceEvents"][6]["args"]["correlation"] = trace["traceEvents"][2][
+            "args"
+        ]["correlation"]
+        del trace["traceEvents"][7]
+        result = validate_kineto(trace, steps(), 3)
+        self.assertFalse(result["trace_valid"], result)
+        self.assertNotIn(2, result["usable_step_ids"])
+
+    def test_launch_ownership_and_causality(self):
+        for fault in ("duplicate", "different_thread", "before_launch"):
+            with self.subTest(fault=fault):
+                trace = actual_trace()
+                call = copy.deepcopy(trace["traceEvents"][6])
+                if fault == "before_launch":
+                    trace["traceEvents"][7]["ts"] = call["ts"] - 1
+                else:
+                    if fault == "different_thread":
+                        call["tid"] += 1
+                    trace["traceEvents"].append(call)
+                self.assertFalse(validate_kineto(trace, steps(), 3)["trace_valid"])
+
+    def test_nested_runtime_driver_launch_can_start_before_api_return(self):
+        trace = actual_trace()
+        call = copy.deepcopy(trace["traceEvents"][6])
+        call.update(
+            cat="cuda_runtime",
+            name="cudaLaunchKernel",
+            ts=call["ts"] - 1,
+            dur=call["dur"] + 2,
+        )
+        trace["traceEvents"].append(call)
+        trace["traceEvents"][7]["ts"] = trace["traceEvents"][6]["ts"] + 1
+        result = validate_kineto(trace, steps(), 3)
+        self.assertTrue(result["trace_valid"], result)
+
     def test_non_forward_correlated_kernel_is_separate_evidence(self):
         trace = actual_trace()
         call = copy.deepcopy(trace["traceEvents"][2])

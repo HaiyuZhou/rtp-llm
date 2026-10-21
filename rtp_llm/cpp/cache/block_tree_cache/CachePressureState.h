@@ -43,8 +43,9 @@ public:
     // Call once for each accepted settlement transition, never from polling.
     void             recordPublication(const PressureTransferKey& key, uint64_t blocks, uint64_t bytes);
     TransferEvidence transfer(const PressureTransferKey& key) const;
-    void             recordWatermarkTrigger(size_t group_id);
-    uint64_t         watermarkTriggers(size_t group_id) const;
+    // DEVICE high-watermark transitions only; HOST/DISK hysteresis stays separate.
+    void     recordWatermarkTrigger(size_t group_id);
+    uint64_t watermarkTriggers(size_t group_id) const;
 
 private:
     mutable std::mutex                              mutex_;

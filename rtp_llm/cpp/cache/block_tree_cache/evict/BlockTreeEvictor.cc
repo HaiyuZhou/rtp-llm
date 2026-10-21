@@ -1201,7 +1201,7 @@ BlockTreeEvictor::computeWatermarkEvictCount(const GroupSet& group_set, Tier tie
     if (required_count == 0) {
         triggered = false;
     } else if (high_reached) {
-        if (!triggered)
+        if (!triggered && tier == Tier::DEVICE)
             tree_->pressureState().recordWatermarkTrigger(group_set.groupSetId());
         triggered = true;
     }

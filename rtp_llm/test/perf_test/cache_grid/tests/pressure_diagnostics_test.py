@@ -412,6 +412,8 @@ class PressurePredicateTest(unittest.TestCase):
 
     def test_store_publication_qualifies_without_double_counting_source(self):
         message = wire()
+        # Stable low-watermark occupancy cannot establish the prior DEVICE trigger.
+        message.ranks[0].pools[0].used_blocks = 80
         for transfer in message.ranks[0].transfers:
             transfer.operation = 3
         sample = decode_pressure_response(message, 1.0, 1.1, (0,)).samples[0]
@@ -427,6 +429,17 @@ class PressurePredicateTest(unittest.TestCase):
             group_valid(
                 dataclasses.replace(group, triggers=0),
                 {p.pool_id: p for p in sample.pools},
+                baseline,
+                configured(),
+            )
+        )
+        message.ranks[0].groups[0].watermark_trigger_count = 0
+        decoded = decode_pressure_response(message, 1.0, 1.1, (0,)).samples[0]
+        self.assertEqual(decoded.groups[0].triggers, 0)
+        self.assertFalse(
+            group_valid(
+                decoded.groups[0],
+                {p.pool_id: p for p in decoded.pools},
                 baseline,
                 configured(),
             )
@@ -673,6 +686,28 @@ class CoverageTest(unittest.TestCase):
                 t + 0.02,
             )
         self.assertEqual(e.intervals(0, 4), [(0.01, 3.99)])
+
+    def test_window_reports_cumulative_reasons_with_explicit_epoch_scope(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        base = dataclasses.replace(
+            rank(), groups=(GroupSample(0, "FULL", ("gpu",), "host", 0, 0),)
+        )
+        evaluator = PressureCoverage((base,), configured())
+        for t in range(5):
+            point = dataclasses.replace(
+                rank(), sequence=t + 2, server_s=t, client_send_s=t, client_receive_s=t
+            )
+            if t == 0:
+                point = dataclasses.replace(point, groups=base.groups)
+            evaluator.add((point,), t)
+        result = dataclasses.asdict(evaluator.assess(2, 4))
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["ratio"], 1)
+        self.assertNotIn("reasons", result)
+        self.assertIn("pressure_lost", result["epoch_reasons"])
 
     def test_gap_age_missing_and_retention(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (

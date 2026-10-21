@@ -1110,6 +1110,7 @@ message PressureGroupPB {
     PressureWatermarkPB device_watermark = 6;
     PressureWatermarkPB host_watermark = 7;
     PressureWatermarkPB disk_watermark = 8;
+    // Cumulative DEVICE high-watermark transitions; excludes HOST and DISK.
     uint64 watermark_trigger_count = 9;
     repeated string group_tags = 10;
     uint64 block_tokens = 11;

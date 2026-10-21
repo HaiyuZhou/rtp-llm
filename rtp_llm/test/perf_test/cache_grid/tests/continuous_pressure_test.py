@@ -1,6 +1,7 @@
 """Bounded continuous request supply, without engine imports."""
 
 import json
+import os
 import struct
 import tempfile
 import time
@@ -1094,6 +1095,51 @@ class TransportRegistrationTest(unittest.TestCase):
 
 
 class RunnerIntegrationTest(unittest.TestCase):
+    def test_latest_epoch_is_atomic_and_retains_preflight_failure(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            CacheGridRunner,
+        )
+
+        for fault in ("checkpoint", "rpc"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                self._assert_latest_epoch_preflight_failure(
+                    CacheGridRunner, directory, fault
+                )
+
+    def _assert_latest_epoch_preflight_failure(self, runner_type, directory, fault):
+        from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2_grpc as rpc
+
+        with patch.object(rpc, "RpcServiceStub") as stub:
+            runner = object.__new__(runner_type)
+            runner.result_dir = Path(directory)
+            runner.run_config = {"full_pressure_startup": {"target_ranks": [0]}}
+            runner._results = {}
+            runner.port, runner.request_timeout = 123, 1
+            runner.pressure_config = config()
+            runner._save = Mock(
+                side_effect=(
+                    ValueError("preflight failure") if fault == "checkpoint" else None
+                )
+            )
+            stub.return_value.GetCachePressure.side_effect = ValueError(
+                "preflight failure"
+            )
+            latest = runner.result_dir / "pressure_latest.json"
+            latest.write_text('{"epoch_id":"previous"}')
+            with patch("os.replace", wraps=os.replace) as replace_file:
+                with self.assertRaisesRegex(ValueError, "preflight failure"):
+                    runner._run_full_pressure_public()
+            pointer = json.loads(latest.read_text())
+            self.assertNotEqual(pointer["epoch_id"], "previous")
+            self.assertEqual(Path(pointer["directory"]), runner._pressure_epoch_dir)
+            self.assertTrue(
+                any(call.args[1] == latest for call in replace_file.call_args_list)
+            )
+            failure = json.loads(
+                (runner._pressure_epoch_dir / "preflight_failure.json").read_text()
+            )
+            self.assertIn("preflight failure", failure["error"])
+
     def test_nsys_wiring_uses_duration_and_never_starts_kineto(self):
         self._runner_case("nsys_failure")
 

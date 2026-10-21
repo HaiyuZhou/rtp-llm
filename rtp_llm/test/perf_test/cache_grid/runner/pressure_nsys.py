@@ -130,6 +130,23 @@ def _complete_range(start, end):
     return isinstance(start, int) and isinstance(end, int) and end > start
 
 
+def unique_cuda_launch(calls):
+    """Return the outer index for one API call or a nested runtime/driver pair.
+
+    Tuples contain (API kind, CPU thread identity, start, end). Repeated calls
+    of the same kind or different threads cannot prove one launch.
+    """
+    if len(calls) == 1:
+        return 0
+    if len(calls) != 2 or {c[0] for c in calls} != {"runtime", "driver"}:
+        return None
+    outer = next(i for i, c in enumerate(calls) if c[0] == "runtime")
+    runtime, driver = calls[outer], calls[1 - outer]
+    if runtime[1] == driver[1] and runtime[2] <= driver[2] <= driver[3] <= runtime[3]:
+        return outer
+    return None
+
+
 def _normalize_nvtx_clocks(rows):
     session = rows.get("TARGET_INFO_SESSION_START_TIME", [])
     details = rows.get("ANALYSIS_DETAILS", [])
@@ -227,6 +244,11 @@ def _normalize(rows, steps_by_rank):
             boundary_exclusions[identity] = "incomplete_internal_step_marker"
     calls = {}
     by_thread = defaultdict(list)
+    forward_ranges = defaultdict(list)
+    for row in rows["NVTX_EVENTS"]:
+        name = row["text"] or strings.get(row["textId"], "")
+        if name.startswith("executor.model_forward"):
+            forward_ranges[row["globalTid"]].append(row)
     for (rank, step), marker in markers.items():
         by_thread[marker["globalTid"]].append(
             (marker["start"], marker["end"], rank, step)
@@ -237,6 +259,7 @@ def _normalize(rows, steps_by_rank):
             reasons.add("overlapping_step_markers")
     for table in ("CUPTI_ACTIVITY_KIND_RUNTIME", "CUPTI_ACTIVITY_KIND_DRIVER"):
         for row in rows.get(table, []):
+            row["api_kind"] = "runtime" if table.endswith("RUNTIME") else "driver"
             pid = row["globalTid"] & 0xFFFFFFFFFF000000
             ranges = by_thread.get(row["globalTid"], [])
             position = bisect_right(ranges, (row["start"], float("inf"))) - 1
@@ -303,22 +326,69 @@ def _normalize(rows, steps_by_rank):
                 reasons.add("invalid_event_duration")
                 continue
             candidates = calls.get((row["globalPid"], row["correlationId"]), [])
-            links = [(c["rank"], c["step_id"], c) for c in candidates if "step_id" in c]
-            # Runtime/driver nesting can represent one launch. Use the outer call
-            # only when every matched call has the same explicit step identity.
-            identities = {(r, s) for r, s, _ in links}
-            if len(identities) == 1:
-                rank, step = next(iter(identities))
-                call = min((c for _, _, c in links), key=lambda c: c["start"])
+            launch = unique_cuda_launch(
+                [
+                    (c["api_kind"], c["globalTid"], c["start"], c["end"])
+                    for c in candidates
+                ]
+            )
+            identities = {(c.get("rank"), c.get("step_id")) for c in candidates}
+            valid_launch = launch is not None and len(identities) == 1
+            if valid_launch:
+                call = candidates[launch]
+                # CUDA execution may begin before the API returns, but never
+                # before any part of its one proven launch chain enters.
+                valid_launch = all(c["start"] <= event["start_ns"] for c in candidates)
+            if valid_launch:
                 event.update(
-                    rank=rank,
-                    step_id=step,
                     submit_ns=call["start"],
                     submit_end_ns=call["end"],
                     submit_global_tid=call["globalTid"],
                 )
-            elif len(identities) > 1:
-                reasons.add("ambiguous_cuda_correlation")
+                if "step_id" in call:
+                    event.update(
+                        rank=call["rank"], step_id=call["step_id"], association="step"
+                    )
+                else:
+                    scopes = forward_ranges[call["globalTid"]]
+                    overlaps = any(
+                        (f["start"] is None or f["start"] < call["end"])
+                        and (f["end"] is None or call["start"] < f["end"])
+                        for f in scopes
+                    ) or any(
+                        start < call["end"] and call["start"] < end
+                        for start, end, _, _ in by_thread[call["globalTid"]]
+                    )
+                    edge = any(
+                        marker["globalTid"] == call["globalTid"]
+                        and (
+                            (
+                                step == rank_edges[rank][0]
+                                and marker["start"] is None
+                                and isinstance(marker["end"], int)
+                                and call["end"] <= marker["end"]
+                            )
+                            or (
+                                step == rank_edges[rank][1]
+                                and marker["end"] is None
+                                and isinstance(marker["start"], int)
+                                and call["start"] >= marker["start"]
+                            )
+                        )
+                        for (rank, step), marker in all_markers.items()
+                    )
+                    if edge:
+                        event["association"] = "incomplete_step_boundary"
+                    elif not overlaps:
+                        event["association"] = "non_forward"
+                    elif kind == "kernel":
+                        reasons.add("missing_model_compute_correlation")
+            elif kind == "kernel":
+                reasons.add(
+                    "ambiguous_cuda_correlation"
+                    if candidates
+                    else "missing_cuda_correlation"
+                )
             gpu.append(event)
     # Include stage ranges and runtime submissions as independently inspectable
     # evidence, without comparing any export time to server CLOCK_MONOTONIC.
@@ -477,6 +547,46 @@ def _normalize(rows, steps_by_rank):
             usable_pairs=pairs,
             exclusions=excluded,
         )
+    # Validate every kernel, including extra work on otherwise healthy steps.
+    # A valid kernel elsewhere in the step cannot hide a bad launch association.
+    for event in gpu:
+        if event["kind"] not in ("kernel", "communication") or "step_id" not in event:
+            continue
+        identity = event["rank"], event["step_id"]
+        if boundary_exclusions.get(identity) in (
+            "incomplete_step_boundary",
+            "incomplete_forward_boundary",
+        ):
+            partial = [
+                f
+                for f in incomplete_forwards[event["submit_global_tid"]]
+                if (
+                    identity[1] == rank_edges[identity[0]][0]
+                    and f["start_ns"] is None
+                    and isinstance(f["end_ns"], int)
+                    and event["submit_end_ns"] <= f["end_ns"]
+                )
+                or (
+                    identity[1] == rank_edges[identity[0]][1]
+                    and f["end_ns"] is None
+                    and isinstance(f["start_ns"], int)
+                    and f["start_ns"] <= event["submit_ns"]
+                )
+            ]
+            if len(partial) != 1:
+                reasons.add("missing_or_ambiguous_model_forward")
+            event["association"] = boundary_exclusions[identity]
+            continue
+        scopes = [
+            f
+            for f in forwards[event["submit_global_tid"]]
+            if f["start_ns"]
+            <= event["submit_ns"]
+            <= event["submit_end_ns"]
+            <= f["end_ns"]
+        ]
+        if len(scopes) != 1:
+            reasons.add("missing_or_ambiguous_model_forward")
     gaps = []
     gpu_ids = {id(g): len(events) + index for index, g in enumerate(gpu)}
     compute = sorted(

@@ -232,7 +232,7 @@ PyTorch record_function 不自动转为 NVTX，kernel 名称和 launch correlati
 `total_blocks/used_blocks/free_blocks` 描述物理占用；`available_blocks` 还包括可回收的纯 CACHE 引用块。
 各 reference category 可能重叠，不能相加计算 used；非 DEVICE pool 的 request 引用标记为不可用，不能解释为已测量的零。
 `pending_release_blocks` 是已排入驱逐流程、尚未完成源释放的块数。
-水位是 group 对应 tier 的配置，`watermark_trigger_count` 累加各 tier 从未触发到触发的转换，重复轮询不累加。
+水位是 group 对应 tier 的配置，`watermark_trigger_count` 仅累加 DEVICE 从未触发到达到高水位的转换，重复轮询不累加。HOST/DISK 水位仍独立观测，不能提供 GPU 高水位触发证据；真实 DEVICE 触发后的 STORE 或 EVICT GPU-to-host 发布均可计入发布增量。
 
 `published_host_blocks` 是当前仍有效、已经成功发布的 HOST 物理块去重数。
 HOST 目标预留及尚未发布的副本不计入；有效 HOST 源在 LOAD_PENDING/LOADING 期间继续计入，
@@ -357,8 +357,12 @@ unknown ages, excessive gaps, and missing ranks cannot add coverage.
 Use `intervals(start, end)` for continuous steady qualification (a full 3-second
 interval normally needs four 1Hz samples; uncertainty may require more).
 `assess(start, end)` returns immutable `CoverageAssessment`: ratio,
-`longest_invalid_s`, `valid`, clipped intervals, reason codes, `epoch_valid`, and
+`longest_invalid_s`, `valid`, clipped intervals, `epoch_reasons`, `epoch_valid`, and
 `max_segments_per_target`. Measurement and profile windows use this same API.
+`epoch_reasons` accumulates diagnostics from the entire epoch up to assessment,
+including fill and earlier windows; it does not identify losses inside the
+assessed window. Window acceptance uses its clipped ratio/longest-invalid/valid
+fields and epoch continuity. A valid window may retain an earlier `pressure_lost`.
 Continue same-distribution polling after t1 until a fresh adjacent sample closes
 the right window edge, then clip to [t0,t1); never extend a last point to t1.
 Service-instance, sequence, or cumulative endpoint counter reset terminates the
@@ -488,9 +492,13 @@ span conservatively overestimates CP-sharded request allocations; a grid alignme
 of 4096 with physical blocks of 512 retains a 512-token execution bound. SWA/LINEAR
 remain observed without FULL-pressure gates.
 
-Every public invocation writes `pressure_epochs/<unique-id>/startup_pressure.json`
-and, after successful preflight, `pressure/` evidence within that epoch directory.
-`pressure_latest.json` identifies the latest started diagnostic epoch. Root launch
+Every public invocation creates `pressure_epochs/<unique-id>/`; after its initial
+RPC completes it writes `startup_pressure.json`, and after successful preflight it
+writes `pressure/` evidence within that epoch directory.
+`pressure_latest.json` is atomically replaced when the epoch directory is created,
+before preflight, and identifies the latest started diagnostic epoch even on
+preflight failure. Such failures retain `preflight_failure.json` in that directory;
+`startup_pressure.json` exists only after the initial RPC completes. Root launch
 snapshots and the empty exact-results checkpoint guard immutable resume inputs;
 completed case rows never skip seed/fill/steady. Prior epoch files are never replaced.
 The manifest includes actual profile/grid hashes, Python pressure-toolchain content

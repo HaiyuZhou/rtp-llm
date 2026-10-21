@@ -822,13 +822,15 @@ def activity_valid(sample, now, timeout_s) -> bool:
 
 @dataclass(frozen=True)
 class CoverageAssessment:
+    """Window coverage with cumulative diagnostics from the entire epoch so far."""
+
     epoch_valid: bool
     max_segments_per_target: int
     ratio: float
     longest_invalid_s: float
     valid: bool
     intervals: tuple[Interval, ...]
-    reasons: tuple[str, ...]
+    epoch_reasons: tuple[str, ...]
 
 
 class PressureCoverage:

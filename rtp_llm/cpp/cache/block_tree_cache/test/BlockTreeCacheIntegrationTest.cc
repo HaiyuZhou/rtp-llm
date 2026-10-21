@@ -1306,13 +1306,23 @@ TEST_F(BlockTreeCacheIntegrationTest, DirectDropDetachesInFlightLoadAndDiscardsI
 
     EXPECT_FALSE(context->success());
     EXPECT_EQ(host_residency(), 0u);
+    size_t load_records = 0;
+    bool   saw_host = false, saw_device = false;
     for (const auto& transfer : cache->pressureSnapshot().transfers) {
         if (transfer.operation == CacheTransferOperation::LOAD) {
+            ++load_records;
+            EXPECT_EQ(transfer.source_tier, Tier::HOST);
+            EXPECT_EQ(transfer.target_tier, Tier::DEVICE);
+            saw_host |= transfer.pool_tier == Tier::HOST;
+            saw_device |= transfer.pool_tier == Tier::DEVICE;
             EXPECT_EQ(transfer.copied_blocks, 0u);
             EXPECT_EQ(transfer.published_blocks, 0u);
             EXPECT_EQ(transfer.failed_operations, 1u);
         }
     }
+    EXPECT_EQ(load_records, 2u);
+    EXPECT_TRUE(saw_host);
+    EXPECT_TRUE(saw_device);
     EXPECT_FALSE(host_pool->isAllocated(host_source));
     EXPECT_TRUE(cache->tree()->findNode({100, 200}).empty());
     EXPECT_TRUE(cache->tree()->pending_node_pool_.empty());

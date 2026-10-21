@@ -16,7 +16,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict
 from pathlib import Path
 
-from .pressure_nsys import classify_gpu_gap, normalize_nsys
+from .pressure_nsys import classify_gpu_gap, normalize_nsys, unique_cuda_launch
 
 
 def run_nsys_window(command, *, duration_s, cancelled):
@@ -244,19 +244,54 @@ def validate_kineto(trace, steps, requested_steps):
     if not markers:
         reasons.append("missing_step_markers")
     sidecar = {int(s["step_id"]): s for s in steps}
+    runtime_by_correlation = {}
+    for call in runtimes:
+        correlation = call.get("args", {}).get("correlation")
+        if correlation is not None:
+            runtime_by_correlation.setdefault(correlation, []).append(call)
+    launches = {}
+    for correlation, calls in runtime_by_correlation.items():
+        index = unique_cuda_launch(
+            [
+                (
+                    c["cat"].removeprefix("cuda_"),
+                    (c.get("pid"), c.get("tid")),
+                    *_range(c),
+                )
+                for c in calls
+            ]
+        )
+        if index is not None:
+            launches[correlation] = calls[index]
+    work_by_launch = {}
+    for kernel in kernels:
+        correlation = kernel.get("args", {}).get("correlation")
+        if correlation in launches and all(
+            _range(call)[0] <= _range(kernel)[0]
+            for call in runtime_by_correlation[correlation]
+        ):
+            work_by_launch.setdefault(id(launches[correlation]), []).append(kernel)
+    scopes_by_step = {
+        step_id: [f for f in forwards if _contains(marker, f) or _contains(f, marker)]
+        for step_id, marker in markers.items()
+    }
+    launch_owners = {}
+    for step_id, scopes in scopes_by_step.items():
+        if len(scopes) == 1:
+            for call in launches.values():
+                if _contains(scopes[0], call) and _contains(markers[step_id], call):
+                    launch_owners.setdefault(id(call), []).append(step_id)
+    if any(len(owners) > 1 for owners in launch_owners.values()):
+        reasons.append("ambiguous_step_forward")
     matched, linked = {}, set()
     for step_id, marker in markers.items():
-        scopes = [f for f in forwards if _contains(marker, f) or _contains(f, marker)]
+        scopes = scopes_by_step[step_id]
         if len(scopes) != 1:
             reasons.append("ambiguous_step_forward")
             continue
         forward = scopes[0]
-        calls = [r for r in runtimes if _contains(forward, r) and _contains(marker, r)]
-        correlations = {r.get("args", {}).get("correlation") for r in calls}
-        correlations.discard(None)
-        work = [
-            k for k in kernels if k.get("args", {}).get("correlation") in correlations
-        ]
+        calls = [r for r in launches.values() if launch_owners.get(id(r)) == [step_id]]
+        work = [k for call in calls for k in work_by_launch.get(id(call), [])]
         linked.update(id(k) for k in work)
         if not work:
             reasons.append("missing_cuda_correlation")
@@ -271,21 +306,13 @@ def validate_kineto(trace, steps, requested_steps):
             [_range(f)[1] for f in forwards]
             + [_range(k)[1] for k in kernels if id(k) in linked]
         )
-        runtime_by_correlation = {}
-        for call in runtimes:
-            correlation = call.get("args", {}).get("correlation")
-            if correlation is not None:
-                runtime_by_correlation.setdefault(correlation, []).append(call)
         for kernel in kernels:
             if id(kernel) in linked or not low <= _range(kernel)[0] <= high:
                 continue
-            calls = runtime_by_correlation.get(
-                kernel.get("args", {}).get("correlation"), []
-            )
-            if len(calls) != 1:
+            call = launches.get(kernel.get("args", {}).get("correlation"))
+            if call is None or kernel not in work_by_launch.get(id(call), []):
                 reasons.append("missing_cuda_correlation")
                 continue
-            call = calls[0]
             overlaps = any(
                 scope.get("pid") == call.get("pid")
                 and scope.get("tid") == call.get("tid")

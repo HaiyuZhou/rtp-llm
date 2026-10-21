@@ -1422,16 +1422,20 @@ TEST_F(BlockTreeEvictorTest, WatermarkRequiresHighAndRequestsDownToLowWithIntege
     const TierWatermark watermark{/*low_ratio=*/0.82, /*high_ratio=*/0.90};
     EXPECT_EQ(evictor_->computeWatermarkEvictCount(*group_, Tier::DEVICE, watermark), 0u);
 
+    EXPECT_EQ(tree_->pressureState().watermarkTriggers(0), 0u);
+
     const auto second = device_pool_->malloc(1);
     ASSERT_TRUE(second.has_value());
     device_pool_->incRef(*second);
     EXPECT_EQ(evictor_->computeWatermarkEvictCount(*group_, Tier::DEVICE, watermark), 12u);
+    EXPECT_EQ(tree_->pressureState().watermarkTriggers(0), 1u);
 
     {
         std::lock_guard<std::mutex> lock(evictor_->pending_release_mutex_);
         evictor_->pending_release_counts_[device_pool_.get()] = 1;
     }
     EXPECT_EQ(evictor_->computeWatermarkEvictCount(*group_, Tier::DEVICE, watermark), 11u);
+    EXPECT_EQ(tree_->pressureState().watermarkTriggers(0), 1u);
     {
         std::lock_guard<std::mutex> lock(evictor_->pending_release_mutex_);
         evictor_->pending_release_counts_.clear();
@@ -1761,6 +1765,7 @@ TEST_F(BlockTreeEvictorTest, HostDiskWatermarkConvergesAcrossBoundedBatches) {
     EXPECT_EQ(evictor_runtime_.transferEngine()->submittedDescriptorCount(), 17u);
     EXPECT_EQ(host_pool->usedBlocksNum(), 78u);
     EXPECT_EQ(disk_pool->usedBlocksNum(), 17u);
+    EXPECT_EQ(tree_->pressureState().watermarkTriggers(0), 0u);
     evictor_->settled_ = [](bool) {};
     while (evictor_->dropLocked(/*group_set_id=*/0, Tier::HOST, /*notify_settled=*/true)) {}
     while (evictor_->dropLocked(/*group_set_id=*/0, Tier::DISK, /*notify_settled=*/false)) {}
@@ -1833,6 +1838,10 @@ TEST_F(BlockTreeEvictorTest, DirectDropWatermarkBatchNotifiesSettlementOnce) {
         EXPECT_FALSE(check_watermark);
     };
 
+    EXPECT_GT(
+        evictor_->computeWatermarkEvictCount(*group_, Tier::DISK, TierWatermark{/*low_ratio=*/0.5, /*high_ratio=*/0.9}),
+        0u);
+    EXPECT_EQ(tree_->pressureState().watermarkTriggers(0), 0u);
     EXPECT_TRUE(evictor_
                     ->batchEvictLocked(
                         /*group_set_id=*/0, Tier::DISK, /*max_victim_count=*/3)

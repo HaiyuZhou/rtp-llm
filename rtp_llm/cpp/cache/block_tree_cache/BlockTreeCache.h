@@ -44,7 +44,7 @@ struct CachePressureGroupSnapshot {
     std::vector<std::string>   device_pool_ids;
     std::optional<std::string> host_pool_id, disk_pool_id;
     TierWatermark              device_watermark, host_watermark, disk_watermark;
-    uint64_t                   watermark_trigger_count{0};
+    uint64_t                   watermark_trigger_count{0};  // DEVICE high-watermark transitions.
     std::vector<std::string>   group_tags;
     uint64_t                   block_tokens{0}, payload_bytes{0}, storage_bytes{0};
     bool                       crc_enabled{false};

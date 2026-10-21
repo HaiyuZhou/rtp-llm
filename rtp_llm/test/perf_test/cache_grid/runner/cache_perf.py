@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -475,7 +476,10 @@ def run_pipeline(args):
 
 
 def parser():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Complete workflows: cache_perf local-run --help; cache_perf aone-run --help",
+    )
     p.add_argument(
         "mode",
         choices=[
@@ -615,9 +619,17 @@ def parser():
     return p
 
 
+HIGH_LEVEL_MODES = frozenset(("local-run", "aone-run"))
+
+
 def main(argv=None):
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] in HIGH_LEVEL_MODES:
+        from rtp_llm.test.perf_test.cache_grid.runner import cache_perf_orchestrator
+
+        return cache_perf_orchestrator.main(raw)
     p = parser()
-    args = p.parse_args(argv)
+    args = p.parse_args(raw)
     try:
         if args.mode == "ci-prepare":
             from rtp_llm.test.perf_test.cache_grid.runner.cache_perf_ci import (

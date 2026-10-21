@@ -7,6 +7,92 @@
 - 本文：配置、生成 grid、运行、分析与产物。
 - [格式与执行参考](docs/reference.md)：必填字段、batch 调度、容量规则、计时口径、profiling 和迁移。
 
+## 本地/AOne 一键运行
+
+首次测试推荐使用 `local-run` 或 `aone-run`：输入按模型、引擎、grid 和环境分类，
+自动生成冻结配置、执行测试，再统一拟合和绘图。无需手动准备 profile/grid 文件。
+
+本地单卡示例：
+
+```bash
+./tools/cache_perf local-run --devices 0 \
+  --model-json '{"type":"qwen_2","checkpoint":"/models/Qwen2.5-0.5B-Instruct"}' \
+  --engine-json '{"max_seq_len":4096,"seq_size_per_block":64,"args":{"act_type":"BF16"}}' \
+  --grid-json '{"cache_alignment":64,"compute_step":[1024,256]}'
+```
+
+`--devices` 必填，逗号分隔且不能重复，数量必须等于拓扑卡数；启动时自动设置
+`CUDA_VISIBLE_DEVICES`。本地使用单次 `bazelisk run` 和共享 GPU lock，
+根据主机架构选择 `cuda13`（x86_64）或 `cuda13_arm`（aarch64）。
+
+AOne 对应示例：
+
+```bash
+./tools/cache_perf aone-run --resource daily --gpu-type SM103_CU13 --max-parallel 1 \
+  --model-json '{"type":"qwen_2","checkpoint":"/models/Qwen2.5-0.5B-Instruct"}' \
+  --engine-json '{"max_seq_len":4096,"seq_size_per_block":64,"args":{"act_type":"BF16"}}' \
+  --grid-json '{"cache_alignment":64,"compute_step":[1024,256]}'
+```
+
+`--resource` 必填，可选 `daily` 或 `online`，分别展开对应的 AOne cache/remote 配置。
+`--gpu-type` 必填：`SM100_ARM_CU13` 使用 `cuda13_arm`；
+`SM103_CU13`、`L20_CU13`、`L20D_DEV` 使用 `cuda13`。
+模型及 tokenizer 路径必须对实际执行节点可见；AOne 不会把本机 checkpoint 上传到
+remote executor，填写远端可访问的共享路径。流程先 build，再远程 test，最后收集和分析。
+`--build-jobs` 默认使用本机可用 CPU 数；`--max-parallel` 默认 1，只控制 test 并发，
+每个 shard 的 GPU 数由模型拓扑决定。编译输出最小下载，测试输出全部下载；测试失败时
+收集已有结果并生成 partial 预览，不拟合，最终保留失败退出码。
+
+三个 `--*-json` 主输入必填，值为严格 JSON 对象，不是文件路径；字段及默认值如下：
+
+| 输入 | 必填项与默认值 |
+|---|---|
+| `--model-json` | 必填 `type`、`checkpoint`；`label` 默认 checkpoint 目录名，`tokenizer` 默认 checkpoint；`topology` 的 `tp/dp/pp/ep` 默认均为 1 |
+| `--engine-json` | 必填 `max_seq_len`、`seq_size_per_block`、`args.act_type`；`max_batch_tokens_size` 默认 `max_seq_len`，`max_context_batch_size` 和 `concurrency_limit` 默认 1；`args` 默认补充 `reuse_cache=1`、`enable_device_cache=1`、`enable_cuda_graph=0` |
+| `--grid-json` | 必填 `cache_alignment`、`compute_step`（正整数数组，步长唯一且从粗到细）；`max_input_len` 默认 `max_seq_len-1`，`commit_tail_tokens` 默认 `cache_alignment`，`min_compute_len` 默认最细步长；`min_cache_len=0`、`random_cache_count=8`、`measure_runs=3`、`batch_size=1`、`seed=104729`、`max_cases=200` |
+| `--engine-env-json` | 可选，默认 `{}`，模型和引擎环境变量 |
+| `--runtime-env-json` | 可选，默认 `{}`，Bazel 启动前生效的编译器、CUDA、动态库及 JIT 环境变量 |
+
+`world_size = gpu_count = TP × DP × PP`；EP 描述专家并行，不额外乘入卡数。
+例如在模型 JSON 中加入 `"topology":{"tp":8,"dp":1,"pp":1,"ep":8}` 时使用 8 卡。
+自动派生 `WORLD_SIZE` 和 `TOKENIZERS_PARALLELISM=false`，不能在环境 JSON 中覆盖；
+同一变量不能出现在两个环境段。本地的 `CUDA_VISIBLE_DEVICES` 由 `--devices` 管理。
+环境值接受字符串或有限数字；敏感凭据变量会被拒绝。
+
+grid 使用固定 cache、递增 compute 的扫描；不设置 `max_cache_len` 时由生成器按长度上限推导。
+也可提供单个 `fixed_cache_len`，此时不能同时指定 `random_cache_count`。
+`max_input_len+1` 不能超过 `max_seq_len`，最小 compute 必须容纳 commit tail。
+AOne 在按物理 cache bucket 去重后，以有效 case 数 N 自动分片：
+`shards = max(1, ceil(N × 5 / 6000))`。每个 case 的 5 秒预算包含默认三轮测量，
+不再乘 `measure_runs`；每个 action 的测试 timeout 为 7000 秒，低于 AOne 的 7200 秒上限。
+该公式是分片预算，不保证实际模型耗时；需要显式时间估算与分片控制时可用下文低层流程。
+
+两种模式都支持 `--result-root`（新目录或空目录）、`--bazel`（默认 `bazelisk`）、
+可重复的 `--bazel-arg` 和 `--dry-run`。以 `--` 开头的 Bazel 参数值必须使用等号写法，
+例如 `--bazel-arg=--jobs=4`、`--bazel-arg=--config=my_config`；这些参数排在工具生成的
+Bazel 选项之后，可覆盖默认值。本地参数仍位于 Bazel 与测试程序之间的 `--` 之前。
+`--devices` 仅属于本地模式；`--resource`、`--gpu-type`、`--build-jobs`、`--max-parallel`
+仅属于 AOne 模式，交叉传入会在参数解析阶段报错。
+
+先在上述命令末尾加 `--dry-run`，可查看含 `world_size`、`max_input_len` 的规范化摘要和
+可复制的分阶段命令；此模式只在内存中规划，不创建目录、不启动 Bazel 或 GPU。
+实际执行时生成的目录如下（`<id>` 为每次运行唯一标识）：
+
+| 目录 | 内容 |
+|---|---|
+| 本地 `cache_grid_local_results_<label>_<id>/` | profile/grid 快照、启动 manifest、原始结果及拟合/图表；`--result-root` 可替换此路径 |
+| AOne `cache_grid_aone_inputs_<label>_<id>/` | 生成的 `profile.json` 和 `grid.json` |
+| AOne `cache_grid_aone_generated_<label>_<id>/` | 动态 Bazel 包、分片 grid、环境脚本及 `cache_perf_ci_plan.json` |
+| AOne `cache_grid_aone_results_<label>_<id>/` | 各 shard 结果、统一报告及记录阶段状态/退出码的 `cache_perf_run.json`；`--result-root` 可替换此路径 |
+
+已有 `run/resume/retest/profile/pipeline/ci-prepare/ci-plan/ci-collect` 仍受支持，
+适用于已有冻结配置的恢复、重测及分阶段诊断。模式参数可分别查看：
+
+```bash
+./tools/cache_perf local-run --help
+./tools/cache_perf aone-run --help
+```
+
 ## 配置 profile
 
 复制 [通用模板](config/local.example.jsonc) 或 [DSV4 模板](config/dsv4_local.example.jsonc)，
@@ -136,7 +222,10 @@ python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_random_batch_grid \
 上传失败会令 pipeline 报错，本地压缩包保留以便重试。上传状态和压缩包 SHA-256 记录在本地
 `pipeline_summary.json`；压缩包内的该文件是上传前的后处理完成快照。
 
-### AOne 长耗时 grid 分片
+### AOne 长耗时 grid 分片（低层诊断流程）
+
+以下 `ci-prepare`、`ci-plan`、`ci-collect` 分阶段流程仍受支持，适合检查生成配置、
+手动控制分片与时间预算，或单独重收集已有 testlogs。日常首次测试优先使用上文 `aone-run`。
 
 AOne 远程 action 的 timeout 上限为 7200 秒。不要让一份约 6 小时的 grid 作为单个
 Bazel test 执行；先将它拆成多个独立 target，由远程 TestRunner 并行调度：

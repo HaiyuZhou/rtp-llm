@@ -8,14 +8,18 @@ import json
 import os
 import platform
 import re
+import shlex
 import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from rtp_llm.test.perf_test.cache_grid.config.grid_config import dedupe_cache_grid_cases
-from rtp_llm.test.perf_test.cache_grid.config.perf_profile import profile_environment
+from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
+    is_sensitive_environment_name,
+    profile_environment,
+)
 from rtp_llm.test.perf_test.cache_grid.config.run_request import (
     ResolvedRunRequest,
     resolve_run_request,
@@ -104,6 +108,17 @@ def make_run_paths(
         "generated directory",
     )
     return RunPaths(result_root, inputs_dir, generated_dir)
+
+
+def _engine_summary(engine: Mapping[str, Any]) -> Dict[str, Any]:
+    """Copy the display view without changing arguments passed to the engine."""
+    return {
+        **engine,
+        "args": {
+            name: "<redacted>" if is_sensitive_environment_name(name) else value
+            for name, value in engine["args"].items()
+        },
+    }
 
 
 def build_local_plan(
@@ -227,6 +242,10 @@ def build_local_plan(
         "effective_case_count": len(request_cases),
         "gpu_count": resolved.gpu_count,
         "devices": devices,
+        "world_size": resolved.world_size,
+        "model": resolved.model,
+        "engine": _engine_summary(resolved.engine),
+        "grid": resolved.grid,
         "engine_env": resolved.engine_env,
         "runtime_env": resolved.runtime_env,
         "commands": {"run": command},
@@ -349,6 +368,10 @@ def build_aone_plan(
         "gpu_type": args.gpu_type,
         "gpu_count": resolved.gpu_count,
         "resource": args.resource,
+        "world_size": resolved.world_size,
+        "model": resolved.model,
+        "engine": _engine_summary(resolved.engine),
+        "grid": resolved.grid,
         "shard_count": ci_plan["shard_count"],
         "build_jobs": build_jobs,
         "max_parallel": args.max_parallel,
@@ -367,6 +390,57 @@ def build_aone_plan(
         summary=summary,
         ci_plan=ci_plan,
     )
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description="Run complete cache perf workflows")
+    modes = root.add_subparsers(dest="mode", required=True)
+    local = modes.add_parser("local-run", help="run on explicitly selected local GPUs")
+    aone = modes.add_parser("aone-run", help="build, test and collect AOne shards")
+    for command in (local, aone):
+        command.add_argument("--model-json", required=True)
+        command.add_argument("--engine-json", required=True)
+        command.add_argument("--grid-json", required=True)
+        command.add_argument("--engine-env-json", default="{}")
+        command.add_argument("--runtime-env-json", default="{}")
+        command.add_argument("--result-root", type=Path)
+        command.add_argument("--bazel", default="bazelisk")
+        command.add_argument(
+            "--bazel-arg",
+            action="append",
+            default=[],
+            help="repeatable Bazel override; use --bazel-arg=--flag=value",
+        )
+        command.add_argument("--dry-run", action="store_true")
+    local.add_argument("--devices", required=True)
+    aone.add_argument(
+        "--resource", required=True, choices=sorted(AONE_RESOURCE_CONFIGS)
+    )
+    aone.add_argument("--gpu-type", required=True)
+    aone.add_argument("--build-jobs", type=int)
+    aone.add_argument("--max-parallel", type=int, default=1)
+    return root
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    argument_parser = parser()
+    args = argument_parser.parse_args(argv)
+    try:
+        plan = (
+            build_local_plan(args, repo=REPO)
+            if args.mode == "local-run"
+            else build_aone_plan(args, repo=REPO)
+        )
+    except ValueError as error:
+        argument_parser.error(str(error))
+    if args.dry_run:
+        print(json.dumps(plan.summary, ensure_ascii=False, indent=2, sort_keys=True))
+        for stage, command in plan.commands.items():
+            print(f"{stage}: {shlex.join(command)}")
+        return 0
+    if args.mode == "local-run":
+        return execute_local_plan(plan)
+    return execute_aone_plan(plan)
 
 
 def write_artifacts(artifacts: Mapping[Path, bytes]) -> None:

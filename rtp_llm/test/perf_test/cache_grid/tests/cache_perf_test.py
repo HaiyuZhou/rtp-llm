@@ -569,6 +569,26 @@ class CachePerfTest(unittest.TestCase):
         self.assertTrue((self.result / cli.MANIFEST).exists())
         self.assertEqual(run.call_args.kwargs["cwd"], cli.REPO)
 
+    def test_legacy_main_dispatches_only_high_level_modes(self):
+        from rtp_llm.test.perf_test.cache_grid.runner import cache_perf_orchestrator
+
+        for mode in ("local-run", "aone-run"):
+            with self.subTest(mode=mode), patch.object(
+                cache_perf_orchestrator, "main", return_value=0, create=True
+            ) as high_level, patch.object(cli, "parser") as legacy_parser:
+                self.assertEqual(cli.main([mode, "--help"]), 0)
+                high_level.assert_called_once_with([mode, "--help"])
+                legacy_parser.assert_not_called()
+
+    def test_legacy_main_dispatches_process_arguments_to_high_level_mode(self):
+        from rtp_llm.test.perf_test.cache_grid.runner import cache_perf_orchestrator
+
+        with patch.object(
+            cache_perf_orchestrator, "main", return_value=7, create=True
+        ) as high_level, patch("sys.argv", ["cache_perf", "aone-run", "--help"]):
+            self.assertEqual(cli.main(), 7)
+        high_level.assert_called_once_with(["aone-run", "--help"])
+
     def test_explicit_default_value_overrides_profile(self):
         from rtp_llm.test.perf_test.batch_decode_test import parse_args
 

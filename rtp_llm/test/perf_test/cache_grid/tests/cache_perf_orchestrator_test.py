@@ -1,8 +1,11 @@
 import argparse
 import hashlib
+import io
 import json
+import shlex
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
@@ -48,6 +51,219 @@ class CachePerfOrchestratorTest(unittest.TestCase):
         )
         values.update(updates)
         return self.local_args(**values)
+
+    def local_argv(self):
+        args = self.local_args()
+        return [
+            "local-run",
+            "--devices=0",
+            f"--model-json={args.model_json}",
+            f"--engine-json={args.engine_json}",
+            f"--grid-json={args.grid_json}",
+        ]
+
+    def aone_argv(self):
+        return [
+            "aone-run",
+            "--resource=daily",
+            "--gpu-type=SM103_CU13",
+            *self.local_argv()[2:],
+        ]
+
+    def test_cli_rejects_cross_mode_options_before_planning(self):
+        cases = [
+            (self.local_argv(), "--resource=daily"),
+            (self.local_argv(), "--gpu-type=SM103_CU13"),
+            (self.local_argv(), "--build-jobs=2"),
+            (self.local_argv(), "--max-parallel=2"),
+            (self.aone_argv(), "--devices=0"),
+        ]
+        with patch.object(orchestrator, "build_local_plan") as local, patch.object(
+            orchestrator, "build_aone_plan"
+        ) as aone:
+            for argv, option in cases:
+                with self.subTest(option=option), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        orchestrator.main([*argv, option])
+                    self.assertEqual(error.exception.code, 2)
+        local.assert_not_called()
+        aone.assert_not_called()
+        self.assertEqual(list(self.repo.iterdir()), [])
+
+    def test_cli_requires_json_arguments_and_mode_specific_selection(self):
+        for argv in (self.local_argv(), self.aone_argv()):
+            for option in argv[1:]:
+                with self.subTest(mode=argv[0], missing=option.split("=")[0]):
+                    with redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit) as error:
+                            orchestrator.parser().parse_args(
+                                [value for value in argv if value != option]
+                            )
+                    self.assertEqual(error.exception.code, 2)
+
+    def test_cli_defaults_environment_and_rejects_unknown_resource(self):
+        for argv in (self.local_argv(), self.aone_argv()):
+            args = orchestrator.parser().parse_args(argv)
+            self.assertEqual(args.engine_env_json, "{}")
+            self.assertEqual(args.runtime_env_json, "{}")
+            self.assertEqual(args.bazel, "bazelisk")
+            self.assertEqual(args.bazel_arg, [])
+        args = orchestrator.parser().parse_args(self.aone_argv())
+        self.assertEqual(args.max_parallel, 1)
+        self.assertIsNone(args.build_jobs)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            orchestrator.parser().parse_args([*self.aone_argv(), "--resource=unknown"])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_cli_dry_run_prints_normalized_plans_without_writes_or_execution(self):
+        for argv, stages in (
+            (self.local_argv(), ["run"]),
+            (self.aone_argv(), ["build", "test"]),
+        ):
+            output = io.StringIO()
+            result_root = self.repo / "results with spaces"
+            with self.subTest(mode=argv[0]), patch.object(
+                orchestrator, "REPO", self.repo
+            ), patch.object(orchestrator.subprocess, "run") as run, patch.object(
+                orchestrator, "write_artifacts"
+            ) as write, patch.object(
+                orchestrator, "write_run_state"
+            ) as state, redirect_stdout(
+                output
+            ):
+                code = orchestrator.main(
+                    [
+                        *argv,
+                        f"--result-root={result_root}",
+                        "--bazel-arg=--jobs=7",
+                        "--dry-run",
+                    ]
+                )
+                self.assertEqual(code, 0)
+                run.assert_not_called()
+                write.assert_not_called()
+                state.assert_not_called()
+                self.assertEqual(list(self.repo.iterdir()), [])
+                rendered = output.getvalue()
+                summary, _ = json.JSONDecoder().raw_decode(rendered)
+                self.assertEqual(summary["world_size"], 1)
+                self.assertEqual(summary["grid"]["max_input_len"], 4095)
+                self.assertEqual(summary["result_root"], str(result_root))
+                lines = [
+                    line
+                    for line in rendered.splitlines()
+                    if any(line.startswith(f"{stage}: ") for stage in stages)
+                ]
+                self.assertEqual(len(lines), len(stages))
+                for stage, line in zip(stages, lines):
+                    command = shlex.split(line.split(": ", 1)[1])
+                    self.assertEqual(command, summary["commands"][stage])
+                    if stage == "run":
+                        self.assertEqual(command[command.index("--") - 1], "--jobs=7")
+                    else:
+                        self.assertEqual(command[-1], "--jobs=7")
+
+    def test_cli_invalid_request_becomes_usage_error_without_side_effects(self):
+        with patch.object(orchestrator, "REPO", self.repo), patch.object(
+            orchestrator.subprocess, "run"
+        ) as run, redirect_stderr(io.StringIO()) as output:
+            with self.assertRaises(SystemExit) as error:
+                orchestrator.main([*self.local_argv(), "--model-json={}"])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("error:", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+        self.assertEqual(list(self.repo.iterdir()), [])
+        run.assert_not_called()
+
+    def credential_engine_json(self):
+        engine = json.loads(self.local_args().engine_json)
+        engine["args"].update(
+            {
+                "api_key": "review-sentinel-only",
+                "REMOTE_PASSWORD": "review-sentinel-only",
+                "client_secret": "review-sentinel-only",
+                "access_key_id": "review-sentinel-only",
+                "credential_file": "review-sentinel-only",
+                "token": "review-sentinel-only",
+                "hf_token": "review-sentinel-only",
+                "max_tokens": 128,
+                "tokenizer_mode": "auto",
+            }
+        )
+        return json.dumps(engine)
+
+    def test_plan_summaries_redact_credentials_without_changing_runtime_artifacts(self):
+        engine_json = self.credential_engine_json()
+        original_args = json.loads(engine_json)["args"]
+        for args, builder, profile_name in (
+            (
+                self.local_args(engine_json=engine_json),
+                orchestrator.build_local_plan,
+                "profile.snapshot.json",
+            ),
+            (
+                self.aone_args(engine_json=engine_json),
+                orchestrator.build_aone_plan,
+                "profile.json",
+            ),
+        ):
+            with self.subTest(mode=args.mode):
+                plan = builder(args, repo=self.repo, run_id="redaction", inherited={})
+                runtime_profile = json.loads(
+                    plan.artifacts[plan.paths.inputs_dir / profile_name]
+                )
+                for key, value in original_args.items():
+                    self.assertEqual(plan.resolved.engine["args"][key], value)
+                    self.assertEqual(runtime_profile["engine_args"][key], value)
+                summary_args = plan.summary["engine"]["args"]
+                self.assertEqual(set(summary_args), set(plan.resolved.engine["args"]))
+                self.assertEqual(summary_args["act_type"], "BF16")
+                self.assertEqual(summary_args["max_tokens"], 128)
+                self.assertEqual(summary_args["tokenizer_mode"], "auto")
+                self.assertEqual(summary_args["reuse_cache"], 1)
+                for key, value in original_args.items():
+                    if value == "review-sentinel-only":
+                        self.assertEqual(summary_args[key], "<redacted>")
+                self.assertNotIn("review-sentinel-only", json.dumps(plan.summary))
+
+    def test_cli_dry_run_never_prints_credential_engine_values(self):
+        for argv in (self.local_argv(), self.aone_argv()):
+            output = io.StringIO()
+            with self.subTest(mode=argv[0]), patch.object(
+                orchestrator, "REPO", self.repo
+            ), redirect_stdout(output):
+                self.assertEqual(
+                    orchestrator.main(
+                        [
+                            *argv,
+                            f"--engine-json={self.credential_engine_json()}",
+                            "--dry-run",
+                        ]
+                    ),
+                    0,
+                )
+                rendered = output.getvalue()
+                self.assertNotIn("review-sentinel-only", rendered)
+                summary, _ = json.JSONDecoder().raw_decode(rendered)
+                self.assertEqual(summary["engine"]["args"]["api_key"], "<redacted>")
+                self.assertEqual(summary["engine"]["args"]["act_type"], "BF16")
+                self.assertEqual(list(self.repo.iterdir()), [])
+
+    def test_cli_executes_selected_plan_and_propagates_exit_code(self):
+        for argv, executor, other in (
+            (self.local_argv(), "execute_local_plan", "execute_aone_plan"),
+            (self.aone_argv(), "execute_aone_plan", "execute_local_plan"),
+        ):
+            with self.subTest(mode=argv[0]), patch.object(
+                orchestrator, "REPO", self.repo
+            ), patch.object(
+                orchestrator, executor, return_value=9
+            ) as execute, patch.object(
+                orchestrator, other
+            ) as unused:
+                self.assertEqual(orchestrator.main(argv), 9)
+                self.assertEqual(execute.call_args.args[0].mode, argv[0])
+                unused.assert_not_called()
 
     def test_aone_plan_expands_resource_and_separates_concurrency(self):
         args = self.aone_args(build_jobs=64, max_parallel=2)

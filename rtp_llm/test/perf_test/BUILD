@@ -1047,6 +1047,13 @@ py_test(
 )
 
 py_test(
+    name = "cache_perf_orchestrator_test",
+    main = "cache_grid/tests/cache_perf_orchestrator_test.py",
+    srcs = ["cache_grid/tests/cache_perf_orchestrator_test.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
     name = "cache_workspace_budget_test",
     main = "cache_grid/tests/workspace_budget_test.py",
     srcs = ["cache_grid/tests/workspace_budget_test.py"],

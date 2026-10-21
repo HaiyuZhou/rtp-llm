@@ -105,6 +105,18 @@ class CachePerfCiTest(unittest.TestCase):
         values.update(updates)
         return argparse.Namespace(**values)
 
+    def test_build_input_artifacts_has_no_output_path_dependency(self):
+        args = self.prepare_args(inputs_dir=None)
+        bundle = ci.build_input_artifacts(args)
+        self.assertEqual(set(bundle["artifacts"]), {ci.PROFILE_NAME, ci.GRID_NAME})
+        self.assertEqual(
+            json.loads(bundle["artifacts"][ci.PROFILE_NAME]), bundle["profile_payload"]
+        )
+        self.assertEqual(
+            json.loads(bundle["artifacts"][ci.GRID_NAME]), bundle["grid_payload"]
+        )
+        self.assertEqual(bundle["grid_payload"]["profile"], bundle["profile_payload"])
+
     def test_prepare_generates_deterministic_valid_profile_and_grid(self):
         first = ci.create_inputs(self.prepare_args(), repo=self.repo)
         second = ci.create_inputs(

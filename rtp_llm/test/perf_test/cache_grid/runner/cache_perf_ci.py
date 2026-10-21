@@ -125,9 +125,8 @@ def _json_settings(
     return result
 
 
-def create_inputs(args: argparse.Namespace, *, repo: Path) -> Dict[str, Any]:
-    """Generate validated profile/grid inputs from CI-friendly scalar options."""
-    output_dir = _new_top_level_dir(args.inputs_dir, repo, "--inputs-dir")
+def build_input_artifacts(args: argparse.Namespace) -> Dict[str, Any]:
+    """Build validated profile/grid payloads and bytes without output paths."""
     tokenizer_path = args.tokenizer_path or args.checkpoint_path
     if not args.model_label or not args.model_type or not args.checkpoint_path:
         raise ValueError(
@@ -239,18 +238,25 @@ def create_inputs(args: argparse.Namespace, *, repo: Path) -> Dict[str, Any]:
     profile_sha256 = fingerprint(profile)
     grid["profile"] = profile
     grid["profile_sha256"] = profile_sha256
-    artifacts = {
-        PROFILE_NAME: _encoded(profile),
-        GRID_NAME: _encoded(grid),
-    }
+    artifacts = {PROFILE_NAME: _encoded(profile), GRID_NAME: _encoded(grid)}
     return {
-        "output_dir": str(output_dir),
-        "profile": str(output_dir / PROFILE_NAME),
-        "grid": str(output_dir / GRID_NAME),
+        "profile_payload": profile,
+        "grid_payload": grid,
         "profile_fingerprint": profile_sha256,
         "grid_sha256": _sha(artifacts[GRID_NAME]),
         "grid_summary": grid["summary"],
         "artifacts": artifacts,
+    }
+
+
+def create_inputs(args: argparse.Namespace, *, repo: Path) -> Dict[str, Any]:
+    output_dir = _new_top_level_dir(args.inputs_dir, repo, "--inputs-dir")
+    result = build_input_artifacts(args)
+    return {
+        **result,
+        "output_dir": str(output_dir),
+        "profile": str(output_dir / PROFILE_NAME),
+        "grid": str(output_dir / GRID_NAME),
     }
 
 

@@ -43,8 +43,16 @@ Kineto defaults to 20 actual steps on every rank; Nsight requires a duration:
 ```
 
 Both captures start after steady qualification and preserve the measurement window.
+Both backends validate completed files after request drain in a bounded subprocess;
+its analysis shares the original capture deadline. Raw files remain available
+after timeout or validation failure. TP shared-cache ownership requires explicit
+server provenance and matching participant layouts; peer-local counters remain
+visible unchanged in the raw evidence.
 Do not supply `--cases`. See [Nsight evidence and attribution](docs/reference.md#continuous-nsight)
 for artifacts, explicit rank markers, independent validity and attribution limits.
+The [runtime acceptance record](docs/reference.md#validated-runtime-acceptance)
+covers real Flash baseline, independent profiles, fixed/all-cold capacity variants
+and cancellation, including retained failed attempts.
 
 复制 [通用模板](config/local.example.jsonc) 或 [DSV4 模板](config/dsv4_local.example.jsonc)，
 填写测试机器实际配置。模板数值只是示例，不代表其他模型的容量或缓存粒度。

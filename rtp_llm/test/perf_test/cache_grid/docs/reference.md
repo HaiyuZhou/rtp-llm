@@ -303,6 +303,24 @@ and successful DEVICE-to-HOST publication deltas against the before-seed epoch
 baseline. EVICT and STORE publication use only the HOST destination endpoint;
 source endpoint counters are never added again. SWA/LINEAR remain observations.
 
+TP cache metadata can have a server-declared shared owner. In that mode the
+frozen evidence records the explicit owner rank (including presence of rank0),
+all participant service identities, matching group tags and block/payload/storage/
+CRC geometry, and all-participant publication scope. Owner occupancy and
+publication are evaluated on the owner's clock and intersected with every
+participant's fresh observations. Root publication certifies successful transfer
+completion on all declared participants. Raw peer-local allocator counters remain
+unchanged; zero peer metadata is never replaced with invented occupancy. Missing
+ownership, incompatible layouts, changed identities or publication scope fail
+closed. Independent ownership continues to use each rank's local counters.
+Sparse zero counters may acquire new endpoints; an existing endpoint disappearing
+or decreasing is still a reset, including when another rank is temporarily absent.
+The initial inventory requires every rank. During an epoch, identity-free transport
+errors and missing peers create unknown intervals without contributing coverage or
+advancing step cursors. Concrete partial payloads still undergo frozen ownership,
+layout and counter checks before missing-peer handling; observed corruption remains
+fatal and cannot be hidden by another rank's error.
+
 `decode_pressure_response(response, client_send_s, client_receive_s,
 expected_ranks)` accepts the schema-1 protobuf and returns immutable evaluator
 samples plus the complete serialized wire response. `raw_pressure_record` with
@@ -357,6 +375,10 @@ active_step_started_s, running, waiting)` uses client-clock seconds.
 Update progress from completions, allocation/publication deltas, and actual
 execution-step evidence. A recent active long-prefill step qualifies until the
 explicit activity timeout; queued work alone cannot mask lack of progress forever.
+FIFO and fixed-batch schedulers expose observed waiting plus loading requests under
+their existing queue lock, excluding running requests. Unsupported schedulers or
+grouped queues retain unavailable semantics. A TP peer's observed local queue0
+does not infer a global queue size.
 
 ### Full-pressure lifecycle (internal opt-in API)
 
@@ -709,6 +731,12 @@ occupy sender workers. The fixed measurement window continues after early trace
 completion; unfinished captures receive same-distribution support subject to
 the configured capture/trace deadlines and support limit. Cleanup is bounded;
 a blocked transport or collector is reported as incomplete, not successful.
+Online waiting checks only status, identity and artifact readiness. After request
+drain and executor shutdown, a fresh interpreter loads and validates one rank file
+at a time, using only the original capture deadline's remaining budget. Timeout
+terminates and reaps the analysis process; raw trace files are retained. Analysis
+does not extend measurement or support windows. The profile result records the
+remaining analysis budget, elapsed time and per-file sizes/timings.
 
 Each rank's `capture_begin_ns` and `capture_end_ns` are owner-thread
 `CLOCK_MONOTONIC` collection boundaries, immediately before enable and after
@@ -724,6 +752,11 @@ thread and interval, then to GPU kernels by correlation. GPU pid/tid values are
 not interpreted as OS identities. Kineto timestamps are never equated with
 server monotonic timestamps. Missing ranks, foreign identities, malformed JSON,
 unlinked model kernels and insufficient observed steps invalidate the trace.
+An additional kernel with exactly one runtime/driver correlation whose launch is
+outside every forward and pressure-step scope is counted separately as
+`non_forward_correlated`. It is not assigned to a model step or used for gap
+attribution. Missing or ambiguous correlation and launches overlapping a forward
+or step boundary remain invalid.
 First-step gather omission and collection-boundary steps are excluded from
 usable adjacent pure-prefill pairs. The compact parser fixture comes from the
 installed CUDA toolchain; it is not a real model acceptance result.
@@ -742,13 +775,20 @@ step-history overflow is explicit and cannot certify a trace as complete.
 
 Use a fresh directory independently of baseline and Kineto. Nsight reuses the
 existing `nsys launch --trace=cuda,nvtx,osrt --session-new=...` session. An independent
-controller issues start only after steady qualification, then stop at the earlier
-explicit `nsys_duration_s`, capture deadline or support/cancellation boundary.
+controller issues start only after steady qualification, then measures the explicit
+`nsys_duration_s` from the successful start acknowledgement. Capture deadline and
+support/cancellation boundaries can stop it earlier. The pre-start call timestamp
+is retained only for the conservative pressure envelope.
 It never calls Kineto start. Start failure still attempts stop; start, stop and
 export failures remain in the manifest, including multiple failures and partial
 artifacts. Each command has the explicit trace timeout. Stop/report flush and
 SQLite export run off sender workers; controller operation budgets are recorded.
 The fixed measurement continues after early capture completion.
+After drain, normalization and JSON serialization run in the same bounded exec
+worker mechanism as Kineto, using the original capture deadline remainder.
+Timeout kills and reaps the worker. A `.normalized.partial.json` file remains
+explicitly partial; only a completed serialization is renamed `.normalized.json`.
+The summary records remaining budget, parse/serialization/wall time and sizes.
 
 Installed toolchain checked: NVIDIA Nsight Systems 2025.6.3.541-256337736014v0.
 Its `nsys export --help` documents the command used here:
@@ -766,6 +806,15 @@ All times are nanoseconds within this export only (Kineto JSON uses microseconds
 convert by 1000 when projecting to these units). Never compare export timestamps
 to server monotonic or wall-clock timestamps. Summary includes per-rank observed/
 usable IDs and adjacent-pair counts, exclusions, artifact paths and command errors.
+
+The installed exporter can leave boundary NVTX ranges in its system-clock domain
+while completed ranges and CUDA events are capture-relative. Conversion requires
+unique, consistent `TARGET_INFO_SESSION_START_TIME.systemClockNs` and
+`ANALYSIS_DETAILS` metadata, and the whole range must belong unambiguously to
+the metadata-defined absolute capture interval. Normalized events retain raw
+times and conversion provenance. Repaired boundary steps still require valid
+CUDA correlations but are excluded from usable adjacent pairs; repaired internal
+steps or missing/inconsistent/ambiguous/out-of-range metadata remain invalid.
 
 Only continuous Nsight enables `RTP_LLM_PRESSURE_NVTX=1` in the service. RAII ranges
 emit `pressure.step/<actual_step_id>` with an unsigned world-rank payload and
@@ -794,3 +843,51 @@ time or CPU delay. CPU wall and thread-CPU evidence remain separate. Perf/OS Run
 traces can supply additional linked evidence, never arithmetic subtraction.
 Real production marker/count and multi-rank Flash acceptance must be verified in
 the diagnostic matrix; toolchain smoke and parser fixtures are not that acceptance.
+
+### Validated runtime acceptance
+
+On 2026-10-21, DeepSeek-V4-Flash at `/mnt/hf3fs/3fs/models/DeepSeek-V4-Flash`
+passed the following independent TP4/EP4/DP1 runs on four NVIDIA L20D GPUs using
+the matching CUDA13 Bazel/runfiles build. Evidence is retained under
+`/data0/zhouhaiyu.zhy/tmp/continuous-full-pressure-20261020-flash/`, particularly
+`acceptance-matrix.json`, `acceptance-final-report.md` and `failure-matrix.md`.
+Each attempt preserves its command, source/native identities, frozen input
+snapshots, raw samples, request outcomes and service logs.
+
+| Attempt | Measurement | Pressure coverage / longest invalid | Trace |
+| --- | --- | --- | --- |
+| `baseline-v11` | FIFO mixed, 60s | 1.0 / 0s | Not applicable |
+| `kineto-v3` | FIFO mixed, 60s | 1.0 / 0s | 20 observed steps/rank; 19 usable, 18 pairs |
+| `nsys-v3` | FIFO mixed, 60s | 1.0 / 0s | 10.726s actual; 21 observed/rank, 20 usable, 19 pairs |
+| `fixed-cold-v3` | Fixed batch2, all-cold, 60s | 1.0 / 0s | Not applicable |
+
+The first three share the same frozen profile/grid. Fixed batching required a
+separate frozen capacity variant: FULL 1023/SWA 2047/host 306 usable blocks rather
+than 127/127/18. Thresholds remain unchanged: device `floor(capacity*.82)-2`,
+host `ceil(capacity*.25)`, steady 3s, coverage >=.95 and longest invalid <=2s.
+The final fixed run observed effective FULL 850..922 (threshold 836), published
+host 180..287 (threshold 77), and 1692 actual FULL GPU-to-host copied/published
+blocks. Earlier fixed runs failed fill or host coverage and remain invalid.
+
+The accepted Nsight SQLite directly contains 21 production `pressure.step`
+markers per rank, with rank identity from `NVTX_EVENTS.uint64Value`.
+Report/SQLite/normalized sizes are 35,430,853/103,874,560/482,601,809 bytes.
+Normalization 12.301s plus serialization 12.392s demonstrates that a 5s analysis
+allowance is insufficient. The bounded exec worker completed in 25.436s within
+the original 59.038s remaining capture budget. Kineto analysis took 44.707s within
+59.507s remaining. These are measured toolchain/workload results, not universal
+latency guarantees. Baseline/Kineto/Nsight throughput was 2.25/1.90/2.033 requests/s;
+the runs are diagnostic and do not assert identical cache contents.
+
+The separate `cancellation-v1` experiment froze drain timeout 0.01s and retained
+the full 60s measurement. Two real RPC cancellations were accepted, execution
+correctly failed with `drain_timeout`, and final all-rank disable/service cleanup
+completed. Both server steps completed after client cancellation, approximately
+0.376s and 0.801s later; this does not demonstrate immediate GPU interruption.
+Real GPU transfer cancellation is separately covered by the native device-host
+transfer regression. All owned GPU allocations were released after the runs.
+
+One earlier Nsight attempt (`nsys-v2`) encountered a rank 2 native SIGSEGV whose
+library/function could not be identified without saved maps/core. Its artifacts
+remain invalid. The successful retry retained process maps; it does not establish
+that the earlier native crash was fixed. No unrelated native repair was made.

@@ -378,6 +378,114 @@ class CachePerfOrchestratorTest(unittest.TestCase):
                 self.assertIn(expected, plan.commands["build"])
                 self.assertIn("--jobs=1", plan.commands["test"])
 
+    def test_aone_plan_rejects_nonpositive_concurrency_before_paths_or_artifacts(self):
+        for option in ("build_jobs", "max_parallel"):
+            for value in (0, -1):
+                with self.subTest(option=option, value=value), patch.object(
+                    orchestrator, "make_run_paths", wraps=orchestrator.make_run_paths
+                ) as paths, patch.object(
+                    orchestrator.ci,
+                    "build_input_artifacts",
+                    wraps=orchestrator.ci.build_input_artifacts,
+                ) as artifacts, patch.object(
+                    Path, "mkdir"
+                ) as mkdir:
+                    with self.assertRaisesRegex(
+                        ValueError, option.replace("_", "-") + ".*positive"
+                    ):
+                        orchestrator.build_aone_plan(
+                            self.aone_args(**{option: value}), repo=self.repo
+                        )
+                    paths.assert_not_called()
+                    artifacts.assert_not_called()
+                    mkdir.assert_not_called()
+                    self.assertEqual(list(self.repo.iterdir()), [])
+
+    def test_plans_reject_managed_environment_before_paths_or_artifacts(self):
+        for builder, args in (
+            (orchestrator.build_local_plan, self.local_args),
+            (orchestrator.build_aone_plan, self.aone_args),
+        ):
+            for category in ("engine_env", "runtime_env"):
+                for name in (
+                    "GPU_COUNT",
+                    "LOCAL_WORLD_SIZE",
+                    "WORLD_RANK",
+                    "TP_SIZE",
+                    "DP_SIZE",
+                    "EP_SIZE",
+                    "HIP_VISIBLE_DEVICES",
+                    "CUDA_VISIBLE_DEVICES",
+                ):
+                    with self.subTest(
+                        mode=builder.__name__, category=category, name=name
+                    ), patch.object(
+                        orchestrator,
+                        "make_run_paths",
+                        wraps=orchestrator.make_run_paths,
+                    ) as paths, patch.object(
+                        orchestrator.ci,
+                        "build_input_artifacts",
+                        wraps=orchestrator.ci.build_input_artifacts,
+                    ) as artifacts, patch.object(
+                        Path, "mkdir"
+                    ) as mkdir:
+                        with self.assertRaisesRegex(ValueError, rf"{category}\.{name}"):
+                            builder(
+                                args(**{f"{category}_json": json.dumps({name: "0"})}),
+                                repo=self.repo,
+                            )
+                        paths.assert_not_called()
+                        artifacts.assert_not_called()
+                        mkdir.assert_not_called()
+                        self.assertEqual(list(self.repo.iterdir()), [])
+
+    def test_derived_topology_environment_overrides_inherited_launch_values(self):
+        expected = {
+            "WORLD_SIZE": "4",
+            "GPU_COUNT": "4",
+            "LOCAL_WORLD_SIZE": "4",
+            "WORLD_RANK": "0",
+            "TP_SIZE": "2",
+            "DP_SIZE": "2",
+            "EP_SIZE": "2",
+        }
+        model = '{"type":"qwen_2","checkpoint":"/models/qwen","topology":{"tp":2,"dp":2,"ep":2}}'
+        for builder, args in (
+            (
+                orchestrator.build_local_plan,
+                self.local_args(devices="0,1,2,3", model_json=model),
+            ),
+            (orchestrator.build_aone_plan, self.aone_args(model_json=model)),
+        ):
+            with self.subTest(mode=args.mode):
+                plan = builder(
+                    args, repo=self.repo, inherited={name: "0" for name in expected}
+                )
+                profile_name = (
+                    "profile.snapshot.json"
+                    if args.mode == "local-run"
+                    else "profile.json"
+                )
+                profile = json.loads(
+                    plan.artifacts[plan.paths.inputs_dir / profile_name]
+                )
+                for name, value in expected.items():
+                    self.assertEqual(profile["engine_env"].get(name), value)
+                    if args.mode == "local-run":
+                        self.assertEqual(plan.process_env[name], value)
+                        self.assertIn(
+                            f"--engine_env={name}={value}", plan.commands["run"]
+                        )
+                    else:
+                        build = plan.artifacts[
+                            plan.paths.generated_dir / "BUILD.bazel"
+                        ].decode()
+                        self.assertIn(
+                            json.dumps(name) + ": " + json.dumps(value), build
+                        )
+                self.assertEqual(plan.resolved.gpu_count, 4)
+
     def test_aone_plan_derives_gpu_count_from_topology_and_keeps_env_ownership(self):
         inherited = {"PATH": "/bin", "CC": "old-gcc", "API_TOKEN": "inherited-only"}
         args = self.aone_args(
@@ -509,7 +617,7 @@ class CachePerfOrchestratorTest(unittest.TestCase):
         self.assertEqual(list(self.repo.iterdir()), [])
 
     def test_local_plan_rejects_invalid_device_syntax_before_side_effects(self):
-        for devices in ("", "0,", ",0", "gpu0", "-1", "0,,1"):
+        for devices in ("", "0,", ",0", "gpu0", "-1", "+1", "0,,1", "２", "²", "١"):
             with self.subTest(devices=devices), self.assertRaisesRegex(
                 ValueError, "GPU indices"
             ):
@@ -517,6 +625,110 @@ class CachePerfOrchestratorTest(unittest.TestCase):
                     self.local_args(devices=devices), repo=self.repo
                 )
         self.assertEqual(list(self.repo.iterdir()), [])
+
+    def test_local_plan_canonicalizes_devices_in_all_launch_contracts(self):
+        args = self.local_args(
+            devices=" 02, 005 ",
+            model_json='{"type":"qwen_2","checkpoint":"/models/qwen","topology":{"tp":2}}',
+        )
+        plan = orchestrator.build_local_plan(args, repo=self.repo, inherited={})
+        launch = json.loads(plan.artifacts[plan.paths.result_root / cli.MANIFEST])
+        self.assertEqual(plan.summary["devices"], ["2", "5"])
+        self.assertEqual(launch["devices"], ["2", "5"])
+        self.assertEqual(plan.process_env["CUDA_VISIBLE_DEVICES"], "2,5")
+        self.assertEqual(launch["env"]["CUDA_VISIBLE_DEVICES"], "2,5")
+        self.assertIn("--engine_env=CUDA_VISIBLE_DEVICES=2,5", plan.commands["run"])
+        self.assertEqual(list(self.repo.iterdir()), [])
+
+    def test_local_plan_rejects_duplicates_after_device_canonicalization(self):
+        for devices in ("0,00", "02,2"):
+            with self.subTest(devices=devices), patch.object(
+                orchestrator, "make_run_paths"
+            ) as paths, patch.object(
+                orchestrator.ci, "build_input_artifacts"
+            ) as artifacts:
+                with self.assertRaisesRegex(ValueError, "must be unique"):
+                    orchestrator.build_local_plan(
+                        self.local_args(devices=devices), repo=self.repo
+                    )
+                paths.assert_not_called()
+                artifacts.assert_not_called()
+        self.assertEqual(list(self.repo.iterdir()), [])
+
+    def test_local_saved_resume_and_retest_preserve_gpu_mask_and_environment_fingerprint(
+        self,
+    ):
+        from rtp_llm.test.perf_test.batch_decode_test import (
+            _build_cache_resume_config,
+            parse_args,
+        )
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            resume_config_fingerprint,
+        )
+
+        plan = orchestrator.build_local_plan(
+            self.local_args(
+                devices="2,5",
+                model_json='{"type":"qwen_2","checkpoint":"/models/qwen","topology":{"tp":2}}',
+                engine_env_json='{"PERF_PROFILE_RUNS":"0"}',
+                runtime_env_json='{"CC":"/usr/bin/gcc"}',
+            ),
+            repo=self.repo,
+            inherited={"CUDA_VISIBLE_DEVICES": "7"},
+        )
+        root = plan.paths.result_root
+        orchestrator.write_artifacts(plan.artifacts)
+        (root / "cache_grid_results.json").write_text("{}")
+        saved = cli.load_saved(root)
+        self.assertEqual(saved["env"].get("CUDA_VISIBLE_DEVICES"), "2,5")
+        self.assertIn("--engine_env=CUDA_VISIBLE_DEVICES=2,5", saved["runner_args"])
+        expected_env = {k: plan.process_env[k] for k in saved["env"]}
+
+        def environment_fingerprint(runner_args, process_env):
+            parsed, remaining = parse_args(runner_args)
+            with patch.dict("os.environ", process_env, clear=True):
+                config = _build_cache_resume_config(
+                    parsed, remaining, list(saved["env"]), 64
+                )
+            environment = config["engine"]["environment"]
+            self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "2,5")
+            return resume_config_fingerprint(environment)
+
+        command = plan.commands["run"]
+        initial_fingerprint = environment_fingerprint(
+            command[command.index("--") + 1 :], plan.process_env
+        )
+        for mode in ("resume", "retest"):
+            argv = [mode, "--result-dir", str(root)]
+            if mode == "retest":
+                argv += ["--cases", "0"]
+            replay = cli.build_plan(
+                cli.parser().parse_args(argv), {"CUDA_VISIBLE_DEVICES": "7"}
+            )
+            orchestrator.write_artifacts(
+                {
+                    replay["destination"] / name: content
+                    for name, content in replay["artifacts"].items()
+                }
+            )
+            self.assertEqual(replay["process_env"]["CUDA_VISIBLE_DEVICES"], "2,5")
+            self.assertEqual(replay["summary"]["environment"], expected_env)
+            runner_args = [
+                value[len("--test_arg=") :]
+                for value in replay["command"]
+                if value.startswith("--test_arg=")
+            ]
+            self.assertEqual(
+                environment_fingerprint(runner_args, replay["process_env"]),
+                initial_fingerprint,
+            )
+            self.assertIn("--test_env=CUDA_VISIBLE_DEVICES=2,5", replay["command"])
+            self.assertIn(
+                "--test_arg=--engine_env=CUDA_VISIBLE_DEVICES=2,5", replay["command"]
+            )
+            if mode == "retest":
+                frozen = json.loads(replay["artifacts"][cli.MANIFEST])
+                self.assertEqual(frozen["env"], expected_env)
 
     def test_local_plan_derives_device_count_from_tp_dp_pp(self):
         args = self.local_args(
@@ -571,7 +783,7 @@ class CachePerfOrchestratorTest(unittest.TestCase):
                     ) as artifacts:
                         with self.assertRaisesRegex(
                             ValueError,
-                            rf"{category}\.CUDA_VISIBLE_DEVICES.*managed by --devices",
+                            rf"{category}\.CUDA_VISIBLE_DEVICES.*derived",
                         ):
                             orchestrator.build_local_plan(
                                 args,
@@ -939,6 +1151,386 @@ class CachePerfOrchestratorTest(unittest.TestCase):
         state = json.loads((plan.paths.result_root / "cache_perf_run.json").read_text())
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["stages"], {"build": {"returncode": 7}})
+
+    def test_execute_aone_records_build_launch_errors_and_interruptions(self):
+        for error, expected, status in (
+            (OSError("cannot launch build"), 1, "failed"),
+            (RuntimeError("build launch failed"), 1, "failed"),
+            (KeyboardInterrupt(), 130, "interrupted"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                plan = orchestrator.build_aone_plan(self.aone_args(), repo=self.repo)
+                events = []
+
+                def launch(command, **kwargs):
+                    events.append(command[1])
+                    self.assertFalse(plan.paths.result_root.exists())
+                    raise error.with_traceback(None)
+
+                with patch.object(
+                    orchestrator.subprocess, "run", side_effect=launch
+                ), patch.object(
+                    orchestrator.ci,
+                    "collect_results",
+                    side_effect=AssertionError("must not collect"),
+                ), patch.object(
+                    orchestrator.unified_pipeline,
+                    "run",
+                    side_effect=AssertionError("must not report"),
+                ):
+                    try:
+                        code = orchestrator.execute_aone_plan(plan)
+                    except (Exception, KeyboardInterrupt) as unhandled:
+                        self.fail(
+                            f"build launch escaped without terminal state: {unhandled!r}"
+                        )
+                self.assertEqual(code, expected)
+                self.assertEqual(events, ["build"])
+                state = json.loads(
+                    (plan.paths.result_root / "cache_perf_run.json").read_text()
+                )
+                self.assertEqual(state["status"], status)
+                self.assertEqual(set(state["stages"]), {"build"})
+                self.assertEqual(state["stages"]["build"]["returncode"], expected)
+                self.assertEqual(state["stages"]["build"]["status"], status)
+                self.assertEqual(state["stages"]["build"]["error"], repr(error))
+
+    def test_execute_aone_test_launch_errors_collect_partial_and_preserve_priority(
+        self,
+    ):
+        for error, expected, status in (
+            (OSError("cannot launch test"), 1, "failed"),
+            (RuntimeError("test launch failed"), 1, "failed"),
+            (KeyboardInterrupt(), 130, "interrupted"),
+        ):
+            for failure in (None, "collect", "pipeline"):
+                with self.subTest(error=type(error).__name__, failure=failure):
+                    plan = orchestrator.build_aone_plan(
+                        self.aone_args(), repo=self.repo
+                    )
+                    events = []
+
+                    def launch(command, **kwargs):
+                        events.append(command[1])
+                        self.assertFalse(plan.paths.result_root.exists())
+                        if command[1] == "test":
+                            raise error.with_traceback(None)
+                        return CompletedProcess(command, 0)
+
+                    def collect_outputs(args, *, repo):
+                        events.append("collect")
+                        self.assertFalse(plan.paths.result_root.exists())
+                        self.assertTrue(args.partial)
+                        self.assertTrue(args.skip_fit)
+                        if failure == "collect":
+                            raise ValueError("partial collection failed")
+                        return {"missing_shards": ["shard_01"]}, 0
+
+                    def report(args):
+                        events.append("pipeline")
+                        self.assertTrue(args.partial)
+                        self.assertTrue(args.skip_fit)
+                        if failure == "pipeline":
+                            raise RuntimeError("partial report failed")
+                        return 0
+
+                    with patch.object(
+                        orchestrator.subprocess, "run", side_effect=launch
+                    ), patch.object(
+                        orchestrator.ci, "collect_results", side_effect=collect_outputs
+                    ), patch.object(
+                        orchestrator.unified_pipeline, "run", side_effect=report
+                    ):
+                        try:
+                            code = orchestrator.execute_aone_plan(plan)
+                        except (Exception, KeyboardInterrupt) as unhandled:
+                            self.fail(
+                                f"test launch escaped without partial collection: {unhandled!r}"
+                            )
+                    self.assertEqual(code, expected)
+                    self.assertEqual(
+                        events,
+                        ["build", "test", "collect"]
+                        + ([] if failure == "collect" else ["pipeline"]),
+                    )
+                    state = json.loads(
+                        (plan.paths.result_root / "cache_perf_run.json").read_text()
+                    )
+                    self.assertEqual(state["status"], status)
+                    self.assertEqual(
+                        state["stages"]["test"],
+                        {
+                            "returncode": expected,
+                            "status": status,
+                            "error": repr(error),
+                        },
+                    )
+                    self.assertEqual(
+                        state["stages"]["collect"]["returncode"],
+                        int(failure == "collect"),
+                    )
+                    if failure == "collect":
+                        self.assertIn(
+                            "partial collection failed",
+                            state["stages"]["collect"]["error"],
+                        )
+                        self.assertNotIn("pipeline", state["stages"])
+                    else:
+                        self.assertEqual(
+                            state["stages"]["collect"]["missing_shards"], ["shard_01"]
+                        )
+                        self.assertEqual(
+                            state["stages"]["pipeline"]["returncode"],
+                            int(failure == "pipeline"),
+                        )
+                        if failure == "pipeline":
+                            self.assertIn(
+                                "partial report failed",
+                                state["stages"]["pipeline"]["error"],
+                            )
+
+    def test_execute_aone_does_not_swallow_unrelated_base_exceptions(self):
+        plan = orchestrator.build_aone_plan(self.aone_args(), repo=self.repo)
+        with patch.object(orchestrator.subprocess, "run", side_effect=SystemExit(42)):
+            with self.assertRaises(SystemExit) as error:
+                orchestrator.execute_aone_plan(plan)
+        self.assertEqual(error.exception.code, 42)
+
+    def write_case_results(self, destination, cases, **metadata):
+        metrics = []
+        for case in cases:
+            inp, cache, batch = (
+                case[key] for key in ("input_len", "cache_len", "batch_size")
+            )
+            requests = [
+                dict(
+                    success=True,
+                    input_len=inp,
+                    output_len=1,
+                    reuse_len=cache,
+                    prefill_time_ms=10 + index,
+                )
+                for index in range(batch)
+            ]
+            metrics.append(
+                {
+                    **case,
+                    "request_groups": [
+                        dict(count=batch, input_len=inp, cache_len=cache)
+                    ],
+                    "status": "ok",
+                    "measure_runs": 3,
+                    "success_runs": 3,
+                    "runs": [
+                        dict(
+                            valid=True,
+                            completed_requests=batch,
+                            requests=requests,
+                            batch_wall_time_ms=20,
+                        )
+                        for _ in range(3)
+                    ],
+                }
+            )
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "cache_grid_results.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "mode": "prefix_cache_grid",
+                    "complete": True,
+                    "metrics": metrics,
+                    "measure_runs": 3,
+                    **metadata,
+                }
+            )
+        )
+
+    def test_aone_test_launch_failure_collects_real_available_partial_outputs(self):
+        real_collect = orchestrator.ci.collect_results
+        real_pipeline = orchestrator.unified_pipeline.run
+        for error, code, status in (
+            (OSError("test launch failed"), 1, "failed"),
+            (KeyboardInterrupt(), 130, "interrupted"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                plan = orchestrator.build_aone_plan(
+                    self.aone_args(
+                        grid_json='{"cache_alignment":64,"compute_step":[256],"max_input_len":512,"fixed_cache_len":0}'
+                    ),
+                    repo=self.repo,
+                )
+                events = []
+
+                def launch(command, **kwargs):
+                    events.append(command[1])
+                    if command[1] == "test":
+                        shard = plan.ci_plan["shards"][0]
+                        self.write_case_results(
+                            self.repo
+                            / "bazel-testlogs"
+                            / plan.ci_plan["package"]
+                            / shard["name"]
+                            / "test.outputs",
+                            plan.request_cases[:1],
+                            complete=False,
+                            grid_sha256=shard["grid_sha256"],
+                            profile_sha256=plan.ci_plan["profile_fingerprint"],
+                        )
+                        raise error.with_traceback(None)
+                    return CompletedProcess(command, 0)
+
+                def collect_outputs(args, *, repo):
+                    events.append("collect")
+                    self.assertFalse(plan.paths.result_root.exists())
+                    self.assertTrue(args.partial)
+                    return real_collect(args, repo=repo)
+
+                def report(args):
+                    events.append("pipeline")
+                    self.assertTrue(args.partial)
+                    return real_pipeline(args)
+
+                with patch.object(orchestrator, "REPO", self.repo), patch.object(
+                    orchestrator.subprocess, "run", side_effect=launch
+                ), patch.object(
+                    orchestrator.ci, "collect_results", side_effect=collect_outputs
+                ), patch.object(
+                    orchestrator.unified_pipeline, "run", side_effect=report
+                ), redirect_stdout(
+                    io.StringIO()
+                ):
+                    try:
+                        actual = orchestrator.execute_aone_plan(plan)
+                    except (Exception, KeyboardInterrupt) as unhandled:
+                        self.fail(
+                            f"partial outputs lost on test launch failure: {unhandled!r}"
+                        )
+                self.assertEqual(actual, code)
+                self.assertEqual(events, ["build", "test", "collect", "pipeline"])
+                state = json.loads(
+                    (plan.paths.result_root / "cache_perf_run.json").read_text()
+                )
+                self.assertEqual(state["status"], status)
+                self.assertEqual(state["stages"]["test"]["returncode"], code)
+                self.assertEqual(state["stages"]["collect"]["returncode"], 0)
+                self.assertEqual(state["stages"]["pipeline"]["returncode"], 0)
+                batch = json.loads(
+                    (plan.paths.result_root / "batch_runs.json").read_text()
+                )
+                self.assertEqual(batch["collected_case_ids"], [0])
+                self.assertEqual(batch["expected_case_ids"], [0, 1])
+                summary = json.loads(
+                    (plan.paths.result_root / "pipeline_summary.json").read_text()
+                )
+                self.assertEqual(summary["status"], "partial")
+
+    def test_aone_records_collection_and_pipeline_interruptions(self):
+        for stage in ("collect", "pipeline"):
+            with self.subTest(stage=stage):
+                plan = orchestrator.build_aone_plan(self.aone_args(), repo=self.repo)
+                with patch.object(
+                    orchestrator.subprocess, "run", return_value=CompletedProcess([], 0)
+                ), patch.object(
+                    orchestrator.ci,
+                    "collect_results",
+                    return_value=({"missing_shards": []}, 0),
+                ) as collect, patch.object(
+                    orchestrator.unified_pipeline, "run", return_value=0
+                ) as pipeline:
+                    (collect if stage == "collect" else pipeline).side_effect = (
+                        KeyboardInterrupt()
+                    )
+                    try:
+                        code = orchestrator.execute_aone_plan(plan)
+                    except KeyboardInterrupt:
+                        self.fail(
+                            f"{stage} interruption escaped without terminal state"
+                        )
+                self.assertEqual(code, 130)
+                state = json.loads(
+                    (plan.paths.result_root / "cache_perf_run.json").read_text()
+                )
+                self.assertEqual(state["status"], "interrupted")
+                self.assertEqual(
+                    state["stages"][stage],
+                    {
+                        "returncode": 130,
+                        "status": "interrupted",
+                        "error": "KeyboardInterrupt()",
+                    },
+                )
+                if stage == "collect":
+                    self.assertNotIn("pipeline", state["stages"])
+
+    def test_nondefault_batch_reaches_real_observations_through_both_executors(self):
+        real_pipeline = orchestrator.unified_pipeline.run
+        for mode in ("local", "aone"):
+            with self.subTest(mode=mode):
+                args = getattr(self, f"{mode}_args")(
+                    grid_json='{"cache_alignment":64,"compute_step":[256],"max_input_len":512,"fixed_cache_len":0,"batch_size":2}'
+                )
+                plan = getattr(orchestrator, f"build_{mode}_plan")(
+                    args, repo=self.repo, inherited={}
+                )
+
+                def launch(command, **kwargs):
+                    if mode == "local":
+                        self.write_case_results(
+                            plan.paths.result_root, plan.request_cases
+                        )
+                    elif command[1] == "test":
+                        for shard in plan.ci_plan["shards"]:
+                            cases = [
+                                case
+                                for case in plan.request_cases
+                                if case["case_id"] in shard["case_ids"]
+                            ]
+                            self.write_case_results(
+                                self.repo
+                                / "bazel-testlogs"
+                                / plan.ci_plan["package"]
+                                / shard["name"]
+                                / "test.outputs",
+                                cases,
+                                grid_sha256=shard["grid_sha256"],
+                                profile_sha256=plan.ci_plan["profile_fingerprint"],
+                            )
+                    return CompletedProcess(command, 0)
+
+                def report(args):
+                    # Tiny synthetic results exercise collection/charts, not fitting.
+                    args.skip_fit = True
+                    return real_pipeline(args)
+
+                with patch.object(orchestrator, "REPO", self.repo), patch.object(
+                    orchestrator.subprocess, "run", side_effect=launch
+                ), patch.object(
+                    orchestrator.unified_pipeline, "run", side_effect=report
+                ), redirect_stdout(
+                    io.StringIO()
+                ):
+                    try:
+                        code = getattr(orchestrator, f"execute_{mode}_plan")(plan)
+                    except ValueError as error:
+                        self.fail(f"batch=2 observations were rejected: {error}")
+                self.assertEqual(code, 0)
+                audit = json.loads(
+                    (plan.paths.result_root / "report/audit.json").read_text()
+                )
+                self.assertEqual(audit["rejected_counts"], {})
+                self.assertEqual(audit["counts_by_batch"], {"2": 2})
+                rows = json.loads(
+                    (plan.paths.result_root / "report/observations.json").read_text()
+                )
+                self.assertEqual([row["batch_size"] for row in rows], [2, 2])
+                self.assertEqual([row["target_ms"] for row in rows], [11, 11])
+                self.assertEqual(sorted(row["case_id"] for row in rows), [0, 1])
+                self.assertTrue(
+                    (
+                        plan.paths.result_root / "report/latency.interactive.html"
+                    ).is_file()
+                )
 
     @patch.object(orchestrator.subprocess, "run")
     @patch.object(orchestrator.ci, "collect_results")

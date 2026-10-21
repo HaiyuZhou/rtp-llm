@@ -53,7 +53,17 @@ class RunRequestTest(unittest.TestCase):
             },
         )
         self.assertEqual(
-            resolved.engine_env, {"WORLD_SIZE": "1", "TOKENIZERS_PARALLELISM": "false"}
+            resolved.engine_env,
+            {
+                "WORLD_SIZE": "1",
+                "GPU_COUNT": "1",
+                "LOCAL_WORLD_SIZE": "1",
+                "WORLD_RANK": "0",
+                "TP_SIZE": "1",
+                "DP_SIZE": "1",
+                "EP_SIZE": "1",
+                "TOKENIZERS_PARALLELISM": "false",
+            },
         )
         with self.assertRaises(FrozenInstanceError):
             resolved.world_size = 2
@@ -100,6 +110,22 @@ class RunRequestTest(unittest.TestCase):
             request.resolve_run_request(
                 MODEL, ENGINE, GRID, "{}", '{"PATH":"$PATH:/x"}'
             )
+
+    def test_rejects_managed_gpu_and_topology_environment_in_both_categories(self):
+        for category in ("engine_env", "runtime_env"):
+            for name in (
+                "GPU_COUNT",
+                "LOCAL_WORLD_SIZE",
+                "WORLD_RANK",
+                "TP_SIZE",
+                "DP_SIZE",
+                "EP_SIZE",
+                "CUDA_VISIBLE_DEVICES",
+                "HIP_VISIBLE_DEVICES",
+            ):
+                with self.subTest(category=category, name=name):
+                    with self.assertRaisesRegex(ValueError, rf"{category}\.{name}"):
+                        self.resolve(**{f"{category}_json": json.dumps({name: "0"})})
 
     def test_rejects_cross_category_and_grid_conflicts(self):
         with self.assertRaisesRegex(ValueError, "max_input_len.*max_seq_len"):

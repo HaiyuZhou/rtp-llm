@@ -280,14 +280,35 @@ def resolve_run_request(
             f"environment variable appears in both sections: "
             f"engine_env.{name} and runtime_env.{name}"
         )
-    reserved = {"WORLD_SIZE", "TOKENIZERS_PARALLELISM"}
+    # These names control GPU locking/visibility or server process topology.
+    reserved = {
+        "WORLD_SIZE",
+        "GPU_COUNT",
+        "LOCAL_WORLD_SIZE",
+        "WORLD_RANK",
+        "TP_SIZE",
+        "DP_SIZE",
+        "EP_SIZE",
+        "CUDA_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "TOKENIZERS_PARALLELISM",
+    }
     for section, values in (("engine_env", engine_env), ("runtime_env", runtime_env)):
         managed = reserved & set(values)
         if managed:
             name = sorted(managed)[0]
             raise ValueError(f"{section}.{name} is derived and cannot be overridden")
     engine_env.update(
-        {"WORLD_SIZE": str(world_size), "TOKENIZERS_PARALLELISM": "false"}
+        {
+            "WORLD_SIZE": str(world_size),
+            "GPU_COUNT": str(world_size),
+            "LOCAL_WORLD_SIZE": str(world_size),
+            "WORLD_RANK": "0",
+            "TP_SIZE": str(topology["tp"]),
+            "DP_SIZE": str(topology["dp"]),
+            "EP_SIZE": str(topology["ep"]),
+            "TOKENIZERS_PARALLELISM": "false",
+        }
     )
     return ResolvedRunRequest(
         model=model,

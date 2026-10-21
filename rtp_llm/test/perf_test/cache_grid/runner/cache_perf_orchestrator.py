@@ -136,12 +136,6 @@ def build_local_plan(
         args.engine_env_json,
         args.runtime_env_json,
     )
-    for category, values in (
-        ("engine_env", resolved.engine_env),
-        ("runtime_env", resolved.runtime_env),
-    ):
-        if "CUDA_VISIBLE_DEVICES" in values:
-            raise ValueError(f"{category}.CUDA_VISIBLE_DEVICES is managed by --devices")
     bazel_config = LOCAL_PLATFORM_CONFIGS.get(machine or platform.machine())
     if bazel_config is None:
         supported = ", ".join(sorted(LOCAL_PLATFORM_CONFIGS))
@@ -149,8 +143,9 @@ def build_local_plan(
             f"unsupported local architecture; expected one of: {supported}"
         )
     devices = [value.strip() for value in args.devices.split(",")]
-    if not devices or any(not value or not value.isdigit() for value in devices):
+    if any(re.fullmatch(r"[0-9]+", value) is None for value in devices):
         raise ValueError("--devices must be a comma-separated list of GPU indices")
+    devices = [str(int(value)) for value in devices]
     if len(devices) != len(set(devices)):
         raise ValueError("--devices entries must be unique")
     if len(devices) != resolved.gpu_count:
@@ -189,6 +184,7 @@ def build_local_plan(
     effective_env = profile_environment(
         {"runtime_env": resolved.runtime_env, "engine_env": resolved.engine_env}
     )
+    effective_env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
     runner_args.extend(
         f"--engine_env={key}={value}" for key, value in sorted(effective_env.items())
     )
@@ -235,7 +231,6 @@ def build_local_plan(
     artifacts[paths.result_root / cli.MANIFEST] = cli.encoded(launch)
     process_env = dict(os.environ if inherited is None else inherited)
     process_env.update(effective_env)
-    process_env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
     summary = {
         "mode": "local-run",
         "result_root": str(paths.result_root),
@@ -269,6 +264,13 @@ def build_aone_plan(
     run_id: str | None = None,
     inherited: Mapping[str, str] | None = None,
 ) -> OrchestrationPlan:
+    build_jobs = (
+        args.build_jobs if args.build_jobs is not None else max(1, os.cpu_count() or 1)
+    )
+    if build_jobs <= 0:
+        raise ValueError("--build-jobs must be positive")
+    if args.max_parallel <= 0:
+        raise ValueError("--max-parallel must be positive")
     platform_config = resolve_gpu_platform(args.gpu_type)
     try:
         resource_configs = AONE_RESOURCE_CONFIGS[args.resource]
@@ -326,9 +328,6 @@ def build_aone_plan(
             paths.generated_dir / name: content
             for name, content in ci_plan["artifacts"].items()
         }
-    )
-    build_jobs = (
-        args.build_jobs if args.build_jobs is not None else max(1, os.cpu_count() or 1)
     )
     common = [f"--config={value}" for value in configs]
     build_command = [
@@ -454,7 +453,9 @@ def write_artifacts(artifacts: Mapping[Path, bytes]) -> None:
             stream.write(content)
 
 
-def postprocess_namespace(result_dir: Path, *, partial: bool) -> argparse.Namespace:
+def postprocess_namespace(
+    result_dir: Path, *, partial: bool, batch_size: int = 1
+) -> argparse.Namespace:
     return argparse.Namespace(
         mode="pipeline",
         profile=None,
@@ -475,7 +476,7 @@ def postprocess_namespace(result_dir: Path, *, partial: bool) -> argparse.Namesp
         dry_run=False,
         test_mode="run",
         skip_test=True,
-        batch_size=1,
+        batch_size=batch_size,
         grid_dir=None,
         result_root=None,
         skip_fit=partial,
@@ -498,7 +499,11 @@ def execute_local_plan(plan: OrchestrationPlan) -> int:
     if completed.returncode:
         return completed.returncode
     return unified_pipeline.run(
-        postprocess_namespace(result_dir=plan.paths.result_root, partial=False)
+        postprocess_namespace(
+            result_dir=plan.paths.result_root,
+            partial=False,
+            batch_size=plan.resolved.grid["batch_size"],
+        )
     )
 
 
@@ -509,7 +514,7 @@ def collect_namespace(plan: OrchestrationPlan, *, partial: bool) -> argparse.Nam
         bazel_testlogs=None,
         result_root=plan.paths.result_root,
         partial=partial,
-        batch_size=1,
+        batch_size=plan.resolved.grid["batch_size"],
         cards=plan.resolved.gpu_count,
         estimator="median",
         skip_fit=partial,
@@ -531,6 +536,18 @@ def write_run_state(path: Path, state: Dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _launch_stage(plan: OrchestrationPlan, stage: str) -> Dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            plan.commands[stage], cwd=REPO, env=plan.process_env, check=False
+        )
+    except KeyboardInterrupt as error:
+        return {"returncode": 130, "status": "interrupted", "error": repr(error)}
+    except Exception as error:
+        return {"returncode": 1, "status": "failed", "error": repr(error)}
+    return {"returncode": completed.returncode}
+
+
 def execute_aone_plan(plan: OrchestrationPlan) -> int:
     """Collect available test outputs while preserving the earliest stage failure."""
     state = {
@@ -549,20 +566,16 @@ def execute_aone_plan(plan: OrchestrationPlan) -> int:
     state_path = plan.paths.result_root / "cache_perf_run.json"
     write_artifacts(plan.artifacts)
 
-    build = subprocess.run(
-        plan.commands["build"], cwd=REPO, env=plan.process_env, check=False
-    )
-    state["stages"]["build"] = {"returncode": build.returncode}
-    if build.returncode:
-        state["status"] = "failed"
+    build = _launch_stage(plan, "build")
+    state["stages"]["build"] = build
+    if build["returncode"]:
+        state["status"] = build.get("status", "failed")
         write_run_state(state_path, state)
-        return build.returncode
+        return build["returncode"]
 
-    test = subprocess.run(
-        plan.commands["test"], cwd=REPO, env=plan.process_env, check=False
-    )
-    state["stages"]["test"] = {"returncode": test.returncode}
-    collect_args = collect_namespace(plan, partial=test.returncode != 0)
+    test = _launch_stage(plan, "test")
+    state["stages"]["test"] = test
+    collect_args = collect_namespace(plan, partial=test["returncode"] != 0)
     collect_code = 0
     pipeline_code = 0
     try:
@@ -571,6 +584,13 @@ def execute_aone_plan(plan: OrchestrationPlan) -> int:
             "returncode": collect_code,
             "missing_shards": collect_manifest["missing_shards"],
         }
+    except KeyboardInterrupt as error:
+        collect_code = 130
+        state["stages"]["collect"] = {
+            "returncode": 130,
+            "status": "interrupted",
+            "error": repr(error),
+        }
     except Exception as error:
         collect_code = 1
         state["stages"]["collect"] = {"returncode": 1, "error": repr(error)}
@@ -578,10 +598,22 @@ def execute_aone_plan(plan: OrchestrationPlan) -> int:
         try:
             pipeline_code = unified_pipeline.run(ci.pipeline_namespace(collect_args))
             state["stages"]["pipeline"] = {"returncode": pipeline_code}
+        except KeyboardInterrupt as error:
+            pipeline_code = 130
+            state["stages"]["pipeline"] = {
+                "returncode": 130,
+                "status": "interrupted",
+                "error": repr(error),
+            }
         except Exception as error:
             pipeline_code = 1
             state["stages"]["pipeline"] = {"returncode": 1, "error": repr(error)}
-    result = test.returncode or collect_code or pipeline_code
-    state["status"] = "complete" if result == 0 else "failed"
+    result = test["returncode"] or collect_code or pipeline_code
+    state["status"] = "complete"
+    for stage in ("test", "collect", "pipeline"):
+        outcome = state["stages"].get(stage, {})
+        if outcome.get("returncode"):
+            state["status"] = outcome.get("status", "failed")
+            break
     write_run_state(state_path, state)
     return result

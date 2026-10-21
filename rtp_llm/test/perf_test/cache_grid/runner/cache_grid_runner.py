@@ -997,7 +997,7 @@ class CacheGridRunner:
         pressure_scheduler: str = "batch_decode",
         pressure_batch_size: int = 1,
         pressure_client_concurrency: int = 2,
-        pressure_seed_count: int = 4,
+        pressure_seed_count: int | None = 4,
         pressure_request_rate: float = 0.0,
         pressure_arrival: str = "constant",
         pressure_random_seed: int = 0,
@@ -1144,7 +1144,12 @@ class CacheGridRunner:
                 raise ValueError(
                     "continuous pressure batch size and concurrency must be positive"
                 )
-            if pressure_seed_count <= 0:
+            if pressure_seed_count is None:
+                if pressure_config is None:
+                    raise ValueError(
+                        "automatic seed count requires full-pressure preload"
+                    )
+            elif isinstance(pressure_seed_count, bool) or pressure_seed_count <= 0:
                 raise ValueError("continuous pressure seed count must be positive")
             if not math.isfinite(pressure_request_rate) or pressure_request_rate < 0:
                 raise ValueError(
@@ -1854,6 +1859,9 @@ class CacheGridRunner:
         endpoint. limits must project resolved server admission/model/token/KV
         bounds, never guesses based on the requested workload.
         """
+        if self.pressure_seed_count is None:
+            raise ValueError("automatic seed count requires a resolved live seed plan")
+
         from google.protobuf.json_format import MessageToDict
 
         from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2

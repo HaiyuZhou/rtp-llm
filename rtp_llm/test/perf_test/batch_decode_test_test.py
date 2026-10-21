@@ -513,12 +513,41 @@ class BatchDecodeTest(unittest.TestCase):
                 ],
                 8192,
             )
+        self.assertEqual(projection["test_block_num"], 0)
         self.assertEqual(projection["model_tokens"], 32768)
         self.assertEqual(projection["batch_tokens"], 3 * 32768)
         self.assertEqual(projection["block_tokens"], 512)
         self.assertEqual(projection["target_ranks"], list(range(8)))
         with self.assertRaisesRegex(ValueError, "seq_size_per_block"):
             entry._full_pressure_startup(args, [], 8192)
+
+    def test_full_pressure_startup_freezes_resolved_synthetic_override(self):
+        from rtp_llm.test.perf_test import batch_decode_test as entry
+
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "profile.json"
+            profile.write_text(
+                json.dumps(
+                    dict(
+                        schema_version=1,
+                        engine=dict(seq_size_per_block=512),
+                        engine_args={"--test_block_num": 128},
+                    )
+                )
+            )
+            for override, expected in (
+                ([], 128),
+                (["--test_block_num=64"], 64),
+                (["--engine_arg=test_block_num=32"], 32),
+            ):
+                with self.subTest(override=override), patch.dict(
+                    os.environ, {}, clear=True
+                ):
+                    args, remaining = parse_args(
+                        ["--profile=" + str(profile), *override]
+                    )
+                    projection = entry._full_pressure_startup(args, remaining, 8192)
+                    self.assertEqual(projection["test_block_num"], expected)
 
     def test_full_pressure_parser_resolves_required_settings_and_count_conflict(self):
         flags = [
@@ -535,6 +564,19 @@ class BatchDecodeTest(unittest.TestCase):
         ]
         args, remaining = parse_args(flags)
         self.assertEqual(remaining, [])
+        self.assertEqual(args.cache_pressure_scheduler, "fifo")
+        self.assertEqual(args.cache_pressure_client_concurrency, 16)
+        self.assertIsNone(args.cache_pressure_seed_count)
+        explicit, _ = parse_args(flags + ["--cache_pressure_seed_count=2"])
+        self.assertEqual(explicit.cache_pressure_seed_count, 2)
+        automatic, _ = parse_args(flags + ["--cache_pressure_client_concurrency=0"])
+        self.assertEqual(automatic.cache_pressure_client_concurrency, 16)
+        with self.assertRaisesRegex(ValueError, "FIFO-only"):
+            parse_args(flags + ["--cache_pressure_scheduler=batch_decode"])
+        ordinary, _ = parse_args(["--cache_pressure_mode=continuous"])
+        self.assertEqual(ordinary.cache_pressure_scheduler, "batch_decode")
+        self.assertEqual(ordinary.cache_pressure_seed_count, 4)
+        self.assertEqual(ordinary.cache_pressure_client_concurrency, 0)
         self.assertEqual(args._pressure_config.measure_s, 60)
         self.assertEqual(args._pressure_config.fill_max_requests, 50)
         profiled, _ = parse_args(
@@ -2995,6 +3037,25 @@ class ContinuousPressureTest(unittest.TestCase):
 
 
 class FullPressurePublicTest(unittest.TestCase):
+    def test_automatic_seed_count_is_preserved_until_live_planning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.runner(
+                directory,
+                pressure_seed_count=None,
+                cases=[dict(case_id=0, batch_size=1, input_len=8192, cache_len=4096)],
+            )
+            self.addCleanup(runner._close_resources)
+            self.assertIsNone(runner.pressure_seed_count)
+            self.assertIsNone(
+                runner.run_config["workload"]["cache_pressure_seed_count"]
+            )
+            with self.assertRaisesRegex(
+                ValueError, "automatic seed count requires.*live"
+            ):
+                runner._run_full_pressure(
+                    runner.cases, self.settings(), None, None, [0], None
+                )
+
     def test_full_pressure_direct_resume_freezes_actual_schedule(self):
         for name, changed in (
             ("pressure_client_concurrency", 1),
@@ -3054,6 +3115,7 @@ class FullPressurePublicTest(unittest.TestCase):
                     "--partial=2",
                     "--cache_pressure_mode=continuous",
                     "--cache_pressure_preload",
+                    "--concurrency_limit=1",
                 ]
             )
             self.assertEqual(parsed[0].cache_measure_runs, 3)
@@ -3084,6 +3146,9 @@ class FullPressurePublicTest(unittest.TestCase):
                 self.assertEqual(run.call_count, 2)
             runner = run.call_args.args[0]
             self.addCleanup(runner._close_resources)
+            self.assertIsNone(runner.pressure_seed_count)
+            self.assertEqual(runner.pressure_client_concurrency, 16)
+            self.assertEqual(runner.pressure_scheduler, "fifo")
             self.assertEqual(runner.pressure_config, self.settings())
             self.assertEqual(
                 runner.run_config["pressure_settings"], asdict(self.settings())

@@ -16,6 +16,86 @@ from rtp_llm.test.perf_test.cache_grid.runner import cache_perf as cli
 
 
 class CachePerfTest(unittest.TestCase):
+    def test_full_pressure_defaults_to_fifo_automatic_seeding_and_formal_fill(self):
+        profile = self.pressure_profile()
+        del profile["cache_grid"]["pressure"]["fill_input_tokens"]
+        self.profile.write_text(json.dumps(profile))
+        plan = cli.build_plan(
+            self.args(extra=["--pressure-mode=continuous", "--pressure-preload"]), {}
+        )
+        launch = json.loads(plan["artifacts"][cli.MANIFEST])
+        runner = launch["runner_args"]
+        self.assertIn("--cache_pressure_scheduler=fifo", runner)
+        self.assertIn("--cache_pressure_client_concurrency=16", runner)
+        self.assertFalse(any("cache_pressure_seed_count" in arg for arg in runner))
+        self.assertEqual(
+            json.loads(plan["artifacts"]["profile.snapshot.json"])["cache_grid"][
+                "pressure"
+            ]["fill_input_tokens"],
+            102400,
+        )
+        for screening in (launch, plan["summary"]):
+            self.assertTrue(screening["formal_candidate"])
+            self.assertEqual(screening["formal_candidate_reasons"], [])
+            self.assertEqual(
+                screening["formal_candidate_scope"], "static_configuration"
+            )
+
+    def test_full_pressure_rejects_batch_decode_scheduler(self):
+        self.pressure_profile()
+        with self.assertRaisesRegex(ValueError, "FIFO-only"):
+            cli.build_plan(
+                self.args(
+                    extra=[
+                        "--pressure-mode=continuous",
+                        "--pressure-preload",
+                        "--pressure-scheduler=batch_decode",
+                    ]
+                ),
+                {},
+            )
+
+    def test_full_pressure_default_fifo_rejects_fixed_batch_size(self):
+        self.pressure_profile()
+        with self.assertRaisesRegex(ValueError, "does not apply to FIFO"):
+            cli.build_plan(
+                self.args(
+                    extra=[
+                        "--pressure-mode=continuous",
+                        "--pressure-preload",
+                        "--pressure-batch-size=2",
+                    ]
+                ),
+                {},
+            )
+
+    def test_full_pressure_static_screening_keeps_all_smoke_reasons(self):
+        profile = self.pressure_profile()
+        profile["engine_args"] = {"--test_block_num": 128}
+        self.profile.write_text(json.dumps(profile))
+        plan = cli.build_plan(
+            self.args(
+                extra=[
+                    "--pressure-mode=continuous",
+                    "--pressure-preload",
+                    "--pressure-seed-count=2",
+                    "--pressure-client-concurrency=2",
+                ]
+            ),
+            {},
+        )
+        launch = json.loads(plan["artifacts"][cli.MANIFEST])
+        self.assertIn("--cache_pressure_seed_count=2", launch["runner_args"])
+        expected = [
+            "manual_seed_count",
+            "client_inflight_below_16",
+            "synthetic_test_block_capacity",
+            "nonstandard_fill_target",
+        ]
+        for screening in (launch, plan["summary"]):
+            self.assertFalse(screening["formal_candidate"])
+            self.assertEqual(screening["formal_candidate_reasons"], expected)
+
     def test_continuous_nsys_has_explicit_duration_and_exclusive_collector(self):
         self.pressure_profile()
         plan = cli.build_plan(
@@ -152,6 +232,12 @@ class CachePerfTest(unittest.TestCase):
         self.assertTrue(
             any("--cache_pressure_preload" in value for value in resumed["command"])
         )
+        for key in (
+            "formal_candidate",
+            "formal_candidate_reasons",
+            "formal_candidate_scope",
+        ):
+            self.assertEqual(resumed["summary"][key], plan["summary"][key])
         with self.assertRaisesRegex(ValueError, "continuous|pressure"):
             cli.build_plan(
                 self.args("profile", explicit=False, extra=["--cases=7"]), {}
@@ -434,6 +520,8 @@ class CachePerfTest(unittest.TestCase):
         defaults = cli.build_plan(self.args(extra=["--pressure-mode=continuous"]), {})[
             "command"
         ]
+        self.assertIn("--test_arg=--cache_pressure_scheduler=batch_decode", defaults)
+        self.assertIn("--test_arg=--cache_pressure_seed_count=4", defaults)
         self.assertIn("--test_arg=--cache_pressure_batch_size=1", defaults)
         self.assertIn("--test_arg=--cache_pressure_client_concurrency=0", defaults)
 

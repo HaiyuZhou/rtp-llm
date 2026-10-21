@@ -933,6 +933,7 @@ def _full_pressure_startup(args, remaining, max_input_len):
         "local_world_size",
         "max_seq_len",
         "concurrency_limit",
+        "test_block_num",
     }
     seen = set()
     for argument in remaining:
@@ -971,6 +972,7 @@ def _full_pressure_startup(args, remaining, max_input_len):
         target_ranks=list(range(tp)),
         dp_size=args.dp_size,
         exclusive_service=True,
+        test_block_num=int(extract_arg(remaining, "test_block_num") or 0),
     )
 
 
@@ -1038,7 +1040,10 @@ def main() -> str:
             raise ValueError(
                 "--cache_pressure_batch_size does not apply to FIFO; leave it at 1"
             )
-        if args.cache_pressure_seed_count <= 0:
+        if (
+            args.cache_pressure_seed_count is not None
+            and args.cache_pressure_seed_count <= 0
+        ):
             raise ValueError("--cache_pressure_seed_count must be positive")
         if args.cache_pressure_request_rate < 0:
             raise ValueError("--cache_pressure_request_rate must be non-negative")
@@ -1178,19 +1183,20 @@ def main() -> str:
                     "continuous pressure client concurrency must be at least "
                     "the scheduler batch size"
                 )
-            required_admission = max(
-                args.cache_pressure_client_concurrency,
-                (
-                    args.cache_pressure_seed_count
-                    if any(int(case["cache_len"]) for case in cases)
-                    else 0
-                ),
-            )
-            if args.concurrency_limit < required_admission:
-                raise ValueError(
-                    f"--concurrency_limit={args.concurrency_limit} cannot admit "
-                    f"continuous pressure concurrency={required_admission}"
+            if not full_pressure:
+                required_admission = max(
+                    args.cache_pressure_client_concurrency,
+                    (
+                        args.cache_pressure_seed_count
+                        if any(int(case["cache_len"]) for case in cases)
+                        else 0
+                    ),
                 )
+                if args.concurrency_limit < required_admission:
+                    raise ValueError(
+                        f"--concurrency_limit={args.concurrency_limit} cannot admit "
+                        f"continuous pressure concurrency={required_admission}"
+                    )
         unknown_profile_ids = set(args.cache_profile_case_ids) - {
             int(c["case_id"]) for c in cases
         }
@@ -1224,6 +1230,7 @@ def main() -> str:
                 cache_pressure_scheduler=args.cache_pressure_scheduler,
                 cache_pressure_batch_size=args.cache_pressure_batch_size,
             )
+            resume_config["cache_pressure_scheduler"] = args.cache_pressure_scheduler
         if args.cache_shared_seed:
             resume_config["cache_seed_mode"] = "shared_prefix_v1"
         elif args.cache_pressure_mode == "continuous":

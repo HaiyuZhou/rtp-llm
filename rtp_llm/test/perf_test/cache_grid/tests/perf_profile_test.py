@@ -29,6 +29,34 @@ def _minimal_profile(**overrides):
 
 
 class ValidateProfileTest(unittest.TestCase):
+    def test_pressure_fill_defaults_without_mutating_profile_and_allows_overrides(self):
+        values = dict(
+            fill_timeout_s=20,
+            fill_max_requests=10,
+            fill_no_progress_s=5,
+            gpu_tolerance_blocks=2,
+            activity_timeout_s=10,
+            drain_timeout_s=10,
+            capture_timeout_s=60,
+        )
+        profile = _minimal_profile(cache_grid=dict(pressure=values))
+        self.assertEqual(
+            pressure_settings(profile, SimpleNamespace()).fill_input_tokens, 102400
+        )
+        self.assertNotIn("fill_input_tokens", values)
+        values["fill_input_tokens"] = 8192
+        self.assertEqual(
+            pressure_settings(profile, SimpleNamespace()).fill_input_tokens, 8192
+        )
+        self.assertEqual(
+            pressure_settings(
+                profile,
+                SimpleNamespace(cache_pressure_fill_input_tokens=16384),
+                direct=True,
+            ).fill_input_tokens,
+            16384,
+        )
+
     def test_pressure_settings_use_explicit_zero_and_reject_unknown_or_nan(self):
         values = dict(
             fill_timeout_s=20,

@@ -19,6 +19,9 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     pressure_settings,
     resolve_int,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import (
+    MIN_FORMAL_CLIENT_INFLIGHT,
+)
 from rtp_llm.test.perf_test.dataclass import PerfTestConfig
 from rtp_llm.test.perf_test.dataset import KNOWN_DATASETS, extract_arg
 from rtp_llm.test.perf_test.hub_download import (
@@ -118,7 +121,7 @@ def parse_args(
     perf.add_argument(
         "--cache_pressure_scheduler",
         choices=("batch_decode", "fifo"),
-        default="batch_decode",
+        default=None,
         help=(
             "Scheduler used by continuous pressure: fixed-size BatchDecodeScheduler "
             "or production-style dynamic FIFO batching"
@@ -142,8 +145,8 @@ def parse_args(
     perf.add_argument(
         "--cache_pressure_seed_count",
         type=int,
-        default=4,
-        help="Number of long shared-prefix families seeded before continuous pressure",
+        default=None,
+        help="Shared-prefix families (omitted: live automatic planning with preload, else 4)",
     )
     perf.add_argument(
         "--cache_pressure_request_rate",
@@ -389,6 +392,17 @@ def parse_args(
 
     args._profile = profile
     args._profile_sha256 = profile_sha256
+    args.cache_pressure_scheduler = args.cache_pressure_scheduler or (
+        "fifo" if args.cache_pressure_preload else "batch_decode"
+    )
+    if args.cache_pressure_preload:
+        if args.cache_pressure_scheduler != "fifo":
+            raise ValueError("full-pressure preload is FIFO-only")
+        args.cache_pressure_client_concurrency = (
+            args.cache_pressure_client_concurrency or MIN_FORMAL_CLIENT_INFLIGHT
+        )
+    elif args.cache_pressure_seed_count is None:
+        args.cache_pressure_seed_count = 4
     args._pressure_config = None
     if args.cache_pressure_preload:
         if args.cache_pressure_mode != "continuous":

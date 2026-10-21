@@ -33,6 +33,10 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import (
+    FORMAL_FILL_TARGET_TOKENS,
+)
+
 SCHEMA_VERSION = 1
 
 # CLI spelling, immutable PressureConfig field, parser type.
@@ -69,6 +73,7 @@ def pressure_settings(profile, args, *, direct=False):
     if not isinstance(values, dict):
         raise ProfileError("cache_grid.pressure must be a JSON object")
     values = dict(values)
+    values.setdefault("fill_input_tokens", FORMAL_FILL_TARGET_TOKENS)
     prefix = "cache_pressure_" if direct else "pressure_"
     for option, field, _ in PRESSURE_OPTIONS:
         value = getattr(args, prefix + option.replace("-", "_"), None)

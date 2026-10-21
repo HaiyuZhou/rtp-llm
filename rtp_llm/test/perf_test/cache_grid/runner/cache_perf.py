@@ -28,6 +28,10 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
 from rtp_llm.test.perf_test.cache_grid.runner.generate_cache_grid import (
     comma_separated_ints,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import (
+    MIN_FORMAL_CLIENT_INFLIGHT,
+    formal_config_reasons,
+)
 from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
     grid_token_budget,
     grid_workspace_tokens,
@@ -168,6 +172,17 @@ def build_plan(args, inherited=None):
     )
     if args.pressure_preload and args.pressure_mode != "continuous":
         raise ValueError("pressure preload requires continuous mode")
+    scheduler = args.pressure_scheduler or (
+        "fifo" if args.pressure_preload else "batch_decode"
+    )
+    client_inflight = args.pressure_client_concurrency or (
+        MIN_FORMAL_CLIENT_INFLIGHT if args.pressure_preload else 0
+    )
+    seed_count = args.pressure_seed_count
+    if seed_count is None and not args.pressure_preload:
+        seed_count = 4
+    if args.pressure_preload and scheduler != "fifo":
+        raise ValueError("full-pressure preload is FIFO-only")
     if (
         args.pressure_preload
         and args.runs is not None
@@ -229,9 +244,9 @@ def build_plan(args, inherited=None):
         )
     if pressure_tuning and args.pressure_mode is None:
         raise ValueError("pressure tuning requires --pressure-mode")
-    if args.pressure_scheduler == "fifo" and args.pressure_mode != "continuous":
+    if scheduler == "fifo" and args.pressure_mode != "continuous":
         raise ValueError("FIFO pressure scheduler requires --pressure-mode=continuous")
-    if args.pressure_scheduler == "fifo" and args.pressure_batch_size not in (None, 1):
+    if scheduler == "fifo" and args.pressure_batch_size not in (None, 1):
         raise ValueError("--pressure-batch-size does not apply to FIFO")
     if (
         args.mode == "profile"
@@ -269,6 +284,15 @@ def build_plan(args, inherited=None):
         raise ValueError("profile currently supports ungrouped batch=1 only")
     env = environment(profile, args.env, inherited) if not saved else dict(saved["env"])
     env["RTP_LLM_PRESSURE_NVTX"] = "0"
+    screening = {
+        key: saved[key]
+        for key in (
+            "formal_candidate",
+            "formal_candidate_reasons",
+            "formal_candidate_scope",
+        )
+        if saved and key in saved
+    }
     if args.pressure_preload:
         settings = pressure_settings(profile, args)
         if (
@@ -329,6 +353,21 @@ def build_plan(args, inherited=None):
             raise ValueError(
                 "full pressure requires a known block and complete commit tail"
             )
+        reasons = formal_config_reasons(
+            manual_seed_count=seed_count,
+            client_inflight=client_inflight,
+            test_block_num=int(
+                engine_args.get(
+                    "--test_block_num", engine_args.get("test_block_num", 0)
+                )
+            ),
+            fill_target_tokens=settings.fill_input_tokens,
+        )
+        screening = dict(
+            formal_candidate=not reasons,
+            formal_candidate_reasons=list(reasons),
+            formal_candidate_scope="static_configuration",
+        )
         profile.setdefault("cache_grid", {})["pressure"] = asdict(settings)
     if saved and args.env:
         overrides = environment({}, args.env, {})
@@ -404,18 +443,12 @@ def build_plan(args, inherited=None):
         if args.pressure_mode is not None:
             updates.update(
                 cache_pressure_mode=args.pressure_mode,
-                cache_pressure_scheduler=(args.pressure_scheduler or "batch_decode"),
+                cache_pressure_scheduler=scheduler,
                 cache_pressure_batch_size=(
                     1 if args.pressure_batch_size is None else args.pressure_batch_size
                 ),
-                cache_pressure_client_concurrency=(
-                    0
-                    if args.pressure_client_concurrency is None
-                    else args.pressure_client_concurrency
-                ),
-                cache_pressure_seed_count=(
-                    4 if args.pressure_seed_count is None else args.pressure_seed_count
-                ),
+                cache_pressure_client_concurrency=client_inflight,
+                cache_pressure_seed_count=seed_count,
                 cache_pressure_request_rate=(
                     0.0
                     if args.pressure_request_rate is None
@@ -519,6 +552,7 @@ def build_plan(args, inherited=None):
             source_result_dir=str(source) if replay else None,
             selected_case_ids=ids,
             snapshots={k: sha(v) for k, v in artifacts.items()},
+            **screening,
         )
         artifacts[MANIFEST] = encoded(launch)
     command = [bazel["executable"]]
@@ -569,6 +603,7 @@ def build_plan(args, inherited=None):
             getattr(args, "allow_restart_without_checkpoint", False)
         ),
         summary=dict(
+            **screening,
             mode=args.mode,
             planned_cases=len(cases),
             selected_case_ids=ids,

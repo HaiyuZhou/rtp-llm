@@ -96,6 +96,43 @@ class CachePerfTest(unittest.TestCase):
             self.assertFalse(screening["formal_candidate"])
             self.assertEqual(screening["formal_candidate_reasons"], expected)
 
+    def test_full_pressure_screening_detects_engine_only_synthetic_capacity(self):
+        profile = self.pressure_profile()
+        profile["cache_grid"]["pressure"]["fill_input_tokens"] = 102400
+        profile["engine"]["test_block_num"] = 128
+        self.profile.write_text(json.dumps(profile))
+        plan = cli.build_plan(
+            self.args(extra=["--pressure-mode=continuous", "--pressure-preload"]), {}
+        )
+        launch = json.loads(plan["artifacts"][cli.MANIFEST])
+        for screening in (launch, plan["summary"]):
+            self.assertFalse(screening["formal_candidate"])
+            self.assertEqual(
+                screening["formal_candidate_reasons"], ["synthetic_test_block_capacity"]
+            )
+
+    def test_full_pressure_screening_uses_engine_precedence_over_engine_args(self):
+        for engine_blocks, extra_blocks, candidate, reasons in (
+            (128, 0, False, ["synthetic_test_block_capacity"]),
+            (0, 128, True, []),
+        ):
+            with self.subTest(engine_blocks=engine_blocks, extra_blocks=extra_blocks):
+                profile = self.pressure_profile()
+                profile["cache_grid"]["pressure"]["fill_input_tokens"] = 102400
+                profile["engine"]["test_block_num"] = engine_blocks
+                profile["engine_args"] = {"--test_block_num": extra_blocks}
+                self.profile.write_text(json.dumps(profile))
+                plan = cli.build_plan(
+                    self.args(
+                        extra=["--pressure-mode=continuous", "--pressure-preload"]
+                    ),
+                    {},
+                )
+                launch = json.loads(plan["artifacts"][cli.MANIFEST])
+                for screening in (launch, plan["summary"]):
+                    self.assertEqual(screening["formal_candidate"], candidate)
+                    self.assertEqual(screening["formal_candidate_reasons"], reasons)
+
     def test_continuous_nsys_has_explicit_duration_and_exclusive_collector(self):
         self.pressure_profile()
         plan = cli.build_plan(

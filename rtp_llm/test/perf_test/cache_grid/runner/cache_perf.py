@@ -22,6 +22,7 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     PRESSURE_OPTIONS,
     is_sensitive_environment_name,
     load_profile,
+    merge_engine_args,
     pressure_settings,
     profile_environment,
 )
@@ -38,6 +39,7 @@ from rtp_llm.test.perf_test.cache_grid.runner.workspace_budget import (
     validate_token_budget,
     workspace_capacity,
 )
+from rtp_llm.test.perf_test.dataset import extract_arg
 
 TARGET = "//rtp_llm/test/perf_test:cache_grid_perf_test"
 REPO = Path(__file__).resolve().parents[5]
@@ -357,9 +359,7 @@ def build_plan(args, inherited=None):
             manual_seed_count=seed_count,
             client_inflight=client_inflight,
             test_block_num=int(
-                engine_args.get(
-                    "--test_block_num", engine_args.get("test_block_num", 0)
-                )
+                extract_arg(merge_engine_args(profile, []), "test_block_num") or 0
             ),
             fill_target_tokens=settings.fill_input_tokens,
         )

@@ -96,6 +96,18 @@ class LifecycleTest(unittest.TestCase):
     def test_early_capture_completion_preserves_measurement_and_finalizes_before_finished(
         self,
     ):
+        cleanup = []
+        original_drain = cp.PressureSession._drain
+        original_shutdown = InlineExecutor.shutdown
+
+        def drain(session):
+            original_drain(session)
+            cleanup.append("drained")
+
+        def shutdown(executor, **kwargs):
+            original_shutdown(executor, **kwargs)
+            cleanup.append("shutdown")
+
         class Controller:
             def start(self, now):
                 self.started = now
@@ -111,13 +123,17 @@ class LifecycleTest(unittest.TestCase):
                     assert self.finalized
 
             def finish(self, coverage):
+                assert cleanup == ["drained", "shutdown", "shutdown"]
                 self.finalized = True
                 return dict(trace_valid=True, pressure_valid=False)
 
         controller = Controller()
-        result, events, _, _ = self.run_session(
-            controller=controller, cfg=config(measure_s=4, steady_s=1)
-        )
+        with patch.object(cp.PressureSession, "_drain", drain), patch.object(
+            InlineExecutor, "shutdown", shutdown
+        ):
+            result, events, _, _ = self.run_session(
+                controller=controller, cfg=config(measure_s=4, steady_s=1)
+            )
         self.assertAlmostEqual(
             result["measurement_end"] - result["measurement_start"], 4
         )

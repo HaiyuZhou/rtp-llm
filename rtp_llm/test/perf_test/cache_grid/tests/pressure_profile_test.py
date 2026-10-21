@@ -1,19 +1,22 @@
 import copy
 import json
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.cache_grid.runner.continuous_pressure import BoundedSender
 from rtp_llm.test.perf_test.cache_grid.runner.pressure_profile import (
     KinetoCapture,
     NsightCapture,
     ProfileController,
+    analyze_kineto_files,
     classify_gpu_gap,
     run_nsys_window,
     validate_kineto,
@@ -362,6 +365,57 @@ def nsys_fixture(path, step_ids=(1, 2, 3)):
 
 
 class PressureProfileTest(unittest.TestCase):
+    def test_non_forward_correlated_kernel_is_separate_evidence(self):
+        trace = actual_trace()
+        call = copy.deepcopy(trace["traceEvents"][2])
+        kernel = copy.deepcopy(trace["traceEvents"][3])
+        call.update(ts=1652691327900.0, dur=5)
+        kernel.update(ts=1652691327920.0, dur=5)
+        call["args"]["correlation"] = 999
+        kernel["args"]["correlation"] = 999
+        trace["traceEvents"].extend([call, kernel])
+        result = validate_kineto(trace, steps(), 3)
+        self.assertTrue(result["trace_valid"], result)
+        self.assertEqual(result["non_forward_correlated"], 1)
+        trace["traceEvents"].append(copy.deepcopy(call))
+        self.assertFalse(validate_kineto(trace, steps(), 3)["trace_valid"])
+        trace["traceEvents"].pop()
+        trace["traceEvents"].remove(call)
+        self.assertFalse(validate_kineto(trace, steps(), 3)["trace_valid"])
+        # A launch overlapping a forward boundary cannot be classified outside it.
+        call.update(ts=1652691327985.0, dur=5)
+        trace["traceEvents"].append(call)
+        self.assertFalse(validate_kineto(trace, steps(), 3)["trace_valid"])
+
+    def test_analysis_timeout_kills_reaps_and_preserves_raw_files(self):
+        original = subprocess.Popen
+        children = []
+
+        def slow_worker(command, **kwargs):
+            child = original(
+                [sys.executable, "-c", "import time; time.sleep(10)"], **kwargs
+            )
+            children.append(child)
+            return child
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "raw.json"
+            path.write_text("raw evidence")
+            with patch("subprocess.Popen", side_effect=slow_worker):
+                result = analyze_kineto_files(
+                    {0: str(path)}, {"0": []}, 20, time.monotonic() + 0.05
+                )
+            self.assertEqual(result["reasons"], ["profile_analysis_timeout"])
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].returncode)
+            self.assertEqual(path.read_text(), "raw evidence")
+
+    def test_expired_analysis_deadline_never_starts_worker(self):
+        with patch("subprocess.run") as run:
+            result = analyze_kineto_files({}, {}, 20, time.monotonic() - 1)
+        run.assert_not_called()
+        self.assertEqual(result["reasons"], ["profile_analysis_timeout"])
+
     def test_result_deadline_requests_independent_cleanup(self):
         entered, release, stopped = (
             threading.Event(),
@@ -414,7 +468,7 @@ class PressureProfileTest(unittest.TestCase):
         self.assertEqual(calls, [False, True])
         self.assertFalse(result["trace_valid"])
 
-    def capture_case(self, fault=None):
+    def capture_case(self, fault=None, check_online=False):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             CoverageAssessment,
         )
@@ -465,10 +519,18 @@ class PressureProfileTest(unittest.TestCase):
             ranks=(0, 1),
             instances={0: "instance0", 1: "instance1"},
             session_id="session",
-            timeout_s=0.1,
+            timeout_s=2,
             requested_steps=3,
         )
-        controller.start(99)
+        if check_online:
+            with patch(
+                "json.load", side_effect=AssertionError("online JSON parsing")
+            ) as load:
+                controller.start(99)
+                controller.controller.result(2)
+                load.assert_not_called()
+        else:
+            controller.start(99)
         sample = copy.deepcopy(raw)
         for page in sample["response"]["ranks"]:
             page["steps"] = [
@@ -490,6 +552,10 @@ class PressureProfileTest(unittest.TestCase):
             True, 4096, 0.9, 3, False, (), ()
         )
         return controller.finish(coverage), root, coverage
+
+    def test_online_wait_only_checks_artifact_readiness(self):
+        result, _, _ = self.capture_case(check_online=True)
+        self.assertTrue(result["trace_valid"], result)
 
     def test_rank_identity_and_real_capture_pressure_window_are_independent(self):
         result, _, coverage = self.capture_case()

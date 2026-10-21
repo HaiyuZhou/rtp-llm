@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -261,14 +264,39 @@ def validate_kineto(trace, steps, requested_steps):
             reasons.append("missing_step_sidecar")
             continue
         matched[step_id] = (marker, forward, work, sidecar[step_id])
+    non_forward_correlated = 0
     if forwards:
         low = min(_range(f)[0] for f in forwards)
         high = max(
             [_range(f)[1] for f in forwards]
             + [_range(k)[1] for k in kernels if id(k) in linked]
         )
-        if any(id(k) not in linked and low <= _range(k)[0] <= high for k in kernels):
-            reasons.append("missing_cuda_correlation")
+        runtime_by_correlation = {}
+        for call in runtimes:
+            correlation = call.get("args", {}).get("correlation")
+            if correlation is not None:
+                runtime_by_correlation.setdefault(correlation, []).append(call)
+        for kernel in kernels:
+            if id(kernel) in linked or not low <= _range(kernel)[0] <= high:
+                continue
+            calls = runtime_by_correlation.get(
+                kernel.get("args", {}).get("correlation"), []
+            )
+            if len(calls) != 1:
+                reasons.append("missing_cuda_correlation")
+                continue
+            call = calls[0]
+            overlaps = any(
+                scope.get("pid") == call.get("pid")
+                and scope.get("tid") == call.get("tid")
+                and _range(scope)[0] < _range(call)[1]
+                and _range(call)[0] < _range(scope)[1]
+                for scope in [*forwards, *markers.values()]
+            )
+            if overlaps:
+                reasons.append("missing_cuda_correlation")
+            else:
+                non_forward_correlated += 1
     observed = {
         i for i, (_, _, _, s) in matched.items() if s.get("context_batch", 0) > 0
     }
@@ -320,14 +348,40 @@ def validate_kineto(trace, steps, requested_steps):
         observed_step_ids=sorted(observed),
         usable_step_ids=sorted(usable),
         exclusions=excluded,
+        non_forward_correlated=non_forward_correlated,
     )
+
+
+def analyze_kineto_files(paths, steps, requested_steps, deadline):
+    """Exec a fresh interpreter; timeout kills and reaps it before returning."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return dict(ranks={}, reasons=["profile_analysis_timeout"])
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(sys.path)
+    request = dict(paths=paths, steps=steps, requested_steps=requested_steps)
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", __package__ + ".pressure_kineto_worker"],
+            input=json.dumps(request),
+            text=True,
+            capture_output=True,
+            timeout=remaining,
+            check=True,
+            env=environment,
+        )
+        return json.loads(completed.stdout)
+    except subprocess.TimeoutExpired:
+        return dict(ranks={}, reasons=["profile_analysis_timeout"])
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        return dict(ranks={}, reasons=["profile_analysis_failed"], error=repr(exc))
 
 
 class KinetoCapture:
     """PressureSession adapter. Supervisor hooks only copy bounded evidence.
 
-    Transport callbacks are injected with explicit deadlines. JSON file waits and
-    parsing execute on the controller thread; final validation follows step drain.
+    Transport callbacks are injected with explicit deadlines. Online readiness
+    never parses traces; isolated final validation follows step drain.
     """
 
     def __init__(
@@ -433,7 +487,7 @@ class KinetoCapture:
     def _wait(self):
         deadline = self.deadline
         cancel_deadline = None
-        traces, paths, last_error = {}, {}, None
+        paths, last_error = {}, None
         while time.monotonic() < deadline:
             if self.controller.cancel.is_set():
                 if cancel_deadline is None:
@@ -473,22 +527,18 @@ class KinetoCapture:
                         or path.suffix != ".json"
                     ):
                         raise ValueError("profile_artifact_identity_mismatch")
+                    if not path.is_file() or path.stat().st_size == 0:
+                        raise OSError("profile_artifact_not_ready")
                     paths[rank] = str(path)
-                    with path.open() as stream:
-                        traces[rank] = json.load(stream)
-                if len(traces) == len(self.ranks):
-                    return dict(traces=traces, trace_files=paths)
+                if len(paths) == len(self.ranks):
+                    return dict(trace_files=paths)
             except (OSError, ValueError) as exc:
                 last_error = repr(exc)
-                # A completed export with invalid JSON is permanent evidence.
-                if isinstance(exc, ValueError) and not isinstance(
-                    exc, json.JSONDecodeError
-                ):
+                if isinstance(exc, ValueError):
                     return dict(
                         trace_valid=False,
                         reasons=[str(exc)],
                         trace_files=paths,
-                        traces=traces,
                     )
             except Exception as exc:
                 last_error = repr(exc)
@@ -498,7 +548,6 @@ class KinetoCapture:
             reasons=["profile_trace_timeout"],
             last_error=last_error,
             trace_files=paths,
-            traces=traces,
         )
 
     def finish(self, coverage):
@@ -514,8 +563,8 @@ class KinetoCapture:
                 reasons=["profile_cleanup_timeout"],
                 control_log=list(self.controller.log),
             )
-        traces = result.pop("traces", {})
-        rank_results, windows = {}, []
+        paths = result.get("trace_files", {})
+        rank_steps, windows = {}, []
         reasons = set(result.get("reasons", [])) | set(self.errors)
         for rank in self.ranks:
             status = self.statuses.get(rank, {})
@@ -527,7 +576,7 @@ class KinetoCapture:
                 reasons.add("missing_capture_clock_boundaries")
             else:
                 windows.append((begin / 1e9 + bounds[0], end / 1e9 + bounds[1]))
-            if rank not in traces:
+            if rank not in paths:
                 reasons.add("missing_rank_trace")
                 continue
             steps = [
@@ -538,9 +587,15 @@ class KinetoCapture:
                 for step in self.steps[rank].values()
                 if begin <= step["forward_enter_ns"] < end
             ]
-            rank_results[str(rank)] = validate_kineto(
-                traces[rank], steps, self.requested_steps
-            )
+            rank_steps[str(rank)] = steps
+        analysis_started = time.monotonic()
+        analysis = analyze_kineto_files(
+            paths, rank_steps, self.requested_steps, self.deadline
+        )
+        analysis["remaining_budget_s"] = max(0, self.deadline - analysis_started)
+        analysis["wall_elapsed_s"] = time.monotonic() - analysis_started
+        rank_results = analysis.get("ranks", {})
+        reasons.update(analysis.get("reasons", []))
         if self.evictions:
             reasons.add("profile_step_history_overflow")
         if result.get("control_errors"):
@@ -568,6 +623,7 @@ class KinetoCapture:
             pressure_valid=pressure["valid"] if pressure else False,
             trace_name=self.trace_name,
             state_evictions=self.evictions,
+            analysis=analysis,
         )
         result["partial_files"] = [
             str(path)

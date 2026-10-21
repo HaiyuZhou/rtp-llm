@@ -1857,6 +1857,7 @@ class CacheGridRunner:
         controller=None,
         *,
         seed_plan,
+        startup_targets,
         evidence_manifest=None,
     ):
         """Internal opt-in entry; CLI validation/wiring is owned by the caller.
@@ -2264,6 +2265,7 @@ class CacheGridRunner:
             batch_size=self.pressure_batch_size,
             max_input_tokens=max(int(c["input_len"]) for c in cases),
             seed_plan=seed_plan,
+            startup_targets=startup_targets,
             make_payload=make_payload,
             request=request,
             poll=poll,
@@ -3251,6 +3253,7 @@ class CacheGridRunner:
                 ranks,
                 None,
                 seed_plan=seed_plan,
+                startup_targets=targets,
                 evidence_manifest=manifest,
             )
             if result.get("failure"):

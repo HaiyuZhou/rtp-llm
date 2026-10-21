@@ -15,7 +15,9 @@ from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.cache_grid.runner import continuous_pressure as cp
 from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+    decode_pressure_response,
     resolve_pressure_config,
+    select_targets,
 )
 from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import SeedPlan
 
@@ -201,15 +203,14 @@ class LifecycleTest(unittest.TestCase):
         clock, events, batches = FakeClock(), [], []
         counter = [0]
 
-        def poll(timeout):
-            counter[0] += 1
+        def sample(sequence):
             group = GroupSample(
-                0, "FULL", ("gpu",), "host", int(counter[0] > 1), int(counter[0] > 1)
+                0, "FULL", ("gpu",), "host", int(sequence > 1), int(sequence > 1)
             )
-            sample = RankSample(
+            return RankSample(
                 0,
                 "service",
-                counter[0],
+                sequence,
                 clock(),
                 clock(),
                 clock(),
@@ -219,7 +220,10 @@ class LifecycleTest(unittest.TestCase):
                 ),
                 (group,),
             )
-            evidence = cp.PressurePoll((sample,), {}, ())
+
+        def poll(timeout):
+            counter[0] += 1
+            evidence = cp.PressurePoll((sample(counter[0]),), {}, ())
             return (
                 poll_transform(evidence, counter[0], clock)
                 if poll_transform
@@ -248,6 +252,7 @@ class LifecycleTest(unittest.TestCase):
             batch_size=3 if scheduler == "batch_decode" else 1,
             max_input_tokens=16,
             seed_plan=seed_plan(seed_count),
+            startup_targets=select_targets((sample(0),), (0,)),
             make_payload=payload,
             request=request,
             poll=poll,
@@ -678,6 +683,8 @@ class LifecycleTest(unittest.TestCase):
                     raise AssertionError("missing bounded cancellation")
             return dict(success=True, input_len=16, output_len=1)
 
+        startup_targets = select_targets(poll(0.01).samples, (0,))
+        sequence[0] = 0
         session = cp.PressureSession(
             config(
                 sample_period_s=0.01,
@@ -693,6 +700,7 @@ class LifecycleTest(unittest.TestCase):
             batch_size=1,
             max_input_tokens=16,
             seed_plan=seed_plan(client_inflight=2),
+            startup_targets=startup_targets,
             make_payload=lambda kind, i: {"input_ids": [1] * 16},
             request=request,
             poll=poll,
@@ -802,6 +810,8 @@ class WarmupCutoffTest(unittest.TestCase):
                 clock.now = round(clock.now + 0.01, 8)
             time.sleep(0.001)
 
+        startup_targets = select_targets(poll(0.01).samples, (0,))
+        sample_sequence[0] = 0
         session = cp.PressureSession(
             config(fill_timeout_s=0.2, drain_timeout_s=0.2, sample_period_s=0.01),
             session_id="partial",
@@ -811,6 +821,7 @@ class WarmupCutoffTest(unittest.TestCase):
             batch_size=1,
             max_input_tokens=16,
             seed_plan=seed_plan(2 if kind == "seed" else 0, client_inflight=2),
+            startup_targets=startup_targets,
             make_payload=payload,
             request=request,
             poll=poll,
@@ -1253,11 +1264,12 @@ class RunnerIntegrationTest(unittest.TestCase):
                 owner.pools[1].available_blocks = 0
         return response
 
-    def _run_startup_epoch(self, runner, fault=None):
+    def _run_startup_epoch(self, runner, fault=None, submissions=None):
         from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2 as pb
         from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2_grpc as rpc
 
-        clock, observations, submissions, sessions = FakeClock(), [], [], []
+        clock, observations, sessions = FakeClock(), [], []
+        submissions = [] if submissions is None else submissions
         original = cp.PressureSession
 
         def poll(request, timeout):
@@ -1279,6 +1291,29 @@ class RunnerIntegrationTest(unittest.TestCase):
                     rank.pools[0].used_blocks = rank.pools[1].published_host_blocks = 0
                     rank.groups[0].watermark_trigger_count = 0
                     rank.transfers[0].published_blocks = 0
+            if not startup and len(observations) == 3:
+                for rank in response.ranks:
+                    if fault == "baseline_geometry":
+                        rank.groups[0].block_tokens = 256
+                    elif fault == "baseline_capacity":
+                        rank.pools[0].total_blocks = 301
+                    elif fault == "baseline_watermark":
+                        rank.groups[0].device_watermark.low_ratio = 0.7
+                    elif fault == "baseline_host_watermark":
+                        rank.groups[0].host_watermark.low_ratio = 0.7
+                    elif fault == "baseline_pool_geometry":
+                        rank.pools[0].block_size_bytes = 8192
+                    elif fault == "baseline_owner":
+                        rank.ownership.owner_world_rank.value = 1
+                    elif fault == "baseline_participants":
+                        del rank.ownership.participant_world_ranks[:]
+                        rank.ownership.participant_world_ranks.extend([1, 0])
+                    elif fault == "baseline_topology":
+                        rank.pools[0].pool_id = "changed-gpu"
+                        rank.groups[0].device_pool_ids[0] = "changed-gpu"
+                    elif fault == "baseline_dynamic_occupancy":
+                        rank.pools[0].free_blocks = 20
+                        rank.pools[0].available_blocks = 30
             return response
 
         def probe():
@@ -1313,6 +1348,7 @@ class RunnerIntegrationTest(unittest.TestCase):
                 executor_factory=InlineExecutor,
             )
             sessions.append(instance)
+            self.assertIs(instance.startup_targets, kwargs["startup_targets"])
             return instance
 
         runner._probe_reuse_granularity = probe
@@ -1469,6 +1505,46 @@ class RunnerIntegrationTest(unittest.TestCase):
             runner._pressure_epoch_dir.mkdir()
             self._run_startup_epoch(runner)
             self.assertIsNot(runner._pressure_seed_plan, previous)
+
+    def test_changed_first_session_inventory_submits_no_pressure_requests(self):
+        for fault in (
+            "baseline_geometry",
+            "baseline_capacity",
+            "baseline_watermark",
+            "baseline_host_watermark",
+            "baseline_pool_geometry",
+            "baseline_owner",
+            "baseline_participants",
+            "baseline_topology",
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                runner = self._startup_runner(directory)
+                submissions = []
+                with self.assertRaisesRegex(RuntimeError, "full pressure failed"):
+                    self._run_startup_epoch(runner, fault, submissions)
+                self.assertEqual(len(submissions), 0)
+                self.assertEqual(runner._pressure_seed_plan.groups[0].block_tokens, 512)
+                root = runner._pressure_epoch_dir / "pressure"
+                self.assertFalse((root / "requests.jsonl").exists())
+                events = [
+                    json.loads(line)
+                    for line in (root / "steps.jsonl").read_text().splitlines()
+                ]
+                self.assertTrue(
+                    any(
+                        event["event"] == "error"
+                        and "discontinuity" in event.get("error", "")
+                        for event in events
+                    )
+                )
+
+    def test_first_session_inventory_allows_dynamic_free_and_available_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(directory)
+            _, submissions, _ = self._run_startup_epoch(
+                runner, "baseline_dynamic_occupancy"
+            )
+            self.assertTrue(submissions)
 
     def test_invalid_startup_evidence_fails_before_any_submission(self):
         for fault, reason in (
@@ -2018,6 +2094,25 @@ class RunnerIntegrationTest(unittest.TestCase):
             response.json.return_value = {"status": "ok"}
             runner._http_session = SimpleNamespace(post=Mock(return_value=response))
             runner.port = 123
+        # Freeze a clean startup inventory before applying this session's fault.
+        session_fault = fault
+        fault = None
+        controls.append(pb.PressureSessionControlRequestPB(action=1))
+        try:
+            startup_response = poll(
+                pb.CachePressureRequestPB(target_ranks=[0, 1]), timeout=1
+            )
+        finally:
+            fault = session_fault
+            controls.clear()
+            polls.clear()
+            sequence[0] = 0
+        startup_targets = select_targets(
+            decode_pressure_response(
+                startup_response, clock(), clock(), (0, 1)
+            ).samples,
+            (0, 1),
+        )
         with patch.dict("sys.modules", dependencies), patch.object(
             cp, "PressureSession", session
         ), patch("time.monotonic", clock), patch(
@@ -2042,6 +2137,7 @@ class RunnerIntegrationTest(unittest.TestCase):
                 (0, 1),
                 events.append,
                 seed_plan=seed_plan(client_inflight=2),
+                startup_targets=startup_targets,
                 evidence_manifest=dict(
                     control_times=dict(capacity_send_s=1),
                     epoch={"0": "actual-wire", "1": "peer-wire"},

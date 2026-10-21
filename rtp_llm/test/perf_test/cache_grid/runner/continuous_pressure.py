@@ -19,6 +19,7 @@ from typing import Any, Callable, Protocol
 
 from .pressure_diagnostics import (
     PressureCoverage,
+    PressureTarget,
     assess_activity,
     group_valid,
     select_targets,
@@ -294,6 +295,7 @@ class PressureSession:
         batch_size,
         max_input_tokens,
         seed_plan: SeedPlan,
+        startup_targets: tuple[PressureTarget, ...],
         make_payload,
         request,
         poll,
@@ -310,6 +312,7 @@ class PressureSession:
     ):
         self.config, self.limits = config, limits
         self.seed_plan = seed_plan
+        self.startup_targets = startup_targets
         seed_count = seed_plan.seed_count
         seed_input_tokens = seed_plan.seed_input_tokens
         self.arrivals = ArrivalClock(rate, poisson, random_seed)
@@ -824,6 +827,13 @@ class PressureSession:
                     raise RuntimeError(baseline.raw["diagnostics_error"])
                 if not baseline.sample_complete:
                     raise RuntimeError("initial pressure inventory is incomplete")
+                validate_inventory(
+                    select_targets(
+                        tuple(baseline.samples),
+                        tuple(sorted({target.rank for target in self.startup_targets})),
+                    ),
+                    self.startup_targets,
+                )
                 self.coverage = PressureCoverage(tuple(baseline.samples), self.config)
                 # Validate reachability before sending any requests.
                 for sample in baseline.samples:

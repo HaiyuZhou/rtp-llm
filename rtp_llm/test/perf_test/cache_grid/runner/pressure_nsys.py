@@ -412,7 +412,9 @@ def _normalize(rows, steps_by_rank):
                         <= marker["end"]
                     )
                 ]
-                if len(partial) == 1:
+                # A repaired marker needs a complete forward scope to establish
+                # CUDA association; clipping cannot bypass that validation.
+                if len(partial) == 1 and "clock_conversion" not in marker:
                     excluded[str(step)] = "incomplete_forward_boundary"
                     boundary_exclusions[rank, step] = "incomplete_forward_boundary"
                     continue

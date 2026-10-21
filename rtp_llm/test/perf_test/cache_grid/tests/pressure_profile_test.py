@@ -36,6 +36,11 @@ class NsightPressureTest(unittest.TestCase):
             "UPDATE ANALYSIS_DETAILS SET stopTime=stopTime+1;",
             "UPDATE NVTX_EVENTS SET end=end+10000 WHERE start>1000000;",
             "DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE correlationId=5;",
+            "UPDATE NVTX_EVENTS SET start=start-1000000,end=NULL "
+            "WHERE text='executor.model_forward' AND start=1005001; "
+            "DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE correlationId=5;",
+            "UPDATE NVTX_EVENTS SET start=start-1000000,end=NULL "
+            "WHERE text='executor.model_forward' AND start=1005001;",
         )
         for fault in faults:
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
@@ -57,6 +62,13 @@ class NsightPressureTest(unittest.TestCase):
                 ]
                 result = normalize_nsys(path, {0: records, 1: records})
                 self.assertFalse(result["trace_valid"], result)
+                if "end=NULL" in fault:
+                    self.assertIn(
+                        "missing_or_ambiguous_model_forward", result["reasons"]
+                    )
+                    self.assertIn(
+                        "missing_model_compute_correlation", result["reasons"]
+                    )
 
     def test_metadata_clock_repair_preserves_raw_and_excludes_only_boundary(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_nsys import (

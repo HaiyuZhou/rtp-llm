@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "kind": "continuous_full_pressure_formal",
+  "description": "DeepSeek-V4-Flash FIFO production FULL pressure workload",
+  "generator": {
+    "name": "continuous_pressure_formal_acceptance",
+    "version": 2,
+    "alignment": 128,
+    "cache_alignment": 4096,
+    "commit_tail_constraint": {
+      "tokens": 4096
+    }
+  },
+  "cases": [
+    {
+      "case_id": 0,
+      "batch_size": 1,
+      "input_len": 32768,
+      "cache_len": 0
+    },
+    {
+      "case_id": 1,
+      "batch_size": 1,
+      "input_len": 36864,
+      "cache_len": 32768
+    },
+    {
+      "case_id": 2,
+      "batch_size": 1,
+      "input_len": 65536,
+      "cache_len": 0
+    },
+    {
+      "case_id": 3,
+      "batch_size": 1,
+      "input_len": 69632,
+      "cache_len": 65536
+    }
+  ]
+}

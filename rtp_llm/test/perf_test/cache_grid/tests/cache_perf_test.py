@@ -13,9 +13,197 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     strip_json_comments,
 )
 from rtp_llm.test.perf_test.cache_grid.runner import cache_perf as cli
+from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+    GroupSample,
+    PoolSample,
+    RankSample,
+    select_targets,
+)
+from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import build_seed_plan
 
 
 class CachePerfTest(unittest.TestCase):
+    def test_production_pressure_example_is_automatic_formal_candidate(self):
+        config = Path(__file__).resolve().parents[1] / "config"
+        self.profile = config / "continuous_full_pressure_dsv4.production.example.jsonc"
+        self.grid = config / "continuous_full_pressure_grid.production.example.json"
+        profile = load_profile(self.profile)
+        _, cases = cli.load_cases(self.grid)
+        self.assertEqual(
+            profile["engine"]["checkpoint_path"],
+            "/mnt/hf3fs/3fs/models/DeepSeek-V4-Flash",
+        )
+        self.assertNotIn("--test_block_num", profile["engine_args"])
+        self.assertNotIn("--dsv4_fixed_pool_blocks", profile["engine_args"])
+        self.assertGreaterEqual(profile["engine"]["max_seq_len"], 102401)
+        self.assertGreaterEqual(max(case["cache_len"] for case in cases), 32768)
+        self.assertEqual(profile["cache_grid"]["pressure"]["seed_timeout_s"], 3600)
+        self.assertNotIn("fill_input_tokens", profile["cache_grid"]["pressure"])
+        plan = cli.build_plan(
+            self.args(extra=["--pressure-mode=continuous", "--pressure-preload"]), {}
+        )
+        launch = json.loads(plan["artifacts"][cli.MANIFEST])
+        self.assertIn("--cache_pressure_scheduler=fifo", launch["runner_args"])
+        self.assertIn("--cache_pressure_client_concurrency=16", launch["runner_args"])
+        self.assertFalse(
+            any("cache_pressure_seed_count" in arg for arg in launch["runner_args"])
+        )
+        snapshot = json.loads(plan["artifacts"]["profile.snapshot.json"])
+        self.assertEqual(
+            snapshot["cache_grid"]["pressure"]["fill_input_tokens"], 102400
+        )
+        settings = snapshot["cache_grid"]["pressure"]
+        # Include capture conservatively although it can overlap measurement/support.
+        phase_budget = sum(
+            settings[name]
+            for name in (
+                "seed_timeout_s",
+                "fill_timeout_s",
+                "steady_timeout_s",
+                "measure_s",
+                "support_s",
+                "drain_timeout_s",
+                "capture_timeout_s",
+            )
+        )
+        self.assertGreater(snapshot["bazel"]["test_timeout"], phase_budget)
+        self.assertEqual(snapshot["bazel"]["test_timeout"], 10800)
+        self.assertIn("--test_timeout=10800", plan["command"])
+        for screening in (launch, plan["summary"]):
+            self.assertTrue(screening["formal_candidate"])
+            self.assertEqual(screening["formal_candidate_reasons"], [])
+            self.assertEqual(
+                screening["formal_candidate_scope"], "static_configuration"
+            )
+            self.assertNotIn("formal_config_valid", screening)
+
+    def test_reduced_pressure_example_retains_every_nonformal_override(self):
+        config = Path(__file__).resolve().parents[1] / "config"
+        self.profile = config / "continuous_full_pressure_dsv4.example.jsonc"
+        self.grid = config / "continuous_full_pressure_grid.example.json"
+        profile = load_profile(self.profile)
+        grid, cases = cli.load_cases(self.grid)
+        self.assertTrue(profile["cache_grid"]["explicit_smoke"])
+        self.assertEqual(grid["kind"], "explicit_cache_grid_smoke")
+        self.assertLess(max(case["cache_len"] for case in cases), 32768)
+        self.assertEqual(profile["cache_grid"]["pressure"]["seed_timeout_s"], 300)
+        self.assertEqual(profile["engine_args"]["--dsv4_fixed_pool_blocks"], 128)
+        self.assertEqual(profile["engine_args"]["--memory_cache_size_mb"], 512)
+        self.assertEqual(profile["engine"]["max_seq_len"], 65536)
+        for key in ("concurrency_limit", "max_context_batch_size"):
+            self.assertEqual(profile["engine"][key], 2)
+        plan = cli.build_plan(
+            self.args(
+                extra=[
+                    "--pressure-mode=continuous",
+                    "--pressure-preload",
+                    "--pressure-client-concurrency=2",
+                    "--pressure-seed-count=2",
+                ]
+            ),
+            {},
+        )
+        snapshot = json.loads(plan["artifacts"]["profile.snapshot.json"])
+        self.assertEqual(snapshot["engine_args"]["--test_block_num"], 128)
+        self.assertEqual(snapshot["cache_grid"]["pressure"]["fill_input_tokens"], 16384)
+        launch = json.loads(plan["artifacts"][cli.MANIFEST])
+        for screening in (launch, plan["summary"]):
+            self.assertFalse(screening["formal_candidate"])
+            self.assertEqual(
+                screening["formal_candidate_reasons"],
+                [
+                    "manual_seed_count",
+                    "client_inflight_below_16",
+                    "synthetic_test_block_capacity",
+                    "nonstandard_fill_target",
+                    "explicit_smoke",
+                ],
+            )
+
+    def test_example_live_plans_are_reproducible_with_explicit_capacity_fixtures(self):
+        # Fixture blocks illustrate feasibility; they do not estimate live MiB capacity.
+        config = Path(__file__).resolve().parents[1] / "config"
+        for production, capacity, host_available, expected in (
+            (True, 8191, 4096, (64, 128, 63, 52, 32, 84)),
+            (False, 127, 72, (2, 64, 1, 1, 1, 2)),
+        ):
+            with self.subTest(production=production):
+                suffix = ".production" if production else ""
+                profile = load_profile(
+                    config / f"continuous_full_pressure_dsv4{suffix}.example.jsonc"
+                )
+                _, cases = cli.load_cases(
+                    config / f"continuous_full_pressure_grid{suffix}.example.json"
+                )
+                sample = RankSample(
+                    0,
+                    "fixture-owner",
+                    1,
+                    1.0,
+                    1.0,
+                    1.1,
+                    (
+                        PoolSample("gpu", capacity, 0, 0, 0.82, 0.9, tier=1),
+                        PoolSample(
+                            "host",
+                            host_available,
+                            0,
+                            0,
+                            0,
+                            0,
+                            tier=2,
+                            available=host_available,
+                        ),
+                    ),
+                    (
+                        GroupSample(
+                            0,
+                            "FULL",
+                            ("gpu",),
+                            "host",
+                            0,
+                            0,
+                            geometry=(512, 4096, 4096, False),
+                        ),
+                    ),
+                )
+                plan = build_seed_plan(
+                    samples=(sample,),
+                    targets=select_targets((sample,), (0,)),
+                    cases=cases,
+                    cache_alignment=4096,
+                    commit_tail_tokens=4096,
+                    fill_target_tokens=profile["cache_grid"]["pressure"].get(
+                        "fill_input_tokens", 102400
+                    ),
+                    client_inflight=16 if production else 2,
+                    manual_seed_count=None if production else 2,
+                    test_block_num=profile["engine_args"].get("--test_block_num", 0),
+                    explicit_smoke=profile["cache_grid"].get("explicit_smoke", False),
+                )
+                group = plan.groups[0]
+                self.assertEqual(
+                    (
+                        plan.seed_count,
+                        group.seed_blocks,
+                        group.gpu_family_capacity,
+                        group.gpu_low_families,
+                        group.host_families,
+                        group.maximum_families,
+                    ),
+                    expected,
+                )
+                self.assertLessEqual(
+                    plan.seed_input_tokens + 1, profile["engine"]["max_seq_len"]
+                )
+                self.assertEqual(plan.formal_config_valid, production)
+                self.assertEqual(plan.source, "automatic" if production else "manual")
+                if not production:
+                    self.assertEqual(
+                        plan.nonformal_reasons[-1], "grid_reuse_below_32768"
+                    )
+                    self.assertEqual(len(plan.nonformal_reasons), 6)
+
     def test_explicit_smoke_profile_and_grid_are_statically_nonformal(self):
         for source in ("profile", "grid"):
             with self.subTest(source=source):

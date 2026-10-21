@@ -1,0 +1,255 @@
+# FIFO 连续 FULL 满载压力测试操作指南
+
+本指南对应 `refine-continuous-pressure-seeding`：从启动后的真实 FULL owner 拓扑自动计算 seed，使用有界 FIFO 请求流建立压力，并在 measurement 内分别检查执行、FULL 压力、正式配置和双向迁移。开启方式为 `--pressure-mode continuous --pressure-preload`，此路径默认且只支持 FIFO。只设置 continuous 而不 preload 仍是原有按次数运行的模式。
+
+## 1. 正式配置与非正式 smoke
+
+| 项目 | 正式 production | NON-FORMAL GPU smoke |
+| --- | --- | --- |
+| profile | [production profile](../config/continuous_full_pressure_dsv4.production.example.jsonc) | [smoke profile](../config/continuous_full_pressure_dsv4.example.jsonc) |
+| grid | [production grid](../config/continuous_full_pressure_grid.production.example.json) | [smoke grid](../config/continuous_full_pressure_grid.example.json) |
+| 模型 | `/mnt/hf3fs/3fs/models/DeepSeek-V4-Flash` | 同左 |
+| 并行 | TP4 / EP4 / DP1 / world4 | 同左 |
+| sequence / token budget | 131072 / 131072 | 65536 / 65536 |
+| 引擎 context / admission 配置 | 16 / 16 | 2 / 2 |
+| 客户端在途上限 | 16，正式最低值也是 16 | 显式 2 |
+| seed family 数 | 不传手工值，启动后计算 | 显式 2，必为非正式 |
+| host cache 配置 | 65536 MiB | 512 MiB，仅 smoke |
+| GPU 容量 | 不传 test/fixed pool 容量替换 | `test_block_num=128`、`dsv4_fixed_pool_blocks=128` |
+| fill 输入 | 默认 102400 tokens | 显式 16384 tokens |
+| seed 独立期限 | 3600 秒 | 300 秒 |
+| Bazel 外层总期限 | 10800 秒 | 3600 秒 |
+| grid 最大 cache_len | 65536（包含 32768 复用请求） | 8192，不满足正式 32K 门槛 |
+
+两份 profile 保留同一模型、FP8 KV、缓存开关、GCC12/CUDA13.2、`/opt/conda310`、Bazel cuda13 和 GPU `2,3,4,5`。启动前检查实际模型/编译器路径、空闲四卡和磁盘空间；JIT 缓存使用 `/tmp/rtp-llm-full-pressure/`，首次可能重新编译。可在首次命令添加 `--env CUDA_VISIBLE_DEVICES=实际四卡` 覆盖选择。历史硬件为 NVIDIA L20D、约 275040 MiB/卡；这是历史环境信息，不能推定本次容量。
+
+从仓库根目录运行，让启动器用匹配的 Bazel/runfiles 独占启动服务。要求 DP1/PP1、完整 TP rank、`dashsc_input_ids`、未分组 `batch_size=1` grid、FULL attention 和已启用的 host cache；不兼容 existing server、fixed workspace、materialized inputs 或 shared-seed。grid 的 batch_size=1 描述单请求，FIFO 自行决定动态 batch。
+
+## 2. 先执行离线校验
+
+以下命令只打印计划，不写结果、不调用 Bazel、不占 GPU：
+
+```bash
+python3 tools/cache_perf --help
+python3 -m unittest rtp_llm.test.perf_test.cache_grid.tests.cache_perf_test -v
+python3 tools/cache_perf run \
+  --profile rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_dsv4.production.example.jsonc \
+  --grid rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_grid.production.example.json \
+  --result-dir /tmp/dsv4-pressure-plan-check \
+  --pressure-mode continuous --pressure-preload --dry-run
+python3 tools/cache_perf run \
+  --profile rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_dsv4.example.jsonc \
+  --grid rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_grid.example.json \
+  --result-dir /tmp/dsv4-pressure-smoke-plan-check \
+  --pressure-mode continuous --pressure-preload \
+  --pressure-client-concurrency 2 --pressure-seed-count 2 --dry-run
+```
+
+正式计划应包含 Bazel 外层期限 `test_timeout=10800`、`--cache_pressure_scheduler=fifo`、客户端 16、102400 fill，且没有 seed-count flag；`formal_candidate=true`、`formal_candidate_reasons=[]` 只是 `static_configuration` 范围的初筛。此时没有真实 pool 容量、自动 seed 数或 `formal_config_valid` 结论。
+
+smoke 静态初筛必须为 false，依次保留 `manual_seed_count`、`client_inflight_below_16`、`synthetic_test_block_capacity`、`nonstandard_fill_target`、`explicit_smoke`。profile 的 `cache_grid.explicit_smoke=true` 和 grid 的 `kind=explicit_cache_grid_smoke` 均能明确标记 smoke。启动后的 planner 读到小 grid 后还会追加 `grid_reuse_below_32768`，后续成功不能消除这些原因。
+
+## 3. 正式 baseline 命令
+
+```bash
+python3 tools/cache_perf run \
+  --profile rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_dsv4.production.example.jsonc \
+  --grid rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_grid.production.example.json \
+  --result-dir /data0/zhouhaiyu.zhy/tmp/dsv4-formal-pressure \
+  --pressure-mode continuous --pressure-preload \
+  --pressure-client-concurrency 16 \
+  --pressure-request-rate 0 --pressure-arrival constant \
+  --pressure-measure-seconds 60
+```
+
+正式运行省略手工 seed 数；32K/64K grid 中的 cold/hit 请求在稳态与测量中重复运行。`cache_len` 是构造的复用目标，真实淘汰可能降低实际命中，不能要求它始终 GPU 命中。
+
+请求速率 0 表示不节流，仍最多 16 个 RPC 在途，包括服务端排队和正在执行的请求。它不表示 16 个长请求同时进入 GPU，也不受当前 active batch 大小直接封顶。preflight 分别验证每种 seed/fill/grid 请求的单请求模型、token、KV 可执行性，以及有界 RPC backlog 的 admission。FIFO 根据自身 token/KV 资源决定实际 batch，不做并发静默缩减、固定批设置或 padding。
+
+结果目录须为新目录或空目录。日志写在目录旁边；若通过 tee 保存，先设置 Bash `set -o pipefail`，避免吞掉启动器失败。60 秒仅为稳态之后的 measurement，不包括编译、加载、seed、fill、steady 和 drain。baseline 不接受显式 `--runs`。
+
+## 4. 真实容量与自动 seed 公式
+
+容量来自启动后 `GetCachePressure` 返回的 FULL owner，不从 profile 的块数猜测。每个 owner/group 的 device pool ID 去重；TP participant 不重复累加共享容量或发布计数，但每个 peer 的身份、布局和采样新鲜度仍必须验证。
+
+`capacity_blocks` 是 RPC 报告的**可分配逻辑块容量**，已经反映 block zero 等保留块，不能再减一次 1。`available_blocks` 是扣除不可回收占用后当前可保留/分配预算，不能简单替换为 total-used。历史 127 是强制 `test_block_num=128` smoke 的可分配 FULL 块数，绝不是 Flash production 的固有 FULL 容量。模型权重显存也不属于 KV pool 容量。
+
+令 A 为 cache alignment，R 为可复用 token 数（不含 commit tail）：
+
+```text
+grid_reuse_tokens = max(grid.cache_len)
+R = align_up(max(32768, grid_reuse_tokens), A)
+seed_input_tokens = R + commit_tail_tokens
+B[g,p] = ceil(R / block_tokens[g,p])
+GPU[g] = min_p floor(capacity_blocks[g,p] / B[g,p])
+LOW[g] = min_p floor(floor(capacity_blocks[g,p] * low_ratio[g,p]) / B[g,p])
+HOST[g] = floor(host.available_blocks / ceil(R / host.block_tokens))
+minimum[g] = GPU[g] + 1
+maximum[g] = LOW[g] + HOST[g]
+seed_count = max_g minimum[g]
+要求 seed_count <= min_g maximum[g]
+```
+
+所有 g 都是必需 FULL owner group；p 是其去重的 device pool。block token span 按 live RPC 几何解释，不能把字节或 device 块数直接当 host 块数。当前 schema1 在 group 上报告 token 几何，plan 的各 pool 保留 `geometry_source=owner_group`。manifest 保存每项输入和上下界，可逐项复算。高/低水位及 FULL 可达性另由冻结目标校验；边界不相交就停止并报告限制 group，不自动缩短复用长度或削弱压力门槛。
+
+本 production grid 的 R=65536，commit tail=4096，因此 seed 输入为 69632。正式 grid 必须实际包含至少 32768 的 cache_len；仅把 seed 初始化变长不能代替真实复用工作集。fill 使用独立唯一 family，目标默认 `100*1024=102400`，按 alignment 向上对齐；其一次性后缀不计入可复用 seed bank。fill 加 1 个输出 token 必须通过单请求预算，不允许悄悄缩短。
+
+## 5. 阶段与期限
+
+```text
+validate/live plan -> rolling seed -> unique fill -> steady -> measurement
+                                                           -> optional support -> drain
+```
+
+seed 懒生成至在途上限，任一成功完成后立即补下一个 family；不会每 16 个全体排空再开下一批。恰好提交 seed_count 个后有界排空。`seed_timeout_s` 是独立期限，不占 fill 的时间。必须保留 planned/submitted/completed/failed/cancelled/pending；缺失、失败、取消、未完成或计划数不一致都不能进入有效 measurement。
+
+fill 通过真实新输入、DEVICE 高水位触发和成功 D2H 发布建立压力；随后正式 grid 连续供给 steady、measurement、support，阶段之间不清缓存、不暂停排空，不额外 pin/刷新 seed。测量边界固定为 `[t0,t1)`；窗口内发出、窗口外完成的请求仍属该 cohort，但 drain 完成不增加窗口内吞吐。
+
+| profile 字段 | production / smoke | CLI 覆盖 |
+| --- | --- | --- |
+| `seed_timeout_s`（必需） | 3600 / 300 s | `--pressure-seed-timeout` |
+| `fill_timeout_s`（必需） | 1800 / 300 s | `--pressure-fill-timeout` |
+| `fill_max_requests`（必需） | 1000 / 1000 | `--pressure-fill-max-requests` |
+| `fill_no_progress_s`（必需） | 300 / 60 s | `--pressure-fill-no-progress` |
+| `fill_input_tokens`（默认 102400） | 省略 / 16384 | `--pressure-fill-input-tokens` |
+| `gpu_tolerance_blocks`（必需） | 2 / 2 | `--pressure-gpu-tolerance-blocks` |
+| `activity_timeout_s`（必需） | 300 / 120 s | `--pressure-activity-timeout` |
+| `drain_timeout_s`（必需） | 300 / 60 s | `--pressure-drain-timeout` |
+| `capture_timeout_s`（必需） | 600 / 120 s | `--pressure-capture-timeout` |
+
+production 的 `bazel.test_timeout=10800` 是整个测试进程的外层期限，须覆盖 seed、fill、steady、measurement、support、drain 与启动/JIT。离线回归还保守加上 capture 600 秒：阶段预算总和为 6480 秒，余量为 4320 秒；它们有重叠，不能把外层期限误当 seed 期限。调整阶段预算时也应在首次运行前增大外层预算。smoke 保留 3600 秒外层期限。
+
+共同默认值：采样周期 1 秒，最大样本间隔/年龄各 2 秒，连续 steady 3 秒，steady 等待 60 秒，measurement 60 秒，host residency 25%，有效覆盖率至少 95%，最长无效/未知区间不超过 2 秒，support 最多 60 秒。CLI 可在首次运行前覆盖并冻结；不要在运行中为通过验收降低阈值。
+
+## 6. Kineto 与 Nsight
+
+下面两个正式采集实验使用与 baseline 相同的 production profile/grid，独立新目录并依次执行；保留自动 seed：
+
+```bash
+python3 tools/cache_perf profile \
+  --profile rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_dsv4.production.example.jsonc \
+  --grid rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_grid.production.example.json \
+  --result-dir /data0/zhouhaiyu.zhy/tmp/dsv4-formal-kineto \
+  --pressure-mode continuous --pressure-preload \
+  --pressure-client-concurrency 16 \
+  --pressure-request-rate 0 --pressure-arrival constant \
+  --pressure-measure-seconds 60 \
+  --profile-backend kineto --pressure-profile-steps 20
+
+nsys --version
+python3 tools/cache_perf profile \
+  --profile rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_dsv4.production.example.jsonc \
+  --grid rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_grid.production.example.json \
+  --result-dir /data0/zhouhaiyu.zhy/tmp/dsv4-formal-nsys \
+  --pressure-mode continuous --pressure-preload \
+  --pressure-client-concurrency 16 \
+  --pressure-request-rate 0 --pressure-arrival constant \
+  --pressure-measure-seconds 60 \
+  --profile-backend nsys --pressure-profile-seconds 10
+```
+
+Kineto 与 Nsight 互斥，不传 `--cases`。20 steps 是每 rank 的真实非空步骤目标；边界排除后需分别查看 observed、usable 和相邻步骤对。历史四 rank Kineto 文件总量曾约 1.1 GB，预留空间与解析预算。Nsight 若不在 runtime PATH，首次命令添加 `--nsys-path /实际路径/nsys`；历史验证版本为 2025.6.3。
+
+采集在 steady 之后开始，Nsight 10 秒从启动 ACK 后计时。measurement 结束后可在原期限内继续同分布 support，但不会延长正式 measurement。排空后的解析仍计入 capture deadline；启动器负责 NVTX，无须手动覆盖环境。CUDA 关联缺失/歧义使 trace 无效，GPU gap 候选不能直接证明 GPU 空闲或 CPU 瓶颈。
+
+## 7. 明确非正式的 GPU smoke
+
+```bash
+python3 tools/cache_perf run \
+  --profile rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_dsv4.example.jsonc \
+  --grid rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_grid.example.json \
+  --result-dir /data0/zhouhaiyu.zhy/tmp/dsv4-smoke-pressure \
+  --pressure-mode continuous --pressure-preload \
+  --pressure-client-concurrency 2 --pressure-seed-count 2 \
+  --pressure-request-rate 0 --pressure-arrival constant \
+  --pressure-measure-seconds 60
+```
+
+此配置验证真实请求、阶段、清理与产物，结果必须 non-formal。smoke 的 R 仍至少 32768，seed 输入 36864；因此 sequence 上限从旧 smoke 的 32768 调整到 65536，host 从 128 调整到 512 MiB，以容纳两 family，而保留 128 强制 GPU pool、2-way limits、16K fill。实际 host 可保留块仍由 live snapshot 决定。
+
+仅用于解释的离线算例：若 owner 报告 device capacity=127、block span=512、low=.82，且 host available=72，则每 family=64 blocks，GPU=1、LOW=1、HOST=1，上界为 2；手工 2 family 可保留。72 是算例，不能用 512 MiB 静态推断 live host 预算，也不能把这些 smoke 数字用于 production。即使执行、压力和迁移均通过，formal_config_valid 仍必须 false。
+
+## 8. 产物与四个正式门槛
+
+```text
+result_dir/
+  cache_perf_launch.json
+  profile.snapshot.json
+  grid.snapshot.json
+  pressure_latest.json
+  pressure_epochs/<epoch_id>/
+    startup_pressure.json
+    preflight_failure.json       # 仅 preflight 失败时
+    pressure/
+      manifest.json
+      summary.json
+      requests.jsonl
+      cache_samples.jsonl
+      steps.jsonl
+```
+
+每次启动/恢复创建新 epoch，latest 原子指向最新启动，即使 preflight 失败也不覆盖历史。服务未进入 runner 前失败时可能没有 latest，先检查启动日志。早期失败可能没有全部 JSONL。
+
+以下只读命令显示最新真实结论：
+
+```bash
+python3 - /data0/zhouhaiyu.zhy/tmp/dsv4-formal-pressure <<'PY'
+import json
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+latest = json.loads((root / "pressure_latest.json").read_text())
+epoch = Path(latest["directory"])
+path = epoch / "pressure" / "summary.json"
+if not path.exists():
+    failure = epoch / "preflight_failure.json"
+    print(failure.read_text() if failure.exists() else "摘要尚未生成，请检查运行日志。")
+    raise SystemExit(1)
+s = json.loads(path.read_text())
+print(json.dumps({k: s.get(k) for k in (
+    "validity", "validity_reasons", "classification", "seed_plan", "seed_outcome", "window"
+)}, ensure_ascii=False, indent=2))
+PY
+```
+
+| 正式门槛 | 证据与判定 |
+| --- | --- |
+| `validity.execution_valid` | 请求/形状/控制/清理成功；seed planned=submitted=completed=冻结计划数，failed=cancelled=pending=0 |
+| `validity.full_pressure_valid` | measurement 内所有 FULL 目标有效时间交集满足覆盖和最长无效区间 |
+| `validity.formal_config_valid` | 冻结 live plan 正式有效，无任何保留的非正式原因 |
+| `validity.bidirectional_migration_valid` | measurement 内每个必需 FULL owner group 的成功 D2H 与 H2D 发布增量均 >0 |
+
+`validity.formal_acceptance_valid` 必须是四项同时 true。FULL 门槛还要求本 epoch 实际 DEVICE 高水位触发及成功 GPU-to-host 发布、至少一个关联 device pool 的 `used-pending_release >= floor(capacity*low_ratio)-tolerance`，以及 `host_resident >= ceil(host_capacity*.25)`。HOST/DISK 触发不能替代 DEVICE；预留、复制完成未发布或 detached 数据不能算 host 驻留。
+
+双向门槛只接受保守时间区间完整落在 measurement 内的 settlement-backed 发布：DEVICE->HOST 的 STORE/EVICT，以及 HOST->DEVICE 的 LOAD。copy-start、失败/取消、seed/fill/steady/support 阶段传输不能代替。owner 共享发布计数一次，同时校验全部 participants；计数回退、实例/拓扑变化或边界证据缺失均不能通过。
+
+manifest 与 summary 都保留同一冻结 `seed_plan`、终态 `seed_outcome`、`classification.inputs/nonformal_reasons` 和独立 `validity_reasons`。复算需核对 raw startup、owner/participant、去重 pool、capacity/available/geometry、水位、上下界、auto/manual source、对齐及 commit/fill 长度，而不能只看程序退出码。`manifest.complete=true` 只表示写出收尾，累计 `epoch_reasons` 也不能代替窗口评估。
+
+profiling 还要单独检查 `pressure_valid.profile` 和 `trace_valid`；baseline 的 trace null 为不适用。这些诊断结果始终 `execution_mode=full_pressure_diagnostic_v1`、`metrics=[]`，不进入 exact-reuse 拟合/严格图表。host residency 不能直接证明 H2D。
+
+## 9. 恢复与排错
+
+```bash
+python3 tools/cache_perf resume --result-dir /data0/zhouhaiyu.zhy/tmp/dsv4-formal-pressure
+```
+
+仅有 checkpoint 后才能 resume；使用冻结的 profile/grid/环境/配置，重新获取 live plan 并执行 seed/fill/steady，不拼接 epoch。早期无 checkpoint 或修改 GPU/容量/并发/窗口后，用新目录。
+
+| 现象 | 检查与处理 |
+| --- | --- |
+| `FIFO-only` / batch-size 不适用 | preload 只支持 FIFO；删除固定 batch 控制，普通 batch case 模式另行使用 |
+| `pressure time window conflicts with explicit --runs` | baseline 删除 runs，以 measurement 秒数控制 |
+| `infeasible ... seed_count` | 查看每个 owner 的 minimum/maximum 与 live host available；增加真实 host 可保留预算或另做非正式 smoke，不能手工小 seed 冒充正式 |
+| seed 超时/部分完成 | 查看 seed_outcome、请求错误和取消；按真实模型耗时在下次运行前设置 seed 期限 |
+| fill/seed/grid 单请求预算失败 | 检查 input+1、模型长度、FIFO token/KV 上限；不能通过减少客户端深度掩盖请求本身不可执行 |
+| `FULL requires positive host capacity` | 检查 enable_memory_cache=1 及真实 host 容量，大小设置不等于启用开关 |
+| 没有 FULL 目标 | 当前不能用纯 SWA/LINEAR 模型认证 FULL 满载 |
+| fill/steady 超时、测量丢压 | 检查 DEVICE 触发、D2H 发布、host 驻留、供给与采样空洞；正请求速率可能不足以维持压力 |
+| 只有 D2H、无 H2D | 压力有效仍可迁移无效；核对 reuse 工作集、host 可保留预算及测量边界，不用 fill 流量替代 |
+| 模型加载 OOM | 核对四卡实际空闲显存与权重开销，smoke 小 KV pool 不会缩小模型权重 |
+| trace 无效/解析超时 | 检查各 rank 文件、CUDA 关联和整个 capture deadline，不能只看文件存在 |
+| cancel 已返回但仍有 GPU 活动 | transport cancel 不保证立刻中断 GPU，核对有界 drain、诊断关闭和服务清理 |
+
+历史 2026-10-21 的 FIFO baseline/Kineto/Nsight 各 60 秒、压力覆盖 100% 记录来自强制小池 smoke；保存 trace 的离线复验未改变原 SHA。固定 batch2/all-cold 曾用另一容量通过旧版判据；该路径已被 FIFO-only capability 替代，不满足本指南的正式验收。历史记录保留在 [reference](reference.md#validated-runtime-acceptance)，不能证明真实 production 容量、自动 seed 或测量内双向迁移已通过。
+
+历史 Nsight 一次出现尚未归因的 rank2 native SIGSEGV；后续成功不等于根因修复。保留失败日志、maps/core（如有）和原始采集文件。实现细节见 [reference](reference.md#full-pressure-cli-and-resume)。

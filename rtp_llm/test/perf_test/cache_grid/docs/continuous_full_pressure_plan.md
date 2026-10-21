@@ -1,12 +1,39 @@
 # Cache Perf 连续 Prefill 满载压力与跨 Step Overhead 方案
 
-状态：已实现，并于 2026-10-21 完成 DeepSeek-V4-Flash 真实 GPU 验收。FIFO mixed 的独立 baseline、Kineto 20 steps、Nsight 10 秒，以及独立容量配置的 fixed batch2/all-cold 均通过；取消实验按预期报告 drain_timeout，不作为成功性能样本。
+状态：首版已实现；以下保留 2026-10-21 DeepSeek-V4-Flash 历史诊断验收，不能作为新版正式验收。FIFO mixed 的独立 baseline、Kineto 20 steps、Nsight 10 秒，以及独立容量配置的 fixed batch2/all-cold 均通过；取消实验按预期报告 drain_timeout，不作为成功性能样本。
 
 验收证据位于 `/data0/zhouhaiyu.zhy/tmp/continuous-full-pressure-20261020-flash/`，以 `acceptance-matrix.json` 和 `acceptance-final-report.md` 为准。四个成功运行的 60 秒 measurement coverage 均为 1.0、longest invalid 为 0；阈值、水位、25% host residency 与 tolerance2 未降低。固定批变体显式扩大 FULL/SWA/host 容量，主 baseline/Kineto/Nsight 配置保持一致。所有失败尝试均保留，包括一次未归因的 Nsight rank2 native 崩溃；后续成功不代表该崩溃已修复。
 
 Task15 运行修复提交依次为 `94f336727a`、`f1f01fc2a8`、`f62615cbf1`、`f7290fc99c`、`eeb14fa433`；各运行保留实际 source/native/profile/grid 身份。详细行为及限制见 [reference](reference.md#validated-runtime-acceptance)。
 
 已确认的首版口径：以 FULL attention 的 cache group 为满载判定基准；本文列出的默认阈值用于首版实现，允许运行前显式配置并冻结，不在运行中为通过验收调整。
+
+## 当前决策：由 refine-continuous-pressure-seeding 替代的部分
+
+当前正式运行以 [中文操作指南](continuous_full_pressure_guide_zh.md)、
+[reference](reference.md#full-pressure-cli-and-resume) 和
+`openspec/changes/refine-continuous-pressure-seeding/` 为准。本文后续保留首版来源与历史证据；
+以下新决策覆盖其中冲突的设计，不代表旧运行已经满足新条件：
+
+- continuous preload 仅支持 FIFO；旧固定 batch preload 对照、批次控制、尾批 padding 已被替代。
+  普通未启用 preload 的 finite continuous/batch case 功能继续保留。
+- 正式命令省略手工 seed 数，启动后按真实 FULL owner 的可分配容量、去重 pool、
+  低水位及 live host available 求上下界；不能从配置或重复 TP peer 计数推算。
+  旧 127 FULL blocks 来自强制 128-block smoke，绝非 production 容量。
+- 正式 grid 最大 cache_len 至少 32768，reuse 按 alignment 上取整；commit tail 不计入工作集。
+  唯一 family fill 默认 102400 tokens，不能用一次性 suffix 替代可复用 bank。
+- 客户端默认且正式至少 16 在途，包含等待与执行 RPC；逐种形状验证单请求可执行性与
+  backlog admission，不再用 active batch 容量限制在途深度或 seed 总数。
+- 旧 seed batch 屏障被有界 rolling FIFO producer 替代：完成即补充，精确提交后有界排空，
+  独立 `seed_timeout_s`（production 3600、smoke 300）不消耗 fill 期限；
+  production 的 Bazel 外层期限为 10800 秒，覆盖阶段预算与启动/JIT。
+- 阶段为 validate/live plan -> seed -> fill -> steady -> measurement -> optional support -> drain。
+  manifest/summary 保存原始启动证据、冻结 seed_plan、终态 seed_outcome 和不可撤销分类原因。
+- execution_valid、full_pressure_valid、formal_config_valid、bidirectional_migration_valid 分别判断；
+  formal_acceptance_valid 要求四者全 true。双向门槛要求 measurement 内每个 FULL owner group
+  都有成功 D2H STORE/EVICT 及 H2D LOAD 发布，历史 host residency/D2H 不能替代。
+- production 使用真实容量、自动 seed、16 在途与 32K+ grid；缩小 smoke 显式保留手工两 seed、
+  强制 pool、浅并发、16K fill 和 explicit_smoke 标记，永不成为正式验收。
 
 ## 1. 目标与实现基线
 
@@ -46,7 +73,7 @@ Task15 运行修复提交依次为 `94f336727a`、`f1f01fc2a8`、`f62615cbf1`、
 
 初版沿用 DP=1、独占服务、未分组 batch_size=1 grid、dashsc_input_ids、已知 block size、完整 commit tail，以及不与 fixed workspace、物化输入和 cache_shared_seed 混用的限制。这里 grid 的 batch_size=1 描述单请求几何，不限制服务端 batch 大小。
 
-真实调度分析优先选择 `--pressure-scheduler fifo`；保留 batch_decode 作为固定 batch 对照。client concurrency、引擎 concurrency_limit、context batch 限制和 token budget 均来自实际配置，不自动提高容量以使测试通过。
+当前 preload 默认且只允许 FIFO；旧 batch_decode preload 对照已废弃，仅普通有限 batch 模式保留。client backlog 与 active batch 分别验证，不自动修改引擎容量以使测试通过。
 
 所谓“满载”包括两个分别检查的条件：
 
@@ -61,7 +88,7 @@ GPU cache 在 watermark 附近运行是正常行为，不要求物理 blocks 永
 
 ```text
 启动服务与配置检查
-    -> 初始化正式 seed family
+    -> 冻结 live owner seed plan，rolling 初始化 seed family
     -> 容量灌注 pressure_fill
     -> 正式 workload 稳定运行 steady
     -> 满载门槛通过
@@ -75,9 +102,9 @@ seed 和容量灌注的请求不计入正式请求性能指标。steady、measur
 
 启动时确认启用了目标 cache backend、FULL group 的 GPU/host tier 和对应容量配置；没有 FULL group、缺少目标 host tier 或不可读取必要压力信号时，返回明确的配置/能力错误。冻结目标 rank/group/pool 清单、共享 pool 映射、水位、容差和 host 驻留目标，已知门槛不可达时提前返回配置错误。
 
-复用 `_initialize_continuous_seeds()` 建立正式请求所需的共享前缀。该函数当前只验证 seed 请求成功、输入输出形状和零复用，不代表容量已满。全 cold grid 即使跳过 seed，也必须执行容量灌注。
+旧 `_initialize_continuous_seeds()` 批量屏障只描述首版。新版 preload 使用 live plan 和 rolling producer；正式全 cold grid 不满足 32K 复用要求。seed 成功不等于 FULL 压力已达标。
 
-保留 block-size 探针和输入预算检查。pressure-fill 并发也不能超过引擎准入和 token/KV 资源约束，不能一次把超过可执行上限的所有长请求同时送入固定 batch。
+保留 block-size 探针和单请求预算检查；FIFO 自行决定 active token/KV 组批，有界客户端 backlog 可超过当前 active 执行容量，并独立验证服务/transport admission。
 
 ### 4.2 容量灌注
 
@@ -87,7 +114,7 @@ seed 和容量灌注的请求不计入正式请求性能指标。steady、measur
 
 成功完成请求数、输入 tokens 和估算新增 blocks 用于解释灌注进展；结束判据必须来自实际 cache 状态和成功降级证据。设置时间上限、请求预算与无进展检测，失败时输出状态并有界结束。
 
-batch_decode 模式保持固定 batch 契约，灌注批与终止尾批必要时补 padding；FIFO 不补 padding。每种请求均标记 phase/kind，padding 不进入正式请求统计。
+首版 batch_decode 灌注批与终止尾批 padding 已被 FIFO-only preload 替代。当前不设置固定 batch、不发 padding，每种请求保留 phase/kind。普通 batch case 契约不受影响。
 
 ### 4.3 稳定窗口
 
@@ -105,7 +132,7 @@ baseline 与 profile 独立运行，各自完成 seed、灌注和 steady。basel
 
 时间窗口模式使用有界任务缓冲区，按需构造 token IDs，不能预先提交无限 futures。循环序号、nonce 和 seed family 分配可审计；constant/poisson 的计划时间连续推进，客户端限流造成的延迟仍计入 schedule lag，不通过重置计划时间掩盖断供。
 
-到 `t1` 停止新增正式请求，单独计时完成在途请求。发送阶段以实际发送时刻为准，不能按任务入队时刻提前标记为 measurement。窗口内发送、窗口外完成的请求仍属于 measurement，并标记跨界。固定 batch 模式在最终停止供给时按总提交数补齐尾批，不因阶段标签切换丢弃已提交请求；padding 失败使运行无效。
+到 `t1` 停止新增正式请求，单独计时完成在途请求。发送阶段以实际发送时刻为准，不能按任务入队时刻提前标记为 measurement。窗口内发送、窗口外完成的请求仍属于 measurement，并标记跨界。首版固定 batch preload 的尾批补齐已废弃；当前 FIFO 无 padding，阶段标签切换不丢弃已提交请求。
 
 profile 未完成时继续提供标为 support 的正式分布请求，默认最多延长至 `t1 + 60s`，已配置的更早采集超时仍然生效。support 期间继续采集压力证据，不把 support 请求或延长时间追加进 measurement 指标。profile 窗口及其延长部分单独报告压力有效性。超时执行显式停止采集、收集已有产物，并完成或有界取消在途请求；分别报告执行、压力和 trace 状态。
 
@@ -163,7 +190,7 @@ GPU 判定匹配真实淘汰语义：以 group set 为淘汰单元，组内任�
 
 ## 6. 连续 Profile 的接入
 
-当前 `cache_perf.py`、`batch_decode_test.py` 和 `CacheGridRunner` 都显式拒绝 continuous 与 profiling 组合，现有 profile 是选中 case 后 seed 并 replay 单请求。新增分支必须执行完整的 continuous 满载流程，不能仅删除校验并继续单请求 replay。
+首版设计前 `cache_perf.py`、`batch_decode_test.py` 和 `CacheGridRunner` 曾拒绝 continuous 与 profiling 组合。现在独立 continuous profile 分支已执行完整满载流程，普通 case profile 仍 seed 后单请求 replay；不得混用两者。
 
 ### 6.1 Kineto
 
@@ -241,6 +268,7 @@ reuse 偏差不自动代表请求失败，但输入输出形状错误、非预�
 | 配置 | 用途 |
 | --- | --- |
 | `--pressure-preload` | 显式启用容量灌注与满载诊断；未启用时保持原 continuous 行为 |
+| `--pressure-seed-timeout` | 独立 seed 期限，profile 中必需 |
 | `--pressure-fill-timeout` / `--pressure-fill-max-requests` | 灌注上限 |
 | `--pressure-host-target-ratio` | FULL 对应 host pool 的已发布驻留目标，默认 0.25 |
 | `--pressure-steady-seconds` | 正式分布的连续达标时长，默认 3 秒 |
@@ -290,7 +318,7 @@ result_dir/
 | 阶段 | 修改内容 | 完成标准 |
 | --- | --- | --- |
 | A. 压力观测 | 按需 cache 分层快照、成功迁移计数、rank/时间信息 | 能证明驻留和溢出，区分 free 与 available，缺失数据明确失败 |
-| B. 灌注与连续窗口 | CacheGridRunner 的 fill/steady/measured 状态、有界任务供给、兼容参数 | 达标后才测量，阶段切换不断流，FIFO/固定 batch 收尾正确 |
+| B. 灌注与连续窗口 | CacheGridRunner 的 fill/steady/measured 状态、有界任务供给、兼容参数 | 达标后才测量，阶段切换不断流，FIFO rolling seed、独立期限和无 padding 收尾正确 |
 | C. 连续 profile | cache_perf CLI/校验、Kineto 多 step、nsys 窗口、异步采集收尾 | 压力流不因控制操作中断，trace 完整且标明窗口 |
 | D. Step 分析与报告 | 引擎轻量 step 标记、必要范围、诊断数据契约 | 请求与 batch 可关联，CPU/等待/GPU 停顿口径清晰 |
 | E. 验证与文档 | 单测、GPU smoke、正式基线、profile 对照、使用说明 | 满足下述验收标准 |
@@ -299,13 +327,16 @@ result_dir/
 
 ## 12. 验证与验收
 
-单元测试覆盖：容量达标/未达标/超时/计数重置、全 cold 仍灌注、seed 被淘汰后的 reuse 契约、阶段切换不断流、固定 batch 尾批与 FIFO 无 padding、窗口跨界计数、profile 不阻塞发送、缺少 rank/空 trace/超时收尾和原 case 模式兼容。
+单元测试覆盖：容量达标/未达标/超时/计数重置、全 cold 仍灌注、seed 被淘汰后的 reuse 契约、阶段切换不断流、普通 batch 尾批兼容与 FIFO preload 无 padding、窗口跨界计数、profile 不阻塞发送、缺少 rank/空 trace/超时收尾和原 case 模式兼容。
 
 新增判据与窗口契约重点覆盖：FULL-only 门槛及无 FULL 配置拒绝、SWA/LINEAR 未达标不影响 FULL 容量判定、共享 pool 去重、group 内任一 pool 触发及 pending release 扣除、复制成功但未发布/detached 不计降级、全部目标 rank/group 分别达标；3 秒 steady 必须有完整时间覆盖、60 秒 steady 超时、采样间隔/年龄超限、跨 rank 有效区间交集、窗口边缘未知、95% 覆盖率与 2 秒最长无效时长同时检查；按实际发送时刻归属、跨界完成不增加窗口吞吐、混合 batch 分类、support 延长上限及其独立压力统计、20-step 采集扣除边界后的有效样本数。
 
-GPU smoke 使用可控的小容量配置，验证真实 GPU 到 host 降级完成，再连续执行真实 prefill；采到多个非空 step 且无 decode，确认 trace 完整、压力信号可信及所有请求最终结束。相关构建和测试执行遵循仓库 test-execution 流程。
+GPU smoke 必须明确 non-formal，使用可控的小容量配置，验证真实 GPU 到 host 降级完成，再连续执行真实 prefill；采到多个非空 step 且无 decode，确认 trace 完整、压力信号可信及所有请求最终结束。相关构建和测试执行遵循仓库 test-execution 流程。
 
-正式验收：
+当前正式验收（旧运行不能追认）：
+
+- DeepSeek-V4-Flash 使用真实 FULL owner 容量，无 test_block_num 强制容量；自动 seed、客户端至少 16 在途、grid 最大 cache_len 至少 32768、默认 102400 fill。
+- 每个 FULL owner 的冻结 seed 上下界可复算且终态 seed 全部成功；四个独立 validity 与 aggregate formal_acceptance_valid 全 true，measurement 内成功 D2H/H2D 发布都存在。
 
 - 从 cache_perf 入口完成 seed、容量灌注、稳定运行、测量/profile 和收尾。
 - 进入测量前有所有目标 TP rank/FULL group 的水位触发、成功 GPU 到 host 发布增量和默认至少 25% host 驻留证据；连续达标默认 3 秒，steady 默认最多等待 60 秒，未达标不输出有效满载结果。

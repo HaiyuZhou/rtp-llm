@@ -75,6 +75,11 @@ S=0 时跳过 seed。HTTP 每个槽使用独立 session，input_ids/gRPC 也支�
 
 ### 连续压力模式
 
+本节保留未启用 preload 的普通有限 continuous/batch 行为。
+`continuous --pressure-preload` 已改为 FIFO-only、自动 live seed 和默认 16 在途；
+其正式配置与结果契约见 [Full-pressure CLI and resume](#full-pressure-cli-and-resume)，
+不沿用下文的手工 seed 批量屏障或固定批 padding。
+
 `--cache_pressure_mode=continuous`（统一入口为 `--pressure-mode continuous`）不再按
 case 执行“seed → 测量 → 下一个 case”。runner 一次并发插入
 `cache_pressure_seed_count` 条长度为 `max(cache_len)+commit_tail` 的独立长前缀，
@@ -99,7 +104,9 @@ FIFO 使用 `engine.concurrency_limit`。结果的 `pressure_scheduler` 和
 
 固定批模式若要观察服务端排队，配置 `client_concurrency > batch_size`；两者相等只保证连续组批，
 不保证 scheduler 内存在等待请求。FIFO 模式通过提高 client concurrency 或 request rate 制造积压。
-`engine.concurrency_limit` 必须至少覆盖 client concurrency 和 seed count。该模式目前要求
+上述普通有限模式要求 `engine.concurrency_limit` 覆盖 client concurrency 和 seed count。
+FULL-pressure preload 则分别验证单请求可执行性及排队 admission，客户端 backlog 不以
+active execution capacity 封顶，seed 总数也不要求同时执行。普通有限模式目前要求
 DP=1、未分组 batch=1、`dashsc_input_ids`、明确 block size 和
 完整 commit tail；不支持 fixed workspace、物化输入、profiling 或额外的 `cache_shared_seed`。
 
@@ -392,25 +399,33 @@ finite continuous invocations still use `_run_continuous`. Public CLI validation
 must resolve the existing profile/server settings and pass frozen
 `ExecutionLimits(model_tokens, admission_requests, batch_tokens,
 available_kv_blocks, block_tokens)`. Include the one generated token in every
-model/token/KV bound. The KV bound is the conservative simultaneous-request
-budget after non-reclaimable reservations, not configured total capacity; use the
-most restrictive real pool/rank bound. No workload-derived default is inferred.
+model/token/KV bound. The KV bound uses live available blocks after
+non-reclaimable reservations,
+not configured total capacity; use the most restrictive real owner-pool bound.
+Each seed/fill/grid shape must admit at least one executing request. This active
+execution feasibility does not cap the client backlog or total seed-family count;
+a separate service/transport admission check validates the bounded queued RPCs.
 The pressure stub is the generated `RpcServiceStub` connected to the actual
 rank-zero endpoint; target ranks are real world ranks. Startup validation remains
 responsible for exclusive DP=1 service, explicit opt-in and unsupported options.
 
-The supervisor freezes configuration, targets and raw baselines before seed
-requests. Seed and fill batches obey the immutable limits. Scheduler controls
-receive the remaining stage/progress budget through
-`set_batch(count, timeout=remaining_s)`; the finite runner retains its existing
-default timeout when no override is supplied. All-cold grids skip seeds but still
-fill. Fill uses independent unique inputs, completes each feasible
-batch, then re-polls actual residency before entering steady. Request/time and
-pressure-progress budgets terminate fill explicitly. Steady uses contiguous
-sampled intervals, not the number of samples. Formal requests repeat a lazy,
-deterministically shuffled grid through steady, measurement and optional support.
-No boundary drains or repair fill are inserted. Inputs and pending requests are
-bounded by concurrency; completion wakes the supervisor to replenish capacity.
+The supervisor freezes configuration, owner targets, raw baselines and the live
+`seed_plan` before seed dispatch. Full-pressure preload is FIFO-only at every
+entry point and never sets fixed batches or pads requests. The phase order is
+validate -> seed -> fill -> steady -> measurement -> optional support -> drain.
+Seeds are generated lazily up to `client_inflight`; every completion permits an
+immediate replacement until exactly `seed_count` families have been submitted,
+then the accepted seeds drain within the independent `seed_timeout_s`. There is
+no whole-batch barrier. Any failed/cancelled/pending seed or count mismatch
+prevents valid execution. Seed traffic is excluded from fill and measurement.
+
+Fill uses independently unique aligned 102400-token requests by default; its
+one-shot suffix is never reusable seed-bank capacity. All-cold formal grids fail
+the >=32768 reuse requirement. Explicit small smoke grids remain non-formal.
+Request/time and pressure-progress budgets terminate fill explicitly. Steady
+uses contiguous sampled intervals, not the number of samples. Grid requests
+repeat lazily through steady, measurement and support without boundary drains
+or repair fill. Inputs and outstanding RPCs remain bounded by client concurrency.
 
 `PressurePhases(config, started_s)` exposes `phase`, `measurement_start`,
 `measurement_end`, `failure`, and `advance(now_s, fill_ready=...,
@@ -439,9 +454,10 @@ failure. Configure the activity timeout for expected long prefill duration;
 repeatedly observing an unchanged old active step does not reset its progress
 budget. No profile collection is implemented by the supervisor itself.
 
-Final fixed-batch padding counts actual formal and support dispatches. FIFO
-never receives batch controls or padding. Drain continues pressure polling past
-the window edge and is bounded by `drain_timeout_s`; live RPCs are cancelled at
+Fixed-batch preload, seed batch barriers and tail padding are superseded by
+`refine-continuous-pressure-seeding`; ordinary finite batch execution retains
+its existing behavior. FIFO preload never receives batch controls or padding.
+Drain continues pressure polling past the window edge and is bounded by `drain_timeout_s`; live RPCs are cancelled at
 the deadline and cancellation evidence is emitted. Dedicated executors shut down
 without waiting indefinitely. Transport deadlines bound RPC worker lifetime;
 Python cannot forcibly stop arbitrary token-generation code, so late preparation
@@ -456,15 +472,30 @@ baseline. Without preload, continuous execution remains finite. Continuous profi
 uses a separate single epoch; case replay remains incompatible with full pressure.
 
 Use the existing JSON/JSONC profile's `cache_grid.pressure` object. Required fields
-are `fill_timeout_s`, `fill_max_requests`, `fill_no_progress_s`, `fill_input_tokens`,
+are `seed_timeout_s`, `fill_timeout_s`, `fill_max_requests`, `fill_no_progress_s`,
 `gpu_tolerance_blocks`, `activity_timeout_s`, `drain_timeout_s`, and
-`capture_timeout_s`. These are experiment choices with no invented defaults.
-The corresponding CLI overrides are `--pressure-fill-timeout`,
+`capture_timeout_s`. These budgets have no invented defaults. `fill_input_tokens`
+is optional and defaults to the formal target `100*1024=102400`, aligned upward
+to cache alignment; a nonstandard target makes the run non-formal. Overrides are
+`--pressure-seed-timeout`, `--pressure-fill-timeout`,
 `--pressure-fill-max-requests`, `--pressure-fill-no-progress`,
 `--pressure-fill-input-tokens`, `--pressure-gpu-tolerance-blocks`,
 `--pressure-activity-timeout`, `--pressure-drain-timeout`, and
 `--pressure-capture-timeout`. Explicit CLI values, including zero GPU tolerance,
-override profile values; missing, negative and nonfinite settings are rejected.
+override profile values; missing required, negative and nonfinite settings fail.
+`cache_grid.explicit_smoke` is an optional strict boolean beside `pressure`;
+`true` or grid kind `explicit_cache_grid_smoke` permanently excludes formal use.
+
+Preload defaults to FIFO and 16 client RPCs in flight. A manually supplied
+`--pressure-seed-count` is reserved for non-formal smoke/debug; production omits
+it. Static dry-run output contains `formal_candidate`,
+`formal_candidate_reasons` and `formal_candidate_scope=static_configuration`.
+It cannot determine live capacity, seed count or `formal_config_valid`.
+The static exclusions are ordered: manual_seed_count, client_inflight_below_16,
+synthetic_test_block_capacity, nonstandard_fill_target, explicit_smoke.
+The live planner additionally diagnoses `grid_reuse_below_32768` for small smoke
+grids (a formal grid below that limit fails preflight). Reasons accumulate and
+cannot be cleared by later pressure or migration success.
 
 Optional profile fields use the shared PressureConfig defaults: `host_ratio=0.25`,
 `sample_period_s=1`, `max_sample_gap_s=2`, `max_sample_age_s=2`, `steady_s=3`,
@@ -491,6 +522,58 @@ additional subtraction of overlapping reference counters. The physical base bloc
 span conservatively overestimates CP-sharded request allocations; a grid alignment
 of 4096 with physical blocks of 512 retains a 512-token execution bound. SWA/LINEAR
 remain observed without FULL-pressure gates.
+
+### Live owner seed plan and capacity
+
+Use the allocatable logical `capacity_blocks` returned by the owner RPC as-is:
+block-zero/reserved effects are already included. Never subtract another one or
+sum duplicate TP participant views. Device pool IDs are deduplicated within a
+FULL group; all participants still require fresh compatible topology evidence.
+The earlier 127-block Flash result came from forced `test_block_num=128` smoke,
+not a production-capacity measurement. Host retention uses live available blocks
+after non-reclaimable occupancy; token-to-block conversion follows reported
+geometry, not byte size. Schema 1 reports geometry on the owner group, retained
+as `geometry_source=owner_group` on each plan pool.
+
+For each required FULL owner group g and deduplicated device pool p:
+
+```text
+R = align_up(max(32768, max(grid.cache_len)), cache_alignment)
+B[g,p] = ceil(R / block_tokens[g,p])
+GPU[g] = min_p floor(capacity[g,p] / B[g,p])
+LOW[g] = min_p floor(floor(capacity[g,p] * low_ratio[g,p]) / B[g,p])
+HOST[g] = floor(host.available_blocks / ceil(R / host.block_tokens))
+minimum[g] = GPU[g] + 1
+maximum[g] = LOW[g] + HOST[g]
+seed_count = max_g minimum[g] <= min_g maximum[g]
+```
+
+A formal grid must actually request `max(cache_len)>=32768`. Commit tail is
+recorded separately and excluded from reusable-family arithmetic. Seed input is
+R+commit_tail; aligned fill plus output, seed plus output and every grid shape
+must fit individual model/token/KV bounds. Empty feasible intervals report group
+bounds and fail without shrinking the workload. The production example grid uses
+R=65536, commit tail=4096, seed input=69632 and default fill=102400.
+Its outer `bazel.test_timeout=10800` exceeds the conservative 6480-second sum
+of seed/fill/steady/measurement/support/drain/capture budgets, leaving 4320
+seconds for startup/JIT and overhead. Increase the outer budget if phase budgets
+are increased; it must not truncate the independent seed deadline.
+
+`pressure/manifest.json` and `summary.json` retain the same immutable `seed_plan`
+and copied terminal `seed_outcome`. Plan fields include source (automatic/manual),
+seed_count, grid_reuse_tokens, reusable_tokens, commit_tail_tokens,
+seed_input_tokens, fill_target_tokens, fill_input_tokens, cache_alignment,
+client_inflight, test_block_num, explicit_smoke, formal_config_valid,
+nonformal_reasons, global_minimum_families and global_maximum_families. Each
+`groups[]` entry records owner rank/group/instance and participants, device_pools,
+host_pool, gpu_family_capacity, gpu_low_families, host_families,
+minimum_families and maximum_families. Pool entries retain pool_id,
+capacity_blocks, available_blocks, block_tokens, geometry_source, low/high_ratio,
+low_blocks and seed_blocks. Raw startup evidence is retained for recalculation.
+Terminal seed counts are planned/submitted/completed/failed/cancelled/pending;
+the first three must match the positive frozen seed count and the rest be zero.
+
+### Epoch artifacts
 
 Every public invocation creates `pressure_epochs/<unique-id>/`; after its initial
 RPC completes it writes `startup_pressure.json`, and after successful preflight it
@@ -522,11 +605,28 @@ count cohort membership without inventing completion timestamps. Transport cance
 acceptance is recorded independently and does not prove server completion. Support,
 seed, fill and padding (including warmup padding) never enter formal window metrics.
 
-Execution validity, measurement pressure validity, profile/support pressure validity,
-reuse validity and trace validity are separate fields. Baseline trace validity is
-null with `not_applicable`; capture validation remains pending until profiler
-integration. Raw errors and raw request timing/reuse fields remain available for
-offline exact analysis; online aggregation retains counters and outstanding jobs only.
+Summary and manifest expose four independent booleans in `validity`:
+`execution_valid`, `full_pressure_valid`, `formal_config_valid`, and
+`bidirectional_migration_valid`. `formal_acceptance_valid` is their conjunction;
+`validity_reasons` retains each gate's reasons and their ordered union.
+`classification` preserves formal_config_valid, nonformal_reasons and actual
+inputs (source, seed_count, client_inflight, test_block_num, fill_target_tokens,
+grid_reuse_tokens, explicit_smoke). Execution requires successfully persisted
+frozen evidence and complete successful seed accounting, in addition to request,
+shape, control and cleanup success. FULL-pressure validity uses measurement
+coverage independently of migration/configuration validity.
+
+Bidirectional qualification requires positive successful settlement-backed D2H
+STORE/EVICT and H2D LOAD publication deltas for every required FULL owner group,
+with conservative sample intervals wholly inside measurement. Seed/fill/steady/
+support transfers, copy-start/reservation, failed/cancelled/unpublished transfers
+and host residency alone cannot qualify. Shared publication is counted once at
+the owner while all participants remain fresh and compatible. Counter resets,
+instance/topology changes and missing boundary evidence invalidate qualification.
+Profile/support pressure, reuse and trace validity remain separate. Baseline
+trace validity is null with not_applicable. These diagnostic results stay
+`execution_mode=full_pressure_diagnostic_v1`, `metrics=[]` even if all gates pass.
+Raw timing/reuse evidence remains available, never exact-fit input.
 
 Production callers must supply `evidence_manifest` to `_run_full_pressure` with
 `code_hash`, `profile_hash`, `grid_hash`, `resolved_settings`, `input_identity`,
@@ -854,8 +954,16 @@ the diagnostic matrix; toolchain smoke and parser fixtures are not that acceptan
 
 ### Validated runtime acceptance
 
+Historical reduced-capacity evidence only: these runs predate automatic seed
+planning and measurement-window bidirectional qualification. The first three are
+forced small-pool smoke; none certifies this capability's production acceptance.
+The fixed-batch preload run is superseded by the FIFO-only capability and does
+not satisfy current formal acceptance. Ordinary finite batch guidance above
+remains applicable. Current runnable commands and both asset pairs are in the
+[Chinese guide](continuous_full_pressure_guide_zh.md).
+
 On 2026-10-21, DeepSeek-V4-Flash at `/mnt/hf3fs/3fs/models/DeepSeek-V4-Flash`
-passed the following independent TP4/EP4/DP1 runs on four NVIDIA L20D GPUs using
+passed the prior diagnostic criteria in the following TP4/EP4/DP1 runs on four NVIDIA L20D GPUs using
 the matching CUDA13 Bazel/runfiles build. Evidence is retained under
 `/data0/zhouhaiyu.zhy/tmp/continuous-full-pressure-20261020-flash/`, particularly
 `acceptance-matrix.json`, `acceptance-final-report.md` and `failure-matrix.md`.
@@ -871,7 +979,8 @@ snapshots, raw samples, request outcomes and service logs.
 
 The first three share the same frozen profile/grid. Fixed batching required a
 separate frozen capacity variant: FULL 1023/SWA 2047/host 306 usable blocks rather
-than 127/127/18. Thresholds remain unchanged: device `floor(capacity*.82)-2`,
+than the forced smoke variant's FULL/SWA/host 127/127/18. Those smoke capacities
+are not Flash production capacities. Historical thresholds were: device `floor(capacity*.82)-2`,
 host `ceil(capacity*.25)`, steady 3s, coverage >=.95 and longest invalid <=2s.
 The final fixed run observed effective FULL 850..922 (threshold 836), published
 host 180..287 (threshold 77), and 1692 actual FULL GPU-to-host copied/published

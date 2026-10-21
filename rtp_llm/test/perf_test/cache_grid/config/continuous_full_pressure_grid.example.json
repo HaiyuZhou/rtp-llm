@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "kind": "explicit_cache_grid_smoke",
+  "description": "DeepSeek-V4-Flash NON-FORMAL GPU smoke: reduced hit/cold workload",
+  "generator": {
+    "name": "continuous_pressure_acceptance",
+    "version": 1,
+    "alignment": 128,
+    "cache_alignment": 4096,
+    "commit_tail_constraint": {
+      "tokens": 4096
+    }
+  },
+  "cases": [
+    {
+      "case_id": 0,
+      "batch_size": 1,
+      "input_len": 8192,
+      "cache_len": 0
+    },
+    {
+      "case_id": 1,
+      "batch_size": 1,
+      "input_len": 8192,
+      "cache_len": 4096
+    },
+    {
+      "case_id": 2,
+      "batch_size": 1,
+      "input_len": 16384,
+      "cache_len": 0
+    },
+    {
+      "case_id": 3,
+      "batch_size": 1,
+      "input_len": 16384,
+      "cache_len": 8192
+    }
+  ]
+}

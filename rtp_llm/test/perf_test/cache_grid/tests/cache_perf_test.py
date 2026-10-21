@@ -16,6 +16,31 @@ from rtp_llm.test.perf_test.cache_grid.runner import cache_perf as cli
 
 
 class CachePerfTest(unittest.TestCase):
+    def test_explicit_smoke_profile_and_grid_are_statically_nonformal(self):
+        for source in ("profile", "grid"):
+            with self.subTest(source=source):
+                profile = self.pressure_profile()
+                profile["cache_grid"]["pressure"]["fill_input_tokens"] = 102400
+                if source == "profile":
+                    profile["cache_grid"]["explicit_smoke"] = True
+                else:
+                    grid = json.loads(self.grid.read_text())
+                    grid["kind"] = "explicit_cache_grid_smoke"
+                    self.grid.write_text(json.dumps(grid))
+                self.profile.write_text(json.dumps(profile))
+                plan = cli.build_plan(
+                    self.args(
+                        extra=["--pressure-mode=continuous", "--pressure-preload"]
+                    ),
+                    {},
+                )
+                launch = json.loads(plan["artifacts"][cli.MANIFEST])
+                for screening in (launch, plan["summary"]):
+                    self.assertFalse(screening["formal_candidate"])
+                    self.assertEqual(
+                        screening["formal_candidate_reasons"], ["explicit_smoke"]
+                    )
+
     def test_full_pressure_defaults_to_fifo_automatic_seeding_and_formal_fill(self):
         profile = self.pressure_profile()
         del profile["cache_grid"]["pressure"]["fill_input_tokens"]

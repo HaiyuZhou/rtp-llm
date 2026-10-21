@@ -17,6 +17,7 @@ from rtp_llm.test.perf_test.cache_grid.plot.generate_prefill_interactive_chart i
 from rtp_llm.test.perf_test.cache_grid.plot.generate_prefill_interactive_chart import (
     load_rows as interactive_rows,
 )
+from rtp_llm.test.perf_test.cache_grid.runner import result_schema
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import single_request_metric
 
 LATENCIES = (1452.7469000022393, 1432.8472790002706, 1425.4715130009572)
@@ -192,6 +193,52 @@ class GroupedSingleRequestTest(unittest.TestCase):
 
 
 class ReaderPolicyTest(unittest.TestCase):
+    def test_formal_pressure_gates_require_explicit_true_for_every_input(self):
+        gates = dict(
+            execution_valid=True,
+            full_pressure_valid=True,
+            formal_config_valid=True,
+            bidirectional_migration_valid=True,
+        )
+        self.assertEqual(
+            result_schema.formal_pressure_validity(**gates),
+            dict(gates, formal_acceptance_valid=True),
+        )
+        for gate in gates:
+            for value in (False, None, 1, "true"):
+                with self.subTest(gate=gate, value=value):
+                    validity = result_schema.formal_pressure_validity(
+                        **dict(gates, **{gate: value})
+                    )
+                    self.assertFalse(validity[gate])
+                    self.assertFalse(validity["formal_acceptance_valid"])
+                    self.assertTrue(
+                        all(validity[name] for name in gates if name != gate)
+                    )
+
+    def test_formal_diagnostic_summary_never_becomes_a_fit_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.json"
+            path.write_text(
+                json.dumps(
+                    dict(
+                        schema_version=2,
+                        mode="prefix_cache_grid",
+                        execution_mode="full_pressure_diagnostic_v1",
+                        metrics=[],
+                        validity=dict(
+                            execution_valid=True,
+                            full_pressure_valid=True,
+                            formal_config_valid=True,
+                            bidirectional_migration_valid=True,
+                            formal_acceptance_valid=True,
+                        ),
+                    )
+                )
+            )
+            self.assertEqual(load_observations([path])[0], [])
+            self.assertEqual(static_rows(path, 1), [])
+
     def test_diagnostic_reuse_mismatch_is_excluded_from_fit_and_static_chart(self):
         item = single_request_metric(grouped_metric(cache_len=4096))
         item.pop("request_groups")

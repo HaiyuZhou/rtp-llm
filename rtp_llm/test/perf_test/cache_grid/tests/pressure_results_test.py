@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import unittest
@@ -30,7 +31,7 @@ class StepClassificationTest(unittest.TestCase):
                 session_id="s",
                 instance="i",
             ),
-            **changes
+            **changes,
         )
 
     def test_gap_requires_adjacent_same_executor_steps(self):
@@ -229,6 +230,362 @@ class StepEvidenceTest(unittest.TestCase):
 
 
 class PressureResultsTest(unittest.TestCase):
+    def plan(self, **changes):
+        return dict(
+            dict(seed_count=2, formal_config_valid=True, nonformal_reasons=[]),
+            **changes,
+        )
+
+    def finished(self, **changes):
+        return dict(
+            dict(
+                event="finished",
+                failure=None,
+                seed=dict(
+                    planned=2,
+                    submitted=2,
+                    completed=2,
+                    failed=0,
+                    cancelled=0,
+                    pending=0,
+                ),
+                pressure=dict(valid=True, reasons=[]),
+                migration=dict(valid=True, reasons=[]),
+            ),
+            **changes,
+        )
+
+    def artifacts(self, *, plan=None, finished=None, manifest=None, events=()):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = PressureWriter(Path(directory), manifest or {})
+            sink = PressureEvidence(writer)
+            sink(
+                dict(
+                    event="frozen",
+                    session_id="s",
+                    config=dict(measure_s=60),
+                    seed_plan=self.plan() if plan is None else plan,
+                )
+            )
+            for event in events:
+                sink(event)
+            sink(self.finished() if finished is None else finished)
+            writer.close()
+            root = Path(directory) / "pressure"
+            return (
+                json.loads((root / "summary.json").read_text()),
+                json.loads((root / "manifest.json").read_text()),
+            )
+
+    def test_formal_acceptance_requires_all_four_independent_gates(self):
+        summary, manifest = self.artifacts()
+        self.assertEqual(
+            summary["validity"],
+            dict(
+                execution_valid=True,
+                full_pressure_valid=True,
+                formal_config_valid=True,
+                bidirectional_migration_valid=True,
+                formal_acceptance_valid=True,
+                pressure_valid=dict(measurement=True, profile=None, support=None),
+                reuse_valid=None,
+                trace_valid=None,
+                trace_applicability="not_applicable",
+            ),
+        )
+        self.assertEqual(summary["execution_mode"], "full_pressure_diagnostic_v1")
+        self.assertEqual(summary["metrics"], [])
+        self.assertTrue(manifest["complete"])
+
+    def test_execution_failure_preserves_other_gates_and_reason(self):
+        summary, _ = self.artifacts(finished=self.finished(failure="drain_timeout"))
+        self.assertFalse(summary["validity"]["execution_valid"])
+        self.assertFalse(summary["validity"]["formal_acceptance_valid"])
+        for gate in (
+            "full_pressure_valid",
+            "formal_config_valid",
+            "bidirectional_migration_valid",
+        ):
+            self.assertTrue(summary["validity"][gate])
+        self.assertIn("drain_timeout", summary["validity_reasons"]["execution_valid"])
+
+    def test_pressure_failure_does_not_rewrite_execution_or_migration(self):
+        summary, _ = self.artifacts(
+            finished=self.finished(
+                pressure=dict(valid=False, reasons=["unknown_activity", "sample_gap"])
+            )
+        )
+        self.assertTrue(summary["validity"]["execution_valid"])
+        self.assertTrue(summary["validity"]["bidirectional_migration_valid"])
+        self.assertFalse(summary["validity"]["full_pressure_valid"])
+        self.assertFalse(summary["validity"]["formal_acceptance_valid"])
+        self.assertEqual(
+            summary["validity_reasons"]["full_pressure_valid"],
+            ["unknown_activity", "sample_gap"],
+        )
+
+    def test_manual_plan_stays_nonformal_after_all_seeds_complete(self):
+        summary, _ = self.artifacts(
+            plan=self.plan(
+                formal_config_valid=False, nonformal_reasons=["manual_seed_count"]
+            )
+        )
+        self.assertTrue(summary["validity"]["execution_valid"])
+        self.assertTrue(summary["validity"]["full_pressure_valid"])
+        self.assertFalse(summary["validity"]["formal_config_valid"])
+        self.assertFalse(summary["validity"]["formal_acceptance_valid"])
+        self.assertEqual(
+            summary["classification"]["nonformal_reasons"], ["manual_seed_count"]
+        )
+
+    def test_d2h_only_migration_failure_preserves_execution_and_full_pressure(self):
+        migration = dict(
+            valid=False,
+            reasons=["missing_h2d_load:0:3"],
+            groups=[dict(owner_rank=0, owner_group_id=3)],
+        )
+        summary, _ = self.artifacts(finished=self.finished(migration=migration))
+        self.assertTrue(summary["validity"]["execution_valid"])
+        self.assertTrue(summary["validity"]["full_pressure_valid"])
+        self.assertFalse(summary["validity"]["bidirectional_migration_valid"])
+        self.assertFalse(summary["validity"]["formal_acceptance_valid"])
+        self.assertEqual(
+            summary["validity_reasons"]["bidirectional_migration_valid"],
+            migration["reasons"],
+        )
+        self.assertEqual(summary["result"]["migration"], migration)
+
+    def test_seed_outcome_discrepancies_fail_execution_without_hiding_counts(self):
+        for change, reason in (
+            (dict(completed=1), "seed_planned_completed_mismatch"),
+            (dict(planned=1, completed=1, submitted=1), "seed_plan_outcome_mismatch"),
+            (dict(submitted=1), "seed_planned_submitted_mismatch"),
+            (dict(failed=1), "seed_failed"),
+            (dict(cancelled=1), "seed_cancelled"),
+            (dict(pending=1), "seed_pending"),
+            (dict(pending=True), "seed_outcome_invalid"),
+        ):
+            with self.subTest(change=change):
+                seed = dict(self.finished()["seed"], **change)
+                summary, manifest = self.artifacts(finished=self.finished(seed=seed))
+                self.assertFalse(summary["validity"]["execution_valid"])
+                self.assertFalse(summary["validity"]["formal_acceptance_valid"])
+                self.assertIn(reason, summary["validity_reasons"]["execution_valid"])
+                self.assertEqual(manifest["seed_outcome"], seed)
+                self.assertEqual(summary["seed_outcome"], seed)
+
+    def test_missing_seed_and_migration_evidence_fail_closed(self):
+        event = self.finished()
+        del event["seed"]
+        del event["migration"]
+        summary, manifest = self.artifacts(finished=event)
+        self.assertFalse(summary["validity"]["execution_valid"])
+        self.assertFalse(summary["validity"]["bidirectional_migration_valid"])
+        self.assertEqual(
+            summary["validity_reasons"]["execution_valid"], ["seed_outcome_missing"]
+        )
+        self.assertEqual(
+            summary["validity_reasons"]["bidirectional_migration_valid"],
+            ["migration_evidence_missing"],
+        )
+        self.assertIsNone(manifest["seed_outcome"])
+
+    def test_initial_plan_exclusions_survive_a_later_formal_plan(self):
+        summary, _ = self.artifacts(
+            manifest=dict(
+                seed_plan=self.plan(
+                    formal_config_valid=False, nonformal_reasons=["explicit_smoke"]
+                )
+            )
+        )
+        self.assertFalse(summary["validity"]["formal_config_valid"])
+        self.assertEqual(
+            summary["classification"]["nonformal_reasons"], ["explicit_smoke"]
+        )
+
+    def test_malformed_seed_count_preserves_other_seed_failures(self):
+        summary, _ = self.artifacts(
+            finished=self.finished(
+                seed=dict(
+                    planned=True,
+                    submitted=2,
+                    completed=0,
+                    failed=1,
+                    cancelled=1,
+                    pending=1,
+                )
+            )
+        )
+        self.assertEqual(
+            summary["validity_reasons"]["execution_valid"],
+            ["seed_outcome_invalid", "seed_failed", "seed_cancelled", "seed_pending"],
+        )
+
+    def test_all_independent_reasons_survive_in_stable_classification_order(self):
+        earlier = [
+            "grid_reuse_below_32768",
+            "explicit_smoke",
+            "synthetic_test_block_capacity",
+            "client_inflight_below_16",
+            "manual_seed_count",
+            "earlier_preflight_exclusion",
+        ]
+        summary, manifest = self.artifacts(
+            manifest=dict(formal_candidate=False, formal_candidate_reasons=earlier),
+            plan=self.plan(formal_config_valid=True, nonformal_reasons=[]),
+            finished=self.finished(
+                failure="seed_timeout",
+                seed=dict(
+                    planned=2,
+                    submitted=2,
+                    completed=0,
+                    failed=1,
+                    cancelled=1,
+                    pending=1,
+                ),
+                pressure=dict(valid=False, reasons=["pressure_gap"]),
+                migration=dict(
+                    valid=False, reasons=["missing_d2h:0:0", "missing_h2d_load:0:0"]
+                ),
+            ),
+            events=[dict(event="error", reason="independent_supervisor_error")],
+        )
+        expected = [
+            "manual_seed_count",
+            "client_inflight_below_16",
+            "synthetic_test_block_capacity",
+            "explicit_smoke",
+            "grid_reuse_below_32768",
+            "earlier_preflight_exclusion",
+        ]
+        self.assertEqual(summary["classification"]["nonformal_reasons"], expected)
+        self.assertEqual(manifest["classification"], summary["classification"])
+        reasons = summary["validity_reasons"]
+        for reason in (
+            "seed_timeout",
+            "independent_supervisor_error",
+            "seed_failed",
+            "seed_cancelled",
+            "seed_pending",
+        ):
+            self.assertIn(reason, reasons["execution_valid"])
+        self.assertEqual(reasons["formal_config_valid"], expected)
+        self.assertEqual(reasons["full_pressure_valid"], ["pressure_gap"])
+        self.assertEqual(
+            reasons["bidirectional_migration_valid"],
+            ["missing_d2h:0:0", "missing_h2d_load:0:0"],
+        )
+        self.assertEqual(manifest["validity_reasons"], reasons)
+        self.assertTrue(
+            all(
+                summary["validity"][gate] is False
+                for gate in (
+                    "execution_valid",
+                    "full_pressure_valid",
+                    "formal_config_valid",
+                    "bidirectional_migration_valid",
+                    "formal_acceptance_valid",
+                )
+            )
+        )
+
+    def test_serialized_summary_recalculates_automatic_count_from_raw_inputs(self):
+        from dataclasses import asdict
+
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            select_targets,
+        )
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import (
+            build_seed_plan,
+        )
+        from rtp_llm.test.perf_test.cache_grid.tests.pressure_seed_plan_test import (
+            owner,
+        )
+
+        sample = owner()
+        plan = asdict(
+            build_seed_plan(
+                (sample,),
+                select_targets((sample,), (0,)),
+                cases=(dict(cache_len=32768),),
+                cache_alignment=4096,
+                commit_tail_tokens=4096,
+                client_inflight=16,
+                manual_seed_count=None,
+                fill_target_tokens=102400,
+                test_block_num=0,
+            )
+        )
+        startup = dict(raw_owner=asdict(sample))
+        seed = dict(
+            planned=plan["seed_count"],
+            submitted=plan["seed_count"],
+            completed=plan["seed_count"],
+            failed=0,
+            cancelled=0,
+            pending=0,
+        )
+        summary, manifest = self.artifacts(
+            plan=plan,
+            manifest=dict(startup_pressure=startup),
+            finished=self.finished(seed=seed),
+        )
+        for artifact in (summary, manifest):
+            self.assertEqual(artifact["seed_plan"], json.loads(json.dumps(plan)))
+            self.assertEqual(
+                artifact["startup_pressure"], json.loads(json.dumps(startup))
+            )
+            saved = artifact["seed_plan"]
+            owner = artifact["startup_pressure"]["raw_owner"]
+            pools = {pool["pool_id"]: pool for pool in owner["pools"]}
+            lower, upper = [], []
+            for group in saved["groups"]:
+                blocks = (
+                    saved["reusable_tokens"] + group["block_tokens"] - 1
+                ) // group["block_tokens"]
+                lower.append(
+                    min(
+                        pools[p["pool_id"]]["capacity"] // blocks
+                        for p in group["device_pools"]
+                    )
+                    + 1
+                )
+                upper.append(
+                    min(
+                        int(pools[p["pool_id"]]["capacity"] * p["low_ratio"]) // blocks
+                        for p in group["device_pools"]
+                    )
+                    + pools[group["host_pool"]["pool_id"]]["available"] // blocks
+                )
+            self.assertEqual(saved["seed_count"], max(lower))
+            self.assertLessEqual(saved["seed_count"], min(upper))
+            self.assertEqual(artifact["seed_outcome"], seed)
+            json.dumps(artifact, allow_nan=False)
+
+    def test_frozen_plan_is_required_and_copied_before_terminal_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = PressureWriter(Path(directory), {})
+            sink = PressureEvidence(writer)
+            with self.assertRaisesRegex((KeyError, ValueError), "seed_plan"):
+                sink(dict(event="frozen", session_id="s", config=dict(measure_s=60)))
+            plan = self.plan()
+            frozen = dict(
+                event="frozen",
+                session_id="s",
+                config=dict(measure_s=60),
+                seed_plan=plan,
+            )
+            sink(frozen)
+            expected = copy.deepcopy(frozen)
+            plan["nonformal_reasons"].append("mutated_after_freeze")
+            sink(self.finished())
+            writer.close()
+            manifest = json.loads(
+                (Path(directory) / "pressure/manifest.json").read_text()
+            )
+            self.assertEqual(manifest["frozen"], expected)
+            self.assertEqual(manifest["seed_plan"], expected["seed_plan"])
+
     def test_profile_first_failure_does_not_mask_execution_evidence(self):
         for terminal in (
             "failed",
@@ -243,6 +600,14 @@ class PressureResultsTest(unittest.TestCase):
             ), tempfile.TemporaryDirectory() as directory:
                 writer = PressureWriter(Path(directory), {})
                 sink = PressureEvidence(writer, profile_requested=True)
+                sink(
+                    dict(
+                        event="frozen",
+                        session_id="s",
+                        config=dict(measure_s=60),
+                        seed_plan=self.plan(),
+                    )
+                )
                 request = dict(
                     event="dispatch",
                     job_id=1,
@@ -269,7 +634,7 @@ class PressureResultsTest(unittest.TestCase):
                     sink(dict(event="cancellation", job_id=1, at_s=72, accepted=True))
                 if terminal == "error":
                     sink(dict(event="error", reason="padding_failed"))
-                sink(dict(event="finished", failure="profile_timeout"))
+                sink(self.finished(failure="profile_timeout"))
                 writer.close()
                 summary = json.loads(
                     (Path(directory) / "pressure/summary.json").read_text()
@@ -292,7 +657,14 @@ class PressureResultsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             writer = PressureWriter(Path(directory), {})
             sink = PressureEvidence(writer)
-            sink(dict(event="frozen", session_id="s", config=dict(measure_s=60)))
+            sink(
+                dict(
+                    event="frozen",
+                    session_id="s",
+                    config=dict(measure_s=60),
+                    seed_plan=self.plan(),
+                )
+            )
             sink(dict(event="phase", phase="measurement", at_s=10))
             sink(
                 dict(
@@ -376,7 +748,14 @@ class PressureResultsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             writer = PressureWriter(Path(directory), {})
             sink = PressureEvidence(writer)
-            sink(dict(event="frozen", session_id="s", config=dict(measure_s=60)))
+            sink(
+                dict(
+                    event="frozen",
+                    session_id="s",
+                    config=dict(measure_s=60),
+                    seed_plan=self.plan(),
+                )
+            )
             sink(dict(event="phase", phase="measurement", at_s=10))
             request = dict(
                 job_id=1,

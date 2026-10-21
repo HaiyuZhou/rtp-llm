@@ -29,6 +29,17 @@ def _minimal_profile(**overrides):
 
 
 class ValidateProfileTest(unittest.TestCase):
+    def test_explicit_smoke_requires_an_actual_boolean(self):
+        for value in (True, False):
+            validate_profile(_minimal_profile(cache_grid=dict(explicit_smoke=value)))
+        for value in (0, 1, "true", "false", None):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ProfileError, "explicit_smoke"
+            ):
+                validate_profile(
+                    _minimal_profile(cache_grid=dict(explicit_smoke=value))
+                )
+
     def test_seed_timeout_is_required_positive_finite_and_overridable(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             resolve_pressure_config,

@@ -6,7 +6,10 @@ import os
 import random
 import threading
 from collections import Counter, OrderedDict
+from copy import deepcopy
 from pathlib import Path
+
+from .result_schema import formal_pressure_validity
 
 
 def server_window(start_ns, end_ns, offset_bounds_ns):
@@ -300,7 +303,7 @@ class StepAnalysis:
                     **{
                         name: value.summary()
                         for name, value in self.distributions[rank].items()
-                    }
+                    },
                 )
                 for rank in self.ranks
             },
@@ -381,7 +384,12 @@ class PressureWriter:
             if self.closed:
                 raise ValueError("pressure writer closed")
             self._atomic("summary.json", summary)
-            self.manifest.update(complete=True, validity=summary.get("validity"))
+            self.manifest.update(
+                complete=True,
+                validity=summary.get("validity"),
+                validity_reasons=summary.get("validity_reasons"),
+                classification=summary.get("classification"),
+            )
             self._atomic("manifest.json", self.manifest)
 
     def close(self):
@@ -406,6 +414,52 @@ MANIFEST_PROJECTION = (
     "control_times",
 )
 
+NONFORMAL_REASON_ORDER = (
+    "manual_seed_count",
+    "client_inflight_below_16",
+    "synthetic_test_block_capacity",
+    "nonstandard_fill_target",
+    "explicit_smoke",
+    "grid_reuse_below_32768",
+)
+
+
+def seed_outcome_reasons(seed, plan):
+    """Validate terminal accounting against both the frozen and accepted work."""
+    if seed is None:
+        return ["seed_outcome_missing"]
+    names = ("planned", "submitted", "completed", "failed", "cancelled", "pending")
+    if not isinstance(seed, dict):
+        return ["seed_outcome_invalid"]
+    valid_counts = {
+        name for name in names if type(seed.get(name)) is int and seed[name] >= 0
+    }
+    reasons = [] if len(valid_counts) == len(names) else ["seed_outcome_invalid"]
+    if "planned" in valid_counts and seed["planned"] != plan.get("seed_count"):
+        reasons.append("seed_plan_outcome_mismatch")
+    if {"planned", "submitted"} <= valid_counts and seed["planned"] != seed[
+        "submitted"
+    ]:
+        reasons.append("seed_planned_submitted_mismatch")
+    if {"planned", "completed"} <= valid_counts and seed["planned"] != seed[
+        "completed"
+    ]:
+        reasons.append("seed_planned_completed_mismatch")
+    for name in ("failed", "cancelled", "pending"):
+        if name in valid_counts and seed[name]:
+            reasons.append("seed_" + name)
+    return reasons
+
+
+def assessment_reasons(event, key):
+    assessment = event.get(key)
+    if not isinstance(assessment, dict):
+        return [key + "_evidence_missing"]
+    reasons = list(assessment.get("reasons", []))
+    if assessment.get("valid") is not True and not reasons:
+        reasons.append(key + "_invalid")
+    return reasons
+
 
 class PressureEvidence:
     """Serialized supervisor sink retaining only outstanding dispatched jobs."""
@@ -425,8 +479,71 @@ class PressureEvidence:
         self.window = None
         self.duration = None
         self.execution_failed = False
+        self.execution_reasons = []
+        previous = writer.manifest.get("classification", {})
+        self.nonformal_reasons = list(previous.get("nonformal_reasons", []))
+        self.nonformal_reasons.extend(
+            writer.manifest.get("formal_candidate_reasons", [])
+        )
+        self.formal_config_eligible = (
+            previous.get("formal_config_valid") is not False
+            and writer.manifest.get("formal_candidate") is not False
+        )
+        if "seed_plan" in writer.manifest:
+            self._classification(writer.manifest["seed_plan"])
         self.lock = threading.RLock()
         self.steps = StepAnalysis(target_ranks, session_id)
+
+    def _execution_failure(self, reason):
+        self.execution_failed = True
+        if reason not in self.execution_reasons:
+            self.execution_reasons.append(reason)
+
+    def _classification(self, plan):
+        self.formal_config_eligible &= plan.get("formal_config_valid") is True
+        self.nonformal_reasons.extend(plan.get("nonformal_reasons", []))
+        # Retain frozen inputs even if an upstream screening reason was omitted.
+        for condition, reason in (
+            (plan.get("source") == "manual", "manual_seed_count"),
+            (
+                "client_inflight" in plan and plan["client_inflight"] < 16,
+                "client_inflight_below_16",
+            ),
+            (plan.get("test_block_num", 0) > 0, "synthetic_test_block_capacity"),
+            (
+                "fill_target_tokens" in plan and plan["fill_target_tokens"] != 102400,
+                "nonstandard_fill_target",
+            ),
+            (plan.get("explicit_smoke") is True, "explicit_smoke"),
+            (
+                "grid_reuse_tokens" in plan and plan["grid_reuse_tokens"] < 32768,
+                "grid_reuse_below_32768",
+            ),
+        ):
+            if condition:
+                self.nonformal_reasons.append(reason)
+        reasons = set(self.nonformal_reasons)
+        ordered = [reason for reason in NONFORMAL_REASON_ORDER if reason in reasons]
+        ordered.extend(sorted(reasons - set(NONFORMAL_REASON_ORDER)))
+        if not self.formal_config_eligible and not ordered:
+            ordered.append("formal_configuration_invalid")
+        self.nonformal_reasons = ordered
+        return dict(
+            formal_config_valid=self.formal_config_eligible and not ordered,
+            nonformal_reasons=ordered.copy(),
+            inputs={
+                name: deepcopy(plan.get(name))
+                for name in (
+                    "source",
+                    "seed_count",
+                    "client_inflight",
+                    "test_block_num",
+                    "fill_target_tokens",
+                    "grid_reuse_tokens",
+                    "explicit_smoke",
+                )
+            },
+        )
 
     def abort(self, error):
         with self.lock:
@@ -450,14 +567,16 @@ class PressureEvidence:
         row.update(event.get("result", {}))
         row["success"] = terminal == "completion" and row.get("success") is True
         if not row["success"]:
-            self.execution_failed = True
+            self._execution_failure(
+                "request_cancelled" if terminal == "cancellation" else "request_failed"
+            )
         if terminal == "completion" and "input_len" in record:
             result = event.get("result", {})
             if (
                 result.get("input_len") != record["input_len"]
                 or result.get("output_len") != 1
             ):
-                self.execution_failed = True
+                self._execution_failure("request_shape_mismatch")
         if terminal == "cancellation":
             row.update(
                 cancel_requested_s=event.get("at_s"),
@@ -474,9 +593,13 @@ class PressureEvidence:
                 "cache_samples" if kind == "pressure" else "steps", event
             )
             if kind == "frozen":
+                plan = deepcopy(event["seed_plan"])
                 self.duration = event["config"]["measure_s"]
                 self.writer.manifest.update(
-                    session_id=event["session_id"], frozen=event
+                    session_id=event["session_id"],
+                    frozen=deepcopy(event),
+                    seed_plan=plan,
+                    classification=self._classification(plan),
                 )
                 self.writer._atomic("manifest.json", self.writer.manifest)
             elif kind == "phase" and event["phase"] == "measurement":
@@ -507,13 +630,15 @@ class PressureEvidence:
                 controls.setdefault("diagnostics", []).append(event)
                 self.writer._atomic("manifest.json", self.writer.manifest)
                 if event.get("result") and not event["result"].get("success"):
-                    self.execution_failed = True
+                    self._execution_failure(
+                        event.get("reason") or "diagnostics_control_failed"
+                    )
             elif kind == "dispatch":
                 self.pending[event["job_id"]] = (event, None)
                 self.steps.dispatch(event)
             elif kind == "completion":
                 if event.get("result", {}).get("success") is not True:
-                    self.execution_failed = True
+                    self._execution_failure("request_failed")
                 entry = self.pending.pop(event["job_id"], None)
                 if entry:
                     self._terminal(entry[0], kind, event)
@@ -522,24 +647,73 @@ class PressureEvidence:
                 if entry:
                     self.pending[event["job_id"]] = (entry[0], event)
             elif kind == "error":
-                self.execution_failed = True
+                self._execution_failure(
+                    event.get("reason") or event.get("error") or "supervisor_error"
+                )
             elif kind == "finished":
                 for record, cancellation in self.pending.values():
                     self._terminal(record, "cancellation", cancellation or {})
                 self.pending.clear()
                 failure = event.get("failure")
                 profile_failure = bool(failure and failure.startswith("profile"))
+                plan = self.writer.manifest.get("seed_plan", {})
+                seed = deepcopy(event.get("seed"))
+                seed_reasons = seed_outcome_reasons(seed, plan)
+                classification = self._classification(plan)
+                execution_reasons = self.execution_reasons.copy()
+                if failure and not profile_failure and failure not in execution_reasons:
+                    execution_reasons.append(failure)
+                execution_reasons.extend(seed_reasons)
+                validity = formal_pressure_validity(
+                    execution_valid=(
+                        not self.execution_failed
+                        and not seed_reasons
+                        and (not failure or profile_failure)
+                    ),
+                    full_pressure_valid=event.get("pressure", {}).get("valid"),
+                    formal_config_valid=classification["formal_config_valid"],
+                    bidirectional_migration_valid=event.get("migration", {}).get(
+                        "valid"
+                    ),
+                )
+                validity_reasons = dict(
+                    execution_valid=execution_reasons,
+                    full_pressure_valid=assessment_reasons(event, "pressure"),
+                    formal_config_valid=classification["nonformal_reasons"],
+                    bidirectional_migration_valid=assessment_reasons(
+                        event, "migration"
+                    ),
+                )
+                validity_reasons["formal_acceptance_valid"] = list(
+                    dict.fromkeys(
+                        reason
+                        for reasons in validity_reasons.values()
+                        for reason in reasons
+                    )
+                )
+                self.writer.manifest["seed_outcome"] = seed
                 summary = dict(
+                    **{
+                        key: deepcopy(self.writer.manifest[key])
+                        for key in (
+                            *MANIFEST_PROJECTION,
+                            "startup_pressure",
+                            "startup_targets",
+                            "seed_plan",
+                            "frozen",
+                        )
+                        if key in self.writer.manifest
+                    },
                     execution_mode="full_pressure_diagnostic_v1",
                     metrics=[],
+                    seed_outcome=seed,
+                    classification=classification,
+                    validity_reasons=validity_reasons,
                     baseline_steps=self.steps.summary(),
                     window=self.window.summary() if self.window else None,
                     result=event,
                     validity=dict(
-                        execution_valid=(
-                            not self.execution_failed
-                            and (not failure or profile_failure)
-                        ),
+                        **validity,
                         pressure_valid=dict(
                             measurement=event.get("pressure", {}).get("valid"),
                             # The actual capture window is supplied by Task 13;

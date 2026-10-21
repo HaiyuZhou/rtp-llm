@@ -20,6 +20,27 @@ from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import (
 
 
 class FormalConfigTest(unittest.TestCase):
+    def test_explicit_smoke_is_ordered_and_requires_a_boolean(self):
+        values = dict(
+            manual_seed_count=2,
+            client_inflight=2,
+            test_block_num=128,
+            fill_target_tokens=16384,
+        )
+        self.assertEqual(
+            formal_config_reasons(**values, explicit_smoke=True),
+            (
+                "manual_seed_count",
+                "client_inflight_below_16",
+                "synthetic_test_block_capacity",
+                "nonstandard_fill_target",
+                "explicit_smoke",
+            ),
+        )
+        for value in (1, "true", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                formal_config_reasons(**values, explicit_smoke=value)
+
     def test_constants_and_monotonic_reasons(self):
         self.assertEqual(MIN_REUSE_TOKENS, 32768)
         self.assertEqual(FORMAL_FILL_TARGET_TOKENS, 102400)

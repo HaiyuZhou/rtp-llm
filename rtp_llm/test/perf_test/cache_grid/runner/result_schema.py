@@ -188,6 +188,23 @@ def single_request_metric(item):
     }
 
 
+def formal_pressure_validity(
+    *,
+    execution_valid,
+    full_pressure_valid,
+    formal_config_valid,
+    bidirectional_migration_valid,
+):
+    """Keep diagnostic gates independent and require explicit evidence for each."""
+    gates = dict(
+        execution_valid=execution_valid is True,
+        full_pressure_valid=full_pressure_valid is True,
+        formal_config_valid=formal_config_valid is True,
+        bidirectional_migration_valid=bidirectional_migration_valid is True,
+    )
+    return dict(gates, formal_acceptance_valid=all(gates.values()))
+
+
 def measurement_status(
     success, shape_exact, reuse_exact, timing_valid, *, skip_reuse=False
 ):

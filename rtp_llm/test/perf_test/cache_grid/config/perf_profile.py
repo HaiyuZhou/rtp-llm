@@ -211,6 +211,12 @@ def validate_profile(profile: Any) -> None:
     cache_grid = profile.get("cache_grid")
     if "cache_grid" in profile and not isinstance(cache_grid, dict):
         raise ProfileError("cache_grid must be a JSON object")
+    if (
+        isinstance(cache_grid, dict)
+        and "explicit_smoke" in cache_grid
+        and type(cache_grid["explicit_smoke"]) is not bool
+    ):
+        raise ProfileError("cache_grid.explicit_smoke must be a boolean")
     if isinstance(cache_grid, dict) and "expected_block_size" in cache_grid:
         raise ProfileError(
             "cache_grid.expected_block_size was removed; set grid.generator.cache_alignment"

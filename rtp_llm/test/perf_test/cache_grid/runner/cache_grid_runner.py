@@ -3145,6 +3145,12 @@ class CacheGridRunner:
                 manual_seed_count=self.pressure_seed_count,
                 fill_target_tokens=self.pressure_config.fill_input_tokens,
                 test_block_num=startup.get("test_block_num", 0),
+                explicit_smoke=(
+                    (self.profile or {})
+                    .get("cache_grid", {})
+                    .get("explicit_smoke", False)
+                    or self.grid_metadata.get("kind") == "explicit_cache_grid_smoke"
+                ),
             )
             self._pressure_seed_plan = seed_plan
             effective_config = replace(

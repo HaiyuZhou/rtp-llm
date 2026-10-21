@@ -19,6 +19,7 @@ def formal_config_reasons(
     client_inflight: int,
     test_block_num: int,
     fill_target_tokens: int,
+    explicit_smoke: bool = False,
 ) -> tuple[str, ...]:
     """Return ordered static exclusions; live capacity planning is still required."""
     for name, value, minimum in (
@@ -31,6 +32,8 @@ def formal_config_reasons(
             continue
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
+    if type(explicit_smoke) is not bool:
+        raise ValueError("explicit_smoke must be a boolean")
     reasons = []
     if manual_seed_count is not None:
         reasons.append("manual_seed_count")
@@ -40,6 +43,8 @@ def formal_config_reasons(
         reasons.append("synthetic_test_block_capacity")
     if fill_target_tokens != FORMAL_FILL_TARGET_TOKENS:
         reasons.append("nonstandard_fill_target")
+    if explicit_smoke:
+        reasons.append("explicit_smoke")
     return tuple(reasons)
 
 
@@ -94,6 +99,7 @@ class SeedPlan:
     test_block_num: int = 0
     global_minimum_families: int = 0
     global_maximum_families: int = 0
+    explicit_smoke: bool = False
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -118,6 +124,7 @@ def build_seed_plan(
     manual_seed_count: int | None,
     fill_target_tokens: int,
     test_block_num: int,
+    explicit_smoke: bool = False,
 ) -> SeedPlan:
     """Plan a uniform reusable bank from owner capacity and live host availability.
 
@@ -130,6 +137,7 @@ def build_seed_plan(
         client_inflight=client_inflight,
         test_block_num=test_block_num,
         fill_target_tokens=fill_target_tokens,
+        explicit_smoke=explicit_smoke,
     )
     if type(commit_tail_tokens) is not int or commit_tail_tokens < 0:
         raise ValueError("commit_tail_tokens must be a nonnegative integer")
@@ -252,4 +260,5 @@ def build_seed_plan(
         test_block_num=test_block_num,
         global_minimum_families=lower,
         global_maximum_families=upper,
+        explicit_smoke=explicit_smoke,
     )

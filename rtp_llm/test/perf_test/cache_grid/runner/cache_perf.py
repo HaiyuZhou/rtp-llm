@@ -362,6 +362,10 @@ def build_plan(args, inherited=None):
                 extract_arg(merge_engine_args(profile, []), "test_block_num") or 0
             ),
             fill_target_tokens=settings.fill_input_tokens,
+            explicit_smoke=(
+                profile.get("cache_grid", {}).get("explicit_smoke", False)
+                or payload.get("kind") == "explicit_cache_grid_smoke"
+            ),
         )
         screening = dict(
             formal_candidate=not reasons,

@@ -1614,6 +1614,38 @@ class RunnerIntegrationTest(unittest.TestCase):
             result = runner._run_full_pressure_epoch("epoch")
         return result, submissions, sessions
 
+    def test_explicit_smoke_remains_nonformal_through_runtime_artifacts(self):
+        for source in ("profile", "grid"):
+            with self.subTest(
+                source=source
+            ), tempfile.TemporaryDirectory() as directory:
+                options = (
+                    dict(profile={"cache_grid": {"explicit_smoke": True}})
+                    if source == "profile"
+                    else dict(
+                        grid_metadata={
+                            "kind": "explicit_cache_grid_smoke",
+                            "generator": {"cache_alignment": 4096},
+                        }
+                    )
+                )
+                runner = self._startup_runner(directory, **options)
+                self._run_startup_epoch(runner)
+                root = runner._pressure_epoch_dir / "pressure"
+                for name in ("manifest.json", "summary.json"):
+                    artifact = json.loads((root / name).read_text())
+                    self.assertTrue(artifact["seed_plan"]["explicit_smoke"])
+                    self.assertEqual(
+                        artifact["seed_plan"]["nonformal_reasons"], ["explicit_smoke"]
+                    )
+                    self.assertFalse(artifact["validity"]["formal_config_valid"])
+                    self.assertFalse(artifact["validity"]["formal_acceptance_valid"])
+                    self.assertTrue(artifact["validity"]["execution_valid"])
+                    self.assertEqual(
+                        artifact["classification"]["nonformal_reasons"],
+                        ["explicit_smoke"],
+                    )
+
     def test_startup_plan_is_frozen_before_requests_and_reproducible(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = self._startup_runner(directory)

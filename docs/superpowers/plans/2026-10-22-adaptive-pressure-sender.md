@@ -157,10 +157,10 @@ Stage the Task 2 files and commit with message `feat(cache-grid): dispatch adapt
 
 - [x] **Step 1: Write failing propagation tests**
 
-Assert profile and explicit CLI settings reach the generated Bazel runner
-arguments, run configuration snapshot, `CacheGridRunner`, session manifest,
-and frozen event. Assert adaptive tiered rolling accepts a positive request
-rate while fixed tiered rolling preserves compatibility.
+Assert profile and explicit CLI settings are frozen into the profile snapshot,
+then resolve through the perf-test parser into `CacheGridRunner`, the session
+manifest, and the frozen event. Assert adaptive tiered rolling accepts a
+positive request rate while fixed tiered rolling preserves compatibility.
 
 - [x] **Step 2: Run propagation tests and confirm RED**
 
@@ -169,9 +169,11 @@ Run `python3 -m unittest rtp_llm.test.perf_test.cache_grid.tests.cache_perf_test
 - [x] **Step 3: Complete CLI and runner propagation**
 
 Use the existing generated `PRESSURE_OPTIONS` CLI path for adaptive settings,
-include resolved values in frozen pressure configuration, and ensure the
-runner uses the resolved `request_rate_max` only for adaptive mode. Preserve
-the legacy `pressure_request_rate` names and defaults for non-adaptive runs.
+include resolved values in the frozen profile snapshot, and let the perf-test
+parser reconstruct the immutable pressure configuration from that snapshot.
+Ensure the runner uses the resolved `request_rate_max` only for adaptive mode.
+Preserve the legacy `pressure_request_rate` names and defaults for
+non-adaptive runs.
 
 - [x] **Step 4: Configure and document the production example**
 
@@ -199,8 +201,9 @@ tier split is a sequence property rather than a batch barrier.
 - [x] **Step 5: Run the focused suite; run the static dry run after target sync**
 
 Run the Task 3 unittest command, then run the documented `tools/cache_perf`
-dry-run command to verify all new settings appear in generated runner arguments
-and snapshots.
+dry-run command and parse the synced profile through the direct perf-test
+configuration path. Pressure window/controller settings live in the frozen
+profile snapshot; only workload settings use generated runner arguments.
 
 - [x] **Step 6: Run syntax and diff checks**
 

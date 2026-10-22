@@ -562,6 +562,7 @@ class BatchDecodeTest(unittest.TestCase):
             "--cache_pressure_activity_timeout=20",
             "--cache_pressure_drain_timeout=20",
             "--cache_pressure_capture_timeout=120",
+            "--cache_pressure_control_timeout=7.5",
         ]
         args, remaining = parse_args(flags)
         self.assertEqual(remaining, [])
@@ -580,6 +581,7 @@ class BatchDecodeTest(unittest.TestCase):
         self.assertEqual(ordinary.cache_pressure_client_concurrency, 0)
         self.assertEqual(args._pressure_config.measure_s, 60)
         self.assertEqual(args._pressure_config.fill_max_requests, 50)
+        self.assertEqual(args._pressure_config.control_timeout_s, 7.5)
         profiled, _ = parse_args(
             flags
             + [

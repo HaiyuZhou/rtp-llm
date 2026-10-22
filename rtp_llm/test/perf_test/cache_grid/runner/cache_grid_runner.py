@@ -2022,7 +2022,7 @@ class CacheGridRunner:
                         recorder_capacity=4096 if action == "enable" else 0,
                         target_ranks=target_ranks,
                     ),
-                    timeout=min(timeout, 1.0),
+                    timeout=timeout,
                 )
                 record["response"] = MessageToDict(
                     response,

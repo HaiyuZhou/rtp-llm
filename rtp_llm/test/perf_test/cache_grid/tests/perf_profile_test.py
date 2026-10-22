@@ -78,6 +78,43 @@ class ValidateProfileTest(unittest.TestCase):
             60,
         )
 
+    def test_control_timeout_defaults_validates_and_allows_cli_overrides(self):
+        values = dict(
+            seed_timeout_s=30,
+            fill_timeout_s=20,
+            fill_max_requests=10,
+            fill_no_progress_s=5,
+            fill_input_tokens=512,
+            gpu_tolerance_blocks=2,
+            activity_timeout_s=10,
+            drain_timeout_s=10,
+            capture_timeout_s=60,
+        )
+        profile = _minimal_profile(cache_grid=dict(pressure=values))
+        self.assertEqual(
+            pressure_settings(profile, SimpleNamespace()).control_timeout_s, 1.0
+        )
+        self.assertEqual(
+            pressure_settings(
+                profile, SimpleNamespace(pressure_control_timeout=7.5)
+            ).control_timeout_s,
+            7.5,
+        )
+        self.assertEqual(
+            pressure_settings(
+                profile,
+                SimpleNamespace(cache_pressure_control_timeout=8.5),
+                direct=True,
+            ).control_timeout_s,
+            8.5,
+        )
+        for invalid in (0, -1, True, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                pressure_settings(
+                    profile,
+                    SimpleNamespace(pressure_control_timeout=invalid),
+                )
+
     def test_pressure_fill_defaults_without_mutating_profile_and_allows_overrides(self):
         values = dict(
             seed_timeout_s=30,

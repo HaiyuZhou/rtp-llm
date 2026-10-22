@@ -50,6 +50,7 @@ PRESSURE_OPTIONS = (
     ("activity-timeout", "activity_timeout_s", float),
     ("drain-timeout", "drain_timeout_s", float),
     ("capture-timeout", "capture_timeout_s", float),
+    ("control-timeout", "control_timeout_s", float),
     ("host-target-ratio", "host_ratio", float),
     ("sample-period", "sample_period_s", float),
     ("max-sample-gap", "max_sample_gap_s", float),

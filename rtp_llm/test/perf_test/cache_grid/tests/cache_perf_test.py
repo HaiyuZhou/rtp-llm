@@ -476,6 +476,7 @@ class CachePerfTest(unittest.TestCase):
                     "--pressure-preload",
                     "--pressure-fill-max-requests=77",
                     "--pressure-measure-seconds=12",
+                    "--pressure-control-timeout=7.5",
                 ]
             ),
             {},
@@ -484,6 +485,7 @@ class CachePerfTest(unittest.TestCase):
         settings = frozen["cache_grid"]["pressure"]
         self.assertEqual(settings["measure_s"], 12)
         self.assertEqual(settings["fill_max_requests"], 77)
+        self.assertEqual(settings["control_timeout_s"], 7.5)
         self.assertEqual(settings["host_ratio"], 0.25)
         self.assertEqual(settings["steady_s"], 3)
         runner = json.loads(plan["artifacts"][cli.MANIFEST])["runner_args"]

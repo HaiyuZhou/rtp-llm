@@ -194,6 +194,7 @@ class LifecycleTest(unittest.TestCase):
         concurrency=4,
         batch_size=1,
         request_observer=None,
+        executor_factory=InlineExecutor,
     ):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             GroupSample,
@@ -265,7 +266,7 @@ class LifecycleTest(unittest.TestCase):
             diagnostics_control=diagnostics_control,
             clock=clock,
             sleep=clock.sleep,
-            executor_factory=InlineExecutor,
+            executor_factory=executor_factory,
             rate=rate,
         )
         result = state.run()
@@ -292,6 +293,40 @@ class LifecycleTest(unittest.TestCase):
         self.assertIn(("phase", "measurement"), controls)
         self.assertEqual(events[-1]["event"], "finished")
         self.assertTrue(polls_after_disable[-1])
+
+    def test_diagnostics_control_uses_configured_rpc_and_application_timeouts(self):
+        rpc_timeouts = []
+        application_timeouts = []
+
+        class TrackingFuture:
+            def __init__(self, future):
+                self.future = future
+
+            def result(self, timeout=None):
+                application_timeouts.append(timeout)
+                return self.future.result(timeout=timeout)
+
+            def __getattr__(self, name):
+                return getattr(self.future, name)
+
+        class TrackingExecutor(InlineExecutor):
+            def submit(self, fn, *args):
+                return TrackingFuture(super().submit(fn, *args))
+
+        def control(action, phase, timeout):
+            rpc_timeouts.append(timeout)
+            return {"success": True}
+
+        result, _, _, _ = self.run_session(
+            cfg=config(control_timeout_s=7.5),
+            diagnostics_control=control,
+            executor_factory=TrackingExecutor,
+        )
+
+        self.assertIsNone(result["failure"])
+        self.assertTrue(rpc_timeouts)
+        self.assertEqual(set(rpc_timeouts), {7.5})
+        self.assertIn(7.6, application_timeouts)
 
     def test_partial_enable_and_disable_failure_are_final_failures(self):
         for fail_action in ("enable", "disable", "phase"):

@@ -390,7 +390,10 @@ class PressureSession:
                         "phase",
                         values["phase"],
                         self.control_executor.submit(
-                            self.diagnostics_control, "phase", values["phase"], 1.0
+                            self.diagnostics_control,
+                            "phase",
+                            values["phase"],
+                            self.config.control_timeout_s,
                         ),
                     )
                 )
@@ -431,12 +434,25 @@ class PressureSession:
             if future.cancel():
                 self.emit("control_cancelled", action=action, phase=phase)
             else:
-                self._control_result(action, phase, future, timeout=1.1)
+                self._control_result(
+                    action,
+                    phase,
+                    future,
+                    timeout=self.config.control_timeout_s + 0.1,
+                )
         self.control_jobs.clear()
         future = self.control_executor.submit(
-            self.diagnostics_control, "disable", "", 1.0
+            self.diagnostics_control,
+            "disable",
+            "",
+            self.config.control_timeout_s,
         )
-        self._control_result("disable", "", future, timeout=1.1)
+        self._control_result(
+            "disable",
+            "",
+            future,
+            timeout=self.config.control_timeout_s + 0.1,
+        )
 
     def _final_steps(self):
         deadline = self.clock() + 2.0
@@ -866,9 +882,17 @@ class PressureSession:
         try:
             if self.diagnostics_control:
                 future = self.control_executor.submit(
-                    self.diagnostics_control, "enable", "", 1.0
+                    self.diagnostics_control,
+                    "enable",
+                    "",
+                    self.config.control_timeout_s,
                 )
-                if not self._control_result("enable", "", future, timeout=1.1):
+                if not self._control_result(
+                    "enable",
+                    "",
+                    future,
+                    timeout=self.config.control_timeout_s + 0.1,
+                ):
                     raise RuntimeError("diagnostic enable failed")
             baseline = self.poll(self.config.sample_period_s)
             try:

@@ -32,6 +32,7 @@ class PressureConfig:
     profile_steps: int = 20
     support_s: float = 60.0
     nsys_duration_s: float | None = None
+    control_timeout_s: float = 1.0
 
 
 @dataclass(frozen=True)

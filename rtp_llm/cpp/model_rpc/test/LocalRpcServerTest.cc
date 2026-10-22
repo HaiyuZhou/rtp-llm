@@ -227,8 +227,9 @@ public:
     PressureStepPage getPressureSteps(const std::string& session, uint64_t after, size_t limit) const override {
         return recorder.read(session, after, limit);
     }
-    ErrorResult<int64_t> controlPressureDiagnostics(const PressureSessionControl& control,
-                                                    std::chrono::system_clock::time_point) override {
+    ErrorResult<int64_t> controlPressureDiagnostics(const PressureSessionControl&         control,
+                                                    std::chrono::system_clock::time_point deadline) override {
+        last_control_deadline = deadline;
         try {
             switch (control.action) {
                 case PressureControlAction::ENABLE:
@@ -247,7 +248,26 @@ public:
             return {ErrorCode::INVALID_PARAMS, error.what()};
         }
     }
+    std::optional<std::chrono::system_clock::time_point> last_control_deadline;
 };
+
+class DelayedPressureEngine: public PressureEngine {
+public:
+    explicit DelayedPressureEngine(std::chrono::milliseconds delay): delay_(delay) {}
+
+    ErrorResult<int64_t> controlPressureDiagnostics(const PressureSessionControl&         control,
+                                                    std::chrono::system_clock::time_point deadline) override {
+        std::this_thread::sleep_for(delay_);
+        if (std::chrono::system_clock::now() >= deadline) {
+            return {ErrorCode::DEADLINE_EXCEEDED, "injected pressure control deadline exceeded"};
+        }
+        return PressureEngine::controlPressureDiagnostics(control, deadline);
+    }
+
+private:
+    std::chrono::milliseconds delay_;
+};
+
 class PressureService: public LocalRpcServiceImpl {
 public:
     explicit PressureService(const std::shared_ptr<LocalRpcServer>& server) {
@@ -1602,6 +1622,71 @@ TEST(PressureRpcTest, ControlDeadlineRetainsSuccessfulRankAndUnsupportedIsExplic
     EXPECT_EQ(coordinator.ControlPressureDiagnosticsInternal(&context, &request, &response).error_code(),
               grpc::StatusCode::UNIMPLEMENTED);
     grpc_server->Shutdown();
+}
+
+TEST(PressureRpcTest, MissingControlDeadlineUsesOneSecondFallback) {
+    TestLocalRpcServer server;
+    server.configurePressure(0);
+    auto engine = std::make_shared<PressureEngine>();
+    server.setEngineForTest(engine);
+    grpc::ServerContext              context;
+    PressureSessionControlRequestPB  request;
+    PressureSessionControlResponsePB response;
+    const auto                       before = std::chrono::system_clock::now();
+    request.set_session_id("fallback-deadline");
+    request.set_action(PressureSessionControlRequestPB::ENABLE);
+
+    ASSERT_TRUE(server.ControlPressureDiagnosticsInternal(&context, &request, &response).ok());
+
+    const auto after = std::chrono::system_clock::now();
+    ASSERT_TRUE(engine->last_control_deadline);
+    EXPECT_GE(*engine->last_control_deadline - before, std::chrono::milliseconds(900));
+    EXPECT_LE(*engine->last_control_deadline - after, std::chrono::milliseconds(1100));
+}
+
+TEST(PressureRpcTest, ExplicitLongControlDeadlineReachesPeerApplication) {
+    auto peer = std::make_shared<TestLocalRpcServer>();
+    peer->configurePressure(1, 1, 2);
+    peer->setEngineForTest(std::make_shared<DelayedPressureEngine>(std::chrono::milliseconds(1200)));
+    PressureService     peer_service(peer);
+    grpc::ServerBuilder peer_builder;
+    int                 peer_port = 0;
+    peer_builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &peer_port);
+    peer_builder.RegisterService(&peer_service);
+    auto peer_server = peer_builder.BuildAndStart();
+    ASSERT_TRUE(peer_server);
+
+    auto coordinator = std::make_shared<TestLocalRpcServer>();
+    coordinator->configurePressure(0, 0, 2, {"", "127.0.0.1:" + std::to_string(peer_port)});
+    coordinator->setEngineForTest(std::make_shared<DelayedPressureEngine>(std::chrono::milliseconds(1200)));
+    PressureService     coordinator_service(coordinator);
+    grpc::ServerBuilder coordinator_builder;
+    int                 coordinator_port = 0;
+    coordinator_builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &coordinator_port);
+    coordinator_builder.RegisterService(&coordinator_service);
+    auto coordinator_server = coordinator_builder.BuildAndStart();
+    ASSERT_TRUE(coordinator_server);
+
+    auto stub = RpcService::NewStub(
+        grpc::CreateChannel("127.0.0.1:" + std::to_string(coordinator_port), grpc::InsecureChannelCredentials()));
+    grpc::ClientContext              context;
+    PressureSessionControlRequestPB  request;
+    PressureSessionControlResponsePB response;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+    request.set_session_id("long-deadline");
+    request.set_action(PressureSessionControlRequestPB::ENABLE);
+
+    const auto begin  = std::chrono::steady_clock::now();
+    auto       status = stub->ControlPressureDiagnostics(&context, request, &response);
+    EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(3));
+    ASSERT_TRUE(status.ok()) << status.error_message();
+    ASSERT_EQ(response.ranks_size(), 2);
+    EXPECT_TRUE(response.ranks(0).error().empty()) << response.ranks(0).error();
+    EXPECT_TRUE(response.ranks(1).error().empty()) << response.ranks(1).error();
+    EXPECT_GT(response.ranks(1).applied_monotonic_ns(), 0);
+
+    coordinator_server->Shutdown();
+    peer_server->Shutdown();
 }
 
 TEST(PressureRpcTest, ControlFanoutUsesInternalWrapperAndPreservesMissingRank) {

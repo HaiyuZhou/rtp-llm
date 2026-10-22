@@ -947,6 +947,7 @@ ErrorResult<int64_t> NormalEngine::controlPressureDiagnostics(const PressureSess
     if (propose_params_) {
         return {kPressureDiagnosticsUnsupported, "pressure step recording requires NormalExecutor"};
     }
+    deadline          = resolvePressureControlDeadline(deadline);
     auto pending      = std::make_shared<PendingPressureControl>();
     pending->control  = control;
     pending->deadline = deadline;

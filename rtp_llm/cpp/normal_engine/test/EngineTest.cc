@@ -166,6 +166,45 @@ TEST_F(NormalEngineTest, testPressureControlAcknowledgesWhileRealLoopIsIdle) {
                     .ok());
 }
 
+TEST_F(NormalEngineTest, testPressureControlDeadlinesRemainBounded) {
+    ModelConfig   model;
+    RuntimeConfig runtime;
+    KVCacheConfig cache;
+    auto          params               = createEngineInitParams(CustomConfig{}, model, runtime, cache);
+    NormalExecutor::test_model_factory = [&](const GptModelInitParams&) {
+        return std::make_unique<MockModel>(model.vocab_size);
+    };
+    struct ResetFactory {
+        ~ResetFactory() {
+            NormalExecutor::test_model_factory = nullptr;
+        }
+    } reset;
+    NormalEngine engine(params, nullptr, false);
+
+    auto expect_timeout = [&](const std::string&                    session,
+                              std::chrono::system_clock::time_point deadline,
+                              std::chrono::milliseconds             max_wait) {
+        auto       result      = std::async(std::launch::async, [&] {
+            return engine.controlPressureDiagnostics({session, PressureControlAction::ENABLE, "", 2}, deadline);
+        });
+        const auto wait_status = result.wait_for(max_wait);
+        EXPECT_EQ(wait_status, std::future_status::ready);
+        if (wait_status != std::future_status::ready) {
+            EXPECT_TRUE(engine.step().ok());
+        }
+        auto outcome = result.get();
+        EXPECT_FALSE(outcome.ok());
+        EXPECT_EQ(outcome.status().code(), ErrorCode::DEADLINE_EXCEEDED);
+        if (wait_status == std::future_status::ready) {
+            EXPECT_TRUE(engine.step().ok());
+        }
+        EXPECT_FALSE(engine.getPressureSteps(session, 0, 10).available);
+    };
+    expect_timeout(
+        "short", std::chrono::system_clock::now() + std::chrono::milliseconds(100), std::chrono::milliseconds(500));
+    expect_timeout("bounded", std::chrono::system_clock::time_point::max(), std::chrono::milliseconds(1500));
+}
+
 TEST_F(NormalEngineTest, testExecutorDecodesCopyRowsUsingPayloadTags) {
     class CopyPayloadProcessor: public NormalBatchStreamProcessor {
     public:

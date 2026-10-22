@@ -1019,8 +1019,7 @@ grpc::Status LocalRpcServer::ControlPressureDiagnosticsInternal(grpc::ServerCont
                                    static_cast<PressureControlAction>(request->action()),
                                    request->phase(),
                                    request->recorder_capacity()};
-    const auto             deadline = std::min(context->deadline(),
-                                   std::chrono::system_clock::now() + std::chrono::milliseconds(kPressureRpcTimeoutMs));
+    const auto             deadline = resolvePressureControlDeadline(context->deadline());
     auto                   result   = engine_ ? engine_->controlPressureDiagnostics(control, deadline) :
                                                 ErrorResult<int64_t>(kPressureDiagnosticsUnsupported, "pressure diagnostics unsupported");
     if (!result.ok()) {
@@ -1076,8 +1075,7 @@ grpc::Status LocalRpcServer::ControlPressureDiagnostics(grpc::ServerContext*    
     RPCPool                               pressure_rpc_pool;
     grpc::CompletionQueue                 queue;
     std::vector<std::unique_ptr<Pending>> pending;
-    const auto                            deadline     = std::min(context->deadline(),
-                                   std::chrono::system_clock::now() + std::chrono::milliseconds(kPressureRpcTimeoutMs));
+    const auto                            deadline     = resolvePressureControlDeadline(context->deadline());
     const auto&                           addresses    = maga_init_params_.runtime_config.worker_grpc_addrs;
     PressureSessionControlRankPB*         local_record = nullptr;
     // Launch peers before waiting for the local engine boundary. Every rank shares the deadline.

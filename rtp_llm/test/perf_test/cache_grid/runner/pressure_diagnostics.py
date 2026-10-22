@@ -33,6 +33,16 @@ class PressureConfig:
     support_s: float = 60.0
     nsys_duration_s: float | None = None
     control_timeout_s: float = 1.0
+    family_schedule: str = "round_robin"
+    memory_reuse_ratio: float = 0.0
+    fill_host_max_ratio: float = 1.0
+    rate_control: str = "fixed"
+    request_rate_min: float = 0.0
+    request_rate_max: float = 0.0
+    backlog_low: int = 0
+    backlog_high: int = 0
+    max_outstanding: int = 0
+    cohort_size: int = 0
 
 
 @dataclass(frozen=True)
@@ -144,20 +154,82 @@ def resolve_pressure_config(values: dict) -> PressureConfig:
         "fill_input_tokens",
         "gpu_tolerance_blocks",
         "profile_steps",
+        "backlog_low",
+        "backlog_high",
+        "max_outstanding",
+        "cohort_size",
     }
     for field in fields(config):
         value = getattr(config, field.name)
+        if field.name in {"family_schedule", "rate_control"}:
+            continue
         if field.name == "nsys_duration_s" and value is None:
             continue
         if field.name in integers:
             _integer(
-                value, field.name, 0 if field.name == "gpu_tolerance_blocks" else 1
+                value,
+                field.name,
+                0
+                if field.name
+                in {
+                    "gpu_tolerance_blocks",
+                    "backlog_low",
+                    "backlog_high",
+                    "max_outstanding",
+                    "cohort_size",
+                }
+                else 1,
             )
+        elif field.name in {
+            "memory_reuse_ratio",
+            "request_rate_min",
+            "request_rate_max",
+        }:
+            _number(value, field.name, inclusive=True)
         else:
             _number(value, field.name)
-    for name in ("host_ratio", "min_coverage"):
+    for name in (
+        "host_ratio",
+        "min_coverage",
+        "memory_reuse_ratio",
+        "fill_host_max_ratio",
+    ):
         if getattr(config, name) > 1:
             raise ValueError(f"{name} must be <= 1")
+    if config.family_schedule not in {"round_robin", "tiered_rolling"}:
+        raise ValueError("family_schedule must be round_robin or tiered_rolling")
+    if config.rate_control not in {"fixed", "adaptive_backlog"}:
+        raise ValueError("rate_control must be fixed or adaptive_backlog")
+    adaptive_values = (
+        config.request_rate_min,
+        config.request_rate_max,
+        config.backlog_low,
+        config.backlog_high,
+        config.max_outstanding,
+        config.cohort_size,
+    )
+    if config.rate_control == "adaptive_backlog":
+        if not 0 < config.request_rate_min <= config.request_rate_max:
+            raise ValueError("adaptive rates must satisfy 0 < min <= max")
+        if not 0 <= config.backlog_low < config.backlog_high:
+            raise ValueError("adaptive backlog requires 0 <= low < high")
+        if config.backlog_high >= config.max_outstanding:
+            raise ValueError("adaptive backlog high must be below max outstanding")
+        if config.cohort_size <= 0:
+            raise ValueError("adaptive backlog requires a positive cohort size")
+        if config.cohort_size % 2:
+            raise ValueError("adaptive backlog requires an even cohort size")
+        if config.family_schedule != "tiered_rolling":
+            raise ValueError("adaptive backlog requires tiered_rolling")
+    elif any(adaptive_values):
+        raise ValueError("adaptive backlog settings require adaptive_backlog control")
+    if config.family_schedule == "tiered_rolling":
+        if config.memory_reuse_ratio != 0.5:
+            raise ValueError("tiered_rolling requires a 50% memory reuse ratio")
+        if config.fill_host_max_ratio <= config.host_ratio:
+            raise ValueError("fill host maximum must exceed the pressure target")
+    elif config.memory_reuse_ratio:
+        raise ValueError("memory reuse ratio requires tiered_rolling")
     if min(config.max_sample_age_s, config.max_sample_gap_s) < config.sample_period_s:
         raise ValueError("sample age and gap must be >= sample period")
     return config

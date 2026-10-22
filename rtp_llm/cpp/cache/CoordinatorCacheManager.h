@@ -272,7 +272,6 @@ protected:
                                             const std::string&                   tag,
                                             const std::shared_ptr<CPSlotMapper>& mapper,
                                             int                                  cp_scale) const;
-    bool                 cpCompactSwaGroup(const std::string& tag, const std::shared_ptr<CPSlotMapper>& mapper) const;
     void                 rollbackBlockIdsToSize(int group_id, BlockIds& block_ids, size_t original_size);
     void                 rollbackInitMalloc(BatchKVCacheResource&                kv_resource,
                                             const std::vector<BlockIndicesType>& referenced_blocks,

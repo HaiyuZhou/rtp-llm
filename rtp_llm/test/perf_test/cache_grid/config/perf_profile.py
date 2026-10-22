@@ -63,6 +63,16 @@ PRESSURE_OPTIONS = (
     ("profile-steps", "profile_steps", int),
     ("support-seconds", "support_s", float),
     ("profile-seconds", "nsys_duration_s", float),
+    ("family-schedule", "family_schedule", str),
+    ("memory-reuse-ratio", "memory_reuse_ratio", float),
+    ("fill-host-max-ratio", "fill_host_max_ratio", float),
+    ("rate-control", "rate_control", str),
+    ("request-rate-min", "request_rate_min", float),
+    ("request-rate-max", "request_rate_max", float),
+    ("backlog-low", "backlog_low", int),
+    ("backlog-high", "backlog_high", int),
+    ("max-outstanding", "max_outstanding", int),
+    ("cohort-size", "cohort_size", int),
 )
 
 

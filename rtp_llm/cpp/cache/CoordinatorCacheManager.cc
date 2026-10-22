@@ -373,17 +373,14 @@ std::vector<KVCachePoolMetricsSnapshot> CoordinatorCacheManager::poolMetricsSnap
     return snapshots;
 }
 
-bool CoordinatorCacheManager::cpCompactSwaGroup(const std::string&                   tag,
-                                                const std::shared_ptr<CPSlotMapper>& mapper) const {
-    return mapper && mapper->isSharded() && mapper->compactLastRankGroup(config_, tag);
-}
-
 size_t CoordinatorCacheManager::loadTargetPosition(size_t                               path_index,
                                                    const std::string&                   tag,
                                                    const std::shared_ptr<CPSlotMapper>& mapper,
                                                    int                                  cp_scale) const {
     const CacheGroupType type = config_.topology().group(tag).policy.group_type;
-    return type == CacheGroupType::LINEAR || (type == CacheGroupType::SWA && !cpCompactSwaGroup(tag, mapper)) ?
+    // LINEAR and SWA resources keep CP's sparse raw-slot coordinates even when SWA payloads use
+    // COMPACT_LAST_RANK. Canonical path i therefore addresses the last slot in CP stripe i.
+    return type == CacheGroupType::LINEAR || type == CacheGroupType::SWA ?
                (path_index + 1) * static_cast<size_t>(cp_scale) - 1 :
                path_index;
 }
@@ -858,9 +855,8 @@ void CoordinatorCacheManager::insertIntoCache(const InsertInfo& insert_info, siz
                     break;
                 }
                 const auto type           = config_.group(tag).policy.group_type;
-                const bool sparse_logical = cp_active
-                                            && (type == CacheGroupType::LINEAR
-                                                || (type == CacheGroupType::SWA && !cpCompactSwaGroup(tag, cp_mapper)));
+                const bool sparse_logical =
+                    cp_active && (type == CacheGroupType::LINEAR || type == CacheGroupType::SWA);
                 const auto& blocks = kv_cache_resource->blocks(batch_id, tag);
                 for (size_t i = 0; i < insert_keys.size(); ++i) {
                     const size_t position = sparse_logical ? (i + 1) * static_cast<size_t>(cp_mapper->cpSize()) - 1 : i;

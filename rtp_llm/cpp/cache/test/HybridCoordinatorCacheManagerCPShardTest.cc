@@ -55,6 +55,29 @@ CacheConfig makeCPHybridConfig() {
     return config;
 }
 
+CacheConfig makeCPSwaHybridConfig() {
+    CacheConfig config;
+    config.dtype              = rtp_llm::DataType::TYPE_FP16;
+    config.layer_num          = 4;
+    config.seq_size_per_block = 4;
+    config.linear_step        = 4;
+
+    auto swa_spec = makeResolvedMhaSpec(config.dtype, 1, 1, config.seq_size_per_block, "swa");
+    auto full_spec = makeResolvedMhaSpec(config.dtype, 1, 1, config.seq_size_per_block, "full");
+    auto swa_policy = defaultCacheGroupPolicy(CacheGroupType::SWA);
+    swa_policy.enable_prefix_reuse = true;
+    swa_policy.cp_mapping          = CpBlockMappingMode::COMPACT_LAST_RANK;
+    swa_policy.sliding_window_size = config.seq_size_per_block;
+    auto full_policy = defaultCacheGroupPolicy(CacheGroupType::FULL);
+    config.fromGroupedSpecs({swa_spec, full_spec},
+                            {{0, 1}, {2, 3}},
+                            {CacheGroupType::SWA, CacheGroupType::FULL},
+                            {"swa", "full"},
+                            {swa_policy, full_policy});
+    config.finalizeBlockNums(64, RuntimeConfig{});
+    return config;
+}
+
 CompleteTokenIdsPtr makeTokens(int batch_size, int seq_length, int seq_size_per_block) {
     auto  tokens = std::make_shared<CompleteTokenIds>(batch_size, batch_size, seq_length + 64, seq_size_per_block);
     auto  ids    = torch::empty({(int64_t)seq_length}, torch::kInt32);
@@ -252,6 +275,43 @@ TEST_F(HybridCoordinatorCacheManagerCPShardTest, ShardedAllocCpSize4) {
     auto result = allocator->malloc(info);
     ASSERT_TRUE(result.success);
     EXPECT_EQ(batch_res->blocksNum(0, "full"), 2);  // ceil(8/4)=2
+}
+
+TEST_F(HybridCoordinatorCacheManagerCPShardTest, CpCompactSwaUsesCanonicalSourceSlotsForReuse) {
+    auto config    = makeCPSwaHybridConfig();
+    auto allocator = std::make_shared<TestHybridTypeCoordinatorCacheManager>(config, AllocationType::DEVICE);
+    ASSERT_TRUE(allocator->init());
+    allocator->setCPSlotMapper(std::make_shared<CPSlotMapper>(0, 4, 4));
+
+    CacheKeysType seed_keys;
+    for (int i = 0; i < 16; ++i) {
+        seed_keys.push_back(100 + i);
+    }
+    auto seed_res    = makeBatchRes(1, config, seed_keys);
+    auto seed_tokens = makeTokens(1, 64, 4);
+    MallocInfo seed_info{seed_res, seed_tokens};
+    seed_info.enable_cache_lookup = false;
+    seed_info.reuse_cache         = true;
+    ASSERT_TRUE(allocator->malloc(seed_info).success);
+    ASSERT_EQ(seed_res->blocksNum(0, "swa"), 16);
+    ASSERT_TRUE(isNullBlockIdx(seed_res->blocks(0, "swa")[0]));
+    ASSERT_FALSE(isNullBlockIdx(seed_res->blocks(0, "swa")[3]));
+    ASSERT_FALSE(isNullBlockIdx(seed_res->blocks(0, "swa")[7]));
+
+    size_t resident_prefix_length = 0;
+    allocator->insertIntoCache(InsertInfo{seed_res, seed_tokens, false}, resident_prefix_length);
+
+    auto hit_res = makeBatchRes(
+        1, config, CacheKeysType(seed_keys.begin(), seed_keys.begin() + 12));
+    auto hit_tokens = makeTokens(1, 48, 4);
+    MallocInfo hit_info{hit_res, hit_tokens};
+    hit_info.enable_cache_lookup = true;
+    hit_info.reuse_cache         = true;
+    auto result                  = allocator->malloc(hit_info);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.reuse_len, 32);
+    EXPECT_TRUE(isNullBlockIdx(hit_res->blocks(0, "swa")[3]));
+    EXPECT_EQ(hit_res->blocks(0, "swa")[7], seed_res->blocks(0, "swa")[7]);
 }
 
 }  // namespace test

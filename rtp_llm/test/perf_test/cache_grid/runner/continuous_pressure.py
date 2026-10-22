@@ -91,6 +91,158 @@ class ArrivalClock:
         return self.offset
 
 
+class AdaptiveBacklogController:
+    """Piecewise-linear offered rate derived from unfinished RPC count."""
+
+    def __init__(self, *, rate_min, rate_max, backlog_low, backlog_high):
+        if (
+            isinstance(rate_min, bool)
+            or isinstance(rate_max, bool)
+            or not math.isfinite(rate_min)
+            or not math.isfinite(rate_max)
+            or rate_min <= 0
+            or rate_max < rate_min
+        ):
+            raise ValueError("adaptive rates must satisfy 0 < min <= max")
+        if (
+            type(backlog_low) is not int
+            or type(backlog_high) is not int
+            or backlog_low < 0
+            or backlog_high <= backlog_low
+        ):
+            raise ValueError("adaptive backlog must satisfy 0 <= low < high")
+        self.rate_min = float(rate_min)
+        self.rate_max = float(rate_max)
+        self.backlog_low = backlog_low
+        self.backlog_high = backlog_high
+
+    def rate(self, outstanding: int) -> float:
+        if type(outstanding) is not int or outstanding < 0:
+            raise ValueError("outstanding must be a nonnegative integer")
+        if outstanding <= self.backlog_low:
+            return self.rate_max
+        if outstanding >= self.backlog_high:
+            return self.rate_min
+        remaining = (self.backlog_high - outstanding) / (
+            self.backlog_high - self.backlog_low
+        )
+        return self.rate_min + (self.rate_max - self.rate_min) * remaining
+
+
+@dataclass(frozen=True)
+class TieredRollingAssignment:
+    cohort_id: int
+    cohort_lane: int
+    family: int
+    case_index: int
+    expected_cache_tier: str
+    promoted_from_cohort: int | None = None
+
+
+class TieredRollingPlanner:
+    """Build fixed cohorts whose memory half becomes the next device half."""
+
+    def __init__(
+        self,
+        *,
+        effective_seed_count: int,
+        cohort_size: int,
+        memory_reuse_ratio: float,
+        case_indices: tuple[int, ...],
+    ):
+        if type(effective_seed_count) is not int or effective_seed_count <= 0:
+            raise ValueError("effective_seed_count must be positive")
+        if type(cohort_size) is not int or cohort_size <= 0:
+            raise ValueError("cohort_size must be positive")
+        if (
+            isinstance(memory_reuse_ratio, bool)
+            or not math.isfinite(memory_reuse_ratio)
+            or not 0 < memory_reuse_ratio < 1
+        ):
+            raise ValueError("memory_reuse_ratio must be between zero and one")
+        memory_count = cohort_size * memory_reuse_ratio
+        if not memory_count.is_integer():
+            raise ValueError("memory reuse ratio must produce an integral cohort")
+        self.memory_count = int(memory_count)
+        self.device_count = cohort_size - self.memory_count
+        if self.memory_count != self.device_count:
+            raise ValueError("tiered rolling currently requires a 50% memory ratio")
+        if not case_indices or self.memory_count % len(case_indices):
+            raise ValueError("cache cases must divide each tier half evenly")
+        self.effective_seed_count = effective_seed_count
+        self.cohort_size = cohort_size
+        self.case_indices = tuple(case_indices)
+        self.hot_start = effective_seed_count - self.device_count
+        self.memory_window_end = (
+            self.hot_start // self.memory_count
+        ) * self.memory_count
+        if self.memory_window_end < 2 * self.memory_count:
+            raise ValueError("effective seed count must provide two memory windows")
+        self.memory_cursor = 0
+        self.cohort_id = 0
+        self.previous_memory: tuple[TieredRollingAssignment, ...] | None = None
+
+    def _cases(self) -> tuple[int, ...]:
+        repeats = self.memory_count // len(self.case_indices)
+        return self.case_indices * repeats
+
+    def assignment(self, sequence: int) -> TieredRollingAssignment:
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError("tiered rolling sequence must be nonnegative")
+        cohort_id, cohort_lane = divmod(sequence, self.cohort_size)
+        lane = cohort_lane // 2
+        cases = self._cases()
+        case_index = cases[lane]
+        memory_start = (cohort_id * self.memory_count) % self.memory_window_end
+        if cohort_lane % 2:
+            return TieredRollingAssignment(
+                cohort_id=cohort_id,
+                cohort_lane=cohort_lane,
+                family=memory_start + lane,
+                case_index=case_index,
+                expected_cache_tier="memory",
+            )
+        if cohort_id == 0:
+            return TieredRollingAssignment(
+                cohort_id=cohort_id,
+                cohort_lane=cohort_lane,
+                family=self.hot_start + lane,
+                case_index=case_index,
+                expected_cache_tier="device",
+            )
+        previous_start = ((cohort_id - 1) * self.memory_count) % (
+            self.memory_window_end
+        )
+        return TieredRollingAssignment(
+            cohort_id=cohort_id,
+            cohort_lane=cohort_lane,
+            family=previous_start + lane,
+            case_index=case_index,
+            expected_cache_tier="device",
+            promoted_from_cohort=cohort_id - 1,
+        )
+
+    def next_cohort(self) -> tuple[TieredRollingAssignment, ...]:
+        start = self.cohort_id * self.cohort_size
+        result = tuple(
+            self.assignment(start + lane) for lane in range(self.cohort_size)
+        )
+        self.cohort_id += 1
+        return result
+
+
+def freeze_seed_families(seed_ids) -> int:
+    """Return the populated prefix length, rejecting holes in seed families."""
+    effective = len(seed_ids)
+    for index, ids in enumerate(seed_ids):
+        if ids is None:
+            effective = index
+            break
+    if any(ids is not None for ids in seed_ids[effective:]):
+        raise ValueError("completed seed families must form a contiguous prefix")
+    return effective
+
+
 class CancellableRequestHandle:
     """A bounded worker plus the actual RPC's cancellation, including start races.
 
@@ -275,9 +427,10 @@ class PressureSession:
 
     poll(timeout) returns PressurePoll; request(payload, register, before) invokes
     before(payload) immediately before its real RPC and uses the returned ID.
-    make_payload(kind, job_id) runs only in accepted request workers. sink(event)
-    must be fast, thread safe and persist/aggregate incrementally. Controller
-    start(now), pending(now), stop(reason, now) must be nonblocking.
+    make_payload(kind, job_id, formal_sequence) runs only in accepted request
+    workers. sink(event) must be fast, thread safe and persist/aggregate
+    incrementally. Controller start(now), pending(now), stop(reason, now) must
+    be nonblocking.
     """
 
     def __init__(
@@ -331,6 +484,22 @@ class PressureSession:
             batch_size,
         )
         self.seed_count = seed_count
+        self.adaptive = None
+        if config.rate_control == "adaptive_backlog":
+            if poisson:
+                raise ValueError("adaptive backlog requires constant arrivals")
+            if rate != 0:
+                raise ValueError(
+                    "adaptive backlog uses request_rate_max instead of fixed rate"
+                )
+            self.adaptive = AdaptiveBacklogController(
+                rate_min=config.request_rate_min,
+                rate_max=config.request_rate_max,
+                backlog_low=config.backlog_low,
+                backlog_high=config.backlog_high,
+            )
+        elif config.family_schedule == "tiered_rolling" and rate != 0:
+            raise ValueError("tiered rolling requires an unlimited arrival rate")
         self.max_input_tokens, self.seed_input_tokens = (
             max_input_tokens,
             seed_input_tokens,
@@ -345,7 +514,9 @@ class PressureSession:
         self.diagnostics_control = diagnostics_control
         self.control_jobs = []
         self.clock, self.sleep, self.executor_factory = clock, sleep, executor_factory
-        self.sender = BoundedSender(concurrency)
+        self.phase_concurrency = concurrency
+        sender_limit = config.max_outstanding if self.adaptive else concurrency
+        self.sender = BoundedSender(sender_limit)
         self.lock = threading.RLock()
         self.wakeup = threading.Event()
         self.jobs = {}
@@ -359,7 +530,11 @@ class PressureSession:
         self.max_seed_pending = 0
         self.seed_started = self.seed_finished = None
         self.seed_deadline = float("inf")
+        self.seed_stop_requested = False
+        self.seed_stop_snapshot = ()
         self.fill_sent = 0
+        self.fill_headroom_reached = False
+        self.fill_headroom_snapshot = ()
         self.closed = False
         self.supply_deadline = float("inf")
         self.profile_started = False
@@ -373,6 +548,15 @@ class PressureSession:
         self.last_execution_progress = clock()
         self.progress = None
         self.ready = False
+        self.supply_stats = dict(
+            max_outstanding=0,
+            rate_count=0,
+            rate_sum=0.0,
+            rate_min=None,
+            rate_max=None,
+            backlog_regions=dict(low=0, interpolated=0, high=0),
+            saturated=False,
+        )
 
     def emit(self, event, **values):
         with self.lock:
@@ -519,7 +703,7 @@ class PressureSession:
                     )
                 self.emit("phase", phase=self.state.phase, at_s=now)
 
-    def _before(self, job_id, kind, scheduled, payload):
+    def _before(self, job_id, kind, scheduled, payload, dispatch_context):
         # Serialize phase classification and identity allocation at the transport
         # boundary, after token generation. Workers never wait for arrival times.
         with self.lock:
@@ -572,6 +756,7 @@ class PressureSession:
                 input_sha256=input_sha256,
                 metadata=metadata,
             )
+            record.update(dispatch_context)
             if scheduled is not None:
                 record["schedule_lag_s"] = max(0, now - self.formal_origin - scheduled)
             self.jobs[job_id] = record
@@ -587,16 +772,22 @@ class PressureSession:
                 raise DispatchClosed()
             return identity
 
-    def _submit(self, kind, scheduled=None):
+    def _submit(self, kind, scheduled=None, formal_sequence=None, **dispatch_context):
         job_id = self.job_id
+        if formal_sequence is not None:
+            dispatch_context = dict(
+                dispatch_context, formal_sequence=formal_sequence
+            )
 
         def work(register):
             try:
-                payload = self.make_payload(kind, job_id)
+                payload = self.make_payload(kind, job_id, formal_sequence)
                 result = self.request(
                     payload,
                     register,
-                    lambda p: self._before(job_id, kind, scheduled, p),
+                    lambda p: self._before(
+                        job_id, kind, scheduled, p, dispatch_context
+                    ),
                 )
                 return dict(result, _pressure_completed_s=self.clock())
             except DispatchClosed:
@@ -680,6 +871,42 @@ class PressureSession:
             self.fail("diagnostics_poll_failed")
             return
         self.coverage.add(evidence.samples, now, complete=evidence.sample_complete)
+        if self.config.family_schedule == "tiered_rolling":
+            occupancy = self._host_pool_occupancy(evidence.samples)
+            at_limit = any(
+                item["ratio"] >= self.config.fill_host_max_ratio
+                for item in occupancy
+            )
+            if (
+                self.state.phase == "seed"
+                and not self.seed_stop_requested
+                and at_limit
+            ):
+                self.seed_stop_requested = True
+                self.seed_stop_snapshot = occupancy
+                self.emit(
+                    "seed_limit",
+                    at_s=now,
+                    reason="host_max_ratio",
+                    configured_limit=self.seed_count,
+                    submitted=self.seed_submitted,
+                    completed=self.seed_completed,
+                    host_pools=list(occupancy),
+                )
+            elif (
+                self.state.phase == "fill"
+                and not self.fill_headroom_reached
+                and at_limit
+            ):
+                self.fill_headroom_reached = True
+                self.fill_headroom_snapshot = occupancy
+                self.emit(
+                    "fill_limit",
+                    at_s=now,
+                    reason="host_max_ratio",
+                    sent=self.fill_sent,
+                    host_pools=list(occupancy),
+                )
         self.ready = False
         if not self.coverage.epoch_valid:
             self.fail("pressure_epoch_invalid")
@@ -749,6 +976,28 @@ class PressureSession:
         elif now - self.last_progress >= self.config.activity_timeout_s:
             self.fail("unknown_activity")
 
+    @staticmethod
+    def _host_pool_occupancy(samples):
+        occupancy = []
+        for sample in samples:
+            pools = {pool.pool_id: pool for pool in sample.pools}
+            for group in sample.groups:
+                pool = pools.get(group.host_pool_id)
+                if pool is None or pool.capacity <= 0:
+                    continue
+                resident = max(0, pool.used - pool.pending_release)
+                occupancy.append(
+                    dict(
+                        rank=sample.rank,
+                        group_id=group.group_id,
+                        pool_id=pool.pool_id,
+                        used=resident,
+                        capacity=pool.capacity,
+                        ratio=resident / pool.capacity,
+                    )
+                )
+        return tuple(occupancy)
+
     def _tick(self):
         self._collect_controls()
         self._collect()
@@ -782,8 +1031,10 @@ class PressureSession:
             self.profile_started = True
             self.profile_pending = self.controller.pending(now)
 
-    def _pause(self):
+    def _pause(self, until=None):
         delay = min(0.01, self.config.sample_period_s / 10)
+        if until is not None:
+            delay = min(delay, max(0.0, until - self.clock()))
         if self.sleep is time.sleep:
             self.wakeup.wait(delay)
             self.wakeup.clear()
@@ -800,8 +1051,14 @@ class PressureSession:
             self._pause()
 
     def _seed_result(self):
-        return dict(
-            planned=self.seed_count,
+        planned = (
+            self.seed_submitted
+            if self.config.family_schedule == "tiered_rolling"
+            and self.seed_stop_requested
+            else self.seed_count
+        )
+        result = dict(
+            planned=planned,
             submitted=self.seed_submitted,
             completed=self.seed_completed,
             failed=self.seed_failed,
@@ -814,6 +1071,18 @@ class PressureSession:
                 else 0.0
             ),
         )
+        if self.config.family_schedule == "tiered_rolling":
+            result.update(
+                configured_limit=self.seed_count,
+                effective_seed_count=self.seed_completed,
+                stop_reason=(
+                    "host_max_ratio"
+                    if self.seed_stop_requested
+                    else "configured_limit"
+                ),
+                stop_host_pools=list(self.seed_stop_snapshot),
+            )
+        return result
 
     def _run_seed_phase(self) -> dict:
         self.seed_started = self.clock()
@@ -825,8 +1094,12 @@ class PressureSession:
             self._advance()
             while (
                 self.state.phase == "seed"
+                and not self.seed_stop_requested
                 and self.seed_submitted < self.seed_count
-                and len(self.sender.pending) < self.sender.limit
+                and sum(
+                    kind == "seed" for kind in self.job_kinds.values()
+                )
+                < self.phase_concurrency
             ):
                 self._advance()
                 if self.state.phase != "seed" or not self._submit("seed"):
@@ -837,6 +1110,8 @@ class PressureSession:
                 )
             self._tick()
             if self.state.phase == "drain":
+                break
+            if self.seed_stop_requested and not self.sender.pending:
                 break
             if self.seed_completed == self.seed_count:
                 break
@@ -866,6 +1141,105 @@ class PressureSession:
         self.progress, self.ready = None, False
         self.fill_sent = 0
         self.emit("phase", phase="fill", at_s=now)
+
+    def _run_formal_supply(self):
+        self.formal_origin = self.clock()
+        if self.adaptive:
+            self._run_adaptive_formal_supply()
+            return
+        due = self.arrivals.next_offset()
+        formal_sequence = 0
+        while self.state.phase in ("steady", "measurement", "support"):
+            self._tick()
+            if self.state.phase == "drain":
+                break
+            while (
+                self.state.phase in ("steady", "measurement", "support")
+                and self.clock() + 1e-8 >= self.formal_origin + due
+            ):
+                if not self._submit("formal", due, formal_sequence):
+                    break
+                formal_sequence += 1
+                due = self.arrivals.next_offset()
+            if self.state.phase != "drain":
+                self._pause()
+
+    def _record_adaptive_dispatch(self, outstanding, rate):
+        stats = self.supply_stats
+        stats["max_outstanding"] = max(stats["max_outstanding"], outstanding + 1)
+        stats["rate_count"] += 1
+        stats["rate_sum"] += rate
+        stats["rate_min"] = rate if stats["rate_min"] is None else min(
+            stats["rate_min"], rate
+        )
+        stats["rate_max"] = rate if stats["rate_max"] is None else max(
+            stats["rate_max"], rate
+        )
+        region = (
+            "low"
+            if outstanding <= self.config.backlog_low
+            else "high"
+            if outstanding >= self.config.backlog_high
+            else "interpolated"
+        )
+        stats["backlog_regions"][region] += 1
+
+    def _run_adaptive_formal_supply(self):
+        due = 0.0
+        formal_sequence = 0
+        while self.state.phase in ("steady", "measurement", "support"):
+            self._tick()
+            if self.state.phase == "drain":
+                break
+            while (
+                self.state.phase in ("steady", "measurement", "support")
+                and self.clock() + 1e-8 >= self.formal_origin + due
+            ):
+                outstanding = len(self.sender.pending)
+                rate = self.adaptive.rate(outstanding)
+                if outstanding >= self.sender.limit:
+                    self.supply_stats["saturated"] = True
+                    self.emit(
+                        "sender_saturated",
+                        at_s=self.clock(),
+                        formal_sequence=formal_sequence,
+                        scheduled_offset_s=due,
+                        outstanding=outstanding,
+                        max_outstanding=self.sender.limit,
+                        effective_rate=rate,
+                    )
+                    self.fail("sender_saturated")
+                    break
+                if not self._submit(
+                    "formal",
+                    due,
+                    formal_sequence,
+                    outstanding_before=outstanding,
+                    effective_rate=rate,
+                ):
+                    raise RuntimeError("adaptive sender rejected below hard limit")
+                self._record_adaptive_dispatch(outstanding, rate)
+                formal_sequence += 1
+                due += 1.0 / rate
+            if self.state.phase != "drain":
+                self._pause(self.formal_origin + due)
+
+    def _supply_result(self):
+        stats = self.supply_stats
+        return dict(
+            max_outstanding=stats["max_outstanding"],
+            configured_max_outstanding=self.sender.limit,
+            rate_min=stats["rate_min"],
+            rate_max=stats["rate_max"],
+            rate_average=(
+                stats["rate_sum"] / stats["rate_count"]
+                if stats["rate_count"]
+                else None
+            ),
+            rate_count=stats["rate_count"],
+            backlog_regions=dict(stats["backlog_regions"]),
+            saturated=stats["saturated"],
+        )
 
     def run(self):
         self.state = PressurePhases(self.config, self.clock())
@@ -945,6 +1319,9 @@ class PressureSession:
                 self._tick()
                 if self.state.phase == "drain":
                     break
+                if self.fill_headroom_reached:
+                    self.fail("fill_headroom_exhausted")
+                    break
                 if self.fill_sent and self.ready and not self.sender.pending:
                     self.state.advance(self.clock(), fill_ready=True)
                     self.emit("phase", phase="steady", at_s=self.clock())
@@ -967,19 +1344,7 @@ class PressureSession:
                     if self.state.phase != "drain":
                         self._pause()
             if self.state.phase == "steady":
-                self.formal_origin = self.clock()
-                due = self.arrivals.next_offset()
-                while self.state.phase in ("steady", "measurement", "support"):
-                    self._tick()
-                    while (
-                        self.state.phase in ("steady", "measurement", "support")
-                        and self.clock() >= self.formal_origin + due
-                    ):
-                        if not self._submit("formal", due):
-                            break
-                        due = self.arrivals.next_offset()
-                    if self.state.phase != "drain":
-                        self._pause()
+                self._run_formal_supply()
         except Exception as exc:
             self.fail("supervisor_failed")
             self.emit("error", error=repr(exc), at_s=self.clock())
@@ -1012,6 +1377,7 @@ class PressureSession:
             failure=self.state.failure,
             measurement_start=self.state.measurement_start,
             measurement_end=self.state.measurement_end,
+            supply=self._supply_result(),
         )
         if profile_result is not None:
             result["profile"] = profile_result
@@ -1050,8 +1416,9 @@ class PressureSession:
                 self.emit("error", error=repr(exc), at_s=self.clock())
         # A failed seed cannot make progress into another phase. Request
         # cancellation immediately, then use the bounded drain to reap it.
-        if self.state.failure and any(
-            kind == "seed" for kind in self.job_kinds.values()
+        if self.state.failure and (
+            self.state.failure == "sender_saturated"
+            or any(kind == "seed" for kind in self.job_kinds.values())
         ):
             self._cancel_pending()
         while self.clock() < deadline:

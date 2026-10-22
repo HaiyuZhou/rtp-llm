@@ -87,9 +87,20 @@ case 执行“seed → 测量 → 下一个 case”。runner 一次并发插入
 并在第一个未缓存 block 内加入唯一后缀，因此共享所需缓存状态但不会复用其他测量请求的尾部。
 cold 请求使用独立 token ID。
 
-压力发送器是有界 open-loop：任务队列只保存几何和计划时间，完整 token IDs 只在工作线程内构造，
-内存随 `cache_pressure_client_concurrency` 而不是总请求数增长。request rate 为 0 时立即填满
-客户端并发；正数时支持 `constant` 和 `poisson` 到达。
+普通 continuous 压力发送器使用有界到达计划：任务队列只保存几何和计划时间，完整 token IDs
+只在工作线程内构造，内存随 `cache_pressure_client_concurrency` 而不是总请求数增长。
+request rate 为 0 时立即填满客户端并发；正数时支持 `constant` 和 `poisson` 到达。达到
+client concurrency 后，普通模式保留旧的 completion-driven backpressure 语义。
+
+FULL-pressure preload 的 `rate_control=adaptive_backlog` 提供独立定时发送，当前仅用于
+`tiered_rolling` constant arrival。它将 seed/fill 的 `cache_pressure_client_concurrency` 与 formal
+阶段的 `max_outstanding` 分开；`cohort_size` 只定义连续 sequence 的逻辑组成，不是发送屏障。
+设未结束 RPC 数为 q，q 不高于 `backlog_low` 时使用 `request_rate_max`，不低于
+`backlog_high` 时使用非零 `request_rate_min`，中间线性插值。completion 只改变后续速率计算，
+不会立即补发请求。到达 `max_outstanding` 时运行以 `sender_saturated` 失败，不等待 completion
+后重试，因此成功结果可证明 formal supply 未静默退化为“一完成一补发”。每次 dispatch 保存
+`formal_sequence`、`outstanding_before`、`effective_rate` 和 schedule lag；finished result 的
+`supply` 保存实际最大在途、速率范围/均值、backlog 区间计数和 saturation 状态。
 
 `cache_pressure_scheduler=batch_decode` 是默认模式。BatchDecodeScheduler 只在攒满
 `cache_pressure_batch_size` 后执行，因此正式请求数不是整批时，runner 自动增加不计入 metric 的

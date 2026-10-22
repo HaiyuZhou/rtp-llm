@@ -443,10 +443,22 @@ def seed_outcome_reasons(seed, plan):
     reasons = plan_reasons.copy()
     if len(valid_counts) != len(names):
         reasons.append("seed_outcome_invalid")
+    headroom_limited = (
+        not plan_reasons
+        and seed.get("stop_reason") == "host_max_ratio"
+        and type(seed.get("configured_limit")) is int
+        and seed["configured_limit"] == plan["seed_count"]
+        and type(seed.get("effective_seed_count")) is int
+        and "planned" in valid_counts
+        and seed["effective_seed_count"] == seed["planned"]
+        and seed["planned"] <= seed["configured_limit"]
+        and isinstance(seed.get("stop_host_pools"), list)
+    )
     if (
         not plan_reasons
         and "planned" in valid_counts
         and seed["planned"] != plan["seed_count"]
+        and not headroom_limited
     ):
         reasons.append("seed_plan_outcome_mismatch")
     if {"planned", "submitted"} <= valid_counts and seed["planned"] != seed[

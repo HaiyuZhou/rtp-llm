@@ -418,6 +418,28 @@ class PressureResultsTest(unittest.TestCase):
                 self.assertEqual(manifest["seed_outcome"], seed)
                 self.assertEqual(summary["seed_outcome"], seed)
 
+    def test_headroom_limited_seed_uses_the_effective_completed_count(self):
+        seed = dict(
+            planned=48,
+            submitted=48,
+            completed=48,
+            failed=0,
+            cancelled=0,
+            pending=0,
+            configured_limit=1000,
+            effective_seed_count=48,
+            stop_reason="host_max_ratio",
+            stop_host_pools=[],
+        )
+
+        summary, manifest = self.artifacts(
+            plan=self.plan(seed_count=1000), finished=self.finished(seed=seed)
+        )
+
+        self.assertTrue(summary["validity"]["execution_valid"])
+        self.assertEqual(summary["validity_reasons"]["execution_valid"], [])
+        self.assertEqual(manifest["seed_outcome"], seed)
+
     def test_frozen_seed_count_requires_a_positive_integer(self):
         for count, terminal_count in (
             (True, 1),

@@ -171,6 +171,43 @@ class ValidateProfileTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pressure settings"):
             pressure_settings(profile, SimpleNamespace())
 
+    def test_adaptive_pressure_settings_resolve_from_profile_and_cli(self):
+        values = dict(
+            seed_timeout_s=30,
+            fill_timeout_s=20,
+            fill_max_requests=10,
+            fill_no_progress_s=5,
+            fill_input_tokens=512,
+            gpu_tolerance_blocks=2,
+            activity_timeout_s=10,
+            drain_timeout_s=10,
+            capture_timeout_s=60,
+            family_schedule="tiered_rolling",
+            memory_reuse_ratio=0.5,
+            fill_host_max_ratio=0.8,
+            rate_control="adaptive_backlog",
+            request_rate_min=50,
+            request_rate_max=400,
+            backlog_low=64,
+            backlog_high=192,
+            max_outstanding=256,
+            cohort_size=32,
+        )
+        profile = _minimal_profile(cache_grid=dict(pressure=values))
+
+        resolved = pressure_settings(profile, SimpleNamespace())
+        self.assertEqual(resolved.request_rate_max, 400)
+        self.assertEqual(resolved.max_outstanding, 256)
+        overridden = pressure_settings(
+            profile,
+            SimpleNamespace(
+                pressure_request_rate_min=25,
+                pressure_request_rate_max=300,
+            ),
+        )
+        self.assertEqual(overridden.request_rate_min, 25)
+        self.assertEqual(overridden.request_rate_max, 300)
+
     def test_minimal_valid_profile(self):
         validate_profile({"schema_version": 1})
 

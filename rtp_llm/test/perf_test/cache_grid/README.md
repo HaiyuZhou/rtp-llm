@@ -6,6 +6,7 @@
 
 - 本文：配置、生成 grid、运行、分析与产物。
 - [格式与执行参考](docs/reference.md)：必填字段、batch 调度、容量规则、计时口径、profiling 和迁移。
+- [FIFO 连续满载压力测试中文指南](docs/continuous_full_pressure_guide_zh.md)：可直接预检的 Flash TP4 profile/grid、baseline/Kineto/Nsight 命令、结果判定与排错。
 
 ## 配置 profile
 
@@ -36,9 +37,11 @@ Kineto defaults to 20 actual steps on every rank; Nsight requires a duration:
 
 ```bash
 ./tools/cache_perf profile --profile /path/local.jsonc --grid /path/grid.json \
-  --result-dir /path/full-pressure-kineto --pressure-mode continuous --pressure-preload
+  --result-dir /path/full-pressure-kineto --pressure-mode continuous --pressure-preload \
+  --pressure-scheduler fifo
 ./tools/cache_perf profile --profile /path/local.jsonc --grid /path/grid.json \
   --result-dir /path/full-pressure-nsys --pressure-mode continuous --pressure-preload \
+  --pressure-scheduler fifo \
   --profile-backend nsys --pressure-profile-seconds 10
 ```
 
@@ -181,7 +184,7 @@ python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_random_batch_grid \
 多 grid 恢复会跳过已完成运行，有 checkpoint 的续测，未开始的按冻结配置启动。
 运行失败但没有 checkpoint 时，应使用新目录重试。
 
-连续压力模式只接受未分组的 `batch_size=1` grid 和 `dashsc_input_ids`，且不与
+上述按次数运行的有限连续压力模式只接受未分组的 `batch_size=1` grid 和 `dashsc_input_ids`，且不与
 fixed workspace、materialized cases、profiling 或 `cache_shared_seed` 混用。
 它先并发 seed 若干条 `max(cache_len)+commit_tail` 长前缀，再将各 case/run 打乱，
 从不同 seed 截断到目标 cache_len 后持续提交。`--pressure-request-rate=0` 表示 burst；

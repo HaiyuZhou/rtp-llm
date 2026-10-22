@@ -101,6 +101,190 @@ class PhaseTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "owner=0 group=1 pool=wide.*KV"):
             limits.require_request(150000)
 
+    def test_tiered_rolling_pressure_settings_are_validated(self):
+        try:
+            resolved = config(
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.5,
+                fill_host_max_ratio=0.8,
+            )
+        except ValueError as exc:
+            self.fail(f"tiered rolling settings were rejected: {exc}")
+        self.assertEqual(resolved.family_schedule, "tiered_rolling")
+        self.assertEqual(resolved.memory_reuse_ratio, 0.5)
+        self.assertEqual(resolved.fill_host_max_ratio, 0.8)
+        with self.assertRaisesRegex(ValueError, "50%"):
+            config(
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.25,
+                fill_host_max_ratio=0.8,
+            )
+
+    def test_adaptive_pressure_settings_are_validated(self):
+        resolved = config(
+            family_schedule="tiered_rolling",
+            memory_reuse_ratio=0.5,
+            fill_host_max_ratio=0.8,
+            rate_control="adaptive_backlog",
+            request_rate_min=50,
+            request_rate_max=400,
+            backlog_low=64,
+            backlog_high=192,
+            max_outstanding=256,
+            cohort_size=32,
+        )
+        self.assertEqual(resolved.rate_control, "adaptive_backlog")
+        self.assertEqual(resolved.request_rate_max, 400)
+        self.assertEqual(resolved.max_outstanding, 256)
+        for changes in (
+            {"request_rate_min": 0},
+            {"request_rate_min": 500},
+            {"backlog_low": 192},
+            {"backlog_high": 256},
+            {"cohort_size": 0},
+            {"cohort_size": 31},
+        ):
+            adaptive = dict(
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.5,
+                fill_host_max_ratio=0.8,
+                rate_control="adaptive_backlog",
+                request_rate_min=50,
+                request_rate_max=400,
+                backlog_low=64,
+                backlog_high=192,
+                max_outstanding=256,
+                cohort_size=32,
+            )
+            adaptive.update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                config(**adaptive)
+
+
+class AdaptiveBacklogControllerTest(unittest.TestCase):
+    def test_piecewise_rate_stays_positive_and_decreases_with_backlog(self):
+        controller_type = getattr(cp, "AdaptiveBacklogController", None)
+        self.assertIsNotNone(
+            controller_type, "adaptive backlog controller is not implemented"
+        )
+        controller = controller_type(
+            rate_min=50,
+            rate_max=400,
+            backlog_low=64,
+            backlog_high=192,
+        )
+
+        self.assertEqual(controller.rate(0), 400)
+        self.assertEqual(controller.rate(64), 400)
+        self.assertAlmostEqual(controller.rate(128), 225)
+        self.assertEqual(controller.rate(192), 50)
+        self.assertEqual(controller.rate(255), 50)
+
+    def test_rejects_invalid_rate_and_watermark_ranges(self):
+        controller_type = getattr(cp, "AdaptiveBacklogController", None)
+        self.assertIsNotNone(
+            controller_type, "adaptive backlog controller is not implemented"
+        )
+        for kwargs in (
+            dict(rate_min=0, rate_max=400, backlog_low=64, backlog_high=192),
+            dict(rate_min=500, rate_max=400, backlog_low=64, backlog_high=192),
+            dict(rate_min=50, rate_max=400, backlog_low=192, backlog_high=192),
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                controller_type(**kwargs)
+
+
+class TieredRollingPlannerTest(unittest.TestCase):
+    def planner(self, seed_count=1000):
+        planner_type = getattr(cp, "TieredRollingPlanner", None)
+        self.assertIsNotNone(
+            planner_type, "tiered rolling family planner is not implemented"
+        )
+        return planner_type(
+            effective_seed_count=seed_count,
+            cohort_size=32,
+            memory_reuse_ratio=0.5,
+            case_indices=(1, 2, 3, 4),
+        )
+
+    def test_promotes_each_memory_family_with_the_same_case_next_cohort(self):
+        planner = self.planner()
+
+        first = planner.next_cohort()
+        second = planner.next_cohort()
+
+        first_device = [item for item in first if item.expected_cache_tier == "device"]
+        first_memory = [item for item in first if item.expected_cache_tier == "memory"]
+        second_device = [
+            item for item in second if item.expected_cache_tier == "device"
+        ]
+        second_memory = [
+            item for item in second if item.expected_cache_tier == "memory"
+        ]
+        self.assertEqual([item.family for item in first_device], list(range(984, 1000)))
+        self.assertEqual([item.family for item in first_memory], list(range(16)))
+        self.assertEqual(
+            [(item.family, item.case_index) for item in second_device],
+            [(item.family, item.case_index) for item in first_memory],
+        )
+        self.assertEqual([item.family for item in second_memory], list(range(16, 32)))
+        self.assertEqual(
+            {case: sum(item.case_index == case for item in first_memory) for case in range(1, 5)},
+            {1: 4, 2: 4, 3: 4, 4: 4},
+        )
+        self.assertTrue(all(item.cohort_id == 0 for item in first))
+        self.assertTrue(all(item.cohort_id == 1 for item in second))
+        self.assertTrue(all(item.promoted_from_cohort == 0 for item in second_device))
+
+    def test_effective_seed_boundary_wraps_without_using_the_initial_hot_tail(self):
+        planner = self.planner(seed_count=48)
+
+        first = planner.next_cohort()
+        second = planner.next_cohort()
+        third = planner.next_cohort()
+
+        self.assertEqual(
+            [item.family for item in first if item.expected_cache_tier == "device"],
+            list(range(32, 48)),
+        )
+        self.assertEqual(
+            [item.family for item in second if item.expected_cache_tier == "memory"],
+            list(range(16, 32)),
+        )
+        self.assertEqual(
+            [item.family for item in third if item.expected_cache_tier == "device"],
+            list(range(16, 32)),
+        )
+        self.assertEqual(
+            [item.family for item in third if item.expected_cache_tier == "memory"],
+            list(range(16)),
+        )
+        self.assertTrue(
+            all(
+                item.family < 32
+                for item in second + third
+                if item.expected_cache_tier == "memory"
+            )
+        )
+
+    def test_assignment_is_random_access_and_independent_of_worker_order(self):
+        sequential = self.planner(seed_count=48)
+        expected = sequential.next_cohort() + sequential.next_cohort()
+        random_access = self.planner(seed_count=48)
+
+        observed = {
+            sequence: random_access.assignment(sequence)
+            for sequence in reversed(range(64))
+        }
+
+        self.assertEqual(tuple(observed[index] for index in range(64)), expected)
+
+    def test_freezes_only_the_contiguous_completed_seed_range(self):
+        seeds = [[0], [1], [2], None, None]
+        self.assertEqual(cp.freeze_seed_families(seeds), 3)
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            cp.freeze_seed_families([[0], None, [2]])
+
 
 class FakeClock:
     def __init__(self):
@@ -242,7 +426,7 @@ class LifecycleTest(unittest.TestCase):
                 output_len=1,
             )
 
-        def payload(kind, sequence):
+        def payload(kind, sequence, formal_sequence):
             if payload_hook:
                 payload_hook(kind, sequence, clock)
             return {"input_ids": [1] * 16, "case": "cold"}
@@ -623,6 +807,209 @@ class LifecycleTest(unittest.TestCase):
             sum(e["event"] == "dispatch" and e["phase"] == "seed" for e in events), 7
         )
 
+    def test_tiered_seed_limit_freezes_the_completed_contiguous_range(self):
+        def reach_headroom(evidence, count, clock):
+            if count < 2:
+                return evidence
+            sample = evidence.samples[0]
+            pools = tuple(
+                replace(pool, used=85)
+                if pool.pool_id == "host"
+                else pool
+                for pool in sample.pools
+            )
+            return replace(evidence, samples=(replace(sample, pools=pools),))
+
+        result, events, _, _ = self.run_session(
+            seed_count=20,
+            concurrency=4,
+            rate=0,
+            poll_transform=reach_headroom,
+            cfg=config(
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.5,
+                fill_host_max_ratio=0.8,
+                measure_s=1,
+                steady_s=0.5,
+                sample_period_s=0.5,
+            ),
+        )
+
+        self.assertEqual(result["seed"].get("configured_limit"), 20)
+        self.assertEqual(result["seed"].get("effective_seed_count"), 8)
+        self.assertEqual(result["seed"].get("stop_reason"), "host_max_ratio")
+        self.assertEqual(result["seed"]["planned"], 8)
+        self.assertEqual(result["seed"]["submitted"], 8)
+        self.assertEqual(result["seed"]["completed"], 8)
+        self.assertTrue(
+            any(event["event"] == "seed_limit" for event in events),
+            "the effective seed boundary must be persisted",
+        )
+
+    def test_fill_stops_before_consuming_reserved_host_headroom(self):
+        def exhaust_headroom(evidence, count, clock):
+            # Let fill first satisfy the pressure target, then prove that the
+            # reserved host headroom remains a hard stop rather than a success.
+            if count < 3:
+                return evidence
+            sample = evidence.samples[0]
+            pools = tuple(
+                replace(pool, used=85)
+                if pool.pool_id == "host"
+                else pool
+                for pool in sample.pools
+            )
+            return replace(evidence, samples=(replace(sample, pools=pools),))
+
+        result, events, _, _ = self.run_session(
+            valid=True,
+            rate=0,
+            poll_transform=exhaust_headroom,
+            cfg=config(
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.5,
+                fill_host_max_ratio=0.8,
+                fill_max_requests=100,
+                fill_no_progress_s=30,
+            ),
+        )
+
+        self.assertEqual(result["failure"], "fill_headroom_exhausted")
+        fill_dispatches = [
+            event
+            for event in events
+            if event["event"] == "dispatch" and event["phase"] == "fill"
+        ]
+        self.assertLessEqual(len(fill_dispatches), 4)
+
+    def test_tiered_formal_supply_refills_before_the_whole_cohort_completes(self):
+        active = [None]
+        formal_dispatches = []
+        formal_completions = []
+        completions_before_refill = []
+
+        class StaggeredHandle:
+            def __init__(self, executor, work, on_done=None):
+                self.phase = None
+                self.formal_index = None
+                self.checks = 0
+                active[0] = self
+                self.value = work(lambda call: None)
+                active[0] = None
+
+            def done(self):
+                if self.phase not in ("steady", "measurement", "support"):
+                    return True
+                self.checks += 1
+                lane = self.formal_index % 32
+                return self.checks > lane
+
+            def result(self):
+                if self.formal_index is not None:
+                    formal_completions.append(self.formal_index)
+                return self.value
+
+            def cancel(self):
+                return True
+
+        def observe(identity):
+            handle = active[0]
+            handle.phase = identity.rsplit(":", 2)[-2]
+            if handle.phase in ("steady", "measurement", "support"):
+                handle.formal_index = len(formal_dispatches)
+                if handle.formal_index == 32 and len(formal_completions) < 32:
+                    completions_before_refill.append(len(formal_completions))
+                formal_dispatches.append(identity)
+
+        with patch.object(cp, "CancellableRequestHandle", StaggeredHandle):
+            result, _, _, _ = self.run_session(
+                concurrency=32,
+                rate=0,
+                request_observer=observe,
+                cfg=config(
+                    family_schedule="tiered_rolling",
+                    memory_reuse_ratio=0.5,
+                    fill_host_max_ratio=0.8,
+                    steady_s=0.2,
+                    measure_s=0.5,
+                    sample_period_s=0.1,
+                ),
+            )
+
+        self.assertIsNone(result["failure"])
+        self.assertGreaterEqual(len(formal_dispatches), 64)
+        self.assertEqual(completions_before_refill, [1])
+
+    def test_adaptive_supply_dispatches_without_completions_until_hard_limit(self):
+        active = [None]
+
+        class PendingFormalHandle:
+            def __init__(self, executor, work, on_done=None):
+                self.formal = False
+                self.cancelled = False
+                active[0] = self
+                self.value = work(lambda call: None)
+                active[0] = None
+
+            def done(self):
+                return not self.formal or self.cancelled
+
+            def result(self):
+                return self.value
+
+            def cancel(self):
+                self.cancelled = True
+                return True
+
+        def observe(identity):
+            phase = identity.rsplit(":", 2)[-2]
+            if phase in ("steady", "measurement", "support"):
+                active[0].formal = True
+
+        with patch.object(cp, "CancellableRequestHandle", PendingFormalHandle):
+            result, events, _, _ = self.run_session(
+                concurrency=2,
+                rate=0,
+                request_observer=observe,
+                cfg=config(
+                    family_schedule="tiered_rolling",
+                    memory_reuse_ratio=0.5,
+                    fill_host_max_ratio=0.8,
+                    rate_control="adaptive_backlog",
+                    request_rate_min=2,
+                    request_rate_max=8,
+                    backlog_low=1,
+                    backlog_high=3,
+                    max_outstanding=4,
+                    cohort_size=2,
+                    steady_s=0.1,
+                    measure_s=1,
+                    sample_period_s=0.1,
+                    drain_timeout_s=1,
+                ),
+            )
+
+        formal = [
+            event
+            for event in events
+            if event["event"] == "dispatch"
+            and event["phase"] in ("steady", "measurement", "support")
+        ]
+        self.assertEqual(result["failure"], "sender_saturated")
+        self.assertEqual(len(formal), 4)
+        self.assertEqual(
+            [event["outstanding_before"] for event in formal], [0, 1, 2, 3]
+        )
+        self.assertEqual(
+            [event["effective_rate"] for event in formal], [8, 8, 5, 2]
+        )
+        self.assertEqual([event["formal_sequence"] for event in formal], list(range(4)))
+        saturation = [event for event in events if event["event"] == "sender_saturated"]
+        self.assertEqual(len(saturation), 1)
+        self.assertEqual(saturation[0]["outstanding"], 4)
+        self.assertEqual(result["supply"]["max_outstanding"], 4)
+        self.assertTrue(result["supply"]["saturated"])
+
     def test_steady_uses_elapsed_coverage_and_times_out(self):
         def alternate(evidence, count, clock):
             if count > 3 and count % 2:
@@ -853,7 +1240,7 @@ class LifecycleTest(unittest.TestCase):
             max_input_tokens=16,
             seed_plan=seed_plan(seed_count, client_inflight=2),
             startup_targets=startup_targets,
-            make_payload=lambda kind, i: {"input_ids": [1] * 16},
+            make_payload=lambda kind, i, formal_sequence: {"input_ids": [1] * 16},
             request=request,
             poll=poll,
             sink=events.append,
@@ -1105,7 +1492,7 @@ class WarmupCutoffTest(unittest.TestCase):
             )
             return cp.PressurePoll((sample,), {})
 
-        def payload(request_kind, job_id):
+        def payload(request_kind, job_id, formal_sequence):
             self.assertEqual(request_kind, "fill")
             if job_id == 1:
                 if not first_sent.wait(2):

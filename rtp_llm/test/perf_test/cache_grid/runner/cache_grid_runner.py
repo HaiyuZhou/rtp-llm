@@ -52,7 +52,11 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 
-from rtp_llm.test.perf_test.cache_grid.runner.continuous_pressure import DispatchClosed
+from rtp_llm.test.perf_test.cache_grid.runner.continuous_pressure import (
+    DispatchClosed,
+    TieredRollingPlanner,
+    freeze_seed_families,
+)
 from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
     SERVER_LATENCY_CONTRACT,
     current_metrics,
@@ -1586,6 +1590,9 @@ class CacheGridRunner:
         seed_text, seed_ids = self.factory.make_seed_and_ids(
             -1, prefix_text, block, self.cache_commit_tail_tokens
         )
+        seed = self._post_request(seed_text, seed_ids, "block_size_probe:seed")
+        if not seed.get("success"):
+            raise RuntimeError(f"block-size probe seed failed: {seed.get('error')}")
         hit_text, hit_ids = self.factory._exact_text_and_ids(
             2 * block, prefix_text + " __block_probe_"
         )
@@ -1595,9 +1602,6 @@ class CacheGridRunner:
             raise RuntimeError(
                 "block-size probe could not build a prompt preserving its own prefix"
             )
-        seed = self._post_request(seed_text, seed_ids, "block_size_probe:seed")
-        if not seed.get("success"):
-            raise RuntimeError(f"block-size probe seed failed: {seed.get('error')}")
         hit = self._post_request(hit_text, hit_ids, "block_size_probe:hit")
         if not hit.get("success"):
             raise RuntimeError(f"block-size probe request failed: {hit.get('error')}")
@@ -1899,6 +1903,10 @@ class CacheGridRunner:
             for case in cases
         ):
             raise ValueError("full pressure requires ungrouped batch_size=1")
+        if config.family_schedule == "tiered_rolling" and any(
+            int(case["cache_len"]) == 0 for case in cases
+        ):
+            raise ValueError("tiered rolling excludes cache_len=0 cases")
         session_id = uuid.uuid4().hex
         if controller is None and getattr(self, "profile_only", False):
             from .pressure_profile import KinetoCapture, NsightCapture
@@ -1998,7 +2006,8 @@ class CacheGridRunner:
         producer_lock = threading.Lock()
         rng = random.Random(self.pressure_random_seed)
         order = list(range(len(cases)))
-        formal_index = seed_index = 0
+        seed_index = 0
+        tiered_planner = None
         cursors = {}
         instances = {
             int(rank.get("world_rank", 0)): rank["service_instance"]
@@ -2056,8 +2065,8 @@ class CacheGridRunner:
             record["client_receive_s"] = time.monotonic()
             return record
 
-        def make_payload(kind, job_id):
-            nonlocal formal_index, seed_index
+        def make_payload(kind, job_id, formal_sequence):
+            nonlocal seed_index, tiered_planner
             nonce = f"{session_id}_{job_id}"
             with producer_lock:
                 if kind in ("seed", "fill"):
@@ -2075,22 +2084,55 @@ class CacheGridRunner:
                         self._continuous_seed_ids[family] = ids
                         payload["family"] = family
                     return payload
-                if formal_index % len(cases) == 0:
-                    rng.shuffle(order)
-                index = formal_index
-                formal_index += 1
-                case_index = order[index % len(cases)]
+                if formal_sequence is None:
+                    raise ValueError("formal payload requires a supervisor sequence")
+                index = formal_sequence
+                assignment = None
+                if config.family_schedule == "tiered_rolling":
+                    if tiered_planner is None:
+                        effective_seed_count = freeze_seed_families(
+                            self._continuous_seed_ids
+                        )
+                        tiered_planner = TieredRollingPlanner(
+                            effective_seed_count=effective_seed_count,
+                            cohort_size=(
+                                config.cohort_size
+                                or self.pressure_client_concurrency
+                            ),
+                            memory_reuse_ratio=config.memory_reuse_ratio,
+                            case_indices=tuple(range(len(cases))),
+                        )
+                    assignment = tiered_planner.assignment(index)
+                    case_index = assignment.case_index
+                    family = assignment.family
+                else:
+                    if index % len(cases) == 0:
+                        rng.shuffle(order)
+                    case_index = order[index % len(cases)]
+                    family = index % seed_count if seed_count else 0
                 case = cases[case_index]
-                family = index % seed_count if seed_count else 0
                 ids = self._continuous_request_ids(case, family, nonce)
-                return dict(
+                payload = dict(
                     input_ids=ids,
                     nonce=nonce,
                     family=family,
-                    epoch=index // len(cases),
+                    epoch=(
+                        assignment.cohort_id
+                        if assignment is not None
+                        else index // len(cases)
+                    ),
                     case_index=case_index,
                     requested_cache_len=int(case["cache_len"]),
                 )
+                if assignment is not None:
+                    payload.update(
+                        cohort_id=assignment.cohort_id,
+                        cohort_lane=assignment.cohort_lane,
+                        expected_cache_tier=assignment.expected_cache_tier,
+                        promoted_from_cohort=assignment.promoted_from_cohort,
+                        effective_seed_count=tiered_planner.effective_seed_count,
+                    )
+                return payload
 
         def request(payload, register, before):
             return _post_prefill_ids(

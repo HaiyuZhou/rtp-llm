@@ -1041,6 +1041,7 @@ public:
     int64_t load_ref_blocks                   = 0;
     int64_t eviction_target_ref_blocks        = 0;
     int64_t store_ref_blocks                  = 0;
+    int64_t mock_source_ref_blocks            = 0;
     float   used_ratio                        = 0;
     bool    report_eviction_target_ref_blocks = false;
 };
@@ -1065,6 +1066,7 @@ public:
     // Compatibility alias retained while dashboards migrate to the clarified name.
     kmonitor::MutableMetric* eviction_ref_blocks_compat_metric = nullptr;
     kmonitor::MutableMetric* store_ref_blocks_metric           = nullptr;
+    kmonitor::MutableMetric* mock_source_ref_blocks_metric     = nullptr;
     kmonitor::MutableMetric* used_ratio_metric                 = nullptr;
 
 private:

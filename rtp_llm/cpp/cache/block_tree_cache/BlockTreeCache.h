@@ -22,6 +22,7 @@ namespace rtp_llm {
 class BlockTreeTaskPool;
 class BlockTransferDispatcher;
 class FullPrefixInvariantScanner;
+class MockMemoryCacheSource;
 struct CacheStats {
     size_t tree_node_count{0};
     size_t device_heap_total_size{0};
@@ -159,7 +160,8 @@ public:
                    std::shared_ptr<StorageBackend>                storage_backend,
                    std::unique_ptr<BlockTransferDispatcher>       transfer_dispatcher,
                    std::unique_ptr<BlockTreeTaskPool>             task_pool,
-                   std::shared_ptr<BlockTreeCacheMetricsReporter> metrics_reporter);
+                   std::shared_ptr<BlockTreeCacheMetricsReporter> metrics_reporter,
+                   std::shared_ptr<MockMemoryCacheSource>         mock_memory_cache_source = nullptr);
 
     ~BlockTreeCache();
     bool init();
@@ -203,6 +205,9 @@ public:
     std::shared_ptr<StorageBackend> storageBackend() const {
         return storage_backend_;
     }
+    std::shared_ptr<const MockMemoryCacheSource> mockMemoryCacheSource() const {
+        return mock_memory_cache_source_;
+    }
 
     // Tier enable queries
     bool isDeviceCacheEnabled() const {
@@ -233,6 +238,8 @@ private:
     BlockTreeCacheConfig                           config_;
     std::unique_ptr<BlockTree>                     tree_;
     std::shared_ptr<StorageBackend>                storage_backend_;
+    // Declared before workers so reservations outlive loader/transfer destruction.
+    std::shared_ptr<MockMemoryCacheSource>         mock_memory_cache_source_;
     std::unique_ptr<BlockTransferDispatcher>       transfer_dispatcher_;
     std::unique_ptr<BlockTreeTaskPool>             task_pool_;
     std::shared_ptr<BlockTreeCacheMetricsReporter> metrics_reporter_;

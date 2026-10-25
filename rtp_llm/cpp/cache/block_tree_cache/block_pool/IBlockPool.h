@@ -28,6 +28,7 @@ enum class BlockTreeRefType : uint8_t {
     LOAD,
     EVICTION,
     STORE,
+    MOCK_SOURCE,
     COUNT,
 };
 

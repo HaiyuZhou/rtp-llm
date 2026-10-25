@@ -719,6 +719,19 @@ TEST(BlockTreeCacheMetricsTest, EvictionReferenceMetricKeepsLegacyAlias) {
     EXPECT_DOUBLE_EQ(snapshotQps(metrics->eviction_ref_blocks_compat_metric, tags), 7);
 }
 
+TEST(BlockTreeCacheMetricsTest, MockSourceReferenceMetricReportsDedicatedGauge) {
+    kmonitor::MetricsTags tags("tier", "HOST");
+    auto                  reporter = std::make_shared<kmonitor::MetricsReporter>("", "", kmonitor::MetricsTags{});
+    RtpLLMCachePoolMetricsCollector collector;
+    collector.mock_source_ref_blocks = 7;
+    ASSERT_TRUE((reporter->report<RtpLLMCachePoolMetrics, RtpLLMCachePoolMetricsCollector>(&tags, &collector)));
+    auto* metrics = reporter->getMetricsGroup<RtpLLMCachePoolMetrics>();
+    ASSERT_NE(metrics, nullptr);
+    ASSERT_NE(metrics->mock_source_ref_blocks_metric, nullptr);
+    EXPECT_EQ(metricSeriesCount(metrics->mock_source_ref_blocks_metric), 1u);
+    EXPECT_DOUBLE_EQ(snapshotQps(metrics->mock_source_ref_blocks_metric, tags), 7);
+}
+
 TEST_F(BlockTreeCacheTest, EvictionTriggerQpsPublishesOnlyExistingGroupTypes) {
     kmonitor::MetricsTags                      tags;
     std::shared_ptr<kmonitor::MetricsReporter> metrics_reporter =

@@ -7,6 +7,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/diagnostic/FullPrefixInvariantScanner.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/evict/BlockTreeEvictor.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/load/MockMemoryCacheSource.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/BlockTransferDispatcher.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/block_pool/DiskBlockPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/block_pool/HostBlockPool.h"
@@ -21,10 +22,12 @@ BlockTreeCache::BlockTreeCache(std::unique_ptr<BlockTree>                     tr
                                std::shared_ptr<StorageBackend>                storage_backend,
                                std::unique_ptr<BlockTransferDispatcher>       transfer_dispatcher,
                                std::unique_ptr<BlockTreeTaskPool>             task_pool,
-                               std::shared_ptr<BlockTreeCacheMetricsReporter> metrics_reporter):
+                               std::shared_ptr<BlockTreeCacheMetricsReporter> metrics_reporter,
+                               std::shared_ptr<MockMemoryCacheSource>         mock_memory_cache_source):
     config_(std::move(config)),
     tree_(std::move(tree)),
     storage_backend_(std::move(storage_backend)),
+    mock_memory_cache_source_(std::move(mock_memory_cache_source)),
     transfer_dispatcher_(std::move(transfer_dispatcher)),
     task_pool_(std::move(task_pool)),
     metrics_reporter_(std::move(metrics_reporter)),
@@ -260,6 +263,7 @@ CachePressureSnapshot BlockTreeCache::pressureSnapshot() const {
         record.load_ref_blocks            = pool->referencedBlocksNum(BlockTreeRefType::LOAD);
         record.eviction_target_ref_blocks = pool->referencedBlocksNum(BlockTreeRefType::EVICTION);
         record.store_ref_blocks           = pool->referencedBlocksNum(BlockTreeRefType::STORE);
+        record.mock_source_ref_blocks     = pool->referencedBlocksNum(BlockTreeRefType::MOCK_SOURCE);
         if (physical.tier == Tier::DEVICE) {
             record.request_ref_blocks           = static_cast<const DeviceBlockPool*>(pool)->referencedBlocksNum();
             record.request_ref_blocks_available = true;

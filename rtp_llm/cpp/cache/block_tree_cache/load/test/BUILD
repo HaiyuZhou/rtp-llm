@@ -26,6 +26,15 @@ test_deps = [
 ] + cuda13_torch_link_deps + torch_deps() + no_block_copy_link_deps()
 
 cc_test(
+    name = "mock_memory_cache_source_test",
+    exec_properties = {"gpu": "L20_CU13"},
+    srcs = ["MockMemoryCacheSourceTest.cc"],
+    copts = test_copts,
+    tags = ["L20_CU13", "exclusive-if-local"],
+    deps = test_deps + ["//rtp_llm/cpp/cache/block_tree_cache/test:block_tree_cache_test_utils"],
+)
+
+cc_test(
     name = "block_tree_loader_test",
     exec_properties = {"gpu": "L20_CU13"},
     srcs = ["BlockTreeLoaderTest.cc"],

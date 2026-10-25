@@ -36,6 +36,7 @@ struct BlockTreePoolMetricsSnapshot {
     size_t      load_ref_blocks{0};
     size_t      eviction_target_ref_blocks{0};
     size_t      store_ref_blocks{0};
+    size_t      mock_source_ref_blocks{0};
 };
 
 enum class CacheTransferOperation : uint8_t {

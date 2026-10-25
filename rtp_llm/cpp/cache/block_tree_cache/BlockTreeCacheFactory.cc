@@ -20,6 +20,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/group_set/FullGroupSet.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/group_set/LinearGroupSet.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/group_set/SWAGroupSet.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/load/MockMemoryCacheSource.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/BlockTransferDispatcher.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/MultiRankBlockTransferEngine.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/PerRankBlockTransferEngine.h"
@@ -687,6 +688,25 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     }
     config.pressure_ownership = std::move(ownership);
 
+    std::shared_ptr<MockMemoryCacheSource> mock_memory_cache_source;
+    if (kv_cache_config.mock_memory_cache) {
+        auto source = MockMemoryCacheSource::create(
+            group_sets, kv_cache_config.mock_memory_cache_source_blocks, kv_cache_config.mock_memory_cache_seed);
+        if (!source.ok()) {
+            RTP_LLM_LOG_ERROR("mock_memory_cache source initialization failed: %s", source.status().ToString().c_str());
+            return nullptr;
+        }
+        mock_memory_cache_source = std::move(source).value();
+        for (const auto& group : group_sets) {
+            RTP_LLM_LOG_WARNING("mock_memory_cache source group_set[%zu]: blocks=%zu payload_bytes=%zu "
+                                "reserved_bytes=%zu; model outputs are invalid",
+                                group->groupSetId(),
+                                mock_memory_cache_source->sourceBlockCount(group->groupSetId()),
+                                group->payloadBytes(),
+                                kv_cache_config.mock_memory_cache_source_blocks * group->hostPool()->strideBytes());
+        }
+    }
+
     auto cache_metrics_reporter = std::make_shared<BlockTreeCacheMetricsReporter>(std::move(metrics_reporter));
     auto per_rank_engine        = std::make_shared<PerRankBlockTransferEngine>(group_sets,
                                                                         kv_cache_config.enable_disk_cache,
@@ -716,7 +736,8 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
                                                    std::move(storage_backend),
                                                    std::move(transfer_dispatcher),
                                                    std::move(task_pool),
-                                                   std::move(cache_metrics_reporter));
+                                                   std::move(cache_metrics_reporter),
+                                                   std::move(mock_memory_cache_source));
     if (result->isRemoteCacheEnabled()) {
         const std::shared_ptr<const CacheTopology> storage_topology = cache_topology;
         const CacheConfig                          storage_config   = cache_config;

@@ -19,7 +19,9 @@
 #include "rtp_llm/cpp/cache/CPSlotMapper.h"
 #include "rtp_llm/cpp/cache/FullCacheManager.h"
 #include "rtp_llm/cpp/cache/CoordinatorCacheManager.h"
+#include "rtp_llm/cpp/cache/KVCacheMetrics.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/group_set/SWAGroupSet.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/load/MockMemoryCacheSource.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/test/BlockTreeCacheTestUtils.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/test/PerRankBlockTransferEngineTestUtils.h"
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
@@ -2214,6 +2216,77 @@ TEST_F(BlockTreeCacheFactoryTest, DisabledMockMemoryCachePreservesOrdinaryStartu
     EXPECT_EQ(options.mock_memory_cache_hit_ratio, 0.0);
     EXPECT_EQ(options.mock_memory_cache_source_blocks, 64);
     EXPECT_NE(createBlockTreeCache(config, options, allocator), nullptr);
+}
+
+TEST_F(BlockTreeCacheFactoryTest, MockMemorySourceReservesConfiguredHostBlocksForCacheLifetime) {
+    const auto    config    = makeHybridConfig();
+    auto          allocator = initAllocator<CoordinatorCacheManager>(config);
+    KVCacheConfig options;
+    options.mock_memory_cache               = true;
+    options.reuse_cache                     = true;
+    options.enable_memory_cache             = true;
+    options.memory_cache_size_mb            = 1;
+    options.mock_memory_cache_source_blocks = 3;
+    auto cache                              = createBlockTreeCache(config, options, allocator);
+    ASSERT_NE(cache, nullptr);
+    ASSERT_NE(cache->mockMemoryCacheSource(), nullptr);
+    const auto groups = cache->groupSets();
+    ASSERT_EQ(groups.size(), 2u);
+    for (const auto& group : groups) {
+        EXPECT_EQ(group->hostPool()->usedBlocksNum(), 3u);
+        EXPECT_EQ(group->hostPool()->activeBlocksNum(), 3u);
+        EXPECT_EQ(group->hostPool()->availableBlocksNum(), group->hostPool()->totalBlocksNum() - 3);
+        EXPECT_EQ(cache->mockMemoryCacheSource()->sourceBlockCount(group->groupSetId()), 3u);
+    }
+    const auto merged    = mergeCachePoolMetricsSnapshots({}, cache->poolMetricsSnapshots());
+    size_t     host_rows = 0;
+    for (const auto& row : merged) {
+        if (row.tier == tierName(Tier::HOST)) {
+            ++host_rows;
+            EXPECT_EQ(row.mock_source_ref_blocks, 3u);
+            EXPECT_EQ(row.block_cache_ref_blocks, 0u);
+            EXPECT_EQ(row.load_ref_blocks, 0u);
+            EXPECT_EQ(row.store_ref_blocks, 0u);
+        }
+    }
+    EXPECT_EQ(host_rows, 2u);
+    for (const auto& row : cache->pressureSnapshot().pools) {
+        EXPECT_EQ(row.mock_source_ref_blocks, row.tier == Tier::HOST ? 3u : 0u);
+    }
+    EXPECT_EQ(cache->getStats().tree_node_count, 0u);
+    cache.reset();
+    for (const auto& group : groups) {
+        EXPECT_EQ(group->hostPool()->usedBlocksNum(), 0u);
+    }
+}
+
+TEST_F(BlockTreeCacheFactoryTest, MockMemorySourceCapacityFailureAbortsConstruction) {
+    const auto    config    = makeSingleConfig();
+    auto          allocator = initAllocator<CoordinatorCacheManager>(config);
+    KVCacheConfig options;
+    options.mock_memory_cache               = true;
+    options.reuse_cache                     = true;
+    options.enable_memory_cache             = true;
+    options.memory_cache_size_mb            = 1;
+    options.mock_memory_cache_source_blocks = 1024 * 1024;
+    EXPECT_EQ(createBlockTreeCache(config, options, allocator), nullptr);
+    EXPECT_EQ(allocator->blockTreeCache(), nullptr);
+}
+
+TEST_F(BlockTreeCacheFactoryTest, MockMemorySourceDisabledLeavesHostCapacityAvailable) {
+    const auto    config    = makeSingleConfig();
+    auto          allocator = initAllocator<CoordinatorCacheManager>(config);
+    KVCacheConfig options;
+    options.enable_memory_cache             = true;
+    options.memory_cache_size_mb            = 1;
+    options.mock_memory_cache_source_blocks = std::numeric_limits<uint64_t>::max();
+    auto cache                              = createBlockTreeCache(config, options, allocator);
+    ASSERT_NE(cache, nullptr);
+    EXPECT_EQ(cache->mockMemoryCacheSource(), nullptr);
+    const auto host = cache->groupSets().front()->hostPool();
+    ASSERT_NE(host, nullptr);
+    EXPECT_EQ(host->freeBlocksNum(), host->totalBlocksNum());
+    EXPECT_EQ(host->referencedBlocksNum(BlockTreeRefType::MOCK_SOURCE), 0u);
 }
 
 TEST_F(BlockTreeCacheFactoryTest, MockMemoryCacheAcceptsInclusiveRatioEndpoints) {

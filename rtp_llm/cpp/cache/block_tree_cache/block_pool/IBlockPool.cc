@@ -41,7 +41,9 @@ std::string IBlockPool::debugString() const {
         << ", load_ref_blocks=" << tree_referenced_block_counts_[treeRefTypeIndex(BlockTreeRefType::LOAD)]
         << ", eviction_target_ref_blocks="
         << tree_referenced_block_counts_[treeRefTypeIndex(BlockTreeRefType::EVICTION)]
-        << ", store_ref_blocks=" << tree_referenced_block_counts_[treeRefTypeIndex(BlockTreeRefType::STORE)] << "}";
+        << ", store_ref_blocks=" << tree_referenced_block_counts_[treeRefTypeIndex(BlockTreeRefType::STORE)]
+        << ", mock_source_ref_blocks=" << tree_referenced_block_counts_[treeRefTypeIndex(BlockTreeRefType::MOCK_SOURCE)]
+        << "}";
     return oss.str();
 }
 

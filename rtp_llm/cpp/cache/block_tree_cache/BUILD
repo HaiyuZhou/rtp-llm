@@ -72,6 +72,7 @@ cc_library(
         "evict/EvictionTaskRunner.cc",
         "load/BlockTreeLoader.cc",
         "load/LoadJoinRegistry.cc",
+        "load/MockMemoryCacheSource.cc",
         "store/BlockTreeStorer.cc",
         "transfer/BlockTransferRequestConverter.cc",
         "group_set/GroupSet.cc",
@@ -112,6 +113,7 @@ cc_library(
         "evict/EvictionTaskRunner.h",
         "load/BlockTreeLoader.h",
         "load/LoadJoinRegistry.h",
+        "load/MockMemoryCacheSource.h",
         "store/BlockTreeStorer.h",
         "transfer/BlockTransferRequestConverter.h",
         "group_set/GroupSet.h",
@@ -170,6 +172,8 @@ cc_library(
         "//rtp_llm/models_py/bindings:crc_block_copy",
         "//rtp_llm/models_py/bindings:no_block_copy_hdr",
         "@havenask//aios/autil:thread",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
     ] + torch_deps() + no_block_copy_link_deps() + select({
         "@//:using_cuda": [
             "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",

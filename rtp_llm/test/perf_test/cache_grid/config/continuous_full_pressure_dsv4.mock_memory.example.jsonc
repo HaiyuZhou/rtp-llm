@@ -1,5 +1,6 @@
 {
   // Diagnostic derivative of the production example; synthetic KV invalidates outputs.
+  // Pair with continuous_full_pressure_grid.mock_memory.example.json (reuse cases only).
   // Profile CLI booleans use 0/1; 1 is equivalent to --mock_memory_cache true.
   // Verify model/toolchain paths and CUDA_VISIBLE_DEVICES before GPU execution.
   "schema_version": 1,

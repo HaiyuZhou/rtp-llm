@@ -26,6 +26,9 @@ from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
     pressure_settings,
     profile_environment,
 )
+from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+    validate_full_pressure_cases,
+)
 from rtp_llm.test.perf_test.cache_grid.runner.generate_cache_grid import (
     comma_separated_ints,
 )
@@ -339,8 +342,7 @@ def build_plan(args, inherited=None):
             raise ValueError("full pressure requires an exclusive owned service")
         if grid_workspace_tokens(payload) is not None:
             raise ValueError("full pressure cannot use fixed workspace")
-        if any(c.get("batch_size", 1) != 1 or "request_groups" in c for c in cases):
-            raise ValueError("full pressure requires ungrouped batch_size=1")
+        validate_full_pressure_cases(cases, settings.family_schedule)
         block = resolve_cache_block_size(payload)
         tail = profile.get("cache_grid", {}).get("commit_tail_tokens", 4096)
         if (

@@ -266,12 +266,12 @@ mock 模式绕过自然 Device、Host、Disk 前缀匹配，即使缓存中已�
 
 每个 Host GroupSet/pool 在启动期预留 64 个不可变 source 块，清零整个 stride，并在开启 CRC 时预先构造合法 CRC footer。初始化在压力/profile 窗口前完成，不应计入请求 CPU 热路径。seed 仅确定 ring offset；逻辑块号循环映射，因此 `source_blocks=64` 限制 Host 预留，不限制单请求/累计传输块数。source 用独立 `MOCK_SOURCE` 引用持有，流量期间数量恒定，不进入普通树；剩余 Host 空间还要容纳真实写回。
 
-运行前先核对实际模型路径、GPU 和工具链。下面使用同一 production grid，但结果目录必须是新的；首次可追加 `--dry-run` 离线检查。dry-run 的 `resolved_engine_args` 列出四个实际开关，label 和静态 classification 必须明确诊断用途，且不写文件或启动服务。
+运行前先核对实际模型路径、GPU 和工具链。下面配套使用[独立 mock grid](../config/continuous_full_pressure_grid.mock_memory.example.json)：它只保留 production 的 32768/65536-token 复用 case（原 case_id 1、3），排除所有 `cache_len=0` cold case，保留 token 长度、alignment 和 commit tail。`tiered_rolling` 在运行时严格拒绝 cold case，离线 dry-run 也使用同一兼容性检查，不会静默过滤用户提供的 grid。production/smoke profile 与 grid 均未修改。结果目录必须是新的；首次可追加 `--dry-run` 离线检查。dry-run 的 `resolved_engine_args` 列出四个实际开关，label 和静态 classification 必须明确诊断用途，且不写文件或启动服务。
 
 ```bash
 python3 tools/cache_perf profile \
   --profile rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_dsv4.mock_memory.example.jsonc \
-  --grid rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_grid.production.example.json \
+  --grid rtp_llm/test/perf_test/cache_grid/config/continuous_full_pressure_grid.mock_memory.example.json \
   --result-dir /data0/zhouhaiyu.zhy/tmp/dsv4-mock-memory-nsys-acceptance \
   --pressure-mode continuous --pressure-preload \
   --pressure-client-concurrency 16 \

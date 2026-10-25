@@ -129,6 +129,18 @@ def is_grouped_case(case: Dict[str, Any]) -> bool:
     return "request_groups" in case
 
 
+def validate_full_pressure_cases(cases, family_schedule):
+    """Share case compatibility between offline plans and real pressure entry."""
+    if any(
+        is_grouped_case(case) or int(case.get("batch_size", 1)) != 1 for case in cases
+    ):
+        raise ValueError("full pressure requires ungrouped batch_size=1")
+    if family_schedule == "tiered_rolling" and any(
+        int(case["cache_len"]) == 0 for case in cases
+    ):
+        raise ValueError("tiered rolling excludes cache_len=0 cases")
+
+
 def build_grouped_prompts(factory, case, run_count):
     """Build per-request prompts with distinct suffixes across all rounds."""
     case = normalize_cache_case(case)
@@ -1897,15 +1909,7 @@ class CacheGridRunner:
         cases = tuple(dict(case) for case in pending)
         if not cases or self._grpc_stub is None:
             raise ValueError("full pressure requires cases and input-ID transport")
-        if any(
-            is_grouped_case(case) or int(case.get("batch_size", 1)) != 1
-            for case in cases
-        ):
-            raise ValueError("full pressure requires ungrouped batch_size=1")
-        if config.family_schedule == "tiered_rolling" and any(
-            int(case["cache_len"]) == 0 for case in cases
-        ):
-            raise ValueError("tiered rolling excludes cache_len=0 cases")
+        validate_full_pressure_cases(cases, config.family_schedule)
         session_id = uuid.uuid4().hex
         if controller is None and getattr(self, "profile_only", False):
             from .pressure_profile import KinetoCapture, NsightCapture

@@ -281,7 +281,8 @@ class LoadProfileTest(unittest.TestCase):
                     str(path),
                     "--grid",
                     str(
-                        config / "continuous_full_pressure_grid.production.example.json"
+                        config
+                        / "continuous_full_pressure_grid.mock_memory.example.json"
                     ),
                     "--result-dir",
                     str(Path(directory) / "result"),

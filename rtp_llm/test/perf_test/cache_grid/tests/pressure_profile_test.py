@@ -580,6 +580,83 @@ def nsys_fixture(path, step_ids=(1, 2, 3)):
 
 
 class PressureProfileTest(unittest.TestCase):
+    def test_mock_profile_dry_run_rejects_grid_rejected_by_runtime(self):
+        from rtp_llm.test.perf_test.cache_grid.config.perf_profile import (
+            load_profile,
+            pressure_settings,
+        )
+        from rtp_llm.test.perf_test.cache_grid.runner import cache_perf
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            CacheGridRunner,
+        )
+
+        config = Path(__file__).resolve().parents[1] / "config"
+        profile_path = (
+            config / "continuous_full_pressure_dsv4.mock_memory.example.jsonc"
+        )
+        grid_path = config / "continuous_full_pressure_grid.production.example.json"
+        with tempfile.TemporaryDirectory() as directory:
+            args = cache_perf.parser().parse_args(
+                [
+                    "profile",
+                    "--profile",
+                    str(profile_path),
+                    "--grid",
+                    str(grid_path),
+                    "--result-dir",
+                    str(Path(directory) / "result"),
+                    "--pressure-mode=continuous",
+                    "--pressure-preload",
+                    "--dry-run",
+                ]
+            )
+            settings = pressure_settings(load_profile(profile_path), args)
+            _, cases = cache_perf.load_cases(grid_path)
+            # Exercise the real entry guard without opening transport or running
+            # traffic: the invalid cases fail before any session is constructed.
+            runner = object.__new__(CacheGridRunner)
+            runner._grpc_stub = object()
+            with self.assertRaisesRegex(
+                ValueError, "tiered rolling excludes cache_len=0"
+            ):
+                runner._run_full_pressure(
+                    cases,
+                    settings,
+                    None,
+                    None,
+                    (0,),
+                    None,
+                    seed_plan=None,
+                    startup_targets=(),
+                )
+            with self.assertRaisesRegex(
+                ValueError, "tiered rolling excludes cache_len=0"
+            ):
+                cache_perf.build_plan(args, {})
+
+    def test_mock_grid_preserves_all_production_reusable_cases(self):
+        from rtp_llm.test.perf_test.cache_grid.config.perf_profile import load_profile
+        from rtp_llm.test.perf_test.cache_grid.runner import cache_perf
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            validate_full_pressure_cases,
+        )
+
+        config = Path(__file__).resolve().parents[1] / "config"
+        grid_path = config / "continuous_full_pressure_grid.mock_memory.example.json"
+        self.assertTrue(grid_path.is_file(), "dedicated mock memory grid is missing")
+        _, cases = cache_perf.load_cases(grid_path)
+        _, production = cache_perf.load_cases(
+            config / "continuous_full_pressure_grid.production.example.json"
+        )
+        self.assertEqual(cases, [case for case in production if case["cache_len"] > 0])
+        self.assertEqual([case["case_id"] for case in cases], [1, 3])
+        profile = load_profile(
+            config / "continuous_full_pressure_dsv4.mock_memory.example.jsonc"
+        )
+        validate_full_pressure_cases(
+            cases, profile["cache_grid"]["pressure"]["family_schedule"]
+        )
+
     def test_diagnostic_marker_survives_live_plan_and_classification(self):
         from dataclasses import asdict
 
@@ -679,7 +756,7 @@ class PressureProfileTest(unittest.TestCase):
                         "--grid",
                         str(
                             config
-                            / "continuous_full_pressure_grid.production.example.json"
+                            / "continuous_full_pressure_grid.mock_memory.example.json"
                         ),
                         "--result-dir",
                         str(destination),

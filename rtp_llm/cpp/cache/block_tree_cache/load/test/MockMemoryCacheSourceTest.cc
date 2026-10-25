@@ -46,10 +46,15 @@ TEST(MockMemoryCacheSourceTest, ReservesDedicatedReferencesInEveryHostPoolAndRel
     ASSERT_EQ(snapshots.size(), 2u);
     EXPECT_EQ(snapshots[0].mock_source_ref_blocks, 3u);
     EXPECT_EQ(snapshots[1].mock_source_ref_blocks, 3u);
+    EXPECT_EQ(snapshots[0].mock_source_ref_bytes, 12288u);
+    EXPECT_EQ(snapshots[1].mock_source_ref_bytes, 12288u);
     source.reset();
     for (const auto& group : groups) {
         EXPECT_EQ(group->hostPool()->freeBlocksNum(), group->hostPool()->totalBlocksNum());
         EXPECT_EQ(group->hostPool()->referencedBlocksNum(BlockTreeRefType::MOCK_SOURCE), 0u);
+    }
+    for (const auto& snapshot : reporter.collectPoolMetricsSnapshots(groups)) {
+        EXPECT_EQ(snapshot.mock_source_ref_bytes, 0u);
     }
 }
 

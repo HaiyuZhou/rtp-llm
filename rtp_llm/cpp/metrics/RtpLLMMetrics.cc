@@ -642,6 +642,7 @@ bool RtpLLMCachePoolMetrics::init(kmonitor::MetricsGroupManager* manager) {
     REGISTER_GAUGE_MUTABLE_METRIC(eviction_ref_blocks_compat_metric, "rtp_llm_kv_cache_pool_eviction_ref_blocks");
     REGISTER_GAUGE_MUTABLE_METRIC(store_ref_blocks_metric, "rtp_llm_kv_cache_pool_store_ref_blocks");
     REGISTER_GAUGE_MUTABLE_METRIC(mock_source_ref_blocks_metric, "rtp_llm_kv_cache_pool_mock_source_ref_blocks");
+    REGISTER_GAUGE_MUTABLE_METRIC(mock_source_ref_bytes_metric, "rtp_llm_kv_cache_pool_mock_source_ref_bytes");
     REGISTER_GAUGE_MUTABLE_METRIC(used_ratio_metric, "rtp_llm_kv_cache_pool_used_ratio");
     return true;
 }
@@ -663,6 +664,7 @@ void RtpLLMCachePoolMetrics::report(const kmonitor::MetricsTags* tags, RtpLLMCac
     }
     REPORT_MUTABLE_METRIC(store_ref_blocks_metric, collector->store_ref_blocks);
     REPORT_MUTABLE_METRIC(mock_source_ref_blocks_metric, collector->mock_source_ref_blocks);
+    REPORT_MUTABLE_METRIC(mock_source_ref_bytes_metric, collector->mock_source_ref_bytes);
     REPORT_MUTABLE_METRIC(used_ratio_metric, collector->used_ratio);
 }
 

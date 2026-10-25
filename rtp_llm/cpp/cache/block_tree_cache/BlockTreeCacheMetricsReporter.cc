@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <limits>
 #include <unordered_set>
 #include <utility>
 
@@ -63,6 +64,12 @@ BlockTreePoolMetricsSnapshot makePoolMetricsSnapshot(Tier tier, const IBlockPool
     snapshot.eviction_target_ref_blocks = pool.referencedBlocksNum(BlockTreeRefType::EVICTION);
     snapshot.store_ref_blocks           = pool.referencedBlocksNum(BlockTreeRefType::STORE);
     snapshot.mock_source_ref_blocks     = pool.referencedBlocksNum(BlockTreeRefType::MOCK_SOURCE);
+    if (tier == Tier::HOST) {
+        const size_t stride            = static_cast<const HostBlockPool&>(pool).strideBytes();
+        snapshot.mock_source_ref_bytes = snapshot.mock_source_ref_blocks > std::numeric_limits<size_t>::max() / stride ?
+                                             std::numeric_limits<size_t>::max() :
+                                             snapshot.mock_source_ref_blocks * stride;
+    }
     return snapshot;
 }
 

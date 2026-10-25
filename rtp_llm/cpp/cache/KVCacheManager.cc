@@ -103,7 +103,7 @@ void reportPoolCacheMetrics(const kmonitor::MetricsReporterPtr& metrics_reporter
                          "active=%zu "
                          "reserve=%zu request_ref_blocks=%zu block_cache_ref_blocks=%zu "
                          "load_ref_blocks=%zu eviction_target_ref_blocks=%zu store_ref_blocks=%zu "
-                         "mock_source_ref_blocks=%zu used_ratio=%.4f%%",
+                         "mock_source_ref_blocks=%zu mock_source_ref_bytes=%zu used_ratio=%.4f%%",
                          pool_snapshot.tier.c_str(),
                          pool_snapshot.pool_name.c_str(),
                          pool_snapshot.block_size_bytes,
@@ -119,6 +119,7 @@ void reportPoolCacheMetrics(const kmonitor::MetricsReporterPtr& metrics_reporter
                          pool_snapshot.eviction_target_ref_blocks,
                          pool_snapshot.store_ref_blocks,
                          pool_snapshot.mock_source_ref_blocks,
+                         pool_snapshot.mock_source_ref_bytes,
                          pool_snapshot.used_ratio);
     }
 
@@ -137,6 +138,8 @@ void reportPoolCacheMetrics(const kmonitor::MetricsReporterPtr& metrics_reporter
     pool_collector.report_eviction_target_ref_blocks = pool_snapshot.tier != tierName(Tier::DEVICE);
     pool_collector.store_ref_blocks                  = static_cast<int64_t>(pool_snapshot.store_ref_blocks);
     pool_collector.mock_source_ref_blocks            = static_cast<int64_t>(pool_snapshot.mock_source_ref_blocks);
+    pool_collector.mock_source_ref_bytes             = static_cast<int64_t>(
+        std::min(pool_snapshot.mock_source_ref_bytes, static_cast<size_t>(std::numeric_limits<int64_t>::max())));
     pool_collector.used_ratio                        = pool_snapshot.used_ratio;
 
     kmonitor::MetricsTags pool_tags("pool_name", pool_snapshot.pool_name);

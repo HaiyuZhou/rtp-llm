@@ -58,6 +58,7 @@ mergeCachePoolMetricsSnapshots(const std::vector<KVCachePoolMetricsSnapshot>&   
         report_snapshot.store_ref_blocks           = snapshot.store_ref_blocks;
         report_snapshot.active_blocks              = snapshot.active_blocks;
         report_snapshot.mock_source_ref_blocks     = snapshot.mock_source_ref_blocks;
+        report_snapshot.mock_source_ref_bytes      = snapshot.mock_source_ref_bytes;
         report_snapshot.used_ratio                 = snapshot.total_blocks == 0 ?
                                                          0.0f :
                                                          static_cast<float>(100.0 * (snapshot.total_blocks - snapshot.free_blocks)

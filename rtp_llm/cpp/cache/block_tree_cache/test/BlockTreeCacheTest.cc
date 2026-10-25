@@ -724,12 +724,16 @@ TEST(BlockTreeCacheMetricsTest, MockSourceReferenceMetricReportsDedicatedGauge) 
     auto                  reporter = std::make_shared<kmonitor::MetricsReporter>("", "", kmonitor::MetricsTags{});
     RtpLLMCachePoolMetricsCollector collector;
     collector.mock_source_ref_blocks = 7;
+    collector.mock_source_ref_bytes  = 57344;
     ASSERT_TRUE((reporter->report<RtpLLMCachePoolMetrics, RtpLLMCachePoolMetricsCollector>(&tags, &collector)));
     auto* metrics = reporter->getMetricsGroup<RtpLLMCachePoolMetrics>();
     ASSERT_NE(metrics, nullptr);
     ASSERT_NE(metrics->mock_source_ref_blocks_metric, nullptr);
     EXPECT_EQ(metricSeriesCount(metrics->mock_source_ref_blocks_metric), 1u);
     EXPECT_DOUBLE_EQ(snapshotQps(metrics->mock_source_ref_blocks_metric, tags), 7);
+    ASSERT_NE(metrics->mock_source_ref_bytes_metric, nullptr);
+    EXPECT_EQ(metricSeriesCount(metrics->mock_source_ref_bytes_metric), 1u);
+    EXPECT_DOUBLE_EQ(snapshotQps(metrics->mock_source_ref_bytes_metric, tags), 57344);
 }
 
 TEST_F(BlockTreeCacheTest, EvictionTriggerQpsPublishesOnlyExistingGroupTypes) {

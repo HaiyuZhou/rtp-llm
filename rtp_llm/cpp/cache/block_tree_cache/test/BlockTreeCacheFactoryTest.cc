@@ -2260,6 +2260,52 @@ TEST_F(BlockTreeCacheFactoryTest, MockMemorySourceReservesConfiguredHostBlocksFo
     }
 }
 
+TEST_F(BlockTreeCacheFactoryTest, MockMemorySourceBytesIncludeCrcAndHostStridePadding) {
+    if (!CrcBlockCopyBatch::available()) {
+        GTEST_SKIP() << "CRC backend unavailable";
+    }
+    const auto config    = test::makeSimpleMhaCacheConfig(2, 8, 64, DataType::TYPE_FP16, 1, 8);
+    auto       allocator = initAllocator<CoordinatorCacheManager>(config);
+    block_transfer_engine_test::TempDirGuard disk_dir("block_tree_cache_mock_source_bytes");
+    KVCacheConfig                            options;
+    options.mock_memory_cache               = true;
+    options.reuse_cache                     = true;
+    options.enable_memory_cache             = true;
+    options.memory_cache_size_mb            = 1;
+    options.mock_memory_cache_source_blocks = 3;
+    options.enable_disk_cache               = true;
+    options.disk_cache_size_mb              = 1;
+    options.disk_cache_paths                = disk_dir.path;
+    options.disk_cache_buffered_io          = false;
+    auto cache                              = createBlockTreeCache(config, options, allocator);
+    ASSERT_NE(cache, nullptr);
+    ASSERT_EQ(cache->groupSets().size(), 1u);
+    const auto& group = cache->groupSets().front();
+    ASSERT_TRUE(group->crcEnabled());
+    ASSERT_EQ(group->payloadBytes(), 4096u);
+    ASSERT_EQ(group->storageBytes(), 4112u);
+    ASSERT_EQ(group->hostPool()->strideBytes(), 8192u);
+
+    const auto snapshots = cache->poolMetricsSnapshots();
+    size_t     host_rows = 0;
+    for (const auto& row : snapshots) {
+        if (row.tier == Tier::HOST) {
+            ++host_rows;
+            EXPECT_EQ(row.mock_source_ref_blocks, 3u);
+            EXPECT_EQ(row.mock_source_ref_bytes, 24576u);
+        } else {
+            EXPECT_EQ(row.mock_source_ref_bytes, 0u);
+        }
+    }
+    EXPECT_EQ(host_rows, 1u);
+    for (const auto& row : cache->pressureSnapshot().pools) {
+        EXPECT_EQ(row.mock_source_ref_bytes, row.tier == Tier::HOST ? 24576u : 0u);
+    }
+    for (const auto& row : mergeCachePoolMetricsSnapshots({}, snapshots)) {
+        EXPECT_EQ(row.mock_source_ref_bytes, row.tier == tierName(Tier::HOST) ? 24576u : 0u);
+    }
+}
+
 TEST_F(BlockTreeCacheFactoryTest, MockMemorySourceCapacityFailureAbortsConstruction) {
     const auto    config    = makeSingleConfig();
     auto          allocator = initAllocator<CoordinatorCacheManager>(config);

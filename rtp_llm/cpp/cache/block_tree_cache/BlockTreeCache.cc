@@ -2,6 +2,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCache.h"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
@@ -264,6 +265,12 @@ CachePressureSnapshot BlockTreeCache::pressureSnapshot() const {
         record.eviction_target_ref_blocks = pool->referencedBlocksNum(BlockTreeRefType::EVICTION);
         record.store_ref_blocks           = pool->referencedBlocksNum(BlockTreeRefType::STORE);
         record.mock_source_ref_blocks     = pool->referencedBlocksNum(BlockTreeRefType::MOCK_SOURCE);
+        if (physical.tier == Tier::HOST) {
+            const size_t stride          = static_cast<const HostBlockPool*>(pool)->strideBytes();
+            record.mock_source_ref_bytes = record.mock_source_ref_blocks > std::numeric_limits<size_t>::max() / stride ?
+                                               std::numeric_limits<size_t>::max() :
+                                               record.mock_source_ref_blocks * stride;
+        }
         if (physical.tier == Tier::DEVICE) {
             record.request_ref_blocks           = static_cast<const DeviceBlockPool*>(pool)->referencedBlocksNum();
             record.request_ref_blocks_available = true;

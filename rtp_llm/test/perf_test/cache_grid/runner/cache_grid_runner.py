@@ -1042,11 +1042,10 @@ class CacheGridRunner:
             pressure_seed_count = 4
         self.pressure_config = pressure_config
         if pressure_config is not None:
-            explicit_smoke = (
-                (profile or {}).get("cache_grid", {}).get("explicit_smoke", False)
-            )
-            if type(explicit_smoke) is not bool:
-                raise ValueError("cache_grid.explicit_smoke must be a boolean")
+            for name in ("explicit_smoke", "diagnostic_only"):
+                marker = (profile or {}).get("cache_grid", {}).get(name, False)
+                if type(marker) is not bool:
+                    raise ValueError(f"cache_grid.{name} must be a boolean")
             from dataclasses import asdict
 
             from .pressure_diagnostics import resolve_pressure_config
@@ -2096,8 +2095,7 @@ class CacheGridRunner:
                         tiered_planner = TieredRollingPlanner(
                             effective_seed_count=effective_seed_count,
                             cohort_size=(
-                                config.cohort_size
-                                or self.pressure_client_concurrency
+                                config.cohort_size or self.pressure_client_concurrency
                             ),
                             memory_reuse_ratio=config.memory_reuse_ratio,
                             case_indices=tuple(range(len(cases))),
@@ -3201,6 +3199,11 @@ class CacheGridRunner:
                     .get("cache_grid", {})
                     .get("explicit_smoke", False)
                     or self.grid_metadata.get("kind") == "explicit_cache_grid_smoke"
+                ),
+                diagnostic_only=(
+                    (self.profile or {})
+                    .get("cache_grid", {})
+                    .get("diagnostic_only", False)
                 ),
             )
             self._pressure_seed_plan = seed_plan

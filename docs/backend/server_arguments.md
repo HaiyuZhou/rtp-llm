@@ -54,6 +54,16 @@ The following legacy options and environment variables were removed and must no 
 | `--reuse-cache` | Activates KV Cache reuse mechanism. | False |
 | `--multi-task-prompt` | Multi-task prompt file path. | None |
 | `--multi-task-prompt-str` | Multi-task prompt JSON string. | None |
+| `--mock_memory_cache` | Diagnostic Memory KVCache pressure mode. Requires `reuse_cache`, `enable_memory_cache`, and positive `memory_cache_size_mb`. Bypasses natural Device/Host/Disk matches and loads synthetic Host KV through real transfers; model outputs are invalid for correctness evaluation. Env: `MOCK_MEMORY_CACHE`. | False |
+| `--mock_memory_cache_hit_ratio` | Finite ratio in `[0, 1]` targeting cumulative eligible reusable prompt tokens in whole reuse blocks, only at initial prompt allocation. It is not the fraction of requests hit. Planned and successful H2D coverage are reported separately. Env: `MOCK_MEMORY_CACHE_HIT_RATIO`. | 0.0 |
+| `--mock_memory_cache_seed` | Unsigned 64-bit deterministic source-ring offset seed. Does not select a random fraction of requests. Env: `MOCK_MEMORY_CACHE_SEED`. | 1 |
+| `--mock_memory_cache_source_blocks` | Positive immutable source block reservation per Host GroupSet/pool. Bounds reserved Host capacity, not transferred logical blocks: source indices wrap around the ring. Initialization, including CRC records when enabled, finishes before traffic/profile measurement. Env: `MOCK_MEMORY_CACHE_SOURCE_BLOCKS`. | 64 |
+
+Mock mode performs real H2D during admission and attempts asynchronous D2H to Host after each successful request; failed/cancelled requests do not trigger this completion writeback. Source records remain outside the normal cache tree with dedicated `MOCK_SOURCE` references. Host allocation/transfer failures remain explicit failures; do not interpret a planned hit as a completed load. General cache-transfer byte and latency metrics retain their existing meaning.
+
+The `rtp_llm_mock_memory_cache_` metrics distinguish `eligible_blocks`, `planned_host_blocks`, `successful_h2d_blocks`, `failed_h2d_blocks`, and `d2h_submitted_blocks` / `d2h_completed_blocks` / `d2h_failed_blocks`. `planned_ratio_ppm` and `success_ratio_ppm` use eligible logical blocks as denominator and scale ratios by 1,000,000; D2H counters count physical Host records. `source_blocks` / `source_bytes` track the reservation including Host stride/CRC overhead. Successful H2D counts terminal attempts, so retries can add successful loads without adding another plan; use request logs to explain retry/failure/cancellation gaps.
+
+See the [Chinese mock pressure guide](../../rtp_llm/test/perf_test/cache_grid/docs/continuous_full_pressure_guide_zh.md#10-mock-memory-诊断配置与验收) for the dedicated frozen profile, continuous sender, and trace acceptance checks. JSON profiles represent CLI boolean values with `0`/`1`, so the enabled example uses `"--mock_memory_cache": 1`.
 
 ## Hardware/Kernel Optimization
 

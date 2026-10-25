@@ -420,6 +420,7 @@ NONFORMAL_REASON_ORDER = (
     "synthetic_test_block_capacity",
     "nonstandard_fill_target",
     "explicit_smoke",
+    "diagnostic_only",
     "grid_reuse_below_32768",
 )
 
@@ -542,6 +543,7 @@ class PressureEvidence:
                 "nonstandard_fill_target",
             ),
             (plan.get("explicit_smoke") is True, "explicit_smoke"),
+            (plan.get("diagnostic_only") is True, "diagnostic_only"),
             (
                 "grid_reuse_tokens" in plan and plan["grid_reuse_tokens"] < 32768,
                 "grid_reuse_below_32768",
@@ -568,6 +570,7 @@ class PressureEvidence:
                     "fill_target_tokens",
                     "grid_reuse_tokens",
                     "explicit_smoke",
+                    "diagnostic_only",
                 )
             },
         )

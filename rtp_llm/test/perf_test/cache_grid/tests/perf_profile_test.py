@@ -29,6 +29,17 @@ def _minimal_profile(**overrides):
 
 
 class ValidateProfileTest(unittest.TestCase):
+    def test_diagnostic_only_requires_an_actual_boolean(self):
+        for value in (True, False):
+            validate_profile(_minimal_profile(cache_grid=dict(diagnostic_only=value)))
+        for value in (0, 1, "true", "false", None):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ProfileError, "diagnostic_only"
+            ):
+                validate_profile(
+                    _minimal_profile(cache_grid=dict(diagnostic_only=value))
+                )
+
     def test_explicit_smoke_requires_an_actual_boolean(self):
         for value in (True, False):
             validate_profile(_minimal_profile(cache_grid=dict(explicit_smoke=value)))
@@ -256,6 +267,47 @@ class ValidateProfileTest(unittest.TestCase):
 
 
 class LoadProfileTest(unittest.TestCase):
+    def test_mock_memory_profile_freezes_all_engine_options_and_diagnostic_marker(self):
+        from rtp_llm.test.perf_test.cache_grid.runner import cache_perf
+
+        config = Path(__file__).resolve().parents[1] / "config"
+        path = config / "continuous_full_pressure_dsv4.mock_memory.example.jsonc"
+        self.assertTrue(path.is_file(), "dedicated mock memory profile is missing")
+        with tempfile.TemporaryDirectory() as directory:
+            args = cache_perf.parser().parse_args(
+                [
+                    "profile",
+                    "--profile",
+                    str(path),
+                    "--grid",
+                    str(
+                        config / "continuous_full_pressure_grid.production.example.json"
+                    ),
+                    "--result-dir",
+                    str(Path(directory) / "result"),
+                    "--pressure-mode=continuous",
+                    "--pressure-preload",
+                ]
+            )
+            plan = cache_perf.build_plan(args, {})
+        frozen = json.loads(plan["artifacts"]["profile.snapshot.json"])
+        for key, value in {
+            "--mock_memory_cache": 1,
+            "--mock_memory_cache_hit_ratio": 0.5,
+            "--mock_memory_cache_seed": 1,
+            "--mock_memory_cache_source_blocks": 64,
+        }.items():
+            self.assertEqual(frozen["engine_args"][key], value)
+        argv = merge_engine_args(frozen, [])
+        self.assertEqual(dict(zip(argv[::2], argv[1::2]))["--mock_memory_cache"], "1")
+        self.assertTrue(frozen["cache_grid"]["diagnostic_only"])
+        self.assertNotIn("explicit_smoke", frozen["cache_grid"])
+        self.assertIn("DIAGNOSTIC ONLY", frozen["label"])
+        self.assertIn("OUTPUT CORRECTNESS INVALID", frozen["label"])
+        launch = json.loads(plan["artifacts"][cache_perf.MANIFEST])
+        self.assertFalse(launch["formal_candidate"])
+        self.assertEqual(launch["formal_candidate_reasons"], ["diagnostic_only"])
+
     def test_load_from_disk(self):
         profile = _minimal_profile(label="test")
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:

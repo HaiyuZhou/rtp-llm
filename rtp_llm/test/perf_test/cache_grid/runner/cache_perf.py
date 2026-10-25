@@ -366,6 +366,7 @@ def build_plan(args, inherited=None):
                 profile.get("cache_grid", {}).get("explicit_smoke", False)
                 or payload.get("kind") == "explicit_cache_grid_smoke"
             ),
+            diagnostic_only=profile.get("cache_grid", {}).get("diagnostic_only", False),
         )
         screening = dict(
             formal_candidate=not reasons,
@@ -598,6 +599,7 @@ def build_plan(args, inherited=None):
         if not managed_env(k) or is_sensitive_environment_name(k)
     }
     process_env.update(env)
+    engine_argv = merge_engine_args(profile, [])
     return dict(
         command=command,
         process_env=process_env,
@@ -608,6 +610,11 @@ def build_plan(args, inherited=None):
         ),
         summary=dict(
             **screening,
+            label=profile.get("label"),
+            resolved_engine_args=[
+                f"{key}={value}"
+                for key, value in zip(engine_argv[::2], engine_argv[1::2])
+            ],
             mode=args.mode,
             planned_cases=len(cases),
             selected_case_ids=ids,

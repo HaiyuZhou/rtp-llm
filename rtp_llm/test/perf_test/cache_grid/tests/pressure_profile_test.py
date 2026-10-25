@@ -1,4 +1,6 @@
+import contextlib
 import copy
+import io
 import json
 import sqlite3
 import subprocess
@@ -578,6 +580,129 @@ def nsys_fixture(path, step_ids=(1, 2, 3)):
 
 
 class PressureProfileTest(unittest.TestCase):
+    def test_diagnostic_marker_survives_live_plan_and_classification(self):
+        from dataclasses import asdict
+
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            select_targets,
+        )
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_results import (
+            PressureEvidence,
+            PressureWriter,
+        )
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import (
+            build_seed_plan,
+            formal_config_reasons,
+        )
+        from rtp_llm.test.perf_test.cache_grid.tests.pressure_seed_plan_test import (
+            owner,
+        )
+
+        values = dict(
+            manual_seed_count=None,
+            client_inflight=16,
+            test_block_num=0,
+            fill_target_tokens=102400,
+        )
+        self.assertEqual(formal_config_reasons(**values), ())
+        self.assertEqual(
+            formal_config_reasons(**values, diagnostic_only=True), ("diagnostic_only",)
+        )
+        for value in (0, 1, "true", None):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "diagnostic_only"
+            ):
+                formal_config_reasons(**values, diagnostic_only=value)
+        samples = (owner(),)
+        plan = asdict(
+            build_seed_plan(
+                samples,
+                select_targets(samples, (0,)),
+                cases=(dict(input_len=36864, cache_len=32768, batch_size=1),),
+                cache_alignment=4096,
+                commit_tail_tokens=4096,
+                diagnostic_only=True,
+                **values,
+            )
+        )
+        self.assertTrue(plan["diagnostic_only"])
+        self.assertFalse(plan["formal_config_valid"])
+        self.assertEqual(plan["nonformal_reasons"], ("diagnostic_only",))
+        # Classification must retain the frozen marker even if an upstream producer
+        # mistakenly supplies an optimistic screening result and omits its reasons.
+        plan.update(
+            formal_config_valid=True,
+            nonformal_reasons=[],
+            explicit_smoke=True,
+            grid_reuse_tokens=8192,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            writer = PressureWriter(Path(directory), {})
+            try:
+                sink = PressureEvidence(writer)
+                sink(
+                    dict(
+                        event="frozen",
+                        session_id="s",
+                        config=dict(measure_s=60),
+                        seed_plan=plan,
+                    )
+                )
+                manifest = json.loads(
+                    (Path(directory) / "pressure/manifest.json").read_text()
+                )
+            finally:
+                writer.close()
+        classification = manifest["classification"]
+        self.assertFalse(classification["formal_config_valid"])
+        self.assertEqual(
+            classification["nonformal_reasons"],
+            ["explicit_smoke", "diagnostic_only", "grid_reuse_below_32768"],
+        )
+        self.assertTrue(classification["inputs"]["diagnostic_only"])
+
+    def test_mock_memory_dry_run_exposes_frozen_options_and_output_invalidity(self):
+        from rtp_llm.test.perf_test.cache_grid.runner import cache_perf
+
+        config = Path(__file__).resolve().parents[1] / "config"
+        path = config / "continuous_full_pressure_dsv4.mock_memory.example.jsonc"
+        self.assertTrue(path.is_file(), "dedicated mock memory profile is missing")
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "diagnostic"
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = cache_perf.main(
+                    [
+                        "profile",
+                        "--profile",
+                        str(path),
+                        "--grid",
+                        str(
+                            config
+                            / "continuous_full_pressure_grid.production.example.json"
+                        ),
+                        "--result-dir",
+                        str(destination),
+                        "--pressure-mode=continuous",
+                        "--pressure-preload",
+                        "--dry-run",
+                    ]
+                )
+            self.assertEqual(result, 0)
+            self.assertFalse(destination.exists())
+        summary, _ = json.JSONDecoder().raw_decode(output.getvalue())
+        for arg in (
+            "--mock_memory_cache=1",
+            "--mock_memory_cache_hit_ratio=0.5",
+            "--mock_memory_cache_seed=1",
+            "--mock_memory_cache_source_blocks=64",
+        ):
+            self.assertIn(arg, summary["resolved_engine_args"])
+        self.assertFalse(summary["formal_candidate"])
+        self.assertEqual(summary["formal_candidate_reasons"], ["diagnostic_only"])
+        self.assertIn("DIAGNOSTIC ONLY", summary["label"])
+        self.assertIn("OUTPUT CORRECTNESS INVALID", summary["label"])
+
     def test_two_markers_cannot_own_the_same_launch(self):
         trace = actual_trace()
         marker = copy.deepcopy(trace["traceEvents"][4])

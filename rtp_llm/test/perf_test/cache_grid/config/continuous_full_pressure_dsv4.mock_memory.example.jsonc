@@ -1,0 +1,97 @@
+{
+  // Diagnostic derivative of the production example; synthetic KV invalidates outputs.
+  // Profile CLI booleans use 0/1; 1 is equivalent to --mock_memory_cache true.
+  // Verify model/toolchain paths and CUDA_VISIBLE_DEVICES before GPU execution.
+  "schema_version": 1,
+  "label": "DeepSeek-V4-Flash MOCK MEMORY DIAGNOSTIC ONLY; OUTPUT CORRECTNESS INVALID",
+  "model_label": "DeepSeek-V4-Flash",
+  "engine": {
+    "model_type": "deepseek_v4",
+    "checkpoint_path": "/mnt/hf3fs/3fs/models/DeepSeek-V4-Flash",
+    "tokenizer_path": "/mnt/hf3fs/3fs/models/DeepSeek-V4-Flash",
+    "tp_size": 4,
+    "ep_size": 4,
+    "dp_size": 1,
+    "world_size": 4,
+    "max_seq_len": 131072,
+    "max_batch_tokens_size": 131072,
+    "max_context_batch_size": 16,
+    "concurrency_limit": 16,
+    "seq_size_per_block": 512,
+    "kernel_seq_size_per_block": 128
+  },
+  "engine_args": {
+    "--timeout_keep_alive": 3600,
+    "--cp_rotate_method": "ALL_GATHER",
+    "--prefill_cp_kv_cache_sharded": 1,
+    "--fp8_kv_cache": 1,
+    "--reuse_cache": 1,
+    "--enable_device_cache": 1,
+    "--enable_memory_cache": 1,
+    "--memory_cache_size_mb": 65536,
+    "--mock_memory_cache": 1,
+    "--mock_memory_cache_hit_ratio": 0.5,
+    "--mock_memory_cache_seed": 1,
+    "--mock_memory_cache_source_blocks": 64,
+    "--block_tree_device_evict_low_watermark_ratio": 0.82,
+    "--block_tree_device_evict_high_watermark_ratio": 0.9,
+    "--use_deepep_moe": 1,
+    "--use_deepep_low_latency": 0,
+    "--act_type": "BF16",
+    "--load_method": "fastsafetensors",
+    "--enable_cuda_graph": 0,
+    "--reserver_runtime_mem_mb": 65536
+  },
+  "cache_grid": {
+    "diagnostic_only": true,
+    "cache_alignment": 4096,
+    "commit_tail_tokens": 4096,
+    "pressure": {
+      "seed_timeout_s": 3600,
+      "fill_timeout_s": 1800,
+      "fill_max_requests": 1000,
+      "fill_no_progress_s": 300,
+      "gpu_tolerance_blocks": 2,
+      "activity_timeout_s": 300,
+      "drain_timeout_s": 300,
+      "capture_timeout_s": 600,
+      "nsys_duration_s": 10,
+      "family_schedule": "tiered_rolling",
+      "memory_reuse_ratio": 0.5,
+      "fill_host_max_ratio": 0.8,
+      "rate_control": "adaptive_backlog",
+      "request_rate_min": 50,
+      "request_rate_max": 400,
+      "backlog_low": 64,
+      "backlog_high": 192,
+      "max_outstanding": 256,
+      "cohort_size": 32
+    }
+  },
+  "engine_env": {
+    "DSV4_USE_MEGA_MOE": "1",
+    "DSV4_USE_MEGA_MOE_SE": "1",
+    "DSV4_CHUNK_TOKENS": "8192",
+    "DSV4_PREFILL_CP_OVERLAP": "0",
+    "DG_JIT_CPP_STANDARD": "20",
+    "WORLD_SIZE": "4",
+    "TOKENIZERS_PARALLELISM": "false",
+    "PERF_PROFILE_RUNS": "0"
+  },
+  "runtime_env": {
+    "CC": "/opt/rh/gcc-toolset-12/root/usr/bin/gcc",
+    "CXX": "/opt/rh/gcc-toolset-12/root/usr/bin/g++",
+    "CUDAHOSTCXX": "/opt/rh/gcc-toolset-12/root/usr/bin/g++",
+    "NVCC_PREPEND_FLAGS": "-ccbin=/opt/rh/gcc-toolset-12/root/usr/bin/g++",
+    "PATH": "/opt/rh/gcc-toolset-12/root/usr/bin:/opt/conda310/bin:/usr/local/cuda-13.2/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "DG_JIT_CACHE_DIR": "/tmp/rtp-llm-full-pressure/deepgemm",
+    "TRITON_CACHE_DIR": "/tmp/rtp-llm-full-pressure/triton",
+    "TILELANG_CACHE_DIR": "/tmp/rtp-llm-full-pressure/tilelang",
+    "CUDA_VISIBLE_DEVICES": "2,3,4,5"
+  },
+  "bazel": {
+    "executable": "/usr/local/bin/bazelisk",
+    "configs": ["cuda13"],
+    "test_timeout": 10800
+  }
+}

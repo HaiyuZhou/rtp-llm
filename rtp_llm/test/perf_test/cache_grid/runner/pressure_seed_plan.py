@@ -20,6 +20,7 @@ def formal_config_reasons(
     test_block_num: int,
     fill_target_tokens: int,
     explicit_smoke: bool = False,
+    diagnostic_only: bool = False,
 ) -> tuple[str, ...]:
     """Return ordered static exclusions; live capacity planning is still required."""
     for name, value, minimum in (
@@ -34,6 +35,8 @@ def formal_config_reasons(
             raise ValueError(f"{name} must be an integer >= {minimum}")
     if type(explicit_smoke) is not bool:
         raise ValueError("explicit_smoke must be a boolean")
+    if type(diagnostic_only) is not bool:
+        raise ValueError("diagnostic_only must be a boolean")
     reasons = []
     if manual_seed_count is not None:
         reasons.append("manual_seed_count")
@@ -45,6 +48,8 @@ def formal_config_reasons(
         reasons.append("nonstandard_fill_target")
     if explicit_smoke:
         reasons.append("explicit_smoke")
+    if diagnostic_only:
+        reasons.append("diagnostic_only")
     return tuple(reasons)
 
 
@@ -100,6 +105,7 @@ class SeedPlan:
     global_minimum_families: int = 0
     global_maximum_families: int = 0
     explicit_smoke: bool = False
+    diagnostic_only: bool = False
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -125,6 +131,7 @@ def build_seed_plan(
     fill_target_tokens: int,
     test_block_num: int,
     explicit_smoke: bool = False,
+    diagnostic_only: bool = False,
 ) -> SeedPlan:
     """Plan a uniform reusable bank from owner capacity and live host availability.
 
@@ -138,6 +145,7 @@ def build_seed_plan(
         test_block_num=test_block_num,
         fill_target_tokens=fill_target_tokens,
         explicit_smoke=explicit_smoke,
+        diagnostic_only=diagnostic_only,
     )
     if type(commit_tail_tokens) is not int or commit_tail_tokens < 0:
         raise ValueError("commit_tail_tokens must be a nonnegative integer")
@@ -261,4 +269,5 @@ def build_seed_plan(
         global_minimum_families=lower,
         global_maximum_families=upper,
         explicit_smoke=explicit_smoke,
+        diagnostic_only=diagnostic_only,
     )

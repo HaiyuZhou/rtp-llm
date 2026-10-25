@@ -25,6 +25,7 @@
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
 #include "rtp_llm/cpp/config/StaticConfig.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
+#include "rtp_llm/cpp/testing/TestLogCapture.h"
 #include "rtp_llm/cpp/model_rpc/BroadcastManager.h"
 #include "rtp_llm/models_py/bindings/CrcBlockCopy.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
@@ -2203,6 +2204,82 @@ TEST_F(BlockTreeCacheFactoryTest, FullPrefixScanConfigPropagatesAndValidates) {
         kv_cache_config.block_tree_full_prefix_scan_interval_ms = invalid_interval;
         expectFactoryRejects(config, allocator, kv_cache_config);
     }
+}
+
+TEST_F(BlockTreeCacheFactoryTest, DisabledMockMemoryCachePreservesOrdinaryStartup) {
+    const auto config = makeSingleConfig();
+    auto allocator = initAllocator<CoordinatorCacheManager>(config);
+    KVCacheConfig options;
+    EXPECT_FALSE(options.mock_memory_cache);
+    EXPECT_EQ(options.mock_memory_cache_hit_ratio, 0.0);
+    EXPECT_EQ(options.mock_memory_cache_source_blocks, 64);
+    EXPECT_NE(createBlockTreeCache(config, options, allocator), nullptr);
+}
+
+TEST_F(BlockTreeCacheFactoryTest, MockMemoryCacheAcceptsInclusiveRatioEndpoints) {
+    const auto config = makeSingleConfig();
+    for (double ratio : {0.0, 1.0}) {
+        SCOPED_TRACE(ratio);
+        auto allocator = initAllocator<CoordinatorCacheManager>(config);
+        KVCacheConfig options;
+        options.mock_memory_cache = true;
+        options.reuse_cache = true;
+        options.enable_memory_cache = true;
+        options.memory_cache_size_mb = 1;
+        options.mock_memory_cache_hit_ratio = ratio;
+        EXPECT_NE(createBlockTreeCache(config, options, allocator), nullptr);
+    }
+}
+
+TEST_F(BlockTreeCacheFactoryTest, MockMemoryCacheRejectsInvalidRatios) {
+    const auto config = makeSingleConfig();
+    for (double ratio : {-0.01, 1.01, std::numeric_limits<double>::quiet_NaN(),
+                         std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
+        SCOPED_TRACE(ratio);
+        auto allocator = initAllocator<CoordinatorCacheManager>(config);
+        KVCacheConfig options;
+        options.mock_memory_cache = true;
+        options.reuse_cache = true;
+        options.enable_memory_cache = true;
+        options.memory_cache_size_mb = 1;
+        options.mock_memory_cache_hit_ratio = ratio;
+        BlockTreeCachePtr cache;
+        EXPECT_NO_THROW(cache = createBlockTreeCache(config, options, allocator));
+        EXPECT_EQ(cache, nullptr);
+        EXPECT_EQ(allocator->blockTreeCache(), nullptr);
+    }
+}
+
+TEST_F(BlockTreeCacheFactoryTest, MockMemoryCacheRequiresReuseAndMemoryCapacityAndSources) {
+    const auto config = makeSingleConfig();
+    for (int invalid_field = 0; invalid_field < 5; ++invalid_field) {
+        SCOPED_TRACE(invalid_field);
+        auto allocator = initAllocator<CoordinatorCacheManager>(config);
+        KVCacheConfig options;
+        options.mock_memory_cache = true;
+        options.reuse_cache = invalid_field != 0;
+        options.enable_memory_cache = invalid_field != 1;
+        options.memory_cache_size_mb = invalid_field == 2 ? 0 : invalid_field == 3 ? -1 : 1;
+        options.mock_memory_cache_source_blocks = invalid_field == 4 ? 0 : 64;
+        BlockTreeCachePtr cache;
+        EXPECT_NO_THROW(cache = createBlockTreeCache(config, options, allocator));
+        EXPECT_EQ(cache, nullptr);
+        EXPECT_EQ(allocator->blockTreeCache(), nullptr);
+    }
+}
+
+TEST_F(BlockTreeCacheFactoryTest, MockMemoryCacheWarnsThatOutputsAreInvalid) {
+    const auto config = makeSingleConfig();
+    auto allocator = initAllocator<CoordinatorCacheManager>(config);
+    KVCacheConfig options;
+    options.mock_memory_cache = true;
+    options.reuse_cache = true;
+    options.enable_memory_cache = true;
+    options.memory_cache_size_mb = 1;
+    test::TestLogCapture capture("mock_memory_cache_startup");
+    ASSERT_NE(createBlockTreeCache(config, options, allocator), nullptr);
+    EXPECT_NE(capture.content().find("mock_memory_cache"), std::string::npos);
+    EXPECT_NE(capture.content().find("outputs are invalid"), std::string::npos);
 }
 
 TEST_F(BlockTreeCacheFactoryTest, DerivesEachLocalTierFromItsOwnSwitch) {

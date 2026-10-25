@@ -162,7 +162,11 @@ std::string KVCacheConfig::to_string() const {
         << "kv_cache_event_instance_group: " << kv_cache_event_instance_group << "\n"
         << "kv_cache_event_instance_id: " << kv_cache_event_instance_id << "\n"
         << "kv_cache_event_host_ip_port: " << kv_cache_event_host_ip_port << "\n"
-        << "block_tree_full_prefix_scan_interval_ms: " << block_tree_full_prefix_scan_interval_ms << "\n";
+        << "block_tree_full_prefix_scan_interval_ms: " << block_tree_full_prefix_scan_interval_ms << "\n"
+        << "mock_memory_cache: " << mock_memory_cache << "\n"
+        << "mock_memory_cache_hit_ratio: " << mock_memory_cache_hit_ratio << "\n"
+        << "mock_memory_cache_seed: " << mock_memory_cache_seed << "\n"
+        << "mock_memory_cache_source_blocks: " << mock_memory_cache_source_blocks << "\n";
     return oss.str();
 }
 

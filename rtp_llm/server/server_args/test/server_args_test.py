@@ -140,6 +140,48 @@ class CacheConfigArgumentsTest(TestCase):
                 with self.subTest(name=name):
                     self.assertEqual(getattr(config, name), value)
 
+    def test_mock_memory_cache_defaults(self):
+        config = self.parse_cache_config([], {})
+        self.assertFalse(config.mock_memory_cache)
+        self.assertEqual(config.mock_memory_cache_hit_ratio, 0.0)
+        self.assertEqual(config.mock_memory_cache_seed, 1)
+        self.assertEqual(config.mock_memory_cache_source_blocks, 64)
+
+    def test_mock_memory_cache_cli_and_environment(self):
+        samples = {
+            "mock_memory_cache": True,
+            "mock_memory_cache_hit_ratio": 0.625,
+            "mock_memory_cache_seed": 18446744073709551615,
+            "mock_memory_cache_source_blocks": 17,
+        }
+        args = [
+            part
+            for name, value in samples.items()
+            for part in (f"--{name}", str(value))
+        ]
+        env = {name.upper(): str(value) for name, value in samples.items()}
+        for config in (
+            self.parse_cache_config(args, {}),
+            self.parse_cache_config([], env),
+        ):
+            for name, value in samples.items():
+                with self.subTest(name=name):
+                    self.assertEqual(getattr(config, name), value)
+
+        config = self.parse_cache_config(
+            [
+                "--mock_memory_cache", "0",
+                "--mock_memory_cache_hit_ratio", "0.0",
+                "--mock_memory_cache_seed", "0",
+                "--mock_memory_cache_source_blocks", "0",
+            ],
+            env,
+        )
+        self.assertFalse(config.mock_memory_cache)
+        self.assertEqual(config.mock_memory_cache_hit_ratio, 0.0)
+        self.assertEqual(config.mock_memory_cache_seed, 0)
+        self.assertEqual(config.mock_memory_cache_source_blocks, 0)
+
     def test_canonical_env_preserves_false_zero_and_empty(self):
         samples = self.startup_samples()
         empty_samples = {name: type(value)() for name, value in samples.items()}

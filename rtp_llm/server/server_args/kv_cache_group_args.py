@@ -184,6 +184,38 @@ def init_kv_cache_group_args(parser, kv_cache_config):
         "DISK_CACHE_PATHS。",
     )
     kv_cache_group.add_argument(
+        "--mock_memory_cache",
+        env_name="MOCK_MEMORY_CACHE",
+        bind_to=(kv_cache_config, "mock_memory_cache"),
+        type=str2bool,
+        default=False,
+        help="Enable mock Memory KVCache pressure testing; model outputs are invalid",
+    )
+    kv_cache_group.add_argument(
+        "--mock_memory_cache_hit_ratio",
+        env_name="MOCK_MEMORY_CACHE_HIT_RATIO",
+        bind_to=(kv_cache_config, "mock_memory_cache_hit_ratio"),
+        type=float,
+        default=0.0,
+        help="Mock Memory KVCache hit fraction in [0.0, 1.0]",
+    )
+    kv_cache_group.add_argument(
+        "--mock_memory_cache_seed",
+        env_name="MOCK_MEMORY_CACHE_SEED",
+        bind_to=(kv_cache_config, "mock_memory_cache_seed"),
+        type=int,
+        default=1,
+        help="Deterministic seed for mock Memory KVCache pressure testing",
+    )
+    kv_cache_group.add_argument(
+        "--mock_memory_cache_source_blocks",
+        env_name="MOCK_MEMORY_CACHE_SOURCE_BLOCKS",
+        bind_to=(kv_cache_config, "mock_memory_cache_source_blocks"),
+        type=int,
+        default=64,
+        help="Positive number of immutable mock source blocks reserved per Host pool",
+    )
+    kv_cache_group.add_argument(
         "--memory_cache_size_mb",
         env_name="MEMORY_CACHE_SIZE_MB",
         bind_to=(kv_cache_config, "memory_cache_size_mb"),

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -382,6 +383,33 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
                                        std::shared_ptr<StorageBackend>            storage_backend,
                                        std::shared_ptr<BroadcastManager>          broadcast_manager,
                                        std::shared_ptr<kmonitor::MetricsReporter> metrics_reporter) {
+    if (kv_cache_config.mock_memory_cache) {
+        if (!kv_cache_config.reuse_cache) {
+            RTP_LLM_LOG_ERROR("mock_memory_cache requires reuse_cache=true");
+            return nullptr;
+        }
+        if (!kv_cache_config.enable_memory_cache) {
+            RTP_LLM_LOG_ERROR("mock_memory_cache requires enable_memory_cache=true");
+            return nullptr;
+        }
+        if (kv_cache_config.memory_cache_size_mb <= 0) {
+            RTP_LLM_LOG_ERROR("mock_memory_cache requires memory_cache_size_mb > 0, got %ld",
+                              kv_cache_config.memory_cache_size_mb);
+            return nullptr;
+        }
+        if (!std::isfinite(kv_cache_config.mock_memory_cache_hit_ratio)
+            || kv_cache_config.mock_memory_cache_hit_ratio < 0.0
+            || kv_cache_config.mock_memory_cache_hit_ratio > 1.0) {
+            RTP_LLM_LOG_ERROR("mock_memory_cache_hit_ratio must be finite and in [0.0, 1.0], got %g",
+                              kv_cache_config.mock_memory_cache_hit_ratio);
+            return nullptr;
+        }
+        if (kv_cache_config.mock_memory_cache_source_blocks == 0) {
+            RTP_LLM_LOG_ERROR("mock_memory_cache_source_blocks must be > 0");
+            return nullptr;
+        }
+        RTP_LLM_LOG_WARNING("mock_memory_cache is enabled: model outputs are invalid; use for pressure testing only");
+    }
     const auto device_eviction_policy = parseEvictionPolicy(kv_cache_config.device_eviction_policy);
     const auto host_eviction_policy   = parseEvictionPolicy(kv_cache_config.memory_eviction_policy);
     const auto disk_eviction_policy   = parseEvictionPolicy(kv_cache_config.disk_eviction_policy);

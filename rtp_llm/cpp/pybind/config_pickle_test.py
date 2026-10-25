@@ -4,6 +4,7 @@ import unittest
 from rtp_llm.ops import (
     GrammarConfig,
     HWKernelConfig,
+    KVCacheConfig,
     MoeConfig,
     PDSepConfig,
     RoleType,
@@ -27,6 +28,76 @@ class _LegacyGrammarConfig:
     def __reduce__(self):
         legacy_state = ("xgrammar", True, 3, "tokenizer-info", [7, 11])
         return _new_grammar_config, (), legacy_state
+
+
+class KVCacheConfigPickleTest(unittest.TestCase):
+    def test_mock_memory_cache_defaults_round_trip(self):
+        config = pickle.loads(pickle.dumps(KVCacheConfig()))
+        self.assertFalse(config.mock_memory_cache)
+        self.assertEqual(config.mock_memory_cache_hit_ratio, 0.0)
+        self.assertEqual(config.mock_memory_cache_seed, 1)
+        self.assertEqual(config.mock_memory_cache_source_blocks, 64)
+
+    def test_mock_memory_cache_values_round_trip(self):
+        config = KVCacheConfig()
+        self.assertEqual(config.__getstate__()[:2], ("KVCacheConfig", 8))
+        config.mock_memory_cache = True
+        config.mock_memory_cache_hit_ratio = 0.625
+        config.mock_memory_cache_seed = 18446744073709551615
+        config.mock_memory_cache_source_blocks = 17
+        self.assertEqual(
+            config.__getstate__()[69:], (True, 0.625, 18446744073709551615, 17)
+        )
+
+        restored = pickle.loads(pickle.dumps(config))
+        self.assertTrue(restored.mock_memory_cache)
+        self.assertEqual(restored.mock_memory_cache_hit_ratio, 0.625)
+        self.assertEqual(restored.mock_memory_cache_seed, 18446744073709551615)
+        self.assertEqual(restored.mock_memory_cache_source_blocks, 17)
+        for text in (
+            "mock_memory_cache: 1",
+            "mock_memory_cache_hit_ratio: 0.625",
+            "mock_memory_cache_seed: 18446744073709551615",
+            "mock_memory_cache_source_blocks: 17",
+        ):
+            self.assertIn(text, restored.to_string())
+
+    def test_version_seven_defaults_mock_fields_and_preserves_event_fields(self):
+        config = KVCacheConfig()
+        config.reuse_cache = True
+        config.memory_cache_size_mb = 128
+        config.kv_cache_event_publisher_type = "kvcm"
+        config.kv_cache_event_manager_endpoint = "http://event-manager"
+        config.kv_cache_event_instance_group = "test-group"
+        config.kv_cache_event_instance_id = "test-id"
+        config.kv_cache_event_host_ip_port = "127.0.0.1:1234"
+        state = list(config.__getstate__()[:69])
+        state[1] = 7
+        restored = _new_config(KVCacheConfig)
+        restored.__setstate__(tuple(state))
+
+        self.assertTrue(restored.reuse_cache)
+        self.assertEqual(restored.memory_cache_size_mb, 128)
+        self.assertEqual(restored.kv_cache_event_publisher_type, "kvcm")
+        self.assertEqual(
+            restored.kv_cache_event_manager_endpoint, "http://event-manager"
+        )
+        self.assertEqual(restored.kv_cache_event_instance_group, "test-group")
+        self.assertEqual(restored.kv_cache_event_instance_id, "test-id")
+        self.assertEqual(restored.kv_cache_event_host_ip_port, "127.0.0.1:1234")
+        self.assertFalse(restored.mock_memory_cache)
+        self.assertEqual(restored.mock_memory_cache_hit_ratio, 0.0)
+        self.assertEqual(restored.mock_memory_cache_seed, 1)
+        self.assertEqual(restored.mock_memory_cache_source_blocks, 64)
+
+    def test_rejects_newer_versions_and_truncated_version_eight(self):
+        state = KVCacheConfig().__getstate__()
+        for version, fields in ((9, state), (8, state[:69])):
+            with self.subTest(version=version), self.assertRaisesRegex(
+                RuntimeError, "invalid KVCacheConfig state"
+            ):
+                restored = _new_config(KVCacheConfig)
+                restored.__setstate__((fields[0], version, *fields[2:]))
 
 
 class _PreviousGrammarConfig:

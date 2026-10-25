@@ -572,10 +572,14 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("kv_cache_event_instance_group", &KVCacheConfig::kv_cache_event_instance_group)
         .def_readwrite("kv_cache_event_instance_id", &KVCacheConfig::kv_cache_event_instance_id)
         .def_readwrite("kv_cache_event_host_ip_port", &KVCacheConfig::kv_cache_event_host_ip_port)
+        .def_readwrite("mock_memory_cache", &KVCacheConfig::mock_memory_cache)
+        .def_readwrite("mock_memory_cache_hit_ratio", &KVCacheConfig::mock_memory_cache_hit_ratio)
+        .def_readwrite("mock_memory_cache_seed", &KVCacheConfig::mock_memory_cache_seed)
+        .def_readwrite("mock_memory_cache_source_blocks", &KVCacheConfig::mock_memory_cache_source_blocks)
         .def(py::pickle(
             [](const KVCacheConfig& self) {
                 return py::make_tuple(std::string("KVCacheConfig"),
-                                      7,
+                                      8,
                                       self.reuse_cache,
                                       self.multi_task_prompt,
                                       self.multi_task_prompt_str,
@@ -642,11 +646,17 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.kv_cache_event_manager_endpoint,
                                       self.kv_cache_event_instance_group,
                                       self.kv_cache_event_instance_id,
-                                      self.kv_cache_event_host_ip_port);
+                                      self.kv_cache_event_host_ip_port,
+                                      self.mock_memory_cache,
+                                      self.mock_memory_cache_hit_ratio,
+                                      self.mock_memory_cache_seed,
+                                      self.mock_memory_cache_source_blocks);
             },
             [](py::tuple t) {
                 const py::tuple event_state = t;
-                const bool has_event_fields = t.size() == 69 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 7;
+                const bool has_mock_fields = t.size() == 73 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 8;
+                const bool has_event_fields =
+                    has_mock_fields || (t.size() == 69 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 7);
                 if (has_event_fields) {
                     t    = t[py::slice(0, 64, 1)].cast<py::tuple>();
                     t[1] = py::int_(6);
@@ -753,6 +763,12 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.kv_cache_event_instance_group   = event_state[66].cast<std::string>();
                     c.kv_cache_event_instance_id      = event_state[67].cast<std::string>();
                     c.kv_cache_event_host_ip_port     = event_state[68].cast<std::string>();
+                }
+                if (has_mock_fields) {
+                    c.mock_memory_cache               = event_state[69].cast<bool>();
+                    c.mock_memory_cache_hit_ratio     = event_state[70].cast<double>();
+                    c.mock_memory_cache_seed          = event_state[71].cast<uint64_t>();
+                    c.mock_memory_cache_source_blocks = event_state[72].cast<size_t>();
                 }
                 return c;
             }));

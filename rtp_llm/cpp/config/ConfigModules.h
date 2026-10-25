@@ -256,6 +256,10 @@ struct KVCacheConfig {
     int         kvcm_get_broadcast_timeout           = 15000;
     int         kvcm_put_broadcast_timeout           = 15000;
     std::string kvcm_client_config                   = "";
+    bool        mock_memory_cache{false};
+    double      mock_memory_cache_hit_ratio{0.0};
+    uint64_t    mock_memory_cache_seed{1};
+    size_t      mock_memory_cache_source_blocks{64};
     void        insertMultiTaskPromptTokens(std::string task_id, std::vector<int64_t> tokens_id);
     std::string to_string() const;
 };

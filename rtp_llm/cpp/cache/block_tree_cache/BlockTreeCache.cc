@@ -46,17 +46,19 @@ BlockTreeCache::BlockTreeCache(std::unique_ptr<BlockTree>                     tr
         config_.max_descriptors_per_transfer_batch,
         [this](Tier tier) { return config_.isTierEnabled(tier); },
         [this](bool check_watermark) { onWorkflowSettledLocked(check_watermark); }),
-    loader_(tree_.get(),
-            evictor_,
-            transfer_dispatcher_.get(),
-            task_pool_.get(),
-            *metrics_reporter_,
-            mutex_,
-            config_.disk_cache_sync_timeout_ms,
-            config_.host_cache_sync_timeout_ms,
-            config_.enable_device_cache,
-            storage_backend_,
-            [this](bool check_watermark) { onWorkflowSettledLocked(check_watermark); }),
+    loader_(
+        tree_.get(),
+        evictor_,
+        transfer_dispatcher_.get(),
+        task_pool_.get(),
+        *metrics_reporter_,
+        mutex_,
+        config_.disk_cache_sync_timeout_ms,
+        config_.host_cache_sync_timeout_ms,
+        config_.enable_device_cache,
+        storage_backend_,
+        [this](bool check_watermark) { onWorkflowSettledLocked(check_watermark); },
+        mock_memory_cache_source_),
     storer_(tree_.get(),
             evictor_,
             transfer_dispatcher_.get(),
@@ -156,6 +158,11 @@ BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType&               ca
     }
     metrics_reporter_->reportCacheReuseTimeMetrics(result.reuse_time_metrics_snapshots);
     return result;
+}
+
+std::shared_ptr<LoadAsyncContext> BlockTreeCache::mockMemoryLoad(size_t logical_blocks) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return loader_.mockMemoryLoad(logical_blocks);
 }
 
 void BlockTreeCache::insert(const CacheKeysType&                              cache_keys,

@@ -748,6 +748,39 @@ TEST_F(CrcBatchTest, ProductionFinishPreservesNvcompErrorsAndNeverResealsReads) 
 }
 #endif
 
+TEST_F(CrcBatchTest, RepeatedHostSourcesLoadIntoEveryDeviceDestination) {
+    Block             source(35, 4);
+    Block             first(35, 5);
+    Block             second(35, 6);
+    CrcBlockCopyBatch copy(0, 2, 35, 6);
+    cudaCheck(cudaStreamSynchronize(nullptr));
+    ASSERT_EQ(copy.store({source.item(true)}), CrcCopyStatus::OK);
+    const std::vector<uint8_t> host_before(source.host, source.host + source.encoded);
+    auto                       first_item  = first.item(true);
+    auto                       second_item = second.item(true);
+    first_item.host                        = source.host;
+    second_item.host                       = source.host;
+
+    ASSERT_EQ(copy.load({first_item, second_item}), CrcCopyStatus::OK);
+    EXPECT_EQ(first.readDevice(), source.expected);
+    EXPECT_EQ(second.readDevice(), source.expected);
+    EXPECT_EQ(std::vector<uint8_t>(source.host, source.host + source.encoded), host_before);
+}
+
+TEST_F(CrcBatchTest, OverlappingHostDestinationsRemainRejected) {
+    Block             first(35, 4);
+    Block             second(35, 5);
+    CrcBlockCopyBatch copy(0, 2, 35, 6);
+    auto              second_item = second.item(true);
+    second_item.host              = first.host;
+    const std::vector<uint8_t> host_before(first.host, first.host + first.encoded);
+
+    EXPECT_EQ(copy.store({first.item(true), second_item}), CrcCopyStatus::INVALID_ARGS);
+    EXPECT_EQ(std::vector<uint8_t>(first.host, first.host + first.encoded), host_before);
+    EXPECT_EQ(first.readDevice(), first.expected);
+    EXPECT_EQ(second.readDevice(), second.expected);
+}
+
 TEST_F(CrcBatchTest, InvalidGeometryNeverWritesTargets) {
     Block                    block(35, 4);
     CrcBlockCopyBatch        copy(0, 1, 35, 3);

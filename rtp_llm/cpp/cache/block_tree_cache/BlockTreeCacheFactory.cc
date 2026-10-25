@@ -664,6 +664,9 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     // single rank per DP group that owns a mutable BlockTree worth scanning.
     const bool owns_mutable_block_tree =
         parallelism_config.tp_rank == 0 && !parallelism_config.ffn_disaggregate_config.is_ffn_service();
+    config.mock_memory_cache             = kv_cache_config.mock_memory_cache;
+    config.mock_memory_cache_hit_ratio   = kv_cache_config.mock_memory_cache_hit_ratio;
+    config.mock_memory_cache_coordinator = owns_mutable_block_tree;
     config.full_prefix_scan_interval_ms = owns_mutable_block_tree ? configured_scan_interval_ms : 0;
 
     CachePressureOwnership ownership;

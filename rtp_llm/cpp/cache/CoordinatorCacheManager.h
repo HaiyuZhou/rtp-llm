@@ -12,6 +12,7 @@
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/cache/Types.h"
 #include "rtp_llm/cpp/cache/CacheConfig.h"
+#include "rtp_llm/cpp/cache/MockMemoryHitController.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/block_pool/DeviceBlockPool.h"
 #include "rtp_llm/cpp/cache/BufferTypes.h"
 #include "rtp_llm/cpp/cache/FullCacheManager.h"
@@ -220,6 +221,7 @@ protected:
     const CacheConfig                  config_;
     AllocationType                     allocation_type_;
     BlockTreeCachePtr                  block_tree_cache_;
+    std::unique_ptr<MockMemoryHitController> mock_memory_hit_controller_;
     std::shared_ptr<CPSlotMapper>      cp_slot_mapper_;
     const kmonitor::MetricsReporterPtr metrics_reporter_             = nullptr;
     bool                               use_device_malloc_block_pool_ = false;

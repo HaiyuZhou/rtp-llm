@@ -14,6 +14,7 @@
 
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/ScopeRollback.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/load/MockMemoryCacheSource.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/TransferBatchAsyncContext.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/BlockTransferDispatcher.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/group_set/FullGroupSet.h"
@@ -219,6 +220,140 @@ TEST(BlockTreeLoaderTest, HostLoadInstallsAllocatorBoundDeviceTargets) {
     }
     environment->reclaimAll();
     environment->expectFullyReclaimed();
+}
+
+TEST(BlockTreeLoaderTest, MockMemoryDescriptorsWrapReservoirAndNeverJoinOrPublishTreeNodes) {
+    if (!cudaAvailable()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    FullSWAEnvironmentOptions options;
+    options.path_length = 0;
+    options.enable_disk = false;
+    auto environment    = FullSWAEnvironment::create(options);
+    ASSERT_NE(environment, nullptr);
+    auto source = MockMemoryCacheSource::create(environment->groups, 2, 42);
+    ASSERT_TRUE(source.ok()) << source.status();
+    environment->cache->mock_memory_cache_source_         = source.value();
+    environment->cache->loader_.mock_memory_cache_source_ = source.value();
+    auto context                                          = environment->cache->mockMemoryLoad(5);
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(context->sourceKind(), LoadSourceKind::MOCK_MEMORY);
+    EXPECT_EQ(environment->cache->tree()->size(), 0u);
+    size_t expected_descriptors = 0;
+    for (size_t group = 0; group < environment->groups.size(); ++group) {
+        const size_t expected_count = environment->groups[group]->computeReuseBlockCount(5);
+        size_t       actual_count   = 0;
+        for (const auto& desc : context->loadDescs()) {
+            if (desc.group_set_id != group) {
+                continue;
+            }
+            ++actual_count;
+            EXPECT_EQ(desc.node, nullptr);
+            EXPECT_EQ(desc.source_tier, Tier::HOST);
+            EXPECT_EQ(desc.target_tier, Tier::DEVICE);
+            ASSERT_EQ(desc.source_blocks.size(), 1u);
+            EXPECT_EQ(desc.source_blocks[0], source.value()->blockFor(group, desc.path_index));
+            EXPECT_GE(desc.path_index, 5u - expected_count);
+        }
+        EXPECT_EQ(actual_count, expected_count);
+        expected_descriptors += expected_count;
+    }
+    EXPECT_EQ(context->loadDescs().size(), expected_descriptors);
+    std::vector<std::pair<DeviceBlockPoolPtr, BlockIdxType>> request_targets;
+    for (size_t index = 0; index < context->loadDescs().size(); ++index) {
+        const auto&      desc = context->loadDescs()[index];
+        BlockIndicesType targets;
+        for (const auto& pool : environment->groups[desc.group_set_id]->devicePools()) {
+            const auto blocks = pool->malloc(1).value();
+            pool->incRef(blocks);
+            targets.push_back(blocks.front());
+            request_targets.emplace_back(pool, blocks.front());
+        }
+        context->setTargetBlocks(index, std::move(targets));
+    }
+    ASSERT_TRUE(context->commit());
+    context->waitDone();
+    EXPECT_TRUE(context->success());
+    EXPECT_EQ(context->matchedBlocks(Tier::HOST), 5u);
+    EXPECT_EQ(environment->cache->tree()->size(), 0u);
+    for (const auto& [pool, block] : request_targets) {
+        EXPECT_EQ(pool->refCount(block), 1u);
+        EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::LOAD), 0u);
+        EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::CACHE), 0u);
+        pool->decRef(block);
+    }
+    for (const auto& pool : environment->host_pools) {
+        EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::MOCK_SOURCE), 2u);
+        EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::LOAD), 0u);
+        EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::CACHE), 0u);
+    }
+}
+
+TEST(BlockTreeLoaderTest, MockMemoryAbortFailureAndExpiredLoadRetainOnlyReservoirReferences) {
+    if (!cudaAvailable()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    for (int scenario = 0; scenario < 5; ++scenario) {
+        SCOPED_TRACE(scenario);
+        FullSWAEnvironmentOptions options;
+        options.path_length = 0;
+        options.enable_disk = false;
+        auto environment    = FullSWAEnvironment::create(options);
+        ASSERT_NE(environment, nullptr);
+        auto source = MockMemoryCacheSource::create(environment->groups, 1, 0);
+        ASSERT_TRUE(source.ok());
+        environment->cache->mock_memory_cache_source_         = source.value();
+        environment->cache->loader_.mock_memory_cache_source_ = source.value();
+        if (scenario == 2) {
+            environment->cache->loader_.load_task_runner_.host_timeout_ms_ = -1;
+        }
+        if (scenario == 1) {
+            environment->scripted_per_rank_transfer_engine->enqueue(false);
+        }
+        auto context = environment->cache->mockMemoryLoad(2);
+        ASSERT_NE(context, nullptr);
+        std::vector<std::pair<DeviceBlockPoolPtr, BlockIdxType>> request_targets;
+        for (size_t index = 0; index < context->loadDescs().size(); ++index) {
+            BlockIndicesType targets;
+            for (const auto& pool : environment->groups[context->loadDescs()[index].group_set_id]->devicePools()) {
+                const auto blocks = pool->malloc(1).value();
+                pool->incRef(blocks);
+                targets.push_back(blocks.front());
+                request_targets.emplace_back(pool, blocks.front());
+            }
+            context->setTargetBlocks(index, std::move(targets));
+        }
+        if (scenario == 0) {
+            EXPECT_TRUE(context->abortPending());
+        } else if (scenario == 3) {
+            environment->cache->shutdownLoads();
+            EXPECT_FALSE(context->commit());
+        } else if (scenario == 4) {
+            // Reject submission after commit acquired every temporary Device LOAD hold.
+            environment->cache->task_pool_->stopAdmission();
+            EXPECT_FALSE(context->commit());
+        } else {
+            ASSERT_TRUE(context->commit());
+        }
+        context->waitDone();
+        EXPECT_FALSE(context->success());
+        EXPECT_EQ(context->matchedBlocks(Tier::HOST), 0u);
+        EXPECT_EQ(environment->cache->tree()->size(), 0u);
+        for (const auto& [pool, block] : request_targets) {
+            EXPECT_EQ(pool->refCount(block), 1u);
+            EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::LOAD), 0u);
+            pool->decRef(block);
+        }
+        for (const auto& pool : environment->host_pools) {
+            EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::MOCK_SOURCE), 1u);
+            EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::LOAD), 0u);
+        }
+        if (scenario == 4) {
+            std::weak_ptr<LoadAsyncContext> released_context = context;
+            context.reset();
+            EXPECT_TRUE(released_context.expired()) << "a rejected task must not retain its failed context";
+        }
+    }
 }
 
 TEST(BlockTreeLoaderTest, HostLoadUsesReservedAdmissionWhenBackgroundQueueIsFull) {

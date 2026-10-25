@@ -19,6 +19,7 @@ namespace rtp_llm {
 
 class BlockTransferDispatcher;
 class BlockTreeTaskPool;
+class MockMemoryCacheSource;
 
 struct BlockTreeMatchResult {
     size_t                                              matched_device_blocks{0};
@@ -34,17 +35,18 @@ public:
     // Invoked with the shared cache mutex held.
     using SettledFn = std::function<void(bool check_watermark)>;
 
-    BlockTreeLoader(BlockTree*                      tree,
-                    BlockTreeEvictor&               evictor,
-                    BlockTransferDispatcher*        transfer_dispatcher,
-                    BlockTreeTaskPool*              task_pool,
-                    BlockTreeCacheMetricsReporter&  metrics_reporter,
-                    std::mutex&                     mutex,
-                    int                             disk_timeout_ms,
-                    int                             host_timeout_ms,
-                    bool                            enable_device_cache,
-                    std::shared_ptr<StorageBackend> storage_backend,
-                    SettledFn                       settled);
+    BlockTreeLoader(BlockTree*                                   tree,
+                    BlockTreeEvictor&                            evictor,
+                    BlockTransferDispatcher*                     transfer_dispatcher,
+                    BlockTreeTaskPool*                           task_pool,
+                    BlockTreeCacheMetricsReporter&               metrics_reporter,
+                    std::mutex&                                  mutex,
+                    int                                          disk_timeout_ms,
+                    int                                          host_timeout_ms,
+                    bool                                         enable_device_cache,
+                    std::shared_ptr<StorageBackend>              storage_backend,
+                    SettledFn                                    settled,
+                    std::shared_ptr<const MockMemoryCacheSource> mock_memory_cache_source = nullptr);
 
     // The caller must hold the shared BlockTreeCache mutex.
     BlockTreeMatchResult matchLocked(const CacheKeysType&               cache_keys,
@@ -52,6 +54,8 @@ public:
     BlockIndicesType     matchedBlocksForGroup(std::string_view                      group_tag,
                                                const std::vector<MultiNodeResource>& matched_resources) const;
     bool                 abortPendingLoad(const std::shared_ptr<AsyncContext>& context);
+    // The caller holds the shared cache mutex; no tree lookup or mutation.
+    std::shared_ptr<LoadAsyncContext> mockMemoryLoad(size_t logical_blocks);
     void                 shutdown();
 
 private:
@@ -71,6 +75,7 @@ private:
                                    size_t                                 prepared_desc_count,
                                    uint64_t                               context_id,
                                    bool                                   release_transferred_refs);
+    void           abortMockLoadLocked(const std::vector<TransferDescriptor>& load_descs, size_t prepared_desc_count);
     void           runLoadTask(const LoadTaskRunner::TaskPtr& task);
     void           scheduleContextSettlement(const LoadTaskRunner::TaskPtr&           task,
                                              const std::shared_ptr<LoadAsyncContext>& context);
@@ -92,6 +97,7 @@ private:
     std::mutex&                             mutex_;
     bool                                    enable_device_cache_{true};
     std::shared_ptr<StorageBackend>         storage_backend_;
+    std::shared_ptr<const MockMemoryCacheSource> mock_memory_cache_source_;
     SettledFn                               settled_;
     LoadTaskRunner                          load_task_runner_;
     LoadJoinRegistry                        load_join_registry_;

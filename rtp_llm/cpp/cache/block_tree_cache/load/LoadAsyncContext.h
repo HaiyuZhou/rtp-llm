@@ -20,6 +20,11 @@ namespace rtp_llm {
 
 class LoadContextCoordinator;
 
+enum class LoadSourceKind {
+    TREE,
+    MOCK_MEMORY
+};
+
 struct LoadMatchResult {
     // Keep bool-returning callbacks source-compatible. A callback failure that
     // does not provide a capacity verdict is terminal rather than eligible for
@@ -50,7 +55,8 @@ public:
                      uint64_t                                       context_id,
                      const std::shared_ptr<LoadContextCoordinator>& coordinator,
                      std::shared_ptr<StorageBackend>                storage_backend = nullptr,
-                     StorageRequest                                 storage_request = {});
+                     StorageRequest                                 storage_request = {},
+                     LoadSourceKind                                 source_kind     = LoadSourceKind::TREE);
     ~LoadAsyncContext() override;
 
     bool     empty() const;
@@ -59,6 +65,9 @@ public:
     size_t   matchedBlocks() const;
     size_t   matchedBlocks(Tier tier) const;
     bool     needBackendMatch() const;
+    LoadSourceKind sourceKind() const {
+        return source_kind_;
+    }
 
     void setValidPrefix(std::function<bool(size_t)> valid_prefix) {
         valid_prefix_ = std::move(valid_prefix);
@@ -103,6 +112,7 @@ private:
 
     std::shared_ptr<LoadContextCoordinator> coordinator_;
     const uint64_t                          context_id_;
+    const LoadSourceKind                    source_kind_;
     std::vector<TransferDescriptor>         load_descs_;
     std::vector<bool>                       joined_load_;
     const size_t                            local_matched_blocks_{0};
@@ -148,7 +158,8 @@ public:
                                              std::vector<bool>               joined_load,
                                              size_t                          matched_blocks,
                                              std::shared_ptr<StorageBackend> storage_backend = nullptr,
-                                             StorageRequest                  storage_request = {});
+                                             StorageRequest                  storage_request = {},
+                                             LoadSourceKind                  source_kind     = LoadSourceKind::TREE);
     bool                              registerContext(const std::shared_ptr<LoadAsyncContext>& context);
     bool                              commit(uint64_t context_id);
     bool                              abort(LoadAsyncContext& context) noexcept;

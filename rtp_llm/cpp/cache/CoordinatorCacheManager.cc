@@ -17,6 +17,7 @@
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 #include <unordered_map>
 #include "rtp_llm/cpp/utils/TimeUtil.h"
+#include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include <iomanip>
 #include <numeric>
 #include <sstream>
@@ -255,6 +256,10 @@ void CoordinatorCacheManager::attachBlockTreeCache(BlockTreeCachePtr block_tree_
     RTP_LLM_CHECK_WITH_INFO(block_tree_cache_ == nullptr, "BlockTreeCache has already been attached");
 
     block_tree_cache_ = std::move(block_tree_cache);
+    if (block_tree_cache_->config().mock_memory_cache && block_tree_cache_->config().mock_memory_cache_coordinator) {
+        mock_memory_hit_controller_ =
+            std::make_unique<MockMemoryHitController>(block_tree_cache_->config().mock_memory_cache_hit_ratio);
+    }
     for (const auto& group : cacheGroups()) {
         const std::string tag = group->tag();
         group->setEvictCallback([cache = block_tree_cache_, tag](size_t need_blocks) {
@@ -461,6 +466,7 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
     prepared.referenced_blocks.resize(kv_cache_groups_.size());
     std::shared_ptr<LoadAsyncContext> load_context;
 
+    const bool mock_memory = block_tree_cache_ && block_tree_cache_->config().mock_memory_cache;
     if (malloc_info.enable_cache_lookup) {
         CacheKeysType match_keys = cpCanonicalCacheKeys(cp_mapper, cache_keys);
         const size_t  max_keys   = static_cast<size_t>(config_.maxPrefixReuseTokens(seq_len))
@@ -472,14 +478,51 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
             match_keys.pop_back();
         }
         const int64_t begin_us = currentTimeUs();
-        load_context =
-            prepareKVCache(match_keys,
-                           *kv_resource,
-                           cp_mapper,
-                           prepared,
-                           [tokens = malloc_info.complete_token_ids, reuse_unit_tokens](size_t count) {
-                               return tokens->isValidReuseLength(static_cast<int>(count) * reuse_unit_tokens);
-                           });
+        if (mock_memory) {
+            RTP_LLM_PROFILE_SCOPE("cache.mock_memory.plan_and_descriptors");
+            if (mock_memory_hit_controller_) {
+                if (!kv_resource->mockMemoryCachePlan()) {
+                    const auto decision = mock_memory_hit_controller_->plan(
+                        match_keys.size(), [tokens = malloc_info.complete_token_ids, reuse_unit_tokens](size_t count) {
+                            return tokens->isValidReuseLength(static_cast<int>(count) * reuse_unit_tokens);
+                        });
+                    kv_resource->setMockMemoryCachePlan({decision.eligible_blocks, decision.planned_host_blocks});
+                }
+                const size_t planned_blocks = kv_resource->mockMemoryCachePlan()->planned_host_blocks;
+                if (planned_blocks > 0) {
+                    load_attempted = true;
+                    load_context   = block_tree_cache_->mockMemoryLoad(planned_blocks);
+                    if (!load_context) {
+                        MallocResult failed{false, 0};
+                        failed.status             = MallocStatus::INTERNAL_ERROR;
+                        failed.load_attempted     = true;
+                        failed.match_end_time_us  = currentTimeUs();
+                        failed.match_cost_time_us = failed.match_end_time_us - begin_us;
+                        return failed;
+                    }
+                    prepared.total_logical_blocks = planned_blocks;
+                    const int cp_scale            = cp_mapper && cp_mapper->isSharded() ? cp_mapper->cpSize() : 1;
+                    for (const auto& group_set : block_tree_cache_->groupSets()) {
+                        for (const auto& tag : group_set->groupTags()) {
+                            const size_t size = loadTargetPosition(planned_blocks - 1, tag, cp_mapper, cp_scale) + 1;
+                            kv_resource->mutableBlockIds(0, tag).assign(BlockIndicesType(size, NULL_BLOCK_IDX));
+                        }
+                    }
+                    for (const auto& tag : config_.groupTags()) {
+                        prepared.original_sizes.push_back(kv_resource->blocksNum(0, tag));
+                    }
+                }
+            }
+        } else {
+            load_context =
+                prepareKVCache(match_keys,
+                               *kv_resource,
+                               cp_mapper,
+                               prepared,
+                               [tokens = malloc_info.complete_token_ids, reuse_unit_tokens](size_t count) {
+                                   return tokens->isValidReuseLength(static_cast<int>(count) * reuse_unit_tokens);
+                               });
+        }
         match_end_time_us  = currentTimeUs();
         match_cost_time_us = match_end_time_us - begin_us;
         load_attempted     = load_context != nullptr;
@@ -1077,6 +1120,9 @@ bool CoordinatorCacheManager::updateKVBlock(const BatchKVCacheResourcePtr&  batc
 
         BatchKVCacheResource staged_resource;
         staged_resource.resetBatchSize(new_batch_size);
+        if (batch_kv_cache_resource->mockMemoryCachePlan()) {
+            staged_resource.setMockMemoryCachePlan(*batch_kv_cache_resource->mockMemoryCachePlan());
+        }
         std::vector<TaggedBlockIdPair>            staged_mapping;
         std::vector<std::pair<BlockIds*, size_t>> replacement_slots;
         std::vector<std::pair<int, int>>          retained_slots;
@@ -1246,7 +1292,12 @@ bool CoordinatorCacheManager::updateKVBlock(const BatchKVCacheResourcePtr&  batc
     }
 
     std::vector<KVCacheResource> old_resources;
+    // This is a reshape of one request, rather than a new-stream reset.
+    const auto mock_plan = batch_kv_cache_resource->mockMemoryCachePlan();
     batch_kv_cache_resource->resetAndReturnOldResources(new_batch_size, old_resources);
+    if (mock_plan) {
+        batch_kv_cache_resource->setMockMemoryCachePlan(*mock_plan);
+    }
     batch_kv_cache_resource->initGroups(config_.topologyPtr());
     std::vector<size_t> next_replacement(static_cast<size_t>(group_nums), 0);
 

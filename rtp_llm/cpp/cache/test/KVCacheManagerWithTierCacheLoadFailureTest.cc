@@ -3,6 +3,43 @@
 namespace rtp_llm::test {
 using namespace tier_cache_test_detail;
 
+TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryTransferFailurePublishesNoReuseAndReleasesLoadTargets) {
+    ASSERT_NO_FATAL_FAILURE(initManager(16, 8, 1.0));
+    auto cache = manager_->blockTreeCache();
+    transfer_engine_->enqueue(false);
+    auto       resource     = makeResource(cache_config_);
+    const int  block_tokens = static_cast<int>(cache_config_.seq_size_per_block);
+    auto       tokens       = makeTokenIds(0, 3 * block_tokens, 3 * block_tokens, block_tokens);
+    MallocInfo info{resource, tokens};
+    info.reuse_cache         = true;
+    info.enable_cache_lookup = true;
+    const auto result        = manager_->malloc(info);
+    ASSERT_TRUE(result.success);
+    ASSERT_NE(result.async_context, nullptr);
+    result.async_context->waitDone();
+    EXPECT_FALSE(result.async_context->success());
+    auto context = std::dynamic_pointer_cast<LoadAsyncContext>(result.async_context);
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(context->matchedBlocks(), 0u);
+    EXPECT_EQ(context->matchedBlocks(Tier::HOST), 0u);
+    EXPECT_EQ(result.reuse_len, 0);
+    EXPECT_EQ(resource->cacheResource().deviceReuseBlockNum(), 0u);
+    EXPECT_EQ(resource->cacheResource().memoryReuseBlockNum(), 0u);
+    EXPECT_EQ(cache->getStats().tree_node_count, 0u);
+    for (const auto& group : cache->groupSets()) {
+        EXPECT_EQ(group->hostPool()->referencedBlocksNum(BlockTreeRefType::MOCK_SOURCE), 2u);
+        EXPECT_EQ(group->hostPool()->referencedBlocksNum(BlockTreeRefType::LOAD), 0u);
+        for (const auto& pool : group->devicePools()) {
+            EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::LOAD), 0u);
+            EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::CACHE), 0u);
+        }
+    }
+    manager_->free(FreeInfo{resource, tokens});
+    for (const auto& pool : manager_->coordinator_manager_->groupBlockPools()) {
+        EXPECT_EQ(pool->referencedBlocksNum(), 0u);
+    }
+}
+
 TEST_P(KVCacheManagerWithTierCacheTest, DSV4CorruptSwaRecordPreservesFullAndAllowsRecomputeAfterReclaim) {
     ASSERT_NO_FATAL_FAILURE(runCorruptLowerTierLoadScenario(CacheGroupType::SWA));
 }

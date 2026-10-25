@@ -93,8 +93,10 @@ private:
     std::function<void()> observer_;
 };
 
-std::shared_ptr<LoadAsyncContext>
-makeAllocatorLoadContext(size_t matched_blocks, const std::vector<Tier>& source_tiers, bool commit = true) {
+std::shared_ptr<LoadAsyncContext> makeAllocatorLoadContext(size_t                   matched_blocks,
+                                                           const std::vector<Tier>& source_tiers,
+                                                           bool                     commit = true,
+                                                           LoadSourceKind source_kind      = LoadSourceKind::TREE) {
     auto coordinator = std::make_shared<LoadContextCoordinator>(
         [](const std::shared_ptr<LoadAsyncContext>&) { return true; }, [](LoadAsyncContext&) {});
     std::vector<TransferDescriptor> descriptors;
@@ -103,8 +105,12 @@ makeAllocatorLoadContext(size_t matched_blocks, const std::vector<Tier>& source_
         descriptors.emplace_back(
             nullptr, /*group_set_id=*/0, path_index, source_tiers[path_index], Tier::DEVICE, BlockIndicesType{1});
     }
-    auto context =
-        coordinator->create(std::move(descriptors), std::vector<bool>(source_tiers.size(), false), matched_blocks);
+    auto context = coordinator->create(std::move(descriptors),
+                                       std::vector<bool>(source_tiers.size(), false),
+                                       matched_blocks,
+                                       nullptr,
+                                       {},
+                                       source_kind);
     EXPECT_TRUE(coordinator->registerContext(context));
     if (commit) {
         EXPECT_TRUE(context->commit());
@@ -1064,6 +1070,64 @@ TEST_F(StreamCacheResourceTest, testLoadCacheDone_PendingAllocatorLoad_ReturnsFa
     EXPECT_TRUE(resource.asyncLoadCache());
     EXPECT_FALSE(resource.loadCacheDone());
     EXPECT_EQ(resource.allocator_load_context_, load_context);
+}
+
+TEST_F(StreamCacheResourceTest, MockMemoryFullGroupBatchReshapePreservesRequestPlan) {
+    prepareResource(/*reuse_cache=*/true);
+    auto& resource = stream_->streamCacheResource();
+    ASSERT_TRUE(resource.initKVBlock().ok());
+    resource.kvCacheMutable().setMockMemoryCachePlan({7, 3});
+    std::vector<TaggedBlockIdPair> mapping;
+    ASSERT_TRUE(cache_manager_->updateKVBlock(resource.batch_kv_cache_resource_, {0, 0}, false, mapping));
+    ASSERT_TRUE(resource.kvCache().mockMemoryCachePlan().has_value());
+    EXPECT_EQ(resource.kvCache().mockMemoryCachePlan()->eligible_blocks, 7u);
+    EXPECT_EQ(resource.kvCache().mockMemoryCachePlan()->planned_host_blocks, 3u);
+}
+
+TEST_F(StreamCacheResourceTest, MockMemoryNewStreamInitializationClearsRequestPlan) {
+    prepareResource(/*reuse_cache=*/true);
+    auto& resource = stream_->streamCacheResource();
+    resource.kvCacheMutable().setMockMemoryCachePlan({7, 3});
+    resource.init(1);
+    EXPECT_FALSE(resource.kvCache().mockMemoryCachePlan().has_value());
+}
+
+TEST_F(StreamCacheResourceTest, MockMemoryFinalizePublishesCompletedHostReuseAndExistingMetrics) {
+    prepareResource(/*reuse_cache=*/true);
+    kmonitor::MetricsTags tags;
+    stream_->setMetricsReporter(std::make_shared<kmonitor::MetricsReporter>("", "", tags));
+    auto& resource = stream_->streamCacheResource();
+    auto  context  = makeAllocatorLoadContext(2, {Tier::HOST, Tier::HOST}, true, LoadSourceKind::MOCK_MEMORY);
+    resource.allocator_load_context_ = context;
+    EXPECT_FALSE(resource.loadCacheDone());
+    EXPECT_EQ(resource.kvCache().cacheResource().memoryReuseBlockNum(), 0u);
+    ASSERT_TRUE(context->completeTransfers(2, true));
+    ASSERT_TRUE(resource.loadCacheDone());
+    EXPECT_EQ(resource.kvCache().cacheResource().memoryReuseBlockNum(), 2u);
+    EXPECT_EQ(resource.kvCache().cacheResource().deviceReuseBlockNum(), 0u);
+    EXPECT_EQ(stream_->reuseLength(), 4);
+    EXPECT_EQ(stream_->hostReuseLength(), 4);
+    resource.reportCacheReuseMetrics();
+    EXPECT_EQ(resource.cache_reuse_metrics_.host_reuse_length, 4);
+    EXPECT_EQ(resource.cache_reuse_metrics_.device_reuse_length, 0);
+}
+
+TEST_F(StreamCacheResourceTest, MockMemoryFailedFinalizePublishesNoCacheReuse) {
+    prepareResource(/*reuse_cache=*/true);
+    kmonitor::MetricsTags tags;
+    stream_->setMetricsReporter(std::make_shared<kmonitor::MetricsReporter>("", "", tags));
+    auto& resource = stream_->streamCacheResource();
+    auto  context  = makeAllocatorLoadContext(2, {Tier::HOST, Tier::HOST}, true, LoadSourceKind::MOCK_MEMORY);
+    resource.allocator_load_context_ = context;
+    ASSERT_TRUE(context->completeTransfers(2, false));
+    ASSERT_TRUE(resource.loadCacheDone());
+    EXPECT_EQ(resource.kvCache().cacheResource().memoryReuseBlockNum(), 0u);
+    EXPECT_EQ(resource.kvCache().cacheResource().deviceReuseBlockNum(), 0u);
+    EXPECT_EQ(stream_->reuseLength(), 0);
+    EXPECT_EQ(stream_->hostReuseLength(), 0);
+    resource.reportCacheReuseMetrics();
+    EXPECT_EQ(resource.cache_reuse_metrics_.host_reuse_length, 0);
+    EXPECT_EQ(resource.cache_reuse_metrics_.kv_cache_reuse_length, 0);
 }
 
 TEST_F(StreamCacheResourceTest, StorageMatchDefersReusePublicationUntilReadCompletes) {

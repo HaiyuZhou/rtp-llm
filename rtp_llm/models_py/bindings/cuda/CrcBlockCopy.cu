@@ -190,7 +190,7 @@ struct CrcBlockCopyBatch::Impl {
         return opts;
     }
 
-    bool valid(const std::vector<CrcCopyItem>& batch) const {
+    bool valid(const std::vector<CrcCopyItem>& batch, bool store) const {
         if (batch.empty() || batch.size() > max_items)
             return false;
         size_t total_tiles = 0;
@@ -202,12 +202,14 @@ struct CrcBlockCopyBatch::Impl {
             const uintptr_t address = reinterpret_cast<uintptr_t>(item.host);
             if (item.capacity_bytes < encoded || address > std::numeric_limits<uintptr_t>::max() - encoded)
                 return false;
-            // Overlapping destinations can invalidate an earlier item's footer.
-            for (size_t previous = 0; previous < index; ++previous) {
-                const uintptr_t other       = reinterpret_cast<uintptr_t>(batch[previous].host);
-                const size_t    other_bytes = CrcBlockCopyBatch::encodedBytes(batch[previous].payload_bytes);
-                if (address < other + other_bytes && other < address + encoded)
-                    return false;
+            // Store destinations must be disjoint; load sources may share immutable records.
+            if (store) {
+                for (size_t previous = 0; previous < index; ++previous) {
+                    const uintptr_t other       = reinterpret_cast<uintptr_t>(batch[previous].host);
+                    const size_t    other_bytes = CrcBlockCopyBatch::encodedBytes(batch[previous].payload_bytes);
+                    if (address < other + other_bytes && other < address + encoded)
+                        return false;
+                }
             }
             if (item.tiles.empty() || item.tiles.size() > max_tiles - total_tiles)
                 return false;
@@ -332,7 +334,7 @@ struct CrcBlockCopyBatch::Impl {
         std::lock_guard<std::mutex> lock(mutex);
         if (failures)
             failures->clear();
-        if (!valid(batch))
+        if (!valid(batch, /*store=*/true))
             return CrcCopyStatus::INVALID_ARGS;
         try {
             if (failures)
@@ -361,7 +363,7 @@ struct CrcBlockCopyBatch::Impl {
         std::lock_guard<std::mutex> lock(mutex);
         if (failures)
             failures->clear();
-        if (!valid(batch))
+        if (!valid(batch, /*store=*/false))
             return CrcCopyStatus::INVALID_ARGS;
         try {
             if (failures)

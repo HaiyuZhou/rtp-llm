@@ -41,6 +41,7 @@ std::shared_ptr<const CacheTopology> warmupCacheTopology() {
 }  // namespace
 
 void StreamCacheResource::init(int batch_size) {
+    batch_kv_cache_resource_->clearMockMemoryCachePlan();
     batch_kv_cache_resource_->resetBatchSize(batch_size);
     // cache manager is null when warmup
     const auto topology = resource_context_.cache_manager ?

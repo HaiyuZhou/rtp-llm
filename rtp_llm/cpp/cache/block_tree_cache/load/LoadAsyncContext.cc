@@ -17,9 +17,11 @@ LoadAsyncContext::LoadAsyncContext(std::vector<TransferDescriptor>              
                                    uint64_t                                       context_id,
                                    const std::shared_ptr<LoadContextCoordinator>& coordinator,
                                    std::shared_ptr<StorageBackend>                storage_backend,
-                                   StorageRequest                                 storage_request):
+                                   StorageRequest                                 storage_request,
+                                   LoadSourceKind                                 source_kind):
     coordinator_(coordinator),
     context_id_(context_id),
+    source_kind_(source_kind),
     load_descs_(std::move(load_descs)),
     joined_load_(std::move(joined_load)),
     local_matched_blocks_(local_matched_blocks),
@@ -42,6 +44,10 @@ LoadAsyncContext::~LoadAsyncContext() {
 
 void LoadAsyncContext::rebuildMatchedBlocksByTier() {
     matched_blocks_by_tier_.fill(0);
+    if (source_kind_ == LoadSourceKind::MOCK_MEMORY) {
+        matched_blocks_by_tier_[static_cast<size_t>(Tier::HOST)] = local_matched_blocks_;
+        return;
+    }
     std::unordered_map<size_t, Tier> reuse_tier_by_path;
     for (const TransferDescriptor& desc : load_descs_) {
         if (desc.source_tier < Tier::DEVICE || desc.source_tier > Tier::DISK) {
@@ -71,10 +77,16 @@ size_t LoadAsyncContext::localMatchedBlocks() const {
 
 size_t LoadAsyncContext::matchedBlocks() const {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (source_kind_ == LoadSourceKind::MOCK_MEMORY && !success()) {
+        return 0;
+    }
     return matched_blocks_;
 }
 
 size_t LoadAsyncContext::matchedBlocks(Tier tier) const {
+    if (source_kind_ == LoadSourceKind::MOCK_MEMORY && !success()) {
+        return 0;
+    }
     return tier >= Tier::DEVICE && tier <= Tier::DISK ? matched_blocks_by_tier_[static_cast<size_t>(tier)] : 0;
 }
 
@@ -337,6 +349,10 @@ bool LoadAsyncContext::onTaskFail() {
         }
         remaining_transfer_count_ = 0;
         backend_pending_          = false;
+        if (source_kind_ == LoadSourceKind::MOCK_MEMORY) {
+            // An unsubmitted task retained here also retains this context.
+            settlement_ready_callback_ = {};
+        }
         state_.store(State::FAILED);
     }
     notifyCompletion();
@@ -437,7 +453,8 @@ std::shared_ptr<LoadAsyncContext> LoadContextCoordinator::create(std::vector<Tra
                                                                  std::vector<bool>               joined_load,
                                                                  size_t                          matched_blocks,
                                                                  std::shared_ptr<StorageBackend> storage_backend,
-                                                                 StorageRequest                  storage_request) {
+                                                                 StorageRequest                  storage_request,
+                                                                 LoadSourceKind                  source_kind) {
     const auto coordinator = shared_from_this();
     uint64_t   context_id  = 0;
     {
@@ -453,7 +470,8 @@ std::shared_ptr<LoadAsyncContext> LoadContextCoordinator::create(std::vector<Tra
                                               context_id,
                                               coordinator,
                                               std::move(storage_backend),
-                                              std::move(storage_request));
+                                              std::move(storage_request),
+                                              source_kind);
 }
 
 bool LoadContextCoordinator::registerContext(const std::shared_ptr<LoadAsyncContext>& context) {

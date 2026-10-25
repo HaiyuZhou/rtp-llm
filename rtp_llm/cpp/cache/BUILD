@@ -253,6 +253,7 @@ cc_library(
     copts = copts(),
     visibility = ["//visibility:public"],
     deps = [
+        ":mock_memory_hit_controller",
         ":cache_types",
         ":cp_slot_mapper",
         ":single_type_cache_manager",
@@ -273,6 +274,8 @@ cc_library(
     copts = copts(),
     visibility = ["//visibility:public"],
     deps = [
+        ":mock_memory_hit_controller",
+        "//rtp_llm/cpp/utils:profiling_scope",
         ":cp_slot_mapper",
         ":device_block_pool_config_helper",
         ":coordinator_cache_manager_hdr",

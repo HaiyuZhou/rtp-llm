@@ -263,6 +263,52 @@ TEST(LoadAsyncContextTest, EmptyStorageMatchStillRunsDeferredAllocationAndCommit
     coordinator->shutdown();
 }
 
+TEST(LoadAsyncContextTest, MockMemoryPublishesLogicalHostReuseOnceAfterSuccessfulSettlement) {
+    size_t                          commits     = 0;
+    size_t                          aborts      = 0;
+    auto                            coordinator = makeCoordinator(commits, aborts);
+    std::vector<TransferDescriptor> descriptors;
+    for (size_t group = 0; group < 2; ++group) {
+        for (size_t path = 0; path < 3; ++path) {
+            descriptors.push_back({nullptr, group, path, Tier::HOST, Tier::DEVICE, {1}});
+            descriptors.back().target_blocks = {2};
+        }
+    }
+    auto context =
+        coordinator->create(descriptors, std::vector<bool>(6, false), 3, nullptr, {}, LoadSourceKind::MOCK_MEMORY);
+    ASSERT_TRUE(coordinator->registerContext(context));
+    EXPECT_EQ(context->sourceKind(), LoadSourceKind::MOCK_MEMORY);
+    EXPECT_EQ(context->localMatchedBlocks(), 3u);
+    EXPECT_EQ(context->matchedBlocks(), 0u);
+    EXPECT_EQ(context->matchedBlocks(Tier::HOST), 0u);
+    ASSERT_TRUE(context->commit());
+    ASSERT_TRUE(context->completeTransfers(5, true));
+    EXPECT_FALSE(context->done());
+    EXPECT_EQ(context->matchedBlocks(Tier::HOST), 0u);
+    ASSERT_TRUE(context->completeTransfers(1, true));
+    EXPECT_TRUE(context->success());
+    EXPECT_EQ(context->matchedBlocks(), 3u);
+    EXPECT_EQ(context->matchedBlocks(Tier::HOST), 3u);
+    EXPECT_EQ(context->matchedBlocks(Tier::DEVICE), 0u);
+    EXPECT_EQ(commits, 1u);
+    EXPECT_EQ(aborts, 0u);
+}
+
+TEST(LoadAsyncContextTest, MockMemoryFailurePublishesNoReuse) {
+    size_t             commits     = 0;
+    size_t             aborts      = 0;
+    auto               coordinator = makeCoordinator(commits, aborts);
+    TransferDescriptor descriptor{nullptr, 0, 0, Tier::HOST, Tier::DEVICE, {1}};
+    descriptor.target_blocks = {2};
+    auto context             = coordinator->create({descriptor}, {false}, 1, nullptr, {}, LoadSourceKind::MOCK_MEMORY);
+    ASSERT_TRUE(coordinator->registerContext(context));
+    ASSERT_TRUE(context->commit());
+    ASSERT_TRUE(context->completeTransfers(1, false));
+    EXPECT_FALSE(context->success());
+    EXPECT_EQ(context->matchedBlocks(), 0u);
+    EXPECT_EQ(context->matchedBlocks(Tier::HOST), 0u);
+}
+
 TEST(LoadAsyncContextTest, OnDoneRunsOnceWhenCommittedTransferCompletes) {
     size_t             commits     = 0;
     size_t             aborts      = 0;

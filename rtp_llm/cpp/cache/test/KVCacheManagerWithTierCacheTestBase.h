@@ -1364,14 +1364,24 @@ protected:
         StaticConfig::user_ft_core_dump_on_exception = old_core_dump_on_exception_;
     }
 
-    void initManager(uint32_t device_blocks, int64_t lower_cache_size_mb = 8) {
+    void initManager(uint32_t              device_blocks,
+                     int64_t               lower_cache_size_mb = 8,
+                     std::optional<double> mock_hit_ratio      = std::nullopt,
+                     int                   min_replay_tokens   = 1) {
         ASSERT_FALSE(disk_dir_.path().empty());
         cache_config_ = makeCompactDsv4CacheConfig(device_blocks);
+        cache_config_.cache_min_replay_tokens = min_replay_tokens;
 
+        auto tier_config = makeTierConfig(GetParam(), disk_dir_.path(), lower_cache_size_mb);
+        if (mock_hit_ratio) {
+            tier_config.mock_memory_cache               = true;
+            tier_config.mock_memory_cache_hit_ratio     = *mock_hit_ratio;
+            tier_config.mock_memory_cache_source_blocks = 2;
+        }
         manager_ = std::make_shared<KVCacheManager>(cache_config_,
                                                     /*warmup=*/false,
                                                     nullptr,
-                                                    makeTierConfig(GetParam(), disk_dir_.path(), lower_cache_size_mb));
+                                                    tier_config);
         ASSERT_TRUE(manager_->init());
         ASSERT_NE(manager_->blockTreeCache(), nullptr);
         auto cache = manager_->blockTreeCache();

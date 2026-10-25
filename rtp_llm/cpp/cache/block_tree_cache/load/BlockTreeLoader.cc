@@ -9,6 +9,7 @@
 
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/ScopeRollback.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/load/MockMemoryCacheSource.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/BlockTransferDispatcher.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/Logger.h"
@@ -16,17 +17,18 @@
 
 namespace rtp_llm {
 
-BlockTreeLoader::BlockTreeLoader(BlockTree*                      tree,
-                                 BlockTreeEvictor&               evictor,
-                                 BlockTransferDispatcher*        transfer_dispatcher,
-                                 BlockTreeTaskPool*              task_pool,
-                                 BlockTreeCacheMetricsReporter&  metrics_reporter,
-                                 std::mutex&                     mutex,
-                                 int                             disk_timeout_ms,
-                                 int                             host_timeout_ms,
-                                 bool                            enable_device_cache,
-                                 std::shared_ptr<StorageBackend> storage_backend,
-                                 SettledFn                       settled):
+BlockTreeLoader::BlockTreeLoader(BlockTree*                                   tree,
+                                 BlockTreeEvictor&                            evictor,
+                                 BlockTransferDispatcher*                     transfer_dispatcher,
+                                 BlockTreeTaskPool*                           task_pool,
+                                 BlockTreeCacheMetricsReporter&               metrics_reporter,
+                                 std::mutex&                                  mutex,
+                                 int                                          disk_timeout_ms,
+                                 int                                          host_timeout_ms,
+                                 bool                                         enable_device_cache,
+                                 std::shared_ptr<StorageBackend>              storage_backend,
+                                 SettledFn                                    settled,
+                                 std::shared_ptr<const MockMemoryCacheSource> mock_memory_cache_source):
     tree_(tree),
     evictor_(evictor),
     transfer_dispatcher_(transfer_dispatcher),
@@ -35,6 +37,7 @@ BlockTreeLoader::BlockTreeLoader(BlockTree*                      tree,
     mutex_(mutex),
     enable_device_cache_(enable_device_cache),
     storage_backend_(std::move(storage_backend)),
+    mock_memory_cache_source_(std::move(mock_memory_cache_source)),
     settled_(std::move(settled)),
     load_task_runner_(tree_->groupSets(), host_timeout_ms, disk_timeout_ms, tree),
     load_join_registry_(tree),
@@ -42,9 +45,42 @@ BlockTreeLoader::BlockTreeLoader(BlockTree*                      tree,
         [this](const std::shared_ptr<LoadAsyncContext>& context) { return commitLoad(context); },
         [this](LoadAsyncContext& context) {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (context.sourceKind() == LoadSourceKind::MOCK_MEMORY) {
+                // Pending mock contexts have neither source LOAD holds nor target LOAD holds.
+                return;
+            }
             abortLoadLocked(
                 context.loadDescs(), context.joinedLoads(), 0, context.contextId(), /*release_transferred_refs=*/false);
         })) {}
+
+std::shared_ptr<LoadAsyncContext> BlockTreeLoader::mockMemoryLoad(size_t logical_blocks) {
+    if (!mock_memory_cache_source_ || logical_blocks == 0) {
+        return nullptr;
+    }
+    std::vector<TransferDescriptor> descriptors;
+    for (size_t group_set_id = 0; group_set_id < tree_->groupSets().size(); ++group_set_id) {
+        const auto&  group_set   = tree_->groupSets()[group_set_id];
+        const size_t reuse_count = std::min(logical_blocks, group_set->computeReuseBlockCount(logical_blocks));
+        for (size_t path_index = logical_blocks - reuse_count; path_index < logical_blocks; ++path_index) {
+            descriptors.push_back({nullptr,
+                                   group_set_id,
+                                   path_index,
+                                   Tier::HOST,
+                                   Tier::DEVICE,
+                                   {mock_memory_cache_source_->blockFor(group_set->groupSetId(), path_index)}});
+        }
+    }
+    auto context = load_context_coordinator_->create(descriptors,
+                                                     std::vector<bool>(descriptors.size(), false),
+                                                     logical_blocks,
+                                                     nullptr,
+                                                     {},
+                                                     LoadSourceKind::MOCK_MEMORY);
+    if (!context || !load_context_coordinator_->registerContext(context)) {
+        return nullptr;
+    }
+    return context;
+}
 
 BlockTreeMatchResult BlockTreeLoader::matchLocked(const CacheKeysType&               cache_keys,
                                                   const std::function<bool(size_t)>& valid_prefix) {
@@ -291,7 +327,11 @@ bool BlockTreeLoader::commitLoad(const std::shared_ptr<LoadAsyncContext>& contex
     const uint64_t                         context_id          = context->contextId();
     size_t                                 prepared_desc_count = 0;
     block_tree_cache_detail::ScopeRollback rollback_guard(
-        [this, &load_descs, &joined_loads, &prepared_desc_count, context_id]() {
+        [this, &load_descs, &joined_loads, &prepared_desc_count, context_id, &context]() {
+            if (context->sourceKind() == LoadSourceKind::MOCK_MEMORY) {
+                abortMockLoadLocked(load_descs, prepared_desc_count);
+                return;
+            }
             abortLoadLocked(load_descs,
                             joined_loads,
                             prepared_desc_count,
@@ -317,12 +357,19 @@ bool BlockTreeLoader::commitLoad(const std::shared_ptr<LoadAsyncContext>& contex
             ++prepared_desc_count;
             continue;
         }
-        if (!changeTransferState(
-                desc.node, desc.group_set_id, GroupSetTransferState::LOAD_PENDING, GroupSetTransferState::LOADING)) {
-            RTP_LLM_LOG_ERROR("committed load source is not LOAD_PENDING, group_set_id=%zu", desc.group_set_id);
-            return false;
+        if (context->sourceKind() == LoadSourceKind::MOCK_MEMORY) {
+            RTP_LLM_CHECK(desc.node == nullptr && desc.source_tier == Tier::HOST && desc.target_tier == Tier::DEVICE);
+            RTP_LLM_CHECK(desc.target_blocks.size() == tree_->groupSets()[desc.group_set_id]->devicePools().size());
+        } else {
+            if (!changeTransferState(desc.node,
+                                     desc.group_set_id,
+                                     GroupSetTransferState::LOAD_PENDING,
+                                     GroupSetTransferState::LOADING)) {
+                RTP_LLM_LOG_ERROR("committed load source is not LOAD_PENDING, group_set_id=%zu", desc.group_set_id);
+                return false;
+            }
+            RTP_LLM_CHECK(load_join_registry_.start(desc.node, desc.group_set_id, desc.target_blocks, context));
         }
-        RTP_LLM_CHECK(load_join_registry_.start(desc.node, desc.group_set_id, desc.target_blocks, context));
         tree_->groupSets()[desc.group_set_id]->referenceBlocks(
             MultiNodeResource{desc.group_set_id, Tier::DEVICE, {{desc.node, desc.target_blocks}}},
             BlockTreeRefType::LOAD);
@@ -375,6 +422,16 @@ bool BlockTreeLoader::commitLoad(const std::shared_ptr<LoadAsyncContext>& contex
 
     rollback_guard.dismiss();
     return true;
+}
+
+void BlockTreeLoader::abortMockLoadLocked(const std::vector<TransferDescriptor>& load_descs,
+                                          size_t                                 prepared_desc_count) {
+    for (size_t i = 0; i < prepared_desc_count; ++i) {
+        const auto& desc = load_descs[i];
+        tree_->groupSets()[desc.group_set_id]->unreferenceBlocks(
+            MultiNodeResource{desc.group_set_id, Tier::DEVICE, {{nullptr, desc.target_blocks}}},
+            BlockTreeRefType::LOAD);
+    }
 }
 
 void BlockTreeLoader::abortLoadLocked(const std::vector<TransferDescriptor>& load_descs,
@@ -518,6 +575,13 @@ bool BlockTreeLoader::validateLoadTaskLocked(const LoadTaskRunner::Task& task) c
 bool BlockTreeLoader::settleLoadLocked(LoadTaskRunner::Task&                           task,
                                        bool                                            aggregate_success,
                                        std::vector<std::shared_ptr<LoadAsyncContext>>& joined_contexts) {
+    if (task.context->sourceKind() == LoadSourceKind::MOCK_MEMORY) {
+        // Request references retain successful destinations. Every terminal outcome
+        // drops the temporary target holds; reservoir MOCK_SOURCE holds are cache-owned.
+        load_task_runner_.releaseTaskResources(task);
+        settled_(false);
+        return aggregate_success;
+    }
     std::vector<BlockTreeEvictor::InvalidationSource> corrupted;
     const auto collect_corrupted = [this, &corrupted](const TransferTask& transfer, const TransferResult& result) {
         for (size_t index = 0; index < result.block_errors.size(); ++index) {

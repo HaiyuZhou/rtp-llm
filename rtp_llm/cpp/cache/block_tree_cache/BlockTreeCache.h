@@ -77,6 +77,9 @@ struct CachePressureSnapshot {
 
 // Unified configuration for BlockTreeCache behavior and pool sizing.
 struct BlockTreeCacheConfig {
+    bool                                  mock_memory_cache{false};
+    double                                mock_memory_cache_hit_ratio{0.5};
+    bool                                  mock_memory_cache_coordinator{true};
     std::optional<CachePressureOwnership> pressure_ownership;
     // ---- Tier enable flags ----
     bool enable_device_cache{true};
@@ -169,6 +172,7 @@ public:
     void shutdownLoads();
 
     BlockTreeMatchResult match(const CacheKeysType& cache_keys, const std::function<bool(size_t)>& valid_prefix = {});
+    std::shared_ptr<LoadAsyncContext> mockMemoryLoad(size_t logical_blocks);
     void                 insert(const CacheKeysType&                              cache_keys,
                                 const std::vector<std::vector<GroupSetResource>>& resources,
                                 Tier                                              target_tier);

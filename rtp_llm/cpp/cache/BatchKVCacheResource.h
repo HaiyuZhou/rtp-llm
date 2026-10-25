@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -9,6 +10,12 @@
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 
 namespace rtp_llm {
+
+struct MockMemoryCachePlan {
+    size_t eligible_blocks{0};
+    size_t planned_host_blocks{0};
+};
+
 class BatchKVCacheResource {
 public:
     BatchKVCacheResource() {}
@@ -167,6 +174,7 @@ public:
         batch_resource.clear();
         batch_resource.resize(new_batch_size);
         cache_keys_initialized_ = false;
+        clearMockMemoryCachePlan();
     }
 
     void moveBatchResource(int batch_idx, KVCacheResource&& resource) {
@@ -177,6 +185,7 @@ public:
     void swap(BatchKVCacheResource& other) noexcept {
         batch_resource.swap(other.batch_resource);
         std::swap(cache_keys_initialized_, other.cache_keys_initialized_);
+        mock_memory_cache_plan_.swap(other.mock_memory_cache_plan_);
     }
 
     std::vector<BlockIndicesType> getAllBatchBlocks(std::string_view tag) const {
@@ -214,6 +223,20 @@ public:
         cache_keys_initialized_ = true;
     }
 
+    // One decision per request, shared by all batch rows and retained across allocation retries
+    // and resetBatchSize() reshapes. Reset for a new request or explicitly clear before replanning.
+    const std::optional<MockMemoryCachePlan>& mockMemoryCachePlan() const {
+        return mock_memory_cache_plan_;
+    }
+
+    void setMockMemoryCachePlan(MockMemoryCachePlan plan) {
+        mock_memory_cache_plan_ = plan;
+    }
+
+    void clearMockMemoryCachePlan() {
+        mock_memory_cache_plan_.reset();
+    }
+
     bool lastBlockAligned() const {
         for (const auto& resource : batch_resource) {
             if (!resource.lastBlockAligned()) {
@@ -236,6 +259,7 @@ public:
 private:
     std::vector<KVCacheResource> batch_resource;  // [batch_size]
     bool                         cache_keys_initialized_{false};
+    std::optional<MockMemoryCachePlan> mock_memory_cache_plan_;
 };
 
 using BatchKVCacheResourcePtr = std::shared_ptr<BatchKVCacheResource>;

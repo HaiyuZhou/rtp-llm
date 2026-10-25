@@ -2,6 +2,14 @@ load("//:def.bzl", "copts")
 load("//bazel:arch_select.bzl", "torch_deps")
 
 cc_library(
+    name = "mock_memory_hit_controller",
+    srcs = ["MockMemoryHitController.cc"],
+    hdrs = ["MockMemoryHitController.h"],
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "cache_async_context",
     srcs = ["AsyncContext.cc"],
     hdrs = [

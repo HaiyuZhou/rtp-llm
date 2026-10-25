@@ -258,7 +258,7 @@ python3 tools/cache_perf resume --result-dir /data0/zhouhaiyu.zhy/tmp/dsv4-forma
 
 [独立 mock profile](../config/continuous_full_pressure_dsv4.mock_memory.example.jsonc) 从 production 示例派生，保留 TP4/EP4、真实容量和工具链设置，不修改 production 或小池 smoke 的含义。它仅用于缓存迁移与 CPU 开销诊断：合成 KV 不对应输入 token，**模型输出正确性无效，不能做质量评测、exact-reuse 拟合或正式推理性能结论**。profile 的结构化 `cache_grid.diagnostic_only=true` 会冻结进 snapshot、live seed plan 和 classification，强制 `formal_candidate=false`，原因 `diagnostic_only`；标签同时写明 `DIAGNOSTIC ONLY; OUTPUT CORRECTNESS INVALID`。该可选布尔字段缺省为 false，与 `explicit_smoke` 是两个独立标记。
 
-该配置设定 `--mock_memory_cache=1`、`--mock_memory_cache_hit_ratio=0.5`、`--mock_memory_cache_seed=1`、`--mock_memory_cache_source_blocks=64`。profile schema 中 CLI 布尔参数使用整数 0/1；这里的 1 与服务端 `true` 等效。启动仍要求 reuse 和 Memory cache 已开启、Host 容量为正且足以预留 source。只改变 ratio 不会启用 mock。
+该配置设定 `--mock_memory_cache=1`、`--mock_memory_cache_hit_ratio=0.5`、`--mock_memory_cache_seed=1`、`--mock_memory_cache_source_blocks=64`，并显式冻结 `cache_grid.pressure.evidence_policy=mock_memory`。profile schema 中 CLI 布尔参数使用整数 0/1；这里的 1 与服务端 `true` 等效。pressure frontend 会校验 evidence policy 与 `--mock_memory_cache` 一致，防止 mock 服务误用普通树压力判据，或普通服务误用 mock 判据。启动仍要求 reuse 和 Memory cache 已开启、Host 容量为正且足以预留 source。只改变 ratio 不会启用 mock。
 
 ratio 指初始 prompt 分配中累计可复用 token 的覆盖率，按完整复用块计算，**不是命中请求占比**。设累计 eligible 逻辑块为 E，计划 Host 块为 P，目标为 `floor(E * ratio)`；请求长度变化、并发 admission 由同一控制器累计，必须符合模型允许的复用边界，尾部至少保留必要的未复用 token。合法前缀粒度可暂时留下不足一个有效复用单元的缺口，后续请求继续追赶。每个请求只在首次计划时收费，分配重试沿用计划；decode/后续扩容不参与比例控制。
 
@@ -280,13 +280,15 @@ python3 tools/cache_perf profile \
   --profile-backend nsys --pressure-profile-seconds 10
 ```
 
-独立 adaptive sender 使用 `adaptive_backlog`，速率范围 50–400 requests/s、backlog 低/高水位 64/192、在途上限 256；引擎 admission 仍为 16。`tiered_rolling` 的 `cohort_size=32` 只定义 family 调度单位，不能增加 32 请求全体完成屏障，不能按上一请求完成来决定下一请求发出时间。sender 的 `memory_reuse_ratio=0.5` 是工作集生成参数，与引擎按累计 eligible token 控制的 mock ratio 是两个概念，不能互作命中证据。FULL 压力、迁移和 trace 的原有门槛仍独立判断，诊断标记不会放宽它们；即使它们通过，也不能消除输出正确性无效标记。
+独立 adaptive sender 使用 `adaptive_backlog`，速率范围 50–400 requests/s、backlog 低/高水位 64/192、在途上限 256；引擎 admission 仍为 16。`tiered_rolling` 的 `cohort_size=32` 只定义 family 调度单位，不能增加 32 请求全体完成屏障，不能按上一请求完成来决定下一请求发出时间。sender 的 `memory_reuse_ratio=0.5` 是工作集生成参数，与引擎按累计 eligible token 控制的 mock ratio 是两个概念，不能互作命中证据。
+
+mock 请求结束后会释放 request Device 引用并异步写回 Host，因此不能要求 fill 产生并持续保留普通 Device-tree 高水位。`mock_memory` evidence policy 在 seed 后重新采集 baseline，不发送 fill 请求，直接启动 steady/adaptive 正式流量；完整、连续、拓扑一致且携带 mock 计数的采样构成压力覆盖。measurement/profile 窗口内必须同时观察到 `successful_h2d_blocks` 和 `d2h_completed_blocks` 增长，任一 `failed_h2d_blocks` 或 `d2h_failed_blocks` 增长都会使 migration 验收失败。它不使用也不伪造普通 transfer tree 的 `published_blocks`。未配置该策略的 production/smoke profile 缺省为 `tree_pressure`，仍执行原 fill、Device/Host 常驻、水位触发和普通 H2D/D2H publication 判据，行为不变。
 
 验收必须保留 `profile.snapshot.json`、`grid.snapshot.json`、`cache_perf_launch.json`、原始指标、请求/采样 JSONL 和原始 timeline，并逐项记录：
 
 1. 在 measurement 末尾读取同一 owner/controller 的累计 E/P，检查 `abs(P - floor(E * ratio))` 不超过一个有效复用块单元；窗口开始也保存累计基线，不能把窗口增量误当从零开始的目标。
 2. 分开报告 `planned_ratio_ppm / 1e6` 与 `success_ratio_ppm / 1e6`（均以 eligible 逻辑块为分母）。`successful_h2d_blocks` / `failed_h2d_blocks` 是终态 load attempt 计数；重试可增加传输次数而不增加计划，须结合请求日志解释重试、失败、取消和窗口边界导致的差异。
-3. 原始 CUDA timeline 中 admission 有真实 Host-to-Device load，成功请求完成后有真实 Device-to-Host store；`d2h_submitted_blocks` 与 completed/failed 分开列出，D2H 计数是物理 Host records，实际字节/延时仍以原有 transfer 指标为准。
+3. pressure RPC 在 mock 模式下必须携带 feature completion/failure counters；measurement 内 `successful_h2d_blocks` 与 `d2h_completed_blocks` 均有正增量，`failed_h2d_blocks` 与 `d2h_failed_blocks` 均无增量。原始 CUDA timeline 中 admission 还必须有真实 Host-to-Device load，成功请求完成后有真实 Device-to-Host store；`d2h_submitted_blocks` 与 completed/failed 分开列出，D2H 计数是物理 Host records，实际字节/延时仍以原有 transfer 指标为准。
 4. 初始 mock attribution 的 Device/Disk reuse 均为 0；`source_blocks` / `source_bytes` 和每池 `mock_source_ref_blocks` / bytes 整段流量恒定，无 source 插入普通树。
 5. 请求发出时间和 backlog 证明在途压力持续，不能出现每 32 请求等待全体完成后才发下一组的空洞。
 6. 保留既有 transfer 与 scheduler spans，分别分析计划、descriptor 构造、调度、H2D 等待/唤醒、D2H worker 和 model-forward 区间。当前 `cache.mock_memory.plan_and_descriptors` 是合并 span，需要结合其子调用/CPU 栈区分计划与 descriptor 开销，不能把整个 span 都算作控制器成本。

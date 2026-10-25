@@ -86,6 +86,16 @@ def pressure_settings(profile, args, *, direct=False):
         raise ProfileError("cache_grid.pressure must be a JSON object")
     values = dict(values)
     values.setdefault("fill_input_tokens", FORMAL_FILL_TARGET_TOKENS)
+    mock_value, _ = _extract_arg_value(
+        merge_engine_args(profile, []), "mock_memory_cache"
+    )
+    mock_enabled = str(mock_value).lower() in {"1", "true"}
+    expected_policy = "mock_memory" if mock_enabled else "tree_pressure"
+    policy = values.setdefault("evidence_policy", expected_policy)
+    if policy != expected_policy:
+        raise ProfileError(
+            "cache_grid.pressure.evidence_policy must match --mock_memory_cache"
+        )
     prefix = "cache_pressure_" if direct else "pressure_"
     for option, field, _ in PRESSURE_OPTIONS:
         value = getattr(args, prefix + option.replace("-", "_"), None)

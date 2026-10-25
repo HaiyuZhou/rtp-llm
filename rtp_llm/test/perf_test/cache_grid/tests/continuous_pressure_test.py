@@ -229,7 +229,10 @@ class TieredRollingPlannerTest(unittest.TestCase):
         )
         self.assertEqual([item.family for item in second_memory], list(range(16, 32)))
         self.assertEqual(
-            {case: sum(item.case_index == case for item in first_memory) for case in range(1, 5)},
+            {
+                case: sum(item.case_index == case for item in first_memory)
+                for case in range(1, 5)
+            },
             {1: 4, 2: 4, 3: 4, 4: 4},
         )
         self.assertTrue(all(item.cohort_id == 0 for item in first))
@@ -314,6 +317,146 @@ class InlineExecutor:
 
 
 class LifecycleTest(unittest.TestCase):
+    def test_mock_memory_policy_runs_formal_measurement_without_tree_pressure(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            MockMemorySample,
+        )
+
+        class Controller:
+            def start(self, now):
+                self.started = now
+
+            def pending(self, now):
+                return False
+
+            def stop(self, reason, now):
+                self.stopped = (reason, now)
+
+            def finish(self, coverage):
+                return dict(trace_valid=True, pressure_valid=True)
+
+        controller = Controller()
+
+        def mock_only(evidence, sequence, clock):
+            sample = evidence.samples[0]
+            return cp.PressurePoll(
+                (
+                    replace(
+                        sample,
+                        pools=tuple(
+                            replace(pool, used=0, pending_release=0, host_resident=0)
+                            for pool in sample.pools
+                        ),
+                        groups=tuple(
+                            replace(group, triggers=0, gpu_host_published=0)
+                            for group in sample.groups
+                        ),
+                        counters=(),
+                        mock_memory=MockMemorySample(
+                            eligible_blocks=sequence * 8,
+                            planned_host_blocks=sequence * 4,
+                            successful_h2d_blocks=max(0, sequence - 1) * 4,
+                            failed_h2d_blocks=0,
+                            d2h_submitted_blocks=max(0, sequence - 1) * 4,
+                            d2h_completed_blocks=max(0, sequence - 1) * 4,
+                            d2h_failed_blocks=0,
+                        ),
+                    ),
+                ),
+                evidence.raw,
+                evidence.activity,
+            )
+
+        result, events, _, _ = self.run_session(
+            valid=False,
+            controller=controller,
+            poll_transform=mock_only,
+            rate=0,
+            cfg=config(
+                evidence_policy="mock_memory",
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.5,
+                fill_host_max_ratio=0.8,
+                rate_control="adaptive_backlog",
+                request_rate_min=10,
+                request_rate_max=20,
+                backlog_low=1,
+                backlog_high=2,
+                max_outstanding=4,
+                cohort_size=2,
+                measure_s=1,
+                steady_s=0.5,
+                sample_period_s=0.1,
+            ),
+        )
+
+        dispatches = [event for event in events if event["event"] == "dispatch"]
+        self.assertIsNone(result["failure"], events)
+        self.assertIsNotNone(result["measurement_start"])
+        self.assertEqual(controller.started, result["measurement_start"])
+        self.assertFalse(any(event["phase"] == "fill" for event in dispatches))
+        self.assertTrue(any(event["phase"] == "measurement" for event in dispatches))
+        self.assertTrue(result["migration"]["valid"])
+        for group in result["migration"]["groups"]:
+            self.assertTrue(group["valid"])
+            self.assertTrue(
+                all(
+                    item["source"] == "mock_memory_successful_h2d_blocks"
+                    for item in group["h2d_evidence"]
+                )
+            )
+            self.assertTrue(
+                all(
+                    item["source"] == "mock_memory_d2h_completed_blocks"
+                    for item in group["d2h_evidence"]
+                )
+            )
+
+    def test_mock_memory_policy_rejects_completion_failures(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            GroupSample,
+            MockMemorySample,
+            PoolSample,
+            PressureCoverage,
+            RankSample,
+        )
+
+        def sample(sequence, now, *, completed, failed):
+            return RankSample(
+                0,
+                "service",
+                sequence,
+                now,
+                now,
+                now,
+                (
+                    PoolSample("gpu", 100, 0, 0, 0.8, 0.9),
+                    PoolSample("host", 100, 0, 0, 0.8, 0.9),
+                ),
+                (GroupSample(0, "FULL", ("gpu",), "host", 0, 0),),
+                counters=(),
+                mock_memory=MockMemorySample(
+                    eligible_blocks=16,
+                    planned_host_blocks=8,
+                    successful_h2d_blocks=completed,
+                    failed_h2d_blocks=failed,
+                    d2h_submitted_blocks=completed,
+                    d2h_completed_blocks=completed,
+                    d2h_failed_blocks=failed,
+                ),
+            )
+
+        coverage = PressureCoverage(
+            (sample(1, 1.0, completed=0, failed=0),),
+            config(evidence_policy="mock_memory"),
+        )
+        coverage.add((sample(2, 1.5, completed=0, failed=0),), 1.5)
+        coverage.add((sample(3, 2.0, completed=4, failed=1),), 2.0)
+        assessment = coverage.assess_migration(1.5, 2.0)
+        self.assertFalse(assessment.valid)
+        self.assertIn("failed_h2d:0:0", assessment.reasons)
+        self.assertIn("failed_d2h:0:0", assessment.reasons)
+
     def test_early_capture_completion_preserves_measurement_and_finalizes_before_finished(
         self,
     ):
@@ -813,9 +956,7 @@ class LifecycleTest(unittest.TestCase):
                 return evidence
             sample = evidence.samples[0]
             pools = tuple(
-                replace(pool, used=85)
-                if pool.pool_id == "host"
-                else pool
+                replace(pool, used=85) if pool.pool_id == "host" else pool
                 for pool in sample.pools
             )
             return replace(evidence, samples=(replace(sample, pools=pools),))
@@ -854,9 +995,7 @@ class LifecycleTest(unittest.TestCase):
                 return evidence
             sample = evidence.samples[0]
             pools = tuple(
-                replace(pool, used=85)
-                if pool.pool_id == "host"
-                else pool
+                replace(pool, used=85) if pool.pool_id == "host" else pool
                 for pool in sample.pools
             )
             return replace(evidence, samples=(replace(sample, pools=pools),))
@@ -1000,9 +1139,7 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(
             [event["outstanding_before"] for event in formal], [0, 1, 2, 3]
         )
-        self.assertEqual(
-            [event["effective_rate"] for event in formal], [8, 8, 5, 2]
-        )
+        self.assertEqual([event["effective_rate"] for event in formal], [8, 8, 5, 2])
         self.assertEqual([event["formal_sequence"] for event in formal], list(range(4)))
         saturation = [event for event in events if event["event"] == "sender_saturated"]
         self.assertEqual(len(saturation), 1)
@@ -1841,6 +1978,35 @@ class TransportRegistrationTest(unittest.TestCase):
 
 
 class RunnerIntegrationTest(unittest.TestCase):
+    def test_pressure_wire_decodes_mock_completion_and_failure_counters(self):
+        clock = FakeClock()
+        response = self._startup_pressure(clock, 1, startup=True)
+        for rank in response.ranks:
+            rank.mock_memory.eligible_blocks = 16
+            rank.mock_memory.planned_host_blocks = 8
+            rank.mock_memory.successful_h2d_blocks = 7
+            rank.mock_memory.failed_h2d_blocks = 1
+            rank.mock_memory.d2h_submitted_blocks = 9
+            rank.mock_memory.d2h_completed_blocks = 8
+            rank.mock_memory.d2h_failed_blocks = 1
+
+        decoded = decode_pressure_response(response, clock(), clock(), (0, 1))
+
+        for sample in decoded.samples:
+            self.assertIsNotNone(sample.mock_memory)
+            self.assertEqual(
+                asdict(sample.mock_memory),
+                {
+                    "eligible_blocks": 16,
+                    "planned_host_blocks": 8,
+                    "successful_h2d_blocks": 7,
+                    "failed_h2d_blocks": 1,
+                    "d2h_submitted_blocks": 9,
+                    "d2h_completed_blocks": 8,
+                    "d2h_failed_blocks": 1,
+                },
+            )
+
     def _startup_runner(self, directory, **changes):
         from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
             CacheGridRunner,

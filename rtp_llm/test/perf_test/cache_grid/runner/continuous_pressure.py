@@ -775,9 +775,7 @@ class PressureSession:
     def _submit(self, kind, scheduled=None, formal_sequence=None, **dispatch_context):
         job_id = self.job_id
         if formal_sequence is not None:
-            dispatch_context = dict(
-                dispatch_context, formal_sequence=formal_sequence
-            )
+            dispatch_context = dict(dispatch_context, formal_sequence=formal_sequence)
 
         def work(register):
             try:
@@ -874,14 +872,9 @@ class PressureSession:
         if self.config.family_schedule == "tiered_rolling":
             occupancy = self._host_pool_occupancy(evidence.samples)
             at_limit = any(
-                item["ratio"] >= self.config.fill_host_max_ratio
-                for item in occupancy
+                item["ratio"] >= self.config.fill_host_max_ratio for item in occupancy
             )
-            if (
-                self.state.phase == "seed"
-                and not self.seed_stop_requested
-                and at_limit
-            ):
+            if self.state.phase == "seed" and not self.seed_stop_requested and at_limit:
                 self.seed_stop_requested = True
                 self.seed_stop_snapshot = occupancy
                 self.emit(
@@ -950,6 +943,7 @@ class PressureSession:
                     (p.pool_id, p.used - p.pending_release, p.host_resident)
                     for p in s.pools
                 ),
+                tuple(asdict(s.mock_memory).values()) if s.mock_memory else (),
             )
             for s in evidence.samples
         )
@@ -1076,9 +1070,7 @@ class PressureSession:
                 configured_limit=self.seed_count,
                 effective_seed_count=self.seed_completed,
                 stop_reason=(
-                    "host_max_ratio"
-                    if self.seed_stop_requested
-                    else "configured_limit"
+                    "host_max_ratio" if self.seed_stop_requested else "configured_limit"
                 ),
                 stop_host_pools=list(self.seed_stop_snapshot),
             )
@@ -1096,9 +1088,7 @@ class PressureSession:
                 self.state.phase == "seed"
                 and not self.seed_stop_requested
                 and self.seed_submitted < self.seed_count
-                and sum(
-                    kind == "seed" for kind in self.job_kinds.values()
-                )
+                and sum(kind == "seed" for kind in self.job_kinds.values())
                 < self.phase_concurrency
             ):
                 self._advance()
@@ -1169,18 +1159,16 @@ class PressureSession:
         stats["max_outstanding"] = max(stats["max_outstanding"], outstanding + 1)
         stats["rate_count"] += 1
         stats["rate_sum"] += rate
-        stats["rate_min"] = rate if stats["rate_min"] is None else min(
-            stats["rate_min"], rate
+        stats["rate_min"] = (
+            rate if stats["rate_min"] is None else min(stats["rate_min"], rate)
         )
-        stats["rate_max"] = rate if stats["rate_max"] is None else max(
-            stats["rate_max"], rate
+        stats["rate_max"] = (
+            rate if stats["rate_max"] is None else max(stats["rate_max"], rate)
         )
         region = (
             "low"
             if outstanding <= self.config.backlog_low
-            else "high"
-            if outstanding >= self.config.backlog_high
-            else "interpolated"
+            else "high" if outstanding >= self.config.backlog_high else "interpolated"
         )
         stats["backlog_regions"][region] += 1
 
@@ -1232,9 +1220,7 @@ class PressureSession:
             rate_min=stats["rate_min"],
             rate_max=stats["rate_max"],
             rate_average=(
-                stats["rate_sum"] / stats["rate_count"]
-                if stats["rate_count"]
-                else None
+                stats["rate_sum"] / stats["rate_count"] if stats["rate_count"] else None
             ),
             rate_count=stats["rate_count"],
             backlog_regions=dict(stats["backlog_regions"]),
@@ -1313,6 +1299,12 @@ class PressureSession:
                 and seed["pending"] == 0
             ):
                 self._start_fill()
+                if (
+                    self.state.phase != "drain"
+                    and self.config.evidence_policy == "mock_memory"
+                ):
+                    self.state.advance(self.clock(), fill_ready=True)
+                    self.emit("phase", phase="steady", at_s=self.clock())
             elif self.state.phase != "drain":
                 self.fail("seed_incomplete")
             while self.state.phase == "fill":

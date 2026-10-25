@@ -43,6 +43,7 @@ class PressureConfig:
     backlog_high: int = 0
     max_outstanding: int = 0
     cohort_size: int = 0
+    evidence_policy: str = "tree_pressure"
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,17 @@ class GroupSample:
 
 
 @dataclass(frozen=True)
+class MockMemorySample:
+    eligible_blocks: int
+    planned_host_blocks: int
+    successful_h2d_blocks: int
+    failed_h2d_blocks: int
+    d2h_submitted_blocks: int
+    d2h_completed_blocks: int
+    d2h_failed_blocks: int
+
+
+@dataclass(frozen=True)
 class PressureOwnership:
     mode: int
     owner_rank: int
@@ -95,6 +107,7 @@ class RankSample:
     offset_bounds: tuple[float, float] | None = None
     counters: tuple[tuple[tuple, int], ...] = ()
     ownership: PressureOwnership | None = None
+    mock_memory: MockMemorySample | None = None
 
 
 @dataclass(frozen=True)
@@ -161,7 +174,7 @@ def resolve_pressure_config(values: dict) -> PressureConfig:
     }
     for field in fields(config):
         value = getattr(config, field.name)
-        if field.name in {"family_schedule", "rate_control"}:
+        if field.name in {"family_schedule", "rate_control", "evidence_policy"}:
             continue
         if field.name == "nsys_duration_s" and value is None:
             continue
@@ -169,16 +182,18 @@ def resolve_pressure_config(values: dict) -> PressureConfig:
             _integer(
                 value,
                 field.name,
-                0
-                if field.name
-                in {
-                    "gpu_tolerance_blocks",
-                    "backlog_low",
-                    "backlog_high",
-                    "max_outstanding",
-                    "cohort_size",
-                }
-                else 1,
+                (
+                    0
+                    if field.name
+                    in {
+                        "gpu_tolerance_blocks",
+                        "backlog_low",
+                        "backlog_high",
+                        "max_outstanding",
+                        "cohort_size",
+                    }
+                    else 1
+                ),
             )
         elif field.name in {
             "memory_reuse_ratio",
@@ -200,6 +215,8 @@ def resolve_pressure_config(values: dict) -> PressureConfig:
         raise ValueError("family_schedule must be round_robin or tiered_rolling")
     if config.rate_control not in {"fixed", "adaptive_backlog"}:
         raise ValueError("rate_control must be fixed or adaptive_backlog")
+    if config.evidence_policy not in {"tree_pressure", "mock_memory"}:
+        raise ValueError("evidence_policy must be tree_pressure or mock_memory")
     adaptive_values = (
         config.request_rate_min,
         config.request_rate_max,
@@ -764,6 +781,25 @@ def decode_pressure_response(
                     if rank.HasField("ownership")
                     else None
                 ),
+                (
+                    MockMemorySample(
+                        *(
+                            _integer(getattr(rank.mock_memory, field), field)
+                            for field in (
+                                "eligible_blocks",
+                                "planned_host_blocks",
+                                "successful_h2d_blocks",
+                                "failed_h2d_blocks",
+                                "d2h_submitted_blocks",
+                                "d2h_completed_blocks",
+                                "d2h_failed_blocks",
+                            )
+                        )
+                    )
+                    if "mock_memory" in rank.DESCRIPTOR.fields_by_name
+                    and rank.HasField("mock_memory")
+                    else None
+                ),
             )
         )
     result = tuple(samples)
@@ -952,6 +988,8 @@ class MigrationGroupAssessment:
     valid: bool
     d2h_evidence: tuple[MigrationPublicationEvidence, ...] = ()
     h2d_evidence: tuple[MigrationPublicationEvidence, ...] = ()
+    d2h_failure_evidence: tuple[MigrationPublicationEvidence, ...] = ()
+    h2d_failure_evidence: tuple[MigrationPublicationEvidence, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -976,6 +1014,11 @@ class PressureCoverage:
         self.ranks = tuple(sorted(s.rank for s in baselines))
         self.targets = select_targets(tuple(baselines), self.ranks)
         self.baselines = {s.rank: s for s in baselines}
+        if config.evidence_policy == "mock_memory" and any(
+            self.baselines[target.owner_rank].mock_memory is None
+            for target in self.targets
+        ):
+            raise ValueError("mock memory pressure counters are unavailable")
         self.previous = {}
         self.last_seen = {}
         self.segments = {(t.rank, t.group_id): [] for t in self.targets}
@@ -990,6 +1033,7 @@ class PressureCoverage:
             for direction in ("d2h", "h2d")
         }
         self.migration_evidence = {key: [] for key in self.migration_intervals}
+        self.migration_failure_evidence = {key: [] for key in self.migration_intervals}
         self.migration_history_overflow = False
         self.open_segments = {}
         self.max_segments = max_segments
@@ -1210,6 +1254,11 @@ class PressureCoverage:
             interval = possible_event_segment(
                 old.server_s, current.server_s, old_bounds, bounds
             )
+            if self.config.evidence_policy == "mock_memory":
+                self._record_mock_memory_migration(
+                    owner_rank, owner_group_id, old, current, interval
+                )
+                continue
             old_counters = dict(old.counters)
             group = next(g for g in current.groups if g.group_id == owner_group_id)
             for direction in ("d2h", "h2d"):
@@ -1259,6 +1308,39 @@ class PressureCoverage:
                     self.migration_history_overflow = True
                     self.reasons.add("history_overflow")
 
+    def _record_mock_memory_migration(
+        self, owner_rank, owner_group_id, old, current, interval
+    ):
+        if old.mock_memory is None or current.mock_memory is None:
+            return
+        fields = {
+            "h2d": ("successful_h2d_blocks", "failed_h2d_blocks"),
+            "d2h": ("d2h_completed_blocks", "d2h_failed_blocks"),
+        }
+        for direction, (success_field, failure_field) in fields.items():
+            key = owner_rank, owner_group_id, direction
+            for field, destination in (
+                (success_field, self.migration_evidence[key]),
+                (failure_field, self.migration_failure_evidence[key]),
+            ):
+                before = getattr(old.mock_memory, field)
+                after = getattr(current.mock_memory, field)
+                if after <= before:
+                    continue
+                destination.append(
+                    MigrationPublicationEvidence(
+                        interval,
+                        before,
+                        after,
+                        ((("mock_memory", field), before, after),),
+                        source=f"mock_memory_{field}",
+                    )
+                )
+                if len(destination) > self.max_segments:
+                    destination.pop(0)
+                    self.migration_history_overflow = True
+                    self.reasons.add("history_overflow")
+
     def assess_migration(self, start: float, end: float) -> MigrationAssessment:
         coverage([], start, end)
         reasons = set(self.reasons) if not self.epoch_valid else set()
@@ -1267,10 +1349,18 @@ class PressureCoverage:
         groups = []
         for owner_rank, owner_group_id in self.owner_groups:
             evidence = {}
+            failures = {}
             for direction in ("d2h", "h2d"):
                 evidence[direction] = tuple(
                     item
                     for item in self.migration_evidence[
+                        (owner_rank, owner_group_id, direction)
+                    ]
+                    if start <= item.interval[0] and item.interval[1] <= end
+                )
+                failures[direction] = tuple(
+                    item
+                    for item in self.migration_failure_evidence[
                         (owner_rank, owner_group_id, direction)
                     ]
                     if start <= item.interval[0] and item.interval[1] <= end
@@ -1281,15 +1371,21 @@ class PressureCoverage:
                 reasons.add(f"missing_d2h:{owner_rank}:{owner_group_id}")
             if not h2d:
                 reasons.add(f"missing_h2d_load:{owner_rank}:{owner_group_id}")
+            if failures["h2d"]:
+                reasons.add(f"failed_h2d:{owner_rank}:{owner_group_id}")
+            if failures["d2h"]:
+                reasons.add(f"failed_d2h:{owner_rank}:{owner_group_id}")
             groups.append(
                 MigrationGroupAssessment(
                     owner_rank,
                     owner_group_id,
                     d2h,
                     h2d,
-                    bool(d2h and h2d),
+                    bool(d2h and h2d and not failures["d2h"] and not failures["h2d"]),
                     evidence["d2h"],
                     evidence["h2d"],
+                    failures["d2h"],
+                    failures["h2d"],
                 )
             )
         valid = (
@@ -1303,6 +1399,8 @@ class PressureCoverage:
         )
 
     def _target_valid(self, target, owner, samples):
+        if self.config.evidence_policy == "mock_memory":
+            return owner.mock_memory is not None
         local = next(s for s in samples if s.rank == target.rank)
         local_pools = {p.pool_id: p for p in local.pools}
         owner_pools = {p.pool_id: p for p in owner.pools}
@@ -1387,4 +1485,17 @@ def _wire_counters(rank):
         ):
             value = getattr(transfer, name, 0)
             output.append(((name,) + endpoint, _integer(value, name)))
+    if "mock_memory" in rank.DESCRIPTOR.fields_by_name and rank.HasField("mock_memory"):
+        for name in (
+            "eligible_blocks",
+            "planned_host_blocks",
+            "successful_h2d_blocks",
+            "failed_h2d_blocks",
+            "d2h_submitted_blocks",
+            "d2h_completed_blocks",
+            "d2h_failed_blocks",
+        ):
+            output.append(
+                (("mock_memory", name), _integer(getattr(rank.mock_memory, name), name))
+            )
     return tuple(sorted(output))

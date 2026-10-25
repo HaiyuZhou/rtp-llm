@@ -29,8 +29,13 @@ void addMockCount(int64_t& count, size_t increment) {
 }
 
 int64_t mockRatioPpm(int64_t numerator, int64_t denominator) {
-    return denominator == 0 ? 0 :
-                              static_cast<int64_t>(static_cast<unsigned __int128>(numerator) * 1000000 / denominator);
+    if (denominator == 0) {
+        return 0;
+    }
+    const auto quotient = static_cast<unsigned __int128>(numerator) * 1000000 / denominator;
+    return quotient > static_cast<unsigned __int128>(std::numeric_limits<int64_t>::max()) ?
+               std::numeric_limits<int64_t>::max() :
+               static_cast<int64_t>(quotient);
 }
 
 size_t transferOperationIndex(CacheTransferOperation operation) {
@@ -154,6 +159,18 @@ void BlockTreeCacheMetricsReporter::reportMockMemoryMetrics() const {
         snapshot = mock_memory_metrics_;
     }
     metrics_reporter_->report<RtpLLMMockMemoryCacheMetrics, RtpLLMMockMemoryCacheMetricsCollector>(nullptr, &snapshot);
+}
+
+MockMemoryCacheMetricsSnapshot BlockTreeCacheMetricsReporter::mockMemoryMetricsSnapshot() const {
+    std::lock_guard<std::mutex> lock(mock_memory_metrics_mutex_);
+    const auto&                 metrics = mock_memory_metrics_;
+    return {metrics.eligible_blocks,
+            metrics.planned_host_blocks,
+            metrics.successful_h2d_blocks,
+            metrics.failed_h2d_blocks,
+            metrics.d2h_submitted_blocks,
+            metrics.d2h_completed_blocks,
+            metrics.d2h_failed_blocks};
 }
 
 std::vector<BlockTreePoolMetricsSnapshot>
@@ -502,7 +519,8 @@ void BlockTreeCacheMetricsReporter::maybeReportCopyError(Tier                  s
     collector.error_type     = cacheCopyErrorName(result.copy_error);
     collector.copy_direction = source_tier == Tier::DEVICE ? "FROM_GPU" :
                                target_tier == Tier::DEVICE ? "TO_GPU" :
-                               target_tier == Tier::DISK   ? "TO_DISK" : "FROM_DISK";
+                               target_tier == Tier::DISK   ? "TO_DISK" :
+                                                             "FROM_DISK";
     metrics_reporter_->report<RtpLLMCacheTransferMetrics, RtpLLMCacheCopyErrorMetricsCollector>(nullptr, &collector);
 }
 

@@ -57,6 +57,7 @@
       "drain_timeout_s": 300,
       "capture_timeout_s": 600,
       "nsys_duration_s": 10,
+      "evidence_policy": "mock_memory",
       "family_schedule": "tiered_rolling",
       "memory_reuse_ratio": 0.5,
       "fill_host_max_ratio": 0.8,

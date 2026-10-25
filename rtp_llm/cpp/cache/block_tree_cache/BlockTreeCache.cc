@@ -268,6 +268,9 @@ std::vector<BlockTreePoolMetricsSnapshot> BlockTreeCache::poolMetricsSnapshots()
 CachePressureSnapshot BlockTreeCache::pressureSnapshot() const {
     CachePressureSnapshot snapshot;
     snapshot.ownership = config_.pressure_ownership;
+    if (config_.mock_memory_cache) {
+        snapshot.mock_memory = metrics_reporter_->mockMemoryMetricsSnapshot();
+    }
     // Lock order: cache -> individual pool / pending-release / ledger mutex.
     // Each subordinate lock is released before acquiring another. Copy callbacks
     // take only the ledger lock. No serialization or tree walk occurs here.

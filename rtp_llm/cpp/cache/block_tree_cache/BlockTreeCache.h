@@ -69,10 +69,11 @@ struct CachePressureOwnership {
     bool             all_participant_publication{false};
 };
 struct CachePressureSnapshot {
-    std::vector<CachePressurePoolSnapshot>     pools;
-    std::vector<CachePressureGroupSnapshot>    groups;
-    std::vector<CachePressureTransferSnapshot> transfers;
-    std::optional<CachePressureOwnership>      ownership;
+    std::vector<CachePressurePoolSnapshot>        pools;
+    std::vector<CachePressureGroupSnapshot>       groups;
+    std::vector<CachePressureTransferSnapshot>    transfers;
+    std::optional<CachePressureOwnership>         ownership;
+    std::optional<MockMemoryCacheMetricsSnapshot> mock_memory;
 };
 
 // Unified configuration for BlockTreeCache behavior and pool sizing.
@@ -174,9 +175,9 @@ public:
     BlockTreeMatchResult match(const CacheKeysType& cache_keys, const std::function<bool(size_t)>& valid_prefix = {});
     std::shared_ptr<LoadAsyncContext> mockMemoryLoad(size_t logical_blocks);
     void                              reportMockMemoryPlan(const MockMemoryHitSnapshot& snapshot);
-    void                 insert(const CacheKeysType&                              cache_keys,
-                                const std::vector<std::vector<GroupSetResource>>& resources,
-                                Tier                                              target_tier);
+    void                              insert(const CacheKeysType&                              cache_keys,
+                                             const std::vector<std::vector<GroupSetResource>>& resources,
+                                             Tier                                              target_tier);
     // Returns the resident key-prefix count, including nodes that were already resident.
     size_t insert(const CacheKeysType&                              cache_keys,
                   const std::vector<std::vector<GroupSetResource>>& resources,
@@ -241,9 +242,9 @@ private:
     // Caller holds mutex_.
     void onWorkflowSettledLocked(bool check_watermark);
 
-    BlockTreeCacheConfig                           config_;
-    std::unique_ptr<BlockTree>                     tree_;
-    std::shared_ptr<StorageBackend>                storage_backend_;
+    BlockTreeCacheConfig            config_;
+    std::unique_ptr<BlockTree>      tree_;
+    std::shared_ptr<StorageBackend> storage_backend_;
     // Declared before workers so reservations outlive loader/transfer destruction.
     std::shared_ptr<MockMemoryCacheSource>         mock_memory_cache_source_;
     std::unique_ptr<BlockTransferDispatcher>       transfer_dispatcher_;

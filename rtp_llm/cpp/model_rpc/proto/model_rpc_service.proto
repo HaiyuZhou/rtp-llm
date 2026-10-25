@@ -1146,6 +1146,15 @@ message PressureActivityPB {
     google.protobuf.UInt64Value waiting_requests = 1;
     google.protobuf.UInt64Value running_requests = 2;
 }
+message PressureMockMemoryPB {
+    uint64 eligible_blocks = 1;
+    uint64 planned_host_blocks = 2;
+    uint64 successful_h2d_blocks = 3;
+    uint64 failed_h2d_blocks = 4;
+    uint64 d2h_submitted_blocks = 5;
+    uint64 d2h_completed_blocks = 6;
+    uint64 d2h_failed_blocks = 7;
+}
 message PressureStepPB {
     string session_id = 1;
     uint64 step_id = 2;
@@ -1216,6 +1225,7 @@ message CachePressureRankPB {
     bool step_history_available = 16;
     ProfileStatusPB profile = 17;
     PressureOwnershipPB ownership = 18;
+    PressureMockMemoryPB mock_memory = 19;
 }
 message CachePressureResponsePB {
     uint32 schema_version = 1;

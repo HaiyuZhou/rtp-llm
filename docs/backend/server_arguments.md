@@ -65,6 +65,8 @@ The `rtp_llm_mock_memory_cache_` metrics distinguish `eligible_blocks`, `planned
 
 See the [Chinese mock pressure guide](../../rtp_llm/test/perf_test/cache_grid/docs/continuous_full_pressure_guide_zh.md#10-mock-memory-诊断配置与验收) for the dedicated frozen profile, continuous sender, and trace acceptance checks. JSON profiles represent CLI boolean values with `0`/`1`, so the enabled example uses `"--mock_memory_cache": 1`.
 
+The dedicated pressure profile also freezes `cache_grid.pressure.evidence_policy=mock_memory`. The frontend requires that policy to agree with `--mock_memory_cache=1`; it starts adaptive formal traffic without a retained Device-tree fill gate and validates measurement-window H2D/D2H completion and failure counters. Profiles without this policy retain the existing tree-pressure fill and publication gates.
+
 ## Hardware/Kernel Optimization
 
 | Arguments | Description | Defaults |

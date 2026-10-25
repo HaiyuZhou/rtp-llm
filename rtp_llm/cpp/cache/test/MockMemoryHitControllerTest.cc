@@ -23,14 +23,12 @@ TEST(MockMemoryHitControllerTest, RatiosUseCumulativeTargetsAcrossVariableLength
         std::vector<size_t> planned;
     };
     // Eligible prefixes total 1, 3, 6, 10, 17; expectations are hand-derived.
-    for (const auto& test : std::vector<Case>{{0.0, {0, 0, 0, 0, 0}},
-                                             {0.5, {0, 1, 2, 2, 3}},
-                                             {1.0, {1, 2, 3, 4, 7}},
-                                             {0.333333, {0, 0, 1, 2, 2}}}) {
-        MockMemoryHitController controller(test.ratio);
+    for (const auto& test : std::vector<Case>{
+             {0.0, {0, 0, 0, 0, 0}}, {0.5, {0, 1, 2, 2, 3}}, {1.0, {1, 2, 3, 4, 7}}, {0.333333, {0, 0, 1, 2, 2}}}) {
+        MockMemoryHitController   controller(test.ratio);
         const std::vector<size_t> lengths{1, 2, 3, 4, 7};
-        uint64_t eligible = 0;
-        uint64_t planned  = 0;
+        uint64_t                  eligible = 0;
+        uint64_t                  planned  = 0;
         for (size_t i = 0; i < lengths.size(); ++i) {
             const auto decision = controller.plan(lengths[i], anyPrefix);
             eligible += lengths[i];
@@ -54,17 +52,20 @@ TEST(MockMemoryHitControllerTest, QuantizesRatioOnceToMillionths) {
 }
 
 TEST(MockMemoryHitControllerTest, RejectsRatiosOutsideFiniteUnitInterval) {
-    for (double ratio : {-0.1, 1.1, std::numeric_limits<double>::infinity(),
-                         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+    for (double ratio : {-0.1,
+                         1.1,
+                         std::numeric_limits<double>::infinity(),
+                         -std::numeric_limits<double>::infinity(),
+                         std::numeric_limits<double>::quiet_NaN()}) {
         EXPECT_THROW(MockMemoryHitController{ratio}, std::invalid_argument);
     }
 }
 
 TEST(MockMemoryHitControllerTest, RoundsDownToLargestValidPrefixAndRecoversDeficit) {
     MockMemoryHitController controller(0.5);
-    const auto multiples_of_four = [](size_t blocks) { return blocks % 4 == 0; };
+    const auto              multiples_of_four = [](size_t blocks) { return blocks % 4 == 0; };
     // Cumulative targets: 3, 6, 9, 12. Prefixes: 0, 4, 4, 4; deficits: 3, 2, 1, 0.
-    const std::vector<size_t> expected{0, 4, 4, 4};
+    const std::vector<size_t>   expected{0, 4, 4, 4};
     const std::vector<uint64_t> targets{3, 6, 9, 12};
     for (size_t i = 0; i < expected.size(); ++i) {
         const auto decision = controller.plan(6, multiples_of_four);
@@ -85,8 +86,8 @@ TEST(MockMemoryHitControllerTest, CarriedDeficitNeverExceedsCurrentRequestCapaci
 
 TEST(MockMemoryHitControllerTest, HandlesNonMonotonicPrefixValidity) {
     MockMemoryHitController controller(1.0);
-    std::vector<size_t> visited;
-    const auto decision = controller.plan(7, [&](size_t n) {
+    std::vector<size_t>     visited;
+    const auto              decision = controller.plan(7, [&](size_t n) {
         visited.push_back(n);
         return n == 0 || n == 3 || n == 5;
     });
@@ -106,7 +107,7 @@ TEST(MockMemoryHitControllerTest, RejectedOrThrowingValidationDoesNotCommitCount
 
 TEST(MockMemoryHitControllerTest, WideProductAndOverflowGuardPreserveCounters) {
     static_assert(sizeof(size_t) == sizeof(uint64_t), "Test requires 64-bit request sizes");
-    const auto max_blocks = std::numeric_limits<uint64_t>::max();
+    const auto              max_blocks = std::numeric_limits<uint64_t>::max();
     MockMemoryHitController controller(0.5);
     EXPECT_EQ(controller.plan(max_blocks, anyPrefix).planned_host_blocks, 9'223'372'036'854'775'807ULL);
     EXPECT_THROW(controller.plan(1, anyPrefix), std::overflow_error);
@@ -116,19 +117,19 @@ TEST(MockMemoryHitControllerTest, WideProductAndOverflowGuardPreserveCounters) {
 }
 
 TEST(MockMemoryHitControllerTest, ConcurrentCallersMatchAValidSerializedOrder) {
-    MockMemoryHitController controller(0.5);
-    std::atomic<bool> start{false};
-    std::atomic<bool> stop_snapshot{false};
-    std::thread observer([&] {
+    MockMemoryHitController            controller(0.5);
+    std::atomic<bool>                  start{false};
+    std::atomic<bool>                  stop_snapshot{false};
+    std::thread                        observer([&] {
         while (!stop_snapshot.load()) {
             const auto state = controller.snapshot();
-            EXPECT_LE(state.cumulative_planned_host_blocks, state.cumulative_eligible_blocks / 2);
+            EXPECT_EQ(state.cumulative_planned_host_blocks, state.cumulative_eligible_blocks / 2);
         }
     });
-    constexpr size_t callers = 8;
-    constexpr size_t calls_per_thread = 64;
+    constexpr size_t                   callers          = 8;
+    constexpr size_t                   calls_per_thread = 64;
     std::vector<MockMemoryHitDecision> decisions(callers * calls_per_thread);
-    std::vector<std::thread> threads;
+    std::vector<std::thread>           threads;
     for (size_t t = 0; t < callers; ++t) {
         threads.emplace_back([&, t] {
             while (!start.load()) {

@@ -18,6 +18,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/group_set/SWAGroupSet.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/BlockTransferDispatcher.h"
 #include "rtp_llm/cpp/cache/FullCacheManager.h"
+#include "rtp_llm/cpp/cache/MockMemoryHitController.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/test/BlockTreeCacheTestUtils.h"
 #include "rtp_llm/cpp/cache/MHAKVCacheSpec.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
@@ -34,6 +35,18 @@ uint64_t publishedHostBlocks(const CachePressureSnapshot& snapshot) {
             blocks += pool.published_host_blocks;
     }
     return blocks;
+}
+
+TEST(BlockTreeMetricsTest, MockRatioIsZeroForEmptyDenominatorAndSaturatesExtremeValues) {
+    BlockTreeCacheMetricsReporter reporter(nullptr);
+    reporter.updateMockMemoryPlan({0, 0});
+    EXPECT_EQ(reporter.mock_memory_metrics_.planned_ratio_ppm, 0);
+    EXPECT_EQ(reporter.mock_memory_metrics_.success_ratio_ppm, 0);
+
+    reporter.updateMockMemoryPlan({1, std::numeric_limits<uint64_t>::max()});
+    EXPECT_EQ(reporter.mock_memory_metrics_.planned_ratio_ppm, std::numeric_limits<int64_t>::max());
+    reporter.recordMockMemoryH2D(std::numeric_limits<size_t>::max(), true);
+    EXPECT_EQ(reporter.mock_memory_metrics_.success_ratio_ppm, std::numeric_limits<int64_t>::max());
 }
 
 TEST(BlockTreePressureTest, DeduplicatesSharedDevicePoolAndRetainsGroupMappings) {

@@ -918,6 +918,17 @@ void pressureSnapshotToProto(const CachePressureSnapshot& snapshot, CachePressur
         pb->set_publication_scope(ownership.all_participant_publication ? PressureOwnershipPB::ALL_PARTICIPANTS :
                                                                           PressureOwnershipPB::LOCAL);
     }
+    if (snapshot.mock_memory) {
+        const auto& metrics = *snapshot.mock_memory;
+        auto*       pb      = output->mutable_mock_memory();
+        pb->set_eligible_blocks(metrics.eligible_blocks);
+        pb->set_planned_host_blocks(metrics.planned_host_blocks);
+        pb->set_successful_h2d_blocks(metrics.successful_h2d_blocks);
+        pb->set_failed_h2d_blocks(metrics.failed_h2d_blocks);
+        pb->set_d2h_submitted_blocks(metrics.d2h_submitted_blocks);
+        pb->set_d2h_completed_blocks(metrics.d2h_completed_blocks);
+        pb->set_d2h_failed_blocks(metrics.d2h_failed_blocks);
+    }
     for (const auto& pool : snapshot.pools) {
         auto* pb = output->add_pools();
         pb->set_pool_id(pool.pool_id);

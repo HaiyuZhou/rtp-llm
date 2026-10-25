@@ -1110,7 +1110,8 @@ TEST(PressureRpcTest, UnsupportedEngineDoesNotReturnEmptySuccess) {
 }
 
 TEST(PressureRpcTest, SnapshotSerializationPreservesPhysicalDimensionsAndPresence) {
-    auto                      engine = std::make_shared<PressureEngine>();
+    auto engine                  = std::make_shared<PressureEngine>();
+    engine->snapshot.mock_memory = MockMemoryCacheMetricsSnapshot{11, 5, 4, 1, 9, 8, 1};
     CachePressurePoolSnapshot pool;
     pool.pool_id                    = "physical-host";
     pool.pool_name                  = "host-name";
@@ -1188,6 +1189,14 @@ TEST(PressureRpcTest, SnapshotSerializationPreservesPhysicalDimensionsAndPresenc
     EXPECT_GE(rank.coordinator_receive_ns(), rank.sampled_monotonic_ns() + rank.collect_duration_ns());
     EXPECT_FALSE(rank.has_activity());
     EXPECT_FALSE(rank.step_history_available());
+    ASSERT_TRUE(rank.has_mock_memory());
+    EXPECT_EQ(rank.mock_memory().eligible_blocks(), 11);
+    EXPECT_EQ(rank.mock_memory().planned_host_blocks(), 5);
+    EXPECT_EQ(rank.mock_memory().successful_h2d_blocks(), 4);
+    EXPECT_EQ(rank.mock_memory().failed_h2d_blocks(), 1);
+    EXPECT_EQ(rank.mock_memory().d2h_submitted_blocks(), 9);
+    EXPECT_EQ(rank.mock_memory().d2h_completed_blocks(), 8);
+    EXPECT_EQ(rank.mock_memory().d2h_failed_blocks(), 1);
     ASSERT_EQ(rank.pools_size(), 2);
     const auto& pb = rank.pools(0);
     EXPECT_EQ(pb.pool_id(), "physical-host");

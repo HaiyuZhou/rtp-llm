@@ -119,6 +119,35 @@ class ValidateProfileTest(unittest.TestCase):
             ).control_timeout_s,
             8.5,
         )
+
+    def test_mock_memory_engine_flag_and_evidence_policy_must_agree(self):
+        values = dict(
+            seed_timeout_s=30,
+            fill_timeout_s=20,
+            fill_max_requests=10,
+            fill_no_progress_s=5,
+            fill_input_tokens=512,
+            gpu_tolerance_blocks=2,
+            activity_timeout_s=10,
+            drain_timeout_s=10,
+            capture_timeout_s=60,
+        )
+        mock_profile = _minimal_profile(
+            engine_args={"--mock_memory_cache": 1},
+            cache_grid={"pressure": values},
+        )
+        self.assertEqual(
+            pressure_settings(mock_profile, SimpleNamespace()).evidence_policy,
+            "mock_memory",
+        )
+        for engine_value, policy in ((1, "tree_pressure"), (0, "mock_memory")):
+            with self.subTest(engine_value=engine_value, policy=policy):
+                profile = _minimal_profile(
+                    engine_args={"--mock_memory_cache": engine_value},
+                    cache_grid={"pressure": dict(values, evidence_policy=policy)},
+                )
+                with self.assertRaisesRegex(ProfileError, "must match"):
+                    pressure_settings(profile, SimpleNamespace())
         for invalid in (0, -1, True, float("nan"), float("inf")):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 pressure_settings(
@@ -302,6 +331,9 @@ class LoadProfileTest(unittest.TestCase):
         argv = merge_engine_args(frozen, [])
         self.assertEqual(dict(zip(argv[::2], argv[1::2]))["--mock_memory_cache"], "1")
         self.assertTrue(frozen["cache_grid"]["diagnostic_only"])
+        self.assertEqual(
+            frozen["cache_grid"]["pressure"]["evidence_policy"], "mock_memory"
+        )
         self.assertNotIn("explicit_smoke", frozen["cache_grid"])
         self.assertIn("DIAGNOSTIC ONLY", frozen["label"])
         self.assertIn("OUTPUT CORRECTNESS INVALID", frozen["label"])

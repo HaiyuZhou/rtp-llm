@@ -24,6 +24,16 @@ namespace rtp_llm {
 
 struct MockMemoryHitSnapshot;
 
+struct MockMemoryCacheMetricsSnapshot {
+    int64_t eligible_blocks{0};
+    int64_t planned_host_blocks{0};
+    int64_t successful_h2d_blocks{0};
+    int64_t failed_h2d_blocks{0};
+    int64_t d2h_submitted_blocks{0};
+    int64_t d2h_completed_blocks{0};
+    int64_t d2h_failed_blocks{0};
+};
+
 struct BlockTreeQueueSizes;
 
 struct BlockTreePoolMetricsSnapshot {
@@ -96,12 +106,13 @@ class BlockTreeCacheMetricsReporter final {
 public:
     explicit BlockTreeCacheMetricsReporter(std::shared_ptr<kmonitor::MetricsReporter> metrics_reporter);
 
-    void updateMockMemoryPlan(const MockMemoryHitSnapshot& snapshot);
-    void updateMockMemorySource(const std::vector<GroupSetPtr>& group_sets);
-    void recordMockMemoryH2D(size_t logical_blocks, bool success);
-    void recordMockMemoryD2HSubmitted(size_t host_records);
-    void recordMockMemoryD2HFinished(size_t host_records, bool success);
-    void reportMockMemoryMetrics() const;
+    void                           updateMockMemoryPlan(const MockMemoryHitSnapshot& snapshot);
+    void                           updateMockMemorySource(const std::vector<GroupSetPtr>& group_sets);
+    void                           recordMockMemoryH2D(size_t logical_blocks, bool success);
+    void                           recordMockMemoryD2HSubmitted(size_t host_records);
+    void                           recordMockMemoryD2HFinished(size_t host_records, bool success);
+    void                           reportMockMemoryMetrics() const;
+    MockMemoryCacheMetricsSnapshot mockMemoryMetricsSnapshot() const;
 
     std::vector<BlockTreePoolMetricsSnapshot>
     collectPoolMetricsSnapshots(const std::vector<GroupSetPtr>& group_sets) const;

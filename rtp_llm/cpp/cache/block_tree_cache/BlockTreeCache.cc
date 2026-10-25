@@ -107,6 +107,9 @@ bool BlockTreeCache::init() {
         }
     }
     initialized_ = true;
+    if (config_.mock_memory_cache) {
+        metrics_reporter_->updateMockMemorySource(tree_->groupSets());
+    }
     return true;
 }
 
@@ -162,7 +165,19 @@ BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType&               ca
 
 std::shared_ptr<LoadAsyncContext> BlockTreeCache::mockMemoryLoad(size_t logical_blocks) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return loader_.mockMemoryLoad(logical_blocks);
+    auto                        context = loader_.mockMemoryLoad(logical_blocks);
+    if (context) {
+        context->onDone([reporter = metrics_reporter_, logical_blocks](ErrorInfo error) {
+            reporter->recordMockMemoryH2D(logical_blocks, error.ok());
+        });
+    } else if (logical_blocks > 0) {
+        metrics_reporter_->recordMockMemoryH2D(logical_blocks, false);
+    }
+    return context;
+}
+
+void BlockTreeCache::reportMockMemoryPlan(const MockMemoryHitSnapshot& snapshot) {
+    metrics_reporter_->updateMockMemoryPlan(snapshot);
 }
 
 void BlockTreeCache::insert(const CacheKeysType&                              cache_keys,
@@ -174,12 +189,14 @@ void BlockTreeCache::insert(const CacheKeysType&                              ca
 size_t BlockTreeCache::insert(const CacheKeysType&                              cache_keys,
                               const std::vector<std::vector<GroupSetResource>>& resources,
                               Tier                                              target_tier,
-                              bool                                              is_resident) {
+                              bool                                              is_resident,
+                              bool                                              mock_memory_cache) {
     size_t           resident_prefix_length = 0;
     StorageWriteTask storage_write;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        storage_write = storer_.storeLocked(cache_keys, resources, target_tier, is_resident, resident_prefix_length);
+        storage_write = storer_.storeLocked(
+            cache_keys, resources, target_tier, is_resident, resident_prefix_length, mock_memory_cache);
     }
     if (storage_write) {
         storage_backend_->write(std::move(storage_write));
@@ -365,6 +382,10 @@ void BlockTreeCache::reportMetrics() const {
     metrics_reporter_->reportEvictableCandidateCount(snapshots);
     metrics_reporter_->reportQueueBacklog(task_pool_->queueSizes(), "business");
     metrics_reporter_->reportQueueBacklog(transfer_dispatcher_->queueSizes(), "transfer");
+    if (config_.mock_memory_cache) {
+        metrics_reporter_->updateMockMemorySource(tree_->groupSets());
+        metrics_reporter_->reportMockMemoryMetrics();
+    }
 }
 
 void BlockTreeCache::setEventPublisher(KVCacheEventPublisherPtr        publisher,

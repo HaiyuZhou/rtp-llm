@@ -43,7 +43,8 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
                                               const std::vector<std::vector<GroupSetResource>>& resources,
                                               Tier                                              target_tier,
                                               bool                                              is_resident,
-                                              size_t& resident_prefix_length) {
+                                              size_t&                                           resident_prefix_length,
+                                              bool                                              mock_memory_cache) {
     resident_prefix_length = 0;
     assert(!is_resident || target_tier == Tier::DEVICE);
     RTP_LLM_CHECK_WITH_INFO(target_tier == Tier::DEVICE || target_tier == Tier::HOST || target_tier == Tier::DISK,
@@ -52,7 +53,7 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
     if (target_tier == Tier::DEVICE) {
         publishDeviceLocked(cache_keys, resources, is_resident, resident_prefix_length);
     } else {
-        submitLowerTierLocked(cache_keys, resources, target_tier);
+        submitLowerTierLocked(cache_keys, resources, target_tier, mock_memory_cache);
         return {};
     }
     return storage_backend_ ? storage_backend_->prepareWrite(makeStorageRequest(cache_keys, resources)) :
@@ -96,7 +97,8 @@ StorageRequest BlockTreeStorer::makeStorageRequest(const CacheKeysType&         
 
 void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                              cache_keys,
                                             const std::vector<std::vector<GroupSetResource>>& resources,
-                                            Tier                                              target_tier) {
+                                            Tier                                              target_tier,
+                                            bool                                              mock_memory_cache) {
     if (stopping_.load()) {
         return;
     }
@@ -105,6 +107,7 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
         target_tier,
         cache_keys,
         std::chrono::milliseconds(target_tier == Tier::DISK ? disk_timeout_ms_ : host_timeout_ms_));
+    task->mock_memory_cache = mock_memory_cache;
 
     block_tree_cache_detail::ScopeRollback prepare_guard([this, &task]() { settleLocked(*task, /*publish=*/false); });
 
@@ -142,6 +145,11 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
                             tierName(target_tier),
                             task->descriptors().size());
         return;
+    }
+    // Admission and settlement share mutex_: even an immediate copy completion
+    // cannot publish its terminal outcome before this submitted count.
+    if (task->mock_memory_cache && task->target_tier == Tier::HOST) {
+        metrics_reporter_.recordMockMemoryD2HSubmitted(task->descriptors().size());
     }
     prepare_guard.dismiss();
 }
@@ -188,6 +196,11 @@ void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stopping = stopping_.load();
+        if (task.mock_memory_cache && task.target_tier == Tier::HOST) {
+            // Count the copy outcome even if duplicate publication or shutdown
+            // declines the new tree resource. Queue expiry is a failed store.
+            metrics_reporter_.recordMockMemoryD2HFinished(task.descriptors().size(), copy_success);
+        }
         accepted = settleLocked(task, copy_success && !stopping);
     }
 

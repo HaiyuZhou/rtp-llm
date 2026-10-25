@@ -19,6 +19,7 @@ cc_library(
     deps = [
         "//rtp_llm/cpp/cache:block_info",
         "//rtp_llm/cpp/cache:cache_types",
+        "//rtp_llm/cpp/cache:mock_memory_hit_controller",
         "//rtp_llm/cpp/cache:memory_layout_strategy",
         "//rtp_llm/cpp/disaggregate/cache_store:cache_store_interface",
         "//rtp_llm/cpp/utils:core_utils",

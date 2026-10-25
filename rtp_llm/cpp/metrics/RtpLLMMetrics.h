@@ -1075,6 +1075,43 @@ private:
     AUTIL_LOG_DECLARE();
 };
 
+// Cumulative, cache-owned mock-mode gauges. No per-request labels.
+class RtpLLMMockMemoryCacheMetricsCollector final {
+public:
+    int64_t eligible_blocks       = 0;
+    int64_t planned_host_blocks   = 0;
+    int64_t successful_h2d_blocks = 0;
+    int64_t failed_h2d_blocks     = 0;
+    int64_t d2h_submitted_blocks  = 0;
+    int64_t d2h_completed_blocks  = 0;
+    int64_t d2h_failed_blocks     = 0;
+    int64_t planned_ratio_ppm     = 0;
+    int64_t success_ratio_ppm     = 0;
+    int64_t source_blocks         = 0;
+    int64_t source_bytes          = 0;
+};
+
+class RtpLLMMockMemoryCacheMetrics: public kmonitor::MetricsGroup {
+public:
+    bool init(kmonitor::MetricsGroupManager* manager) override;
+    void report(const kmonitor::MetricsTags* tags, RtpLLMMockMemoryCacheMetricsCollector* collector);
+
+    kmonitor::MutableMetric* eligible_blocks_metric       = nullptr;
+    kmonitor::MutableMetric* planned_host_blocks_metric   = nullptr;
+    kmonitor::MutableMetric* successful_h2d_blocks_metric = nullptr;
+    kmonitor::MutableMetric* failed_h2d_blocks_metric     = nullptr;
+    kmonitor::MutableMetric* d2h_submitted_blocks_metric  = nullptr;
+    kmonitor::MutableMetric* d2h_completed_blocks_metric  = nullptr;
+    kmonitor::MutableMetric* d2h_failed_blocks_metric     = nullptr;
+    kmonitor::MutableMetric* planned_ratio_ppm_metric     = nullptr;
+    kmonitor::MutableMetric* success_ratio_ppm_metric     = nullptr;
+    kmonitor::MutableMetric* source_blocks_metric         = nullptr;
+    kmonitor::MutableMetric* source_bytes_metric          = nullptr;
+
+private:
+    AUTIL_LOG_DECLARE();
+};
+
 class RtpLLMCacheTransferMetricsCollector final {
 public:
     std::string operation;

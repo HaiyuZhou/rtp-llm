@@ -136,6 +136,7 @@ struct InsertInfo {
     CompleteTokenIdsPtr     complete_token_ids;
     bool                    is_resident;
     Tier                    target_tier{Tier::DEVICE};
+    bool                    mock_memory_cache{false};
 };
 
 }  // namespace rtp_llm

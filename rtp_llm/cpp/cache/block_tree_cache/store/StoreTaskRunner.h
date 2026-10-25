@@ -40,6 +40,7 @@ public:
         CacheKeysType cache_keys;
         TransferTask  transfer_task;
         Phase         phase{Phase::CREATED};
+        bool          mock_memory_cache{false};
     };
     using TaskPtr = std::shared_ptr<Task>;
 

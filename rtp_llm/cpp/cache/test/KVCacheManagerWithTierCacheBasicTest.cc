@@ -45,6 +45,24 @@ TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryColdPrefixLoadsFromReservedHos
     ASSERT_NE(context, nullptr);
     EXPECT_EQ(context->matchedBlocks(Tier::HOST), 3u);
     EXPECT_EQ(context->matchedBlocks(Tier::DEVICE), 0u);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*manager_->blockTreeCache());
+    {
+        const auto                  cache = manager_->blockTreeCache();
+        std::lock_guard<std::mutex> lock(cache->metrics_reporter_->mock_memory_metrics_mutex_);
+        const auto&                 metrics = cache->metrics_reporter_->mock_memory_metrics_;
+        EXPECT_EQ(metrics.eligible_blocks, 3);
+        EXPECT_EQ(metrics.planned_host_blocks, 3);
+        EXPECT_EQ(metrics.successful_h2d_blocks, 3);
+        EXPECT_EQ(metrics.failed_h2d_blocks, 0);
+        EXPECT_EQ(metrics.planned_ratio_ppm, 1000000);
+        EXPECT_EQ(metrics.success_ratio_ppm, 1000000);
+        EXPECT_EQ(metrics.source_blocks, 4);
+        size_t source_bytes = 0;
+        for (const auto& group : cache->groupSets()) {
+            source_bytes += 2 * group->hostPool()->strideBytes();
+        }
+        EXPECT_EQ(metrics.source_bytes, source_bytes);
+    }
     EXPECT_EQ(manager_->blockTreeCache()->getStats().tree_node_count, 0u);
     for (const auto& desc : context->loadDescs()) {
         EXPECT_EQ(desc.node, nullptr);
@@ -298,6 +316,17 @@ TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryRetryPreservesPlanAndAdmission
     EXPECT_EQ(snapshot.cumulative_eligible_blocks, 4u);
     EXPECT_EQ(snapshot.cumulative_planned_host_blocks, 2u);
     EXPECT_EQ(resource->cacheResource().deviceReuseBlockNum(), 0);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*manager_->blockTreeCache());
+    {
+        const auto                  cache = manager_->blockTreeCache();
+        std::lock_guard<std::mutex> lock(cache->metrics_reporter_->mock_memory_metrics_mutex_);
+        const auto&                 metrics = cache->metrics_reporter_->mock_memory_metrics_;
+        EXPECT_EQ(metrics.eligible_blocks, 4);
+        EXPECT_EQ(metrics.planned_host_blocks, 2);
+        EXPECT_EQ(metrics.successful_h2d_blocks, 2);
+        EXPECT_EQ(metrics.planned_ratio_ppm, 500000);
+        EXPECT_EQ(metrics.success_ratio_ppm, 500000);
+    }
     manager_->free(FreeInfo{resource, tokens});
 }
 

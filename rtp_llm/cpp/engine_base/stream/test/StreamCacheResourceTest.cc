@@ -18,6 +18,9 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCacheFactory.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/StorageBackend.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/load/LoadAsyncContext.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/test/BlockTreeCacheTestUtils.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/test/BoundedThreadTestUtils.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/ScopeRollback.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/engine_base/stream/StreamCacheResource.h"
@@ -778,6 +781,141 @@ TEST_F(StreamCacheResourceTest, testStoreTargetPreservesReuseCacheOverride) {
 
     deployment.enable_remote_cache = false;
     EXPECT_EQ(resource.storeTarget(), Tier::NONE);
+}
+
+TEST_F(StreamCacheResourceTest, MockMemoryStoreForcesHostAndNeverFallsBackWhenHostUnavailable) {
+    KVCacheConfig config;
+    config.reuse_cache                     = true;
+    config.enable_memory_cache             = true;
+    config.memory_cache_size_mb            = 1;
+    config.mock_memory_cache               = true;
+    config.mock_memory_cache_source_blocks = 2;
+    prepareResourceWithCacheConfig(init_config(), {1, 2, 3, 4, 5, 6}, true, RoleType::PDFUSION, config);
+    auto& resource                                 = stream_->streamCacheResource();
+    resource.resource_context_.enable_device_cache = true;
+    resource.resource_context_.enable_memory_cache = true;
+    resource.resource_context_.enable_disk_cache   = true;
+    EXPECT_EQ(resource.storeTarget(), Tier::HOST);
+    resource.resource_context_.enable_memory_cache = false;
+    EXPECT_EQ(resource.storeTarget(), Tier::NONE);
+    resource.resource_context_.enable_memory_cache = true;
+    stream_->generateConfig()->reuse_cache         = false;
+    EXPECT_EQ(resource.storeTarget(), Tier::NONE);
+}
+
+TEST_F(StreamCacheResourceTest, MockMemoryFinishedReleaseCopiesRealRequestToHostAsynchronously) {
+    using namespace block_tree_cache_test;
+    KVCacheConfig config;
+    config.reuse_cache                     = true;
+    config.enable_memory_cache             = true;
+    config.memory_cache_size_mb            = 1;
+    config.mock_memory_cache               = true;
+    config.mock_memory_cache_hit_ratio     = 0;
+    config.mock_memory_cache_source_blocks = 2;
+    prepareResourceWithCacheConfig(init_config(), {1, 2, 3, 4, 5, 6}, true, RoleType::PDFUSION, config);
+    auto                  cache = cache_manager_->blockTreeCache();
+    kmonitor::MetricsTags tags;
+    auto                  reporter                 = std::make_shared<kmonitor::MetricsReporter>("", "", tags);
+    cache->metrics_reporter_->metrics_reporter_    = reporter;
+    auto                                   barrier = std::make_shared<CallbackBarrier>();
+    block_tree_cache_detail::ScopeRollback release_barrier([barrier] { barrier->release(); });
+    auto                                   engine = std::make_shared<ControlledPerRankBlockTransferEngine>(
+        cache->groupSets(), TransferCopyAction::Succeed, barrier);
+    BlockTreeCacheTestPeer::setPerRankBlockTransferEngineForTest(*cache, engine);
+    auto& resource                                 = stream_->streamCacheResource();
+    resource.resource_context_.enable_device_cache = true;
+    resource.resource_context_.enable_memory_cache = true;
+    ASSERT_TRUE(resource.initKVBlock().ok());
+    const auto keys                   = resource.kvCache().cacheKeys(0);
+    stream_->generate_status_->status = StreamState::FINISHED;
+    BoundedThread<void> release([stream = stream_] { stream->streamCacheResource().releaseResource(); });
+    const auto          released_while_copy_blocked = release.waitFor(std::chrono::seconds(5));
+    if (released_while_copy_blocked != std::future_status::ready) {
+        barrier->release();
+    }
+    ASSERT_EQ(release.waitFor(std::chrono::seconds(5)), std::future_status::ready);
+    release.get();
+    EXPECT_EQ(released_while_copy_blocked, std::future_status::ready);
+    EXPECT_TRUE(resource.isResourceReleased());
+    ASSERT_TRUE(barrier->waitUntilEnteredFor(1, std::chrono::seconds(5)));
+    EXPECT_TRUE(cache->tree()->findNode(keys).empty());
+    {
+        std::lock_guard<std::mutex> lock(cache->metrics_reporter_->mock_memory_metrics_mutex_);
+        EXPECT_GT(cache->metrics_reporter_->mock_memory_metrics_.d2h_submitted_blocks, 0);
+        EXPECT_EQ(cache->metrics_reporter_->mock_memory_metrics_.d2h_completed_blocks, 0);
+    }
+    for (const auto& group : cache->groupSets()) {
+        for (const auto& pool : group->devicePools()) {
+            EXPECT_GT(pool->referencedBlocksNum(BlockTreeRefType::STORE), 0u);
+            EXPECT_EQ(pool->referencedBlocksNum(), 0u);
+        }
+    }
+    barrier->release();
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+    const auto path = cache->tree()->findNode(keys);
+    ASSERT_FALSE(path.empty());
+    for (const auto* node : path) {
+        EXPECT_TRUE(node->group_set_resources[0].hasTier(Tier::HOST));
+        EXPECT_FALSE(node->group_set_resources[0].hasTier(Tier::DEVICE));
+    }
+    EXPECT_EQ(cache->metrics_reporter_->mock_memory_metrics_.d2h_completed_blocks, path.size());
+    EXPECT_EQ(cache->metrics_reporter_->mock_memory_metrics_.d2h_failed_blocks, 0);
+    cache->reportMetrics();
+    auto*      metrics  = reporter->getMetricsGroup<RtpLLMMockMemoryCacheMetrics>();
+    const auto snapshot = [&](kmonitor::MutableMetric* metric, const char* name, int64_t expected) {
+        ASSERT_NE(metric, nullptr);
+        auto* series = metric->DeclareMetric(&tags);
+        ASSERT_NE(series, nullptr);
+        kmonitor::MetricsRecord record(nullptr, nullptr, 0);
+        series->Snapshot(&record, 1000);
+        ASSERT_TRUE(metric->UndeclareMetric(series));
+        ASSERT_EQ(record.Values().size(), 1u);
+        EXPECT_NE(record.Values().front()->Name().find(name), std::string::npos);
+        EXPECT_DOUBLE_EQ(std::stod(record.Values().front()->Value()), expected);
+    };
+    const auto& expected = cache->metrics_reporter_->mock_memory_metrics_;
+    snapshot(metrics->eligible_blocks_metric, "mock_memory_cache_eligible_blocks", expected.eligible_blocks);
+    snapshot(metrics->planned_host_blocks_metric, "mock_memory_cache_planned_host_blocks", 0);
+    snapshot(metrics->successful_h2d_blocks_metric, "mock_memory_cache_successful_h2d_blocks", 0);
+    snapshot(metrics->failed_h2d_blocks_metric, "mock_memory_cache_failed_h2d_blocks", 0);
+    snapshot(metrics->d2h_submitted_blocks_metric, "mock_memory_cache_d2h_submitted_blocks", path.size());
+    snapshot(metrics->d2h_completed_blocks_metric, "mock_memory_cache_d2h_completed_blocks", path.size());
+    snapshot(metrics->d2h_failed_blocks_metric, "mock_memory_cache_d2h_failed_blocks", 0);
+    snapshot(metrics->planned_ratio_ppm_metric, "mock_memory_cache_planned_ratio_ppm", 0);
+    snapshot(metrics->success_ratio_ppm_metric, "mock_memory_cache_success_ratio_ppm", 0);
+    snapshot(metrics->source_blocks_metric, "mock_memory_cache_source_blocks", 2);
+    snapshot(metrics->source_bytes_metric, "mock_memory_cache_source_bytes", expected.source_bytes);
+}
+
+TEST_F(StreamCacheResourceTest, MockMemoryUnsuccessfulReleaseNeverStores) {
+    using namespace block_tree_cache_test;
+    for (const auto error : {ErrorCode::NONE_ERROR, ErrorCode::CANCELLED, ErrorCode::EXECUTION_EXCEPTION}) {
+        SCOPED_TRACE(static_cast<int>(error));
+        KVCacheConfig config;
+        config.reuse_cache                     = true;
+        config.enable_memory_cache             = true;
+        config.memory_cache_size_mb            = 1;
+        config.mock_memory_cache               = true;
+        config.mock_memory_cache_hit_ratio     = 0;
+        config.mock_memory_cache_source_blocks = 2;
+        prepareResourceWithCacheConfig(init_config(), {1, 2, 3, 4, 5, 6}, true, RoleType::PDFUSION, config);
+        auto cache = cache_manager_->blockTreeCache();
+        auto engine =
+            std::make_shared<ControlledPerRankBlockTransferEngine>(cache->groupSets(), TransferCopyAction::Succeed);
+        BlockTreeCacheTestPeer::setPerRankBlockTransferEngineForTest(*cache, engine);
+        auto& resource                                 = stream_->streamCacheResource();
+        resource.resource_context_.enable_device_cache = true;
+        resource.resource_context_.enable_memory_cache = true;
+        ASSERT_TRUE(resource.initKVBlock().ok());
+        if (error != ErrorCode::NONE_ERROR) {
+            stream_->generate_status_->status     = StreamState::FINISHED;
+            stream_->generate_status_->error_info = ErrorInfo(error, "unsuccessful request");
+        }
+        resource.releaseResource();
+        BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+        EXPECT_EQ(engine->submittedBatchCount(), 0u);
+        EXPECT_EQ(cache->tree()->size(), 0u);
+    }
 }
 
 TEST_F(StreamCacheResourceTest, testDecodeInitKVBlock_DisablesDeviceCacheOnlyForFirstMalloc) {

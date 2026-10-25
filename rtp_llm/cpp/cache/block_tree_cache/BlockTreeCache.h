@@ -173,6 +173,7 @@ public:
 
     BlockTreeMatchResult match(const CacheKeysType& cache_keys, const std::function<bool(size_t)>& valid_prefix = {});
     std::shared_ptr<LoadAsyncContext> mockMemoryLoad(size_t logical_blocks);
+    void                              reportMockMemoryPlan(const MockMemoryHitSnapshot& snapshot);
     void                 insert(const CacheKeysType&                              cache_keys,
                                 const std::vector<std::vector<GroupSetResource>>& resources,
                                 Tier                                              target_tier);
@@ -180,7 +181,8 @@ public:
     size_t insert(const CacheKeysType&                              cache_keys,
                   const std::vector<std::vector<GroupSetResource>>& resources,
                   Tier                                              target_tier,
-                  bool                                              is_resident);
+                  bool                                              is_resident,
+                  bool                                              mock_memory_cache = false);
     // Directly reclaim up to num_blocks device blocks belonging to one group set
     // (target_tier = NONE, content dropped). Returns the number actually freed.
     int evictForGroup(std::string_view group_tag, size_t num_blocks);

@@ -1139,5 +1139,84 @@ TEST(BlockTreeStorerTest, DuplicateStoreForSameKeyReleasesLoserBlock) {
     releaseDeviceBlocks(*env.cache, env.device_pools[0], second_holder.front());
 }
 
+TEST(BlockTreeStorerTest, MockMemoryStoresCountTerminalCopiesAndReleaseEverySource) {
+    if (!cudaAvailable()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    for (const auto action : {TransferCopyAction::Succeed, TransferCopyAction::Fail, TransferCopyAction::Throw}) {
+        SCOPED_TRACE(transferCopyActionName(action));
+        auto env     = makeStoreEnvironment("mock_store_outcome", true, true, false, {2, 2});
+        auto barrier = std::make_shared<CallbackBarrier>();
+        block_tree_cache_detail::ScopeRollback release_barrier([barrier] { barrier->release(); });
+        installStoreTransferEngine(env, action, barrier);
+        std::vector<BlockIndicesType> sources;
+        for (const auto& group : env.groups) {
+            const auto blocks = allocateDeviceBlocksForTest(*group, 1);
+            ASSERT_EQ(blocks.size(), 1u);
+            sources.push_back(blocks.front());
+        }
+        // One key carries two physical Host records, one for each GroupSet.
+        env.cache->insert({100}, deviceSourceResources(sources), Tier::HOST, false, true);
+        ASSERT_TRUE(barrier->waitUntilEnteredFor(1, std::chrono::seconds(5)));
+        {
+            std::lock_guard<std::mutex> lock(env.cache->metrics_reporter_->mock_memory_metrics_mutex_);
+            const auto&                 metrics = env.cache->metrics_reporter_->mock_memory_metrics_;
+            EXPECT_EQ(metrics.d2h_submitted_blocks, 2);
+            EXPECT_EQ(metrics.d2h_completed_blocks, 0);
+            EXPECT_EQ(metrics.d2h_failed_blocks, 0);
+        }
+        EXPECT_TRUE(env.cache->tree()->findNode({100}).empty());
+        for (size_t i = 0; i < sources.size(); ++i) {
+            releaseDeviceBlocks(*env.cache, env.device_pools[i], sources[i]);
+            EXPECT_EQ(env.device_pools[i]->referencedBlocksNum(BlockTreeRefType::STORE), 1u);
+            EXPECT_TRUE(env.device_pools[i]->isAllocated(sources[i].front()));
+        }
+        barrier->release();
+        BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*env.cache);
+        const bool  success = action == TransferCopyAction::Succeed;
+        const auto& metrics = env.cache->metrics_reporter_->mock_memory_metrics_;
+        EXPECT_EQ(metrics.d2h_submitted_blocks, 2);
+        EXPECT_EQ(metrics.d2h_completed_blocks, success ? 2 : 0);
+        EXPECT_EQ(metrics.d2h_failed_blocks, success ? 0 : 2);
+        EXPECT_EQ(env.cache->tree()->findNode({100}).size(), success ? 1u : 0u);
+        EXPECT_EQ(env.storeRefCount(), 0u);
+        for (size_t i = 0; i < sources.size(); ++i) {
+            EXPECT_EQ(env.device_pools[i]->freeBlocksNum(), 4u);
+            EXPECT_EQ(env.host_pools[i]->freeBlocksNum(), success ? 1u : 2u);
+        }
+    }
+}
+
+TEST(BlockTreeStorerTest, MockMemoryDuplicateCopiesRemainCountedAndOrdinaryCopiesAreExcluded) {
+    if (!cudaAvailable()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    auto                                   env = makeStoreEnvironment("mock_store_duplicates", true, true, false, {3});
+    auto                                   barrier = std::make_shared<CallbackBarrier>();
+    block_tree_cache_detail::ScopeRollback release_barrier([barrier] { barrier->release(); });
+    auto       engine = installStoreTransferEngine(env, TransferCopyAction::Succeed, barrier);
+    const auto holder = allocateDeviceBlocksForTest(*env.groups[0], 1);
+    ASSERT_EQ(holder.size(), 1u);
+    for (int i = 0; i < 2; ++i) {
+        env.cache->insert({100}, deviceSourceResources({holder.front()}), Tier::HOST, false, true);
+    }
+    ASSERT_TRUE(barrier->waitUntilEnteredFor(2, std::chrono::seconds(5)));
+    EXPECT_TRUE(env.cache->tree()->findNode({100}).empty());
+    barrier->release();
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*env.cache);
+    EXPECT_EQ(env.cache->metrics_reporter_->mock_memory_metrics_.d2h_submitted_blocks, 2);
+    EXPECT_EQ(env.cache->metrics_reporter_->mock_memory_metrics_.d2h_completed_blocks, 2);
+    EXPECT_EQ(env.cache->metrics_reporter_->mock_memory_metrics_.d2h_failed_blocks, 0);
+    ASSERT_EQ(env.cache->tree()->findNode({100}).size(), 1u);
+    EXPECT_EQ(env.host_pools[0]->freeBlocksNum(), 2u);
+    engine->setCopyBehavior(TransferCopyAction::Succeed, nullptr);
+    env.cache->insert({200}, deviceSourceResources({holder.front()}), Tier::HOST);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*env.cache);
+    EXPECT_EQ(env.cache->metrics_reporter_->mock_memory_metrics_.d2h_submitted_blocks, 2);
+    EXPECT_EQ(env.cache->metrics_reporter_->mock_memory_metrics_.d2h_completed_blocks, 2);
+    EXPECT_EQ(env.storeRefCount(), 0u);
+    releaseDeviceBlocks(*env.cache, env.device_pools[0], holder.front());
+}
+
 }  // namespace
 }  // namespace rtp_llm

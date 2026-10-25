@@ -140,6 +140,7 @@ public:
     BlockTreeCachePtr blockTreeCache() const {
         return block_tree_cache_;
     }
+    bool mockMemoryCacheEnabled() const;
 
     // Increment KV cache reference count for PD separation (connector refcount)
     std::shared_ptr<KVCacheResource>

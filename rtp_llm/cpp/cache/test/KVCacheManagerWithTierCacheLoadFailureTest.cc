@@ -26,6 +26,17 @@ TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryTransferFailurePublishesNoReus
     EXPECT_EQ(resource->cacheResource().deviceReuseBlockNum(), 0u);
     EXPECT_EQ(resource->cacheResource().memoryReuseBlockNum(), 0u);
     EXPECT_EQ(cache->getStats().tree_node_count, 0u);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+    {
+        std::lock_guard<std::mutex> lock(cache->metrics_reporter_->mock_memory_metrics_mutex_);
+        const auto&                 metrics = cache->metrics_reporter_->mock_memory_metrics_;
+        EXPECT_EQ(metrics.eligible_blocks, 2);
+        EXPECT_EQ(metrics.planned_host_blocks, 2);
+        EXPECT_EQ(metrics.successful_h2d_blocks, 0);
+        EXPECT_EQ(metrics.failed_h2d_blocks, 2);
+        EXPECT_EQ(metrics.planned_ratio_ppm, 1000000);
+        EXPECT_EQ(metrics.success_ratio_ppm, 0);
+    }
     for (const auto& group : cache->groupSets()) {
         EXPECT_EQ(group->hostPool()->referencedBlocksNum(BlockTreeRefType::MOCK_SOURCE), 2u);
         EXPECT_EQ(group->hostPool()->referencedBlocksNum(BlockTreeRefType::LOAD), 0u);

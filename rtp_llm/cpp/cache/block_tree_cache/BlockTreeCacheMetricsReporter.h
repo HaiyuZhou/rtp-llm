@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -13,12 +14,15 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/evict/BlockTreeEvictor.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/group_set/GroupSet.h"
 #include "rtp_llm/cpp/utils/ErrorCode.h"
+#include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 
 namespace kmonitor {
 class MetricsReporter;
 }
 
 namespace rtp_llm {
+
+struct MockMemoryHitSnapshot;
 
 struct BlockTreeQueueSizes;
 
@@ -92,6 +96,13 @@ class BlockTreeCacheMetricsReporter final {
 public:
     explicit BlockTreeCacheMetricsReporter(std::shared_ptr<kmonitor::MetricsReporter> metrics_reporter);
 
+    void updateMockMemoryPlan(const MockMemoryHitSnapshot& snapshot);
+    void updateMockMemorySource(const std::vector<GroupSetPtr>& group_sets);
+    void recordMockMemoryH2D(size_t logical_blocks, bool success);
+    void recordMockMemoryD2HSubmitted(size_t host_records);
+    void recordMockMemoryD2HFinished(size_t host_records, bool success);
+    void reportMockMemoryMetrics() const;
+
     std::vector<BlockTreePoolMetricsSnapshot>
     collectPoolMetricsSnapshots(const std::vector<GroupSetPtr>& group_sets) const;
     std::vector<BlockTreeEvictableMetricsSnapshot>
@@ -152,6 +163,8 @@ private:
                                  const std::vector<GroupSetPtr>&        group_sets,
                                  BlockTreeTransferBytes&                transfer_bytes) const;
     std::shared_ptr<kmonitor::MetricsReporter>                                     metrics_reporter_;
+    mutable std::mutex                                                             mock_memory_metrics_mutex_;
+    RtpLLMMockMemoryCacheMetricsCollector                                          mock_memory_metrics_;
     std::array<std::array<std::atomic<int64_t>, kDirectionCount>, kOperationCount> transfer_in_flight_{};
 };
 

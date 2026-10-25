@@ -481,6 +481,7 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
         if (mock_memory) {
             RTP_LLM_PROFILE_SCOPE("cache.mock_memory.plan_and_descriptors");
             if (mock_memory_hit_controller_) {
+                const bool retry = kv_resource->mockMemoryCachePlan().has_value();
                 if (!kv_resource->mockMemoryCachePlan()) {
                     const auto decision = mock_memory_hit_controller_->plan(
                         match_keys.size(), [tokens = malloc_info.complete_token_ids, reuse_unit_tokens](size_t count) {
@@ -488,7 +489,14 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
                         });
                     kv_resource->setMockMemoryCachePlan({decision.eligible_blocks, decision.planned_host_blocks});
                 }
+                block_tree_cache_->reportMockMemoryPlan(mock_memory_hit_controller_->snapshot());
+                const size_t eligible_blocks = kv_resource->mockMemoryCachePlan()->eligible_blocks;
                 const size_t planned_blocks = kv_resource->mockMemoryCachePlan()->planned_host_blocks;
+                RTP_LLM_LOG_DEBUG("mock_memory_cache request=%ld eligible=%zu planned=%zu successful_host=0 retry=%d",
+                                  malloc_info.request_id,
+                                  eligible_blocks,
+                                  planned_blocks,
+                                  retry);
                 if (planned_blocks > 0) {
                     load_attempted = true;
                     load_context   = block_tree_cache_->mockMemoryLoad(planned_blocks);
@@ -500,6 +508,16 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
                         failed.match_cost_time_us = failed.match_end_time_us - begin_us;
                         return failed;
                     }
+                    load_context->onDone(
+                        [request_id = malloc_info.request_id, eligible_blocks, planned_blocks, retry](ErrorInfo error) {
+                            RTP_LLM_LOG_DEBUG(
+                                "mock_memory_cache request=%ld eligible=%zu planned=%zu successful_host=%zu retry=%d",
+                                request_id,
+                                eligible_blocks,
+                                planned_blocks,
+                                error.ok() ? planned_blocks : 0,
+                                retry);
+                        });
                     prepared.total_logical_blocks = planned_blocks;
                     const int cp_scale            = cp_mapper && cp_mapper->isSharded() ? cp_mapper->cpSize() : 1;
                     for (const auto& group_set : block_tree_cache_->groupSets()) {
@@ -952,11 +970,12 @@ void CoordinatorCacheManager::insertIntoCache(const InsertInfo& insert_info, siz
         insert_keys.resize(publish_prefix);
         resources.resize(publish_prefix);
         if (insert_info.is_resident) {
-            const size_t batch_resident_prefix_length =
-                block_tree_cache_->insert(insert_keys, resources, insert_info.target_tier, true);
+            const size_t batch_resident_prefix_length = block_tree_cache_->insert(
+                insert_keys, resources, insert_info.target_tier, true, insert_info.mock_memory_cache);
             resident_prefix_length += batch_resident_prefix_length;
         } else {
-            block_tree_cache_->insert(insert_keys, resources, insert_info.target_tier);
+            block_tree_cache_->insert(
+                insert_keys, resources, insert_info.target_tier, false, insert_info.mock_memory_cache);
         }
     }
 }

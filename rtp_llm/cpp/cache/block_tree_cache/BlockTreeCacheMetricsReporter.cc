@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
+#include "rtp_llm/cpp/cache/MockMemoryHitController.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/evict/BlockTreeEvictor.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 #include "rtp_llm/cpp/utils/TimeUtil.h"
@@ -18,6 +19,19 @@ namespace {
 constexpr std::array<Tier, 3>           kMetricTiers      = {Tier::DEVICE, Tier::HOST, Tier::DISK};
 constexpr std::array<CacheGroupType, 3> kMetricGroupTypes = {
     CacheGroupType::FULL, CacheGroupType::SWA, CacheGroupType::LINEAR};
+
+int64_t boundedMockCount(uint64_t count) {
+    return static_cast<int64_t>(std::min<uint64_t>(count, std::numeric_limits<int64_t>::max()));
+}
+
+void addMockCount(int64_t& count, size_t increment) {
+    count += static_cast<int64_t>(std::min<uint64_t>(increment, std::numeric_limits<int64_t>::max() - count));
+}
+
+int64_t mockRatioPpm(int64_t numerator, int64_t denominator) {
+    return denominator == 0 ? 0 :
+                              static_cast<int64_t>(static_cast<unsigned __int128>(numerator) * 1000000 / denominator);
+}
 
 size_t transferOperationIndex(CacheTransferOperation operation) {
     return static_cast<size_t>(operation);
@@ -84,6 +98,63 @@ BlockTreePoolMetricsSnapshot makeDevicePoolMetricsSnapshot(const DeviceBlockPool
 BlockTreeCacheMetricsReporter::BlockTreeCacheMetricsReporter(
     std::shared_ptr<kmonitor::MetricsReporter> metrics_reporter):
     metrics_reporter_(std::move(metrics_reporter)) {}
+
+void BlockTreeCacheMetricsReporter::updateMockMemoryPlan(const MockMemoryHitSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(mock_memory_metrics_mutex_);
+    // Concurrent admissions may deliver snapshots out of order. Retry snapshots
+    // are idempotent, and an older snapshot must never lower a cumulative gauge.
+    auto& metrics           = mock_memory_metrics_;
+    metrics.eligible_blocks = std::max(metrics.eligible_blocks, boundedMockCount(snapshot.cumulative_eligible_blocks));
+    metrics.planned_host_blocks =
+        std::max(metrics.planned_host_blocks, boundedMockCount(snapshot.cumulative_planned_host_blocks));
+    metrics.planned_ratio_ppm = mockRatioPpm(metrics.planned_host_blocks, metrics.eligible_blocks);
+    metrics.success_ratio_ppm = mockRatioPpm(metrics.successful_h2d_blocks, metrics.eligible_blocks);
+}
+
+void BlockTreeCacheMetricsReporter::updateMockMemorySource(const std::vector<GroupSetPtr>& group_sets) {
+    const auto                  snapshots = collectPoolMetricsSnapshots(group_sets);
+    std::lock_guard<std::mutex> lock(mock_memory_metrics_mutex_);
+    mock_memory_metrics_.source_blocks = 0;
+    mock_memory_metrics_.source_bytes  = 0;
+    // Mirror the existing physical-pool snapshots, including footer/alignment
+    // bytes; the general pool metrics retain their existing series and labels.
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.tier == Tier::HOST) {
+            addMockCount(mock_memory_metrics_.source_blocks, snapshot.mock_source_ref_blocks);
+            addMockCount(mock_memory_metrics_.source_bytes, snapshot.mock_source_ref_bytes);
+        }
+    }
+}
+
+void BlockTreeCacheMetricsReporter::recordMockMemoryH2D(size_t logical_blocks, bool success) {
+    std::lock_guard<std::mutex> lock(mock_memory_metrics_mutex_);
+    auto&                       metrics = mock_memory_metrics_;
+    addMockCount(success ? metrics.successful_h2d_blocks : metrics.failed_h2d_blocks, logical_blocks);
+    metrics.success_ratio_ppm = mockRatioPpm(metrics.successful_h2d_blocks, metrics.eligible_blocks);
+}
+
+void BlockTreeCacheMetricsReporter::recordMockMemoryD2HSubmitted(size_t host_records) {
+    std::lock_guard<std::mutex> lock(mock_memory_metrics_mutex_);
+    addMockCount(mock_memory_metrics_.d2h_submitted_blocks, host_records);
+}
+
+void BlockTreeCacheMetricsReporter::recordMockMemoryD2HFinished(size_t host_records, bool success) {
+    std::lock_guard<std::mutex> lock(mock_memory_metrics_mutex_);
+    addMockCount(success ? mock_memory_metrics_.d2h_completed_blocks : mock_memory_metrics_.d2h_failed_blocks,
+                 host_records);
+}
+
+void BlockTreeCacheMetricsReporter::reportMockMemoryMetrics() const {
+    if (!metrics_reporter_) {
+        return;
+    }
+    RtpLLMMockMemoryCacheMetricsCollector snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mock_memory_metrics_mutex_);
+        snapshot = mock_memory_metrics_;
+    }
+    metrics_reporter_->report<RtpLLMMockMemoryCacheMetrics, RtpLLMMockMemoryCacheMetricsCollector>(nullptr, &snapshot);
+}
 
 std::vector<BlockTreePoolMetricsSnapshot>
 BlockTreeCacheMetricsReporter::collectPoolMetricsSnapshots(const std::vector<GroupSetPtr>& group_sets) const {

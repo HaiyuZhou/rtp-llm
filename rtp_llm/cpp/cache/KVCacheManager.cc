@@ -501,6 +501,10 @@ std::function<void()> KVCacheManager::allocationChangeCallback() const {
     };
 }
 
+bool KVCacheManager::mockMemoryCacheEnabled() const {
+    return block_tree_cache_ && block_tree_cache_->config().mock_memory_cache;
+}
+
 void KVCacheManager::insertIntoCache(const InsertInfo& insert_info, size_t& resident_prefix_length) {
     RTP_LLM_PROFILE_FUNCTION();
     PressureNvtxScope nvtx_scope("cache.insert");

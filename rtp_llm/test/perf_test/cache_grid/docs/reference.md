@@ -423,7 +423,8 @@ responsible for exclusive DP=1 service, explicit opt-in and unsupported options.
 The supervisor freezes configuration, owner targets, raw baselines and the live
 `seed_plan` before seed dispatch. Full-pressure preload is FIFO-only at every
 entry point and never sets fixed batches or pads requests. The phase order is
-validate -> seed -> fill -> steady -> measurement -> optional support -> drain.
+validate -> seed -> fill -> optional tiered rewarm -> steady -> measurement ->
+optional support -> drain.
 Seeds are generated lazily up to `client_inflight`; every completion permits an
 immediate replacement until exactly `seed_count` families have been submitted,
 then the accepted seeds drain within the independent `seed_timeout_s`. There is
@@ -436,7 +437,13 @@ the >=32768 reuse requirement. Explicit small smoke grids remain non-formal.
 Request/time and pressure-progress budgets terminate fill explicitly. Steady
 uses contiguous sampled intervals, not the number of samples. Grid requests
 repeat lazily through steady, measurement and support without boundary drains
-or repair fill. Inputs and outstanding RPCs remain bounded by client concurrency.
+or repair fill. For `tree_pressure` with `tiered_rolling`, reaching fill pressure
+rewarns the first cohort's device half before steady. Those requests reuse the
+same family/case assignments as the first formal device lanes without consuming
+formal sequence numbers. All rewarm requests must complete successfully and a
+post-rewarm pressure sample must remain below `fill_host_max_ratio`; otherwise the
+session fails closed. Inputs and outstanding RPCs remain bounded by client
+concurrency.
 
 `PressurePhases(config, started_s)` exposes `phase`, `measurement_start`,
 `measurement_end`, `failure`, and `advance(now_s, fill_ready=...,
@@ -620,7 +627,8 @@ Throughput counts actual completions (including failures) per window second;
 success throughput counts only successful completions. Terminal cancellations
 count cohort membership without inventing completion timestamps. Transport cancel
 acceptance is recorded independently and does not prove server completion. Support,
-seed, fill and padding (including warmup padding) never enter formal window metrics.
+seed, fill, tiered rewarm and padding (including warmup padding) never enter formal
+window metrics.
 
 Summary and manifest expose four independent booleans in `validity`:
 `execution_valid`, `full_pressure_valid`, `formal_config_valid`, and

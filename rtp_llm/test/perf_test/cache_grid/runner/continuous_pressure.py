@@ -230,6 +230,11 @@ class TieredRollingPlanner:
         self.cohort_id += 1
         return result
 
+    def initial_device_assignments(self) -> tuple[TieredRollingAssignment, ...]:
+        return tuple(
+            self.assignment(lane) for lane in range(0, self.cohort_size, 2)
+        )
+
 
 def freeze_seed_families(seed_ids) -> int:
     """Return the populated prefix length, rejecting holes in seed families."""
@@ -535,6 +540,22 @@ class PressureSession:
         self.fill_sent = 0
         self.fill_headroom_reached = False
         self.fill_headroom_snapshot = ()
+        rewarm_cohort_size = config.cohort_size or concurrency
+        if (
+            config.evidence_policy == "tree_pressure"
+            and config.family_schedule == "tiered_rolling"
+            and rewarm_cohort_size % 2
+        ):
+            raise ValueError("tiered real pressure requires an even effective cohort")
+        self.rewarm_planned = (
+            rewarm_cohort_size // 2
+            if config.evidence_policy == "tree_pressure"
+            and config.family_schedule == "tiered_rolling"
+            else 0
+        )
+        self.rewarm_submitted = 0
+        self.rewarm_completed = 0
+        self.rewarm_failed = 0
         self.closed = False
         self.supply_deadline = float("inf")
         self.profile_started = False
@@ -714,6 +735,7 @@ class PressureSession:
                 or self.clock() >= self.supply_deadline
                 or self.state.phase == "drain"
                 or (kind == "seed" and self.state.phase != "seed")
+                or (kind == "rewarm" and self.state.phase != "fill")
                 or (
                     kind == "formal"
                     and phase not in ("steady", "measurement", "support")
@@ -813,6 +835,9 @@ class PressureSession:
                 if kind == "seed" and not cancelled:
                     self.seed_failed += 1
                     self.fail("request_failed")
+                elif kind == "rewarm" and not cancelled:
+                    self.rewarm_failed += 1
+                    self.fail("request_failed")
                 if not result.get("not_dispatched"):
                     self.fail("request_failed")
                     self.emit(
@@ -844,6 +869,11 @@ class PressureSession:
                     self.seed_completed += 1
                 elif not cancelled:
                     self.seed_failed += 1
+            elif kind == "rewarm":
+                if success:
+                    self.rewarm_completed += 1
+                elif not cancelled:
+                    self.rewarm_failed += 1
             if not success and not cancelled:
                 self.fail("request_failed")
 
@@ -1076,6 +1106,66 @@ class PressureSession:
             )
         return result
 
+    def _rewarm_result(self):
+        return dict(
+            planned=self.rewarm_planned,
+            submitted=self.rewarm_submitted,
+            completed=self.rewarm_completed,
+            failed=self.rewarm_failed,
+            pending=sum(kind == "rewarm" for kind in self.job_kinds.values()),
+        )
+
+    def _run_rewarm_phase(self):
+        if not self.rewarm_planned:
+            return
+        self.emit("rewarm_start", planned=self.rewarm_planned, at_s=self.clock())
+        while (
+            self.state.phase == "fill"
+            and not self.fill_headroom_reached
+            and self.rewarm_submitted < self.rewarm_planned
+        ):
+            while (
+                self.rewarm_submitted < self.rewarm_planned
+                and len(self.sender.pending) < self.sender.limit
+                and not self.fill_headroom_reached
+            ):
+                if not self._submit("rewarm"):
+                    break
+                self.rewarm_submitted += 1
+            while (
+                any(kind == "rewarm" for kind in self.job_kinds.values())
+                and self.state.phase == "fill"
+            ):
+                self._tick()
+                if self.fill_headroom_reached:
+                    self.fail("fill_headroom_exhausted")
+                    break
+                if self.state.phase != "drain":
+                    self._pause()
+            if self.state.phase != "fill":
+                break
+            if self.poll_future is not None:
+                evidence = self.poll_future.result(
+                    timeout=self.config.sample_period_s
+                )
+                self.poll_future = None
+                self._consume_poll(evidence)
+            if self.fill_headroom_reached:
+                self.fail("fill_headroom_exhausted")
+            elif self.state.phase == "fill":
+                self._consume_poll(self.poll(self.config.sample_period_s))
+            if self.fill_headroom_reached:
+                self.fail("fill_headroom_exhausted")
+        result = self._rewarm_result()
+        self.emit("rewarm_summary", **result)
+        if (
+            result["submitted"] != result["planned"]
+            or result["completed"] != result["planned"]
+            or result["failed"]
+            or result["pending"]
+        ):
+            self.fail("rewarm_incomplete")
+
     def _run_seed_phase(self) -> dict:
         self.seed_started = self.clock()
         self.seed_deadline = self.seed_started + self.config.seed_timeout_s
@@ -1123,6 +1213,21 @@ class PressureSession:
                 return
             if not baseline.sample_complete:
                 raise RuntimeError("post-seed pressure inventory is incomplete")
+            occupancy = self._host_pool_occupancy(baseline.samples)
+            if self.config.family_schedule == "tiered_rolling" and any(
+                item["ratio"] >= self.config.fill_host_max_ratio for item in occupancy
+            ):
+                self.fill_headroom_reached = True
+                self.fill_headroom_snapshot = occupancy
+                self.emit(
+                    "fill_limit",
+                    at_s=self.clock(),
+                    reason="host_max_ratio",
+                    sent=0,
+                    host_pools=list(occupancy),
+                )
+                self.fail("fill_headroom_exhausted")
+                return
             self.coverage = PressureCoverage(tuple(baseline.samples), self.config)
             self.emit("fill_baseline", at_s=self.clock(), raw_baseline=baseline.raw)
         now = self.clock()
@@ -1315,8 +1420,10 @@ class PressureSession:
                     self.fail("fill_headroom_exhausted")
                     break
                 if self.fill_sent and self.ready and not self.sender.pending:
-                    self.state.advance(self.clock(), fill_ready=True)
-                    self.emit("phase", phase="steady", at_s=self.clock())
+                    self._run_rewarm_phase()
+                    if self.state.phase != "drain":
+                        self.state.advance(self.clock(), fill_ready=True)
+                        self.emit("phase", phase="steady", at_s=self.clock())
                     break
                 if (
                     self.fill_sent >= self.config.fill_max_requests
@@ -1366,6 +1473,7 @@ class PressureSession:
         self.emit("seed_summary", **seed)
         result = dict(
             seed=seed,
+            rewarm=self._rewarm_result(),
             failure=self.state.failure,
             measurement_start=self.state.measurement_start,
             measurement_end=self.state.measurement_end,
@@ -1406,11 +1514,13 @@ class PressureSession:
             except Exception as exc:
                 self.fail("profile_stop_failed")
                 self.emit("error", error=repr(exc), at_s=self.clock())
-        # A failed seed cannot make progress into another phase. Request
+        # Failed setup traffic cannot make progress into another phase. Request
         # cancellation immediately, then use the bounded drain to reap it.
         if self.state.failure and (
             self.state.failure == "sender_saturated"
-            or any(kind == "seed" for kind in self.job_kinds.values())
+            or any(
+                kind in ("seed", "rewarm") for kind in self.job_kinds.values()
+            )
         ):
             self._cancel_pending()
         while self.clock() < deadline:

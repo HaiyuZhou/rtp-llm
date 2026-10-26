@@ -2037,6 +2037,7 @@ class CacheGridRunner:
         rng = random.Random(self.pressure_random_seed)
         order = list(range(len(cases)))
         seed_index = 0
+        rewarm_index = 0
         tiered_planner = None
         cursors = {}
         instances = {
@@ -2095,8 +2096,24 @@ class CacheGridRunner:
             record["client_receive_s"] = time.monotonic()
             return record
 
+        def get_tiered_planner():
+            nonlocal tiered_planner
+            if tiered_planner is None:
+                effective_seed_count = freeze_seed_families(
+                    self._continuous_seed_ids
+                )
+                tiered_planner = TieredRollingPlanner(
+                    effective_seed_count=effective_seed_count,
+                    cohort_size=(
+                        config.cohort_size or self.pressure_client_concurrency
+                    ),
+                    memory_reuse_ratio=config.memory_reuse_ratio,
+                    case_indices=tuple(range(len(cases))),
+                )
+            return tiered_planner
+
         def make_payload(kind, job_id, formal_sequence):
-            nonlocal seed_index, tiered_planner
+            nonlocal seed_index, rewarm_index
             nonce = f"{session_id}_{job_id}"
             with producer_lock:
                 if kind in ("seed", "fill"):
@@ -2114,24 +2131,25 @@ class CacheGridRunner:
                         self._continuous_seed_ids[family] = ids
                         payload["family"] = family
                     return payload
-                if formal_sequence is None:
+                if kind == "rewarm":
+                    if config.family_schedule != "tiered_rolling":
+                        raise ValueError("rewarm requires tiered rolling")
+                    assignments = get_tiered_planner().initial_device_assignments()
+                    if rewarm_index >= len(assignments):
+                        raise ValueError("rewarm assignment overflow")
+                    assignment = assignments[rewarm_index]
+                    rewarm_index += 1
+                    index = assignment.cohort_lane
+                elif formal_sequence is None:
                     raise ValueError("formal payload requires a supervisor sequence")
-                index = formal_sequence
-                assignment = None
-                if config.family_schedule == "tiered_rolling":
-                    if tiered_planner is None:
-                        effective_seed_count = freeze_seed_families(
-                            self._continuous_seed_ids
-                        )
-                        tiered_planner = TieredRollingPlanner(
-                            effective_seed_count=effective_seed_count,
-                            cohort_size=(
-                                config.cohort_size or self.pressure_client_concurrency
-                            ),
-                            memory_reuse_ratio=config.memory_reuse_ratio,
-                            case_indices=tuple(range(len(cases))),
-                        )
-                    assignment = tiered_planner.assignment(index)
+                else:
+                    index = formal_sequence
+                    assignment = (
+                        get_tiered_planner().assignment(index)
+                        if config.family_schedule == "tiered_rolling"
+                        else None
+                    )
+                if assignment is not None:
                     case_index = assignment.case_index
                     family = assignment.family
                 else:
@@ -2161,6 +2179,8 @@ class CacheGridRunner:
                         promoted_from_cohort=assignment.promoted_from_cohort,
                         effective_seed_count=tiered_planner.effective_seed_count,
                     )
+                if kind == "rewarm":
+                    payload["rewarm"] = True
                 return payload
 
         def request(payload, register, before):

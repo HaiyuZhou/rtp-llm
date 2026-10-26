@@ -239,6 +239,18 @@ class TieredRollingPlannerTest(unittest.TestCase):
         self.assertTrue(all(item.cohort_id == 1 for item in second))
         self.assertTrue(all(item.promoted_from_cohort == 0 for item in second_device))
 
+    def test_initial_rewarm_matches_first_device_half_without_consuming_cohort(self):
+        planner = self.planner()
+
+        rewarm = planner.initial_device_assignments()
+        first = planner.next_cohort()
+        first_device = [item for item in first if item.expected_cache_tier == "device"]
+
+        self.assertEqual(rewarm, tuple(first_device))
+        self.assertEqual([item.family for item in rewarm], list(range(984, 1000)))
+        self.assertTrue(all(item.cohort_id == 0 for item in rewarm))
+        self.assertTrue(all(item.promoted_from_cohort is None for item in rewarm))
+
     def test_effective_seed_boundary_wraps_without_using_the_initial_hot_tail(self):
         planner = self.planner(seed_count=48)
 
@@ -879,6 +891,287 @@ class LifecycleTest(unittest.TestCase):
         )
         self.assertGreater(state.last_poll_s, result["measurement_end"])
 
+    def test_tiered_real_pressure_rewarms_device_half_before_steady(self):
+        kinds = []
+        cfg = config(
+            family_schedule="tiered_rolling",
+            memory_reuse_ratio=0.5,
+            fill_host_max_ratio=0.8,
+            rate_control="adaptive_backlog",
+            request_rate_min=1,
+            request_rate_max=2,
+            backlog_low=1,
+            backlog_high=3,
+            max_outstanding=8,
+            cohort_size=4,
+            measure_s=1,
+            steady_s=0.5,
+            sample_period_s=0.25,
+        )
+
+        result, events, _, _ = self.run_session(
+            cfg=cfg,
+            seed_count=8,
+            rate=0,
+            payload_hook=lambda kind, sequence, clock: kinds.append(kind),
+        )
+
+        self.assertIsNone(result["failure"])
+        self.assertEqual(result["rewarm"], {
+            "planned": 2,
+            "submitted": 2,
+            "completed": 2,
+            "failed": 0,
+            "pending": 0,
+        })
+        self.assertEqual(kinds.count("rewarm"), 2)
+        dispatch = [event for event in events if event["event"] == "dispatch"]
+        rewarm_indices = [
+            index for index, event in enumerate(dispatch) if event["phase"] == "rewarm"
+        ]
+        formal_indices = [
+            index
+            for index, event in enumerate(dispatch)
+            if event["phase"] in ("steady", "measurement", "support")
+        ]
+        self.assertEqual(len(rewarm_indices), 2)
+        self.assertLess(max(rewarm_indices), min(formal_indices))
+
+    def test_tiered_fixed_supply_rewarms_half_the_client_concurrency(self):
+        result, _, _, _ = self.run_session(
+            seed_count=8,
+            concurrency=4,
+            rate=0,
+            cfg=config(
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.5,
+                fill_host_max_ratio=0.8,
+                measure_s=1,
+                steady_s=0.5,
+                sample_period_s=0.25,
+            ),
+        )
+
+        self.assertIsNone(result["failure"])
+        self.assertEqual(result["rewarm"]["planned"], 2)
+        self.assertEqual(result["rewarm"]["completed"], 2)
+
+    def test_tiered_fixed_supply_requires_even_client_concurrency(self):
+        with self.assertRaisesRegex(ValueError, "even effective cohort"):
+            self.run_session(
+                seed_count=8,
+                concurrency=3,
+                rate=0,
+                cfg=config(
+                    family_schedule="tiered_rolling",
+                    memory_reuse_ratio=0.5,
+                    fill_host_max_ratio=0.8,
+                ),
+            )
+
+    def test_rewarm_submits_in_waves_when_cohort_half_exceeds_sender_limit(self):
+        result, _, _, _ = self.run_session(
+            seed_count=12,
+            concurrency=4,
+            rate=0,
+            cfg=config(
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.5,
+                fill_host_max_ratio=0.8,
+                rate_control="adaptive_backlog",
+                request_rate_min=1,
+                request_rate_max=2,
+                backlog_low=0,
+                backlog_high=1,
+                max_outstanding=2,
+                cohort_size=8,
+                measure_s=1,
+                steady_s=0.5,
+                sample_period_s=0.25,
+            ),
+        )
+
+        self.assertIsNone(result["failure"])
+        self.assertEqual(result["rewarm"]["planned"], 4)
+        self.assertEqual(result["rewarm"]["submitted"], 4)
+        self.assertEqual(result["rewarm"]["completed"], 4)
+
+    def test_rewarm_stops_before_next_wave_when_host_headroom_is_exhausted(self):
+        rewarm_payloads = [0]
+
+        def count_rewarm(kind, sequence, clock):
+            if kind == "rewarm":
+                rewarm_payloads[0] += 1
+
+        def exhaust_after_first_wave(evidence, count, clock):
+            if rewarm_payloads[0] < 2:
+                return evidence
+            sample = evidence.samples[0]
+            pools = tuple(
+                replace(pool, used=85) if pool.pool_id == "host" else pool
+                for pool in sample.pools
+            )
+            return replace(evidence, samples=(replace(sample, pools=pools),))
+
+        result, _, _, _ = self.run_session(
+            seed_count=12,
+            concurrency=4,
+            rate=0,
+            payload_hook=count_rewarm,
+            poll_transform=exhaust_after_first_wave,
+            cfg=config(
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.5,
+                fill_host_max_ratio=0.8,
+                rate_control="adaptive_backlog",
+                request_rate_min=1,
+                request_rate_max=2,
+                backlog_low=0,
+                backlog_high=1,
+                max_outstanding=2,
+                cohort_size=8,
+            ),
+        )
+
+        self.assertEqual(result["failure"], "fill_headroom_exhausted")
+        self.assertEqual(result["rewarm"]["submitted"], 2)
+
+    def test_rewarm_rechecks_host_headroom_before_steady(self):
+        rewarm_started = [False]
+
+        def mark_rewarm(kind, sequence, clock):
+            if kind == "rewarm":
+                rewarm_started[0] = True
+
+        def exhaust_after_rewarm(evidence, count, clock):
+            if not rewarm_started[0]:
+                return evidence
+            sample = evidence.samples[0]
+            pools = tuple(
+                replace(pool, used=85) if pool.pool_id == "host" else pool
+                for pool in sample.pools
+            )
+            return replace(evidence, samples=(replace(sample, pools=pools),))
+
+        result, events, _, _ = self.run_session(
+            seed_count=8,
+            rate=0,
+            payload_hook=mark_rewarm,
+            poll_transform=exhaust_after_rewarm,
+            cfg=config(
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.5,
+                fill_host_max_ratio=0.8,
+                rate_control="adaptive_backlog",
+                request_rate_min=1,
+                request_rate_max=2,
+                backlog_low=1,
+                backlog_high=3,
+                max_outstanding=8,
+                cohort_size=4,
+                measure_s=1,
+                steady_s=0.5,
+                sample_period_s=0.25,
+            ),
+        )
+
+        self.assertEqual(result["failure"], "fill_headroom_exhausted")
+        self.assertFalse(
+            any(
+                event["event"] == "dispatch" and event["kind"] == "formal"
+                for event in events
+            )
+        )
+
+    def test_failed_rewarm_immediately_cancels_pending_siblings(self):
+        active = [None]
+        rewarm_handles = []
+
+        class FailedThenPendingRewarmHandle:
+            def __init__(self, executor, work, on_done=None):
+                self.phase = None
+                self.cancelled = False
+                self.done_checks = 0
+                active[0] = self
+                self.value = work(lambda call: None)
+                active[0] = None
+                if self.phase == "rewarm":
+                    rewarm_handles.append(self)
+                    self.rewarm_position = len(rewarm_handles)
+                    if self.rewarm_position == 1:
+                        self.value["success"] = False
+
+            def done(self):
+                if (
+                    self.phase == "rewarm"
+                    and getattr(self, "rewarm_position", 0) == 2
+                ):
+                    self.done_checks += 1
+                    return self.cancelled
+                return True
+
+            def result(self):
+                return self.value
+
+            def cancel(self):
+                self.cancelled = True
+                return True
+
+        def observe(identity):
+            active[0].phase = identity.rsplit(":", 2)[-2]
+
+        with patch.object(cp, "CancellableRequestHandle", FailedThenPendingRewarmHandle):
+            result, events, _, _ = self.run_session(
+                seed_count=8,
+                rate=0,
+                request_observer=observe,
+                cfg=config(
+                    family_schedule="tiered_rolling",
+                    memory_reuse_ratio=0.5,
+                    fill_host_max_ratio=0.8,
+                    rate_control="adaptive_backlog",
+                    request_rate_min=1,
+                    request_rate_max=2,
+                    backlog_low=1,
+                    backlog_high=3,
+                    max_outstanding=8,
+                    cohort_size=4,
+                    drain_timeout_s=1,
+                ),
+            )
+
+        self.assertEqual(result["failure"], "request_failed", events)
+        self.assertEqual(len(rewarm_handles), 2)
+        self.assertTrue(rewarm_handles[1].cancelled)
+        self.assertLessEqual(rewarm_handles[1].done_checks, 2)
+
+    def test_rewarm_payload_failures_are_counted(self):
+        def fail_rewarm_payload(kind, sequence, clock):
+            if kind == "rewarm":
+                raise RuntimeError("rewarm payload failed")
+
+        result, _, _, _ = self.run_session(
+            seed_count=8,
+            rate=0,
+            payload_hook=fail_rewarm_payload,
+            cfg=config(
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.5,
+                fill_host_max_ratio=0.8,
+                rate_control="adaptive_backlog",
+                request_rate_min=1,
+                request_rate_max=2,
+                backlog_low=1,
+                backlog_high=3,
+                max_outstanding=8,
+                cohort_size=4,
+            ),
+        )
+
+        self.assertEqual(result["failure"], "request_failed")
+        self.assertEqual(result["rewarm"]["submitted"], 2)
+        self.assertEqual(result["rewarm"]["failed"], 2)
+
     def test_insufficient_residency_stops_at_request_budget(self):
         result, events, _, _ = self.run_session(
             valid=False, cfg=config(fill_max_requests=3)
@@ -1110,10 +1403,25 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(result["seed"]["planned"], 8)
         self.assertEqual(result["seed"]["submitted"], 8)
         self.assertEqual(result["seed"]["completed"], 8)
+        self.assertEqual(result["failure"], "fill_headroom_exhausted")
+        self.assertFalse(
+            any(
+                event["event"] == "dispatch" and event["phase"] == "fill"
+                for event in events
+            )
+        )
         self.assertTrue(
             any(event["event"] == "seed_limit" for event in events),
             "the effective seed boundary must be persisted",
         )
+
+    def test_round_robin_seed_does_not_apply_tiered_host_headroom_guard(self):
+        result, _, _, _ = self.run_session(
+            seed_count=4,
+            cfg=config(fill_host_max_ratio=0.2, measure_s=1, steady_s=0.5),
+        )
+
+        self.assertIsNone(result["failure"])
 
     def test_fill_stops_before_consuming_reserved_host_headroom(self):
         def exhaust_headroom(evidence, count, clock):

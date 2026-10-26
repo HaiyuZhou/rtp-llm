@@ -97,13 +97,13 @@ seed_count = max_g minimum[g]
 ## 5. 阶段与期限
 
 ```text
-validate/live plan -> rolling seed -> unique fill -> steady -> measurement
-                                                           -> optional support -> drain
+validate/live plan -> rolling seed -> unique fill -> tiered rewarm -> steady -> measurement
+                                                                             -> optional support -> drain
 ```
 
 seed 懒生成至在途上限，任一成功完成后立即补下一个 family；不会每 16 个全体排空再开下一批。恰好提交 seed_count 个后有界排空。`seed_timeout_s` 是独立期限，不占 fill 的时间。必须保留 planned/submitted/completed/failed/cancelled/pending；缺失、失败、取消、未完成或计划数不一致都不能进入有效 measurement。
 
-fill 通过真实新输入、DEVICE 高水位触发和成功 D2H 发布建立压力；随后正式 grid 连续供给 steady、measurement、support，阶段之间不清缓存、不暂停排空，不额外 pin/刷新 seed。测量边界固定为 `[t0,t1)`；窗口内发出、窗口外完成的请求仍属该 cohort，但 drain 完成不增加窗口内吞吐。
+fill 通过真实新输入、DEVICE 高水位触发和成功 D2H 发布建立压力。使用 `tree_pressure + tiered_rolling` 时，fill 达标后先重热 cohort 0 的 device half（32-request cohort 对应 16 个 family）；它使用与正式首批 device lane 相同的 family/case，但不推进正式 sequence，也不形成 cohort 屏障。重热全部成功且重热后的新诊断快照仍低于 `fill_host_max_ratio`，才进入 steady；否则以 `rewarm_incomplete` 或 `fill_headroom_exhausted` 终止。随后正式 grid 连续供给 steady、measurement、support，阶段之间不清缓存、不暂停排空。测量边界固定为 `[t0,t1)`；窗口内发出、窗口外完成的请求仍属该 cohort，但 drain 完成不增加窗口内吞吐。
 
 | profile 字段 | production / smoke | CLI 覆盖 |
 | --- | --- | --- |

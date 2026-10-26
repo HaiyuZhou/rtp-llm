@@ -67,6 +67,34 @@ from rtp_llm.test.perf_test.cache_grid.runner.scheduler import configure_schedul
 from rtp_llm.test.perf_test.perf_utils import _sanitize_nested_provenance
 
 
+_STARTUP_PRESSURE_RETRY_BUDGET_S = 10.0
+_STARTUP_PRESSURE_RETRY_DELAY_S = 0.25
+_TRANSIENT_PRESSURE_RANK_ERRORS = (
+    "connect failed",
+    "connection refused",
+    "failed to connect",
+    "temporarily unavailable",
+)
+
+
+def _is_transient_pressure_rank_failure(response, error: ValueError) -> bool:
+    errors = [rank.error.strip().lower() for rank in response.ranks if rank.error]
+    raised = str(error).strip().lower()
+    rank_failures = {
+        f"rank {rank.world_rank}: {rank.error}".strip().lower()
+        for rank in response.ranks
+        if rank.error
+    }
+    return (
+        bool(errors)
+        and raised in rank_failures
+        and all(
+            any(marker in error for marker in _TRANSIENT_PRESSURE_RANK_ERRORS)
+            for error in errors
+        )
+    )
+
+
 def profile_trace_name(session_id: str, case_key: str, run_index: int) -> str:
     """Return a stable Kineto-safe trace name below the engine's 64-byte limit."""
     case_digest = hashlib.sha256(case_key.encode("utf-8")).hexdigest()[:16]
@@ -3176,17 +3204,51 @@ class CacheGridRunner:
         self._save(complete=False)
         with grpc.insecure_channel(f"127.0.0.1:{self.port + 1}") as channel:
             stub = rpc.RpcServiceStub(channel)
-            sent = time.perf_counter()
-            response = stub.GetCachePressure(
-                pb.CachePressureRequestPB(target_ranks=ranks),
-                timeout=min(self.request_timeout, self.pressure_config.fill_timeout_s),
+            retry_deadline = time.monotonic() + min(
+                _STARTUP_PRESSURE_RETRY_BUDGET_S,
+                self.pressure_config.fill_timeout_s,
             )
-            received = time.perf_counter()
-            raw = raw_pressure_record(response, sent, received)
-            (self._pressure_epoch_dir / "startup_pressure.json").write_text(
-                json.dumps(raw, allow_nan=False, indent=2) + "\n"
-            )
-            decoded = decode_pressure_response(response, sent, received, ranks)
+            startup_attempts = []
+            while True:
+                sent = time.perf_counter()
+                response = stub.GetCachePressure(
+                    pb.CachePressureRequestPB(target_ranks=ranks),
+                    timeout=min(
+                        self.request_timeout,
+                        self.pressure_config.fill_timeout_s,
+                        max(0.1, retry_deadline - time.monotonic()),
+                    ),
+                )
+                received = time.perf_counter()
+                raw = raw_pressure_record(response, sent, received)
+                startup_attempts.append(raw)
+                (self._pressure_epoch_dir / "startup_pressure.json").write_text(
+                    json.dumps(raw, allow_nan=False, indent=2) + "\n"
+                )
+                (
+                    self._pressure_epoch_dir / "startup_pressure_attempts.json"
+                ).write_text(
+                    json.dumps(startup_attempts, allow_nan=False, indent=2) + "\n"
+                )
+                try:
+                    decoded = decode_pressure_response(
+                        response, sent, received, ranks
+                    )
+                    break
+                except ValueError as error:
+                    remaining = retry_deadline - time.monotonic()
+                    if (
+                        remaining <= 0
+                        or not _is_transient_pressure_rank_failure(response, error)
+                    ):
+                        raise
+                    logging.warning(
+                        "startup pressure snapshot has transient rank errors; "
+                        "retrying attempt=%d remaining_s=%.3f",
+                        len(startup_attempts),
+                        remaining,
+                    )
+                    time.sleep(min(_STARTUP_PRESSURE_RETRY_DELAY_S, remaining))
             targets = select_targets(decoded.samples, ranks)
             seed_plan = build_seed_plan(
                 decoded.samples,

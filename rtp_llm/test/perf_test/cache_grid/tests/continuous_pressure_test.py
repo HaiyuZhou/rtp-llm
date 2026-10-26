@@ -2272,11 +2272,32 @@ class RunnerIntegrationTest(unittest.TestCase):
         from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2_grpc as rpc
 
         clock, observations, sessions = FakeClock(), [], []
+        startup_connect_failures = 1 if fault == "startup_connect_once" else 0
         submissions = [] if submissions is None else submissions
         original = cp.PressureSession
 
         def poll(request, timeout):
+            nonlocal startup_connect_failures
             startup = not request.session_id
+            if startup and (
+                startup_connect_failures
+                or fault in (
+                    "startup_connect_always",
+                    "startup_nontransport",
+                    "startup_malformed_connect",
+                )
+            ):
+                if startup_connect_failures:
+                    startup_connect_failures -= 1
+                response = self._startup_pressure(clock, 1, startup=True)
+                response.ranks[1].error = (
+                    "pressure diagnostics unavailable"
+                    if fault == "startup_nontransport"
+                    else "Connect Failed"
+                )
+                if fault == "startup_malformed_connect":
+                    response.schema_version = 2
+                return response
             if startup:
                 self.assertEqual(observations, [])
                 self.assertIsNone(runner._pressure_seed_plan)
@@ -2363,6 +2384,8 @@ class RunnerIntegrationTest(unittest.TestCase):
             ),
         ), patch.object(cp, "PressureSession", session), patch(
             "time.monotonic", clock
+        ), patch(
+            "time.sleep", clock.sleep
         ), patch(
             "rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner._post_prefill_ids",
             side_effect=post,
@@ -2491,6 +2514,100 @@ class RunnerIntegrationTest(unittest.TestCase):
                     for ids in formal
                 )
             )
+
+    def test_startup_snapshot_retries_transient_rank_connection_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(directory)
+            result, submissions, _ = self._run_startup_epoch(
+                runner, "startup_connect_once"
+            )
+
+            self.assertEqual(result, [])
+            self.assertTrue(submissions)
+            attempts = json.loads(
+                (
+                    runner._pressure_epoch_dir
+                    / "startup_pressure_attempts.json"
+                ).read_text()
+            )
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(
+                attempts[0]["response"]["ranks"][1]["error"], "Connect Failed"
+            )
+            self.assertNotIn("error", attempts[1]["response"]["ranks"][1])
+
+    def test_startup_snapshot_first_success_records_one_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(directory)
+            result, submissions, _ = self._run_startup_epoch(runner)
+
+            self.assertEqual(result, [])
+            self.assertTrue(submissions)
+            attempts = json.loads(
+                (
+                    runner._pressure_epoch_dir
+                    / "startup_pressure_attempts.json"
+                ).read_text()
+            )
+            self.assertEqual(len(attempts), 1)
+
+    def test_startup_snapshot_persistent_connection_failure_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(directory)
+            submissions = []
+
+            with self.assertRaisesRegex(ValueError, "Connect Failed"):
+                self._run_startup_epoch(
+                    runner, "startup_connect_always", submissions=submissions
+                )
+
+            self.assertEqual(submissions, [])
+            attempts = json.loads(
+                (
+                    runner._pressure_epoch_dir
+                    / "startup_pressure_attempts.json"
+                ).read_text()
+            )
+            self.assertGreater(len(attempts), 1)
+            self.assertLessEqual(len(attempts), 42)
+
+    def test_startup_snapshot_nontransport_error_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(directory)
+            submissions = []
+
+            with self.assertRaisesRegex(ValueError, "unavailable"):
+                self._run_startup_epoch(
+                    runner, "startup_nontransport", submissions=submissions
+                )
+
+            self.assertEqual(submissions, [])
+            attempts = json.loads(
+                (
+                    runner._pressure_epoch_dir
+                    / "startup_pressure_attempts.json"
+                ).read_text()
+            )
+            self.assertEqual(len(attempts), 1)
+
+    def test_startup_snapshot_malformed_response_is_not_masked_by_rank_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._startup_runner(directory)
+            submissions = []
+
+            with self.assertRaisesRegex(ValueError, "unsupported pressure schema"):
+                self._run_startup_epoch(
+                    runner, "startup_malformed_connect", submissions=submissions
+                )
+
+            self.assertEqual(submissions, [])
+            attempts = json.loads(
+                (
+                    runner._pressure_epoch_dir
+                    / "startup_pressure_attempts.json"
+                ).read_text()
+            )
+            self.assertEqual(len(attempts), 1)
 
     def test_manual_startup_plan_records_nonformal_count(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -338,6 +338,15 @@ TEST(BlockTreeLoaderTest, MockMemoryAbortFailureAndExpiredLoadRetainOnlyReservoi
         context->waitDone();
         EXPECT_FALSE(context->success());
         EXPECT_EQ(context->matchedBlocks(Tier::HOST), 0u);
+        auto outcomes = environment->cache->metrics_reporter_->mockMemoryMetricsSnapshot();
+        EXPECT_EQ(outcomes.successful_h2d_blocks, 0u);
+        EXPECT_EQ(outcomes.failed_h2d_blocks, 2u);
+        // Neither redundant failure notification nor pending cancellation may
+        // count the same physical/expiry/admission outcome a second time.
+        EXPECT_FALSE(context->onTaskFail());
+        EXPECT_FALSE(context->abortPending());
+        outcomes = environment->cache->metrics_reporter_->mockMemoryMetricsSnapshot();
+        EXPECT_EQ(outcomes.failed_h2d_blocks, 2u);
         EXPECT_EQ(environment->cache->tree()->size(), 0u);
         for (const auto& [pool, block] : request_targets) {
             EXPECT_EQ(pool->refCount(block), 1u);

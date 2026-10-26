@@ -127,7 +127,11 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
                             task->descriptors().size());
         scheduleStoreSettlement(task, ErrorInfo(ErrorCode::DEADLINE_EXCEEDED, "store business queue timeout"));
     };
-    const auto deadline = task->transfer_task.deadline();
+    const auto                   deadline = task->transfer_task.deadline();
+    std::unique_lock<std::mutex> outcome_lock(task->mock_memory_outcome_mutex, std::defer_lock);
+    if (task->mock_memory_cache && task->target_tier == Tier::HOST) {
+        outcome_lock.lock();
+    }
     if (!task_pool_->submit(
             BlockTreeTaskClass::BACKGROUND,
             [this, task, queue_begin]() {
@@ -146,8 +150,8 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
                             task->descriptors().size());
         return;
     }
-    // Admission and settlement share mutex_: even an immediate copy completion
-    // cannot publish its terminal outcome before this submitted count.
+    // Only the task-local lock orders immediate terminal callbacks after the
+    // accepted submission; unrelated tree work cannot delay outcome evidence.
     if (task->mock_memory_cache && task->target_tier == Tier::HOST) {
         metrics_reporter_.recordMockMemoryD2HSubmitted(task->descriptors().size());
     }
@@ -174,6 +178,9 @@ void BlockTreeStorer::runStoreTask(const StoreTaskPtr& task) {
 }
 
 void BlockTreeStorer::scheduleStoreSettlement(const StoreTaskPtr& task, ErrorInfo error) {
+    // Queue timeout/shutdown/submission exceptions have no physical callback.
+    // The task guard prevents a physical outcome being counted again here.
+    task->recordMockMemoryTransferOutcome(metrics_reporter_, error.ok());
     auto          settle      = [this, task, error = std::move(error)]() mutable { settleTask(*task, error.ok()); };
     const int64_t queue_begin = currentTimeUs();
     if (!task_pool_->submitCompletion([this, settle, queue_begin]() mutable {
@@ -196,11 +203,6 @@ void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stopping = stopping_.load();
-        if (task.mock_memory_cache && task.target_tier == Tier::HOST) {
-            // Count the copy outcome even if duplicate publication or shutdown
-            // declines the new tree resource. Queue expiry is a failed store.
-            metrics_reporter_.recordMockMemoryD2HFinished(task.descriptors().size(), copy_success);
-        }
         accepted = settleLocked(task, copy_success && !stopping);
     }
 

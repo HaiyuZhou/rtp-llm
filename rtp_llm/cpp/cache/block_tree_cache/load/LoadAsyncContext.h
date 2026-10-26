@@ -59,12 +59,12 @@ public:
                      LoadSourceKind                                 source_kind     = LoadSourceKind::TREE);
     ~LoadAsyncContext() override;
 
-    bool     empty() const;
-    uint64_t contextId() const;
-    size_t   localMatchedBlocks() const;
-    size_t   matchedBlocks() const;
-    size_t   matchedBlocks(Tier tier) const;
-    bool     needBackendMatch() const;
+    bool           empty() const;
+    uint64_t       contextId() const;
+    size_t         localMatchedBlocks() const;
+    size_t         matchedBlocks() const;
+    size_t         matchedBlocks(Tier tier) const;
+    bool           needBackendMatch() const;
     LoadSourceKind sourceKind() const {
         return source_kind_;
     }
@@ -74,6 +74,10 @@ public:
     }
     void setMatchCallback(MatchCallback callback);
     void setSettlementReadyCallback(SettlementReadyCallback callback);
+    // Observe transfer terminal notification separately from deferred resource
+    // settlement. Pre-transfer abort/rejection reports a failed outcome.
+    void setTransferOutcomeCallback(DoneCallback callback);
+    void reportTransferOutcome(bool success);
     void startBackendMatch();
     void setTargetBlocks(size_t desc_index, std::vector<BlockIdxType> target_blocks);
     void setBackendTargetBlock(size_t key_index, size_t handle_index, BlockIdxType target_block);
@@ -143,6 +147,7 @@ private:
     bool                      settlement_ready_{false};
     SettlementReadyCallback   settlement_ready_callback_;
     std::vector<DoneCallback> callbacks_;
+    DoneCallback              transfer_outcome_callback_;
 
     friend class LoadContextCoordinator;
 };

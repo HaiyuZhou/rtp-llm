@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -36,11 +37,17 @@ public:
             return transfer_task.descriptors();
         }
 
+        void recordMockMemoryTransferOutcome(BlockTreeCacheMetricsReporter& metrics_reporter, bool success);
+
         Tier          target_tier{Tier::NONE};
         CacheKeysType cache_keys;
         TransferTask  transfer_task;
         Phase         phase{Phase::CREATED};
         bool          mock_memory_cache{false};
+        // Serializes accepted submission with terminal accounting, independently
+        // of the tree mutex and the deferred publication queue.
+        std::mutex mock_memory_outcome_mutex;
+        bool       mock_memory_outcome_recorded{false};
     };
     using TaskPtr = std::shared_ptr<Task>;
 

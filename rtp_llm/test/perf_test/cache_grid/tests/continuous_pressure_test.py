@@ -316,6 +316,113 @@ class InlineExecutor:
         self.closed = True
 
 
+class MockTerminalEvidenceTest(unittest.TestCase):
+    def test_mock_policy_requires_supported_terminal_counter_semantics(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        baseline = self.sample(1, 0.5)
+        # Old servers have the mock counters but date them by settlement.
+        for version in (None, 0, 2):
+            with self.subTest(version=version):
+                fields = asdict(baseline.mock_memory)
+                fields.pop("terminal_outcome_version", None)
+                if version is not None:
+                    fields["terminal_outcome_version"] = version
+                old = replace(baseline, mock_memory=SimpleNamespace(**fields))
+                with self.assertRaisesRegex(ValueError, "terminal"):
+                    PressureCoverage((old,), config(evidence_policy="mock_memory"))
+
+    def sample(self, sequence, now, *, completed=0, h2d_failed=0, d2h_failed=0):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            GroupSample,
+            MockMemorySample,
+            PoolSample,
+            RankSample,
+        )
+
+        return RankSample(
+            0,
+            "service",
+            sequence,
+            now,
+            now,
+            now,
+            (
+                PoolSample("gpu", 100, 0, 0, 0.8, 0.9),
+                PoolSample("host", 100, 0, 0, 0.8, 0.9),
+            ),
+            (GroupSample(0, "FULL", ("gpu",), "host", 0, 0),),
+            mock_memory=MockMemorySample(
+                16,
+                8,
+                completed,
+                h2d_failed,
+                completed,
+                completed,
+                d2h_failed,
+                terminal_outcome_version=1,
+            ),
+        )
+
+    def test_failure_envelopes_overlapping_either_window_boundary_reject(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        # The break caught here is accepting positive transfers while silently
+        # discarding a failure because its sampled envelope straddles a boundary.
+        for direction in ("h2d", "d2h"):
+            for failure_at in (1.5, 2.5):
+                with self.subTest(direction=direction, failure_at=failure_at):
+                    coverage = PressureCoverage(
+                        (self.sample(1, 0.5),), config(evidence_policy="mock_memory")
+                    )
+                    for sequence, now in enumerate((1.0, 1.5, 2.0, 2.5), 2):
+                        failed = int(now >= failure_at)
+                        sample = self.sample(
+                            sequence,
+                            now,
+                            completed=4 if now >= 2 else 0,
+                            **{f"{direction}_failed": failed},
+                        )
+                        coverage.add((sample,), now)
+                    result = coverage.assess_migration(1.25, 2.25)
+                    self.assertFalse(result.valid)
+                    self.assertIn(f"failed_{direction}:0:0", result.reasons)
+
+    def test_delayed_settlement_cannot_move_terminal_evidence_across_boundaries(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        # Counters model physical terminal notifications. The later settlement
+        # poll carries unchanged counters and must neither create nor hide work.
+        for terminal_at, settlement_at, expected in (
+            (1.0, 2.0, False),
+            (2.0, 3.0, True),
+        ):
+            with self.subTest(terminal_at=terminal_at, settlement_at=settlement_at):
+                coverage = PressureCoverage(
+                    (self.sample(1, 0.0),), config(evidence_policy="mock_memory")
+                )
+                for sequence, now in enumerate((0.5, 1.0, 1.5, 2.0, 2.5, 3.0), 2):
+                    coverage.add(
+                        (
+                            self.sample(
+                                sequence, now, completed=4 if now >= terminal_at else 0
+                            ),
+                        ),
+                        now,
+                    )
+                result = coverage.assess_migration(1.5, 2.5)
+                self.assertEqual(result.valid, expected)
+                if expected:
+                    self.assertEqual(result.groups[0].d2h_intervals, ((1.5, 2.0),))
+                    self.assertEqual(result.groups[0].h2d_intervals, ((1.5, 2.0),))
+
+
 class LifecycleTest(unittest.TestCase):
     def test_mock_memory_policy_runs_formal_measurement_without_tree_pressure(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
@@ -355,11 +462,12 @@ class LifecycleTest(unittest.TestCase):
                         mock_memory=MockMemorySample(
                             eligible_blocks=sequence * 8,
                             planned_host_blocks=sequence * 4,
-                            successful_h2d_blocks=max(0, sequence - 1) * 4,
-                            failed_h2d_blocks=0,
-                            d2h_submitted_blocks=max(0, sequence - 1) * 4,
-                            d2h_completed_blocks=max(0, sequence - 1) * 4,
-                            d2h_failed_blocks=0,
+                            successful_h2d_blocks=100 + max(0, sequence - 1) * 4,
+                            failed_h2d_blocks=7 if sequence > 1 else 0,
+                            d2h_submitted_blocks=100 + max(0, sequence - 1) * 4,
+                            d2h_completed_blocks=100 + max(0, sequence - 1) * 4,
+                            d2h_failed_blocks=9 if sequence > 1 else 0,
+                            terminal_outcome_version=1,
                         ),
                     ),
                 ),
@@ -367,8 +475,9 @@ class LifecycleTest(unittest.TestCase):
                 evidence.activity,
             )
 
-        result, events, _, _ = self.run_session(
+        result, events, _, session = self.run_session(
             valid=False,
+            seed_count=3,
             controller=controller,
             poll_transform=mock_only,
             rate=0,
@@ -392,6 +501,12 @@ class LifecycleTest(unittest.TestCase):
 
         dispatches = [event for event in events if event["event"] == "dispatch"]
         self.assertIsNone(result["failure"], events)
+        self.assertEqual(result["seed"]["completed"], 3)
+        self.assertTrue(any(event["event"] == "fill_baseline" for event in events))
+        baseline = session.coverage.baselines[0].mock_memory
+        self.assertGreater(baseline.successful_h2d_blocks, 100)
+        self.assertEqual(baseline.failed_h2d_blocks, 7)
+        self.assertEqual(baseline.d2h_failed_blocks, 9)
         self.assertIsNotNone(result["measurement_start"])
         self.assertEqual(controller.started, result["measurement_start"])
         self.assertFalse(any(event["phase"] == "fill" for event in dispatches))
@@ -399,6 +514,18 @@ class LifecycleTest(unittest.TestCase):
         self.assertTrue(result["migration"]["valid"])
         for group in result["migration"]["groups"]:
             self.assertTrue(group["valid"])
+            self.assertTrue(
+                all(
+                    item["before_blocks"] >= baseline.successful_h2d_blocks
+                    for item in group["h2d_evidence"]
+                )
+            )
+            self.assertTrue(
+                all(
+                    item["before_blocks"] >= baseline.d2h_completed_blocks
+                    for item in group["d2h_evidence"]
+                )
+            )
             self.assertTrue(
                 all(
                     item["source"] == "mock_memory_successful_h2d_blocks"
@@ -443,6 +570,7 @@ class LifecycleTest(unittest.TestCase):
                     d2h_submitted_blocks=completed,
                     d2h_completed_blocks=completed,
                     d2h_failed_blocks=failed,
+                    terminal_outcome_version=1,
                 ),
             )
 
@@ -1989,6 +2117,11 @@ class RunnerIntegrationTest(unittest.TestCase):
             rank.mock_memory.d2h_submitted_blocks = 9
             rank.mock_memory.d2h_completed_blocks = 8
             rank.mock_memory.d2h_failed_blocks = 1
+            # Literal protobuf tag 8, varint value 1 also checks compatibility
+            # when the binding predates the terminal-outcome capability.
+            rank.mock_memory.ParseFromString(
+                rank.mock_memory.SerializeToString() + b"\x40\x01"
+            )
 
         decoded = decode_pressure_response(response, clock(), clock(), (0, 1))
 
@@ -2004,6 +2137,7 @@ class RunnerIntegrationTest(unittest.TestCase):
                     "d2h_submitted_blocks": 9,
                     "d2h_completed_blocks": 8,
                     "d2h_failed_blocks": 1,
+                    "terminal_outcome_version": 1,
                 },
             )
 

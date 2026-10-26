@@ -167,7 +167,7 @@ std::shared_ptr<LoadAsyncContext> BlockTreeCache::mockMemoryLoad(size_t logical_
     std::lock_guard<std::mutex> lock(mutex_);
     auto                        context = loader_.mockMemoryLoad(logical_blocks);
     if (context) {
-        context->onDone([reporter = metrics_reporter_, logical_blocks](ErrorInfo error) {
+        context->setTransferOutcomeCallback([reporter = metrics_reporter_, logical_blocks](ErrorInfo error) {
             reporter->recordMockMemoryH2D(logical_blocks, error.ok());
         });
     } else if (logical_blocks > 0) {

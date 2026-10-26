@@ -11,6 +11,18 @@
 
 namespace rtp_llm {
 
+void StoreTaskRunner::Task::recordMockMemoryTransferOutcome(BlockTreeCacheMetricsReporter& metrics_reporter,
+                                                            bool                           success) {
+    if (!mock_memory_cache || target_tier != Tier::HOST) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mock_memory_outcome_mutex);
+    if (!mock_memory_outcome_recorded) {
+        metrics_reporter.recordMockMemoryD2HFinished(descriptors().size(), success);
+        mock_memory_outcome_recorded = true;
+    }
+}
+
 StoreTaskRunner::StoreTaskRunner(const std::vector<GroupSetPtr>& group_sets, BlockTree* pressure_tree):
     pressure_tree_(pressure_tree), group_sets_(group_sets) {}
 
@@ -52,6 +64,7 @@ void StoreTaskRunner::runTransfer(TaskPtr                        task,
 
         auto stage_state = std::make_shared<TransferStageState>(
             [this, task, &metrics_reporter, transfer_begin, callback](TransferResult result) mutable {
+                task->recordMockMemoryTransferOutcome(metrics_reporter, result.ok());
                 try {
                     if (pressure_tree_) {
                         pressure_tree_->recordPressureCopy(CacheTransferOperation::STORE, task->descriptors(), result);

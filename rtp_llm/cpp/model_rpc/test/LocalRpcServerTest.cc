@@ -1190,6 +1190,7 @@ TEST(PressureRpcTest, SnapshotSerializationPreservesPhysicalDimensionsAndPresenc
     EXPECT_FALSE(rank.has_activity());
     EXPECT_FALSE(rank.step_history_available());
     ASSERT_TRUE(rank.has_mock_memory());
+    EXPECT_EQ(rank.mock_memory().terminal_outcome_version(), PressureMockMemoryPB::TRANSFER_TERMINAL_V1);
     EXPECT_EQ(rank.mock_memory().eligible_blocks(), 11);
     EXPECT_EQ(rank.mock_memory().planned_host_blocks(), 5);
     EXPECT_EQ(rank.mock_memory().successful_h2d_blocks(), 4);

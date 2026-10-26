@@ -118,6 +118,23 @@ void LoadAsyncContext::startBackendMatch() {
         });
 }
 
+void LoadAsyncContext::setTransferOutcomeCallback(DoneCallback callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    RTP_LLM_CHECK(callback && !transfer_outcome_callback_ && !commit_started_.load() && !done());
+    transfer_outcome_callback_ = std::move(callback);
+}
+
+void LoadAsyncContext::reportTransferOutcome(bool success) {
+    DoneCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        callback = std::move(transfer_outcome_callback_);
+    }
+    if (callback) {
+        callback(success ? ErrorInfo::OkStatus() : ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "load transfer failed"));
+    }
+}
+
 void LoadAsyncContext::setTargetBlocks(size_t desc_index, std::vector<BlockIdxType> target_blocks) {
     load_descs_[desc_index].target_blocks = std::move(target_blocks);
 }
@@ -381,6 +398,7 @@ void LoadAsyncContext::dispatchCompletion(bool notify, SettlementReadyCallback s
         notifyCompletion();
     }
     if (settlement_ready_callback) {
+        reportTransferOutcome(aggregateSuccess());
         settlement_ready_callback(shared_from_this());
     }
 }
@@ -413,6 +431,9 @@ void LoadAsyncContext::onDone(DoneCallback callback) {
 }
 
 void LoadAsyncContext::notifyCompletion() {
+    // Abort and rejected admission have no transfer callback. Moving the
+    // observer makes this fallback and later settlement exactly once.
+    reportTransferOutcome(success());
     std::vector<DoneCallback> callbacks;
     ErrorInfo                 error = ErrorInfo::OkStatus();
     {

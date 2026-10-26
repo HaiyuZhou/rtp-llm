@@ -65,6 +65,9 @@ void LoadTaskRunner::runTransfer(TaskPtr                        task,
             task->host_to_device_task,
             [this, task, &transfer_dispatcher, &metrics_reporter, transfer_begin, callback = std::move(callback)](
                 TransferResult result) mutable {
+                if (task->context && task->context->sourceKind() == LoadSourceKind::MOCK_MEMORY) {
+                    task->context->reportTransferOutcome(result.ok());
+                }
                 task->host_result = result;
                 try {
                     reportStageFinished(*task,

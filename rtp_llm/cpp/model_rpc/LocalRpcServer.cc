@@ -921,6 +921,7 @@ void pressureSnapshotToProto(const CachePressureSnapshot& snapshot, CachePressur
     if (snapshot.mock_memory) {
         const auto& metrics = *snapshot.mock_memory;
         auto*       pb      = output->mutable_mock_memory();
+        pb->set_terminal_outcome_version(PressureMockMemoryPB::TRANSFER_TERMINAL_V1);
         pb->set_eligible_blocks(metrics.eligible_blocks);
         pb->set_planned_host_blocks(metrics.planned_host_blocks);
         pb->set_successful_h2d_blocks(metrics.successful_h2d_blocks);

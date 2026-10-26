@@ -75,6 +75,11 @@ class GroupSample:
     geometry: tuple[int, int, int, bool] = (0, 0, 0, False)
 
 
+# Version 1 counters change at transfer terminal notification, before deferred
+# tree/context settlement. Version 0 servers cannot certify event timing.
+MOCK_MEMORY_TERMINAL_OUTCOME_VERSION = 1
+
+
 @dataclass(frozen=True)
 class MockMemorySample:
     eligible_blocks: int
@@ -84,6 +89,7 @@ class MockMemorySample:
     d2h_submitted_blocks: int
     d2h_completed_blocks: int
     d2h_failed_blocks: int
+    terminal_outcome_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -794,7 +800,10 @@ def decode_pressure_response(
                                 "d2h_completed_blocks",
                                 "d2h_failed_blocks",
                             )
-                        )
+                        ),
+                        terminal_outcome_version=getattr(
+                            rank.mock_memory, "terminal_outcome_version", 0
+                        ),
                     )
                     if "mock_memory" in rank.DESCRIPTOR.fields_by_name
                     and rank.HasField("mock_memory")
@@ -1019,6 +1028,18 @@ class PressureCoverage:
             for target in self.targets
         ):
             raise ValueError("mock memory pressure counters are unavailable")
+        if config.evidence_policy == "mock_memory" and any(
+            getattr(
+                self.baselines[target.owner_rank].mock_memory,
+                "terminal_outcome_version",
+                0,
+            )
+            != MOCK_MEMORY_TERMINAL_OUTCOME_VERSION
+            for target in self.targets
+        ):
+            raise ValueError(
+                "mock memory terminal outcome counters are unavailable or unsupported"
+            )
         self.previous = {}
         self.last_seen = {}
         self.segments = {(t.rank, t.group_id): [] for t in self.targets}
@@ -1060,6 +1081,14 @@ class PressureCoverage:
                 self.epoch_valid = False
                 self.reasons.add("inventory_discontinuity")
                 continue
+            if (
+                self.config.evidence_policy == "mock_memory"
+                and any(target.owner_rank == sample.rank for target in self.targets)
+                and getattr(sample.mock_memory, "terminal_outcome_version", 0)
+                != MOCK_MEMORY_TERMINAL_OUTCOME_VERSION
+            ):
+                self.epoch_valid = False
+                self.reasons.add("mock_terminal_outcomes_unavailable")
             if (
                 sample.instance != baseline.instance
                 or sample.ownership != baseline.ownership
@@ -1363,7 +1392,10 @@ class PressureCoverage:
                     for item in self.migration_failure_evidence[
                         (owner_rank, owner_group_id, direction)
                     ]
-                    if start <= item.interval[0] and item.interval[1] <= end
+                    # A boundary-straddling failure may have occurred inside
+                    # the window. Reject conservatively; containment is only
+                    # sufficient for positive evidence.
+                    if item.interval[0] <= end and start <= item.interval[1]
                 )
             d2h = tuple(item.interval for item in evidence["d2h"])
             h2d = tuple(item.interval for item in evidence["h2d"])

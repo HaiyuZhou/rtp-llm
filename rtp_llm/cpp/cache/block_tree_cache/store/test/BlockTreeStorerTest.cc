@@ -15,6 +15,8 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/ScopeRollback.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/group_set/FullGroupSet.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/load/LoadAsyncContext.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/load/MockMemoryCacheSource.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/transfer/TransferBatchAsyncContext.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/test/BoundedThreadTestUtils.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/test/BlockTreeCacheTestUtils.h"
 #include "rtp_llm/cpp/config/StaticConfig.h"
@@ -1137,6 +1139,95 @@ TEST(BlockTreeStorerTest, DuplicateStoreForSameKeyReleasesLoserBlock) {
 
     releaseDeviceBlocks(*env.cache, env.device_pools[0], first_holder.front());
     releaseDeviceBlocks(*env.cache, env.device_pools[0], second_holder.front());
+}
+
+class ManualTerminalTransferEngine final: public PerRankBlockTransferEngine {
+public:
+    explicit ManualTerminalTransferEngine(const std::vector<GroupSetPtr>& groups): PerRankBlockTransferEngine(groups) {}
+
+    std::shared_ptr<TransferAsyncContext> execute(TransferTask) override {
+        return completion;
+    }
+
+    std::shared_ptr<TransferBatchAsyncContext> completion = std::make_shared<TransferBatchAsyncContext>();
+};
+
+TEST(BlockTreeStorerTest, MockMemoryD2HTerminalCountersPrecedeDelayedSettlement) {
+    if (!cudaAvailable()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    for (const bool success : {true, false}) {
+        SCOPED_TRACE(success);
+        auto env    = makeStoreEnvironment("mock_terminal_store", true, true, false);
+        auto engine = std::make_shared<ManualTerminalTransferEngine>(env.groups);
+        BlockTreeCacheTestPeer::setPerRankBlockTransferEngineForTest(*env.cache, engine);
+        const auto sources = allocateDeviceBlocksForTest(*env.groups[0], 1);
+        ASSERT_EQ(sources.size(), 1u);
+        env.cache->insert({100}, deviceSourceResources({sources.front()}), Tier::HOST, false, true);
+        // Drain task bodies while the external transfer remains pending.
+        env.cache->task_pool_->waitForIdle();
+        EXPECT_EQ(env.cache->metrics_reporter_->mockMemoryMetricsSnapshot().d2h_submitted_blocks, 1u);
+        {
+            // Model copy completion before a window boundary, with publication
+            // delayed beyond it by an unrelated holder of the tree mutex.
+            std::lock_guard<std::mutex> lock(env.cache->mutex_);
+            engine->completion->complete(success ? ErrorInfo::OkStatus() :
+                                                   ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "copy failed"));
+            const auto terminal = env.cache->metrics_reporter_->mockMemoryMetricsSnapshot();
+            EXPECT_EQ(terminal.d2h_completed_blocks, success ? 1u : 0u);
+            EXPECT_EQ(terminal.d2h_failed_blocks, success ? 0u : 1u);
+            EXPECT_TRUE(env.cache->tree()->findNode({100}).empty());
+            EXPECT_EQ(env.storeRefCount(), 2u);
+        }
+        BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*env.cache);
+        const auto settled = env.cache->metrics_reporter_->mockMemoryMetricsSnapshot();
+        EXPECT_EQ(settled.d2h_completed_blocks, success ? 1u : 0u);
+        EXPECT_EQ(settled.d2h_failed_blocks, success ? 0u : 1u);
+        EXPECT_EQ(env.cache->tree()->findNode({100}).size(), success ? 1u : 0u);
+        EXPECT_EQ(env.storeRefCount(), 0u);
+        releaseDeviceBlocks(*env.cache, env.device_pools[0], sources.front());
+    }
+}
+
+TEST(BlockTreeStorerTest, MockMemoryH2DTerminalCountersPrecedeDelayedSettlement) {
+    if (!cudaAvailable()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    for (const bool success : {true, false}) {
+        SCOPED_TRACE(success);
+        auto env    = makeStoreEnvironment("mock_terminal_load", true, true, false);
+        auto source = MockMemoryCacheSource::create(env.groups, 1, 0);
+        ASSERT_TRUE(source.ok());
+        env.cache->mock_memory_cache_source_         = source.value();
+        env.cache->loader_.mock_memory_cache_source_ = source.value();
+        auto engine                                  = std::make_shared<ManualTerminalTransferEngine>(env.groups);
+        BlockTreeCacheTestPeer::setPerRankBlockTransferEngineForTest(*env.cache, engine);
+        auto context = env.cache->mockMemoryLoad(1);
+        ASSERT_NE(context, nullptr);
+        const auto targets = allocateDeviceBlocksForTest(*env.groups[0], 1);
+        ASSERT_EQ(targets.size(), 1u);
+        context->setTargetBlocks(0, targets.front());
+        ASSERT_TRUE(context->commit());
+        env.cache->task_pool_->waitForIdle();
+        {
+            std::lock_guard<std::mutex> lock(env.cache->mutex_);
+            engine->completion->complete(success ? ErrorInfo::OkStatus() :
+                                                   ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "copy failed"));
+            const auto terminal = env.cache->metrics_reporter_->mockMemoryMetricsSnapshot();
+            EXPECT_EQ(terminal.successful_h2d_blocks, success ? 1u : 0u);
+            EXPECT_EQ(terminal.failed_h2d_blocks, success ? 0u : 1u);
+            EXPECT_FALSE(context->done());
+            EXPECT_EQ(context->matchedBlocks(Tier::HOST), 0u);
+        }
+        BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*env.cache);
+        const auto settled = env.cache->metrics_reporter_->mockMemoryMetricsSnapshot();
+        EXPECT_EQ(settled.successful_h2d_blocks, success ? 1u : 0u);
+        EXPECT_EQ(settled.failed_h2d_blocks, success ? 0u : 1u);
+        EXPECT_EQ(context->success(), success);
+        EXPECT_EQ(context->matchedBlocks(Tier::HOST), success ? 1u : 0u);
+        EXPECT_EQ(env.cache->tree()->size(), 0u);
+        releaseDeviceBlocks(*env.cache, env.device_pools[0], targets.front());
+    }
 }
 
 TEST(BlockTreeStorerTest, MockMemoryStoresCountTerminalCopiesAndReleaseEverySource) {

@@ -466,8 +466,10 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
     prepared.referenced_blocks.resize(kv_cache_groups_.size());
     std::shared_ptr<LoadAsyncContext> load_context;
 
-    const bool mock_memory = block_tree_cache_ && block_tree_cache_->config().mock_memory_cache
-                             && malloc_info.mock_memory_cache_request.value_or(true);
+    // A retained plan, including a zero-block decision, owns admission across allocation retries.
+    const bool mock_memory = kv_resource->mockMemoryCachePlan().has_value()
+                             || (block_tree_cache_ && block_tree_cache_->config().mock_memory_cache
+                                 && malloc_info.mock_memory_cache_request.value_or(true));
     if (malloc_info.enable_cache_lookup) {
         CacheKeysType match_keys = cpCanonicalCacheKeys(cp_mapper, cache_keys);
         const size_t  max_keys   = static_cast<size_t>(config_.maxPrefixReuseTokens(seq_len))

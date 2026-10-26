@@ -340,7 +340,10 @@ TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryRetryPreservesPlanAndAdmission
     manager_->free(FreeInfo{later, later_tokens});
     manager_->free(FreeInfo{holder, holder_tokens});
 
-    const auto retry = manager_->malloc(info);
+    // Admission is latched even if the request/service controls change while waiting.
+    info.mock_memory_cache_request                        = false;
+    manager_->blockTreeCache()->config_.mock_memory_cache = false;
+    const auto retry                                      = manager_->malloc(info);
     ASSERT_TRUE(retry.success);
     ASSERT_NE(retry.async_context, nullptr);
     retry.async_context->waitDone();
@@ -363,6 +366,53 @@ TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryRetryPreservesPlanAndAdmission
         EXPECT_EQ(metrics.success_ratio_ppm, 500000);
     }
     manager_->free(FreeInfo{resource, tokens});
+}
+
+TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryZeroPlanRetryBypassesNaturalMatchAfterControlsChange) {
+    for (const bool disable_service : {false, true}) {
+        SCOPED_TRACE(disable_service);
+        ASSERT_NO_FATAL_FAILURE(initManager(6, 8, 0.0));
+        const int  block_tokens  = static_cast<int>(cache_config_.seq_size_per_block);
+        auto       holder        = makeResource(cache_config_);
+        auto       holder_tokens = makeTokenIds(10000, 3 * block_tokens, 3 * block_tokens, block_tokens);
+        MallocInfo hold_info{holder, holder_tokens};
+        hold_info.enable_cache_lookup = false;
+        ASSERT_TRUE(manager_->malloc(hold_info).success);
+
+        auto       resource = makeResource(cache_config_);
+        auto       tokens   = makeTokenIds(0, 4 * block_tokens, 4 * block_tokens, block_tokens);
+        MallocInfo info{resource, tokens};
+        info.mock_memory_cache_request = true;
+        const auto failed              = manager_->malloc(info);
+        ASSERT_FALSE(failed.success);
+        EXPECT_EQ(failed.status, MallocStatus::RETRYABLE_RESOURCE_EXHAUSTED);
+        EXPECT_EQ(resource->curBlocksNum(), 0);
+        ASSERT_TRUE(resource->mockMemoryCachePlan().has_value());
+        EXPECT_EQ(resource->mockMemoryCachePlan()->eligible_blocks, 3u);
+        EXPECT_EQ(resource->mockMemoryCachePlan()->planned_host_blocks, 0u);
+        manager_->free(FreeInfo{holder, holder_tokens});
+
+        // A real prefix makes accidental fallback observable even with no planned H2D.
+        ASSERT_TRUE(seedDevicePrefix(manager_, cache_config_, 0, 3).has_value());
+        info.mock_memory_cache_request                        = disable_service;
+        manager_->blockTreeCache()->config_.mock_memory_cache = !disable_service;
+        const auto retry                                      = manager_->malloc(info);
+        ASSERT_TRUE(retry.success);
+        EXPECT_EQ(retry.reuse_len, 0);
+        EXPECT_EQ(retry.async_context, nullptr);
+        EXPECT_EQ(resource->cacheResource().deviceReuseBlockNum(), 0);
+        ASSERT_TRUE(resource->mockMemoryCachePlan().has_value());
+        EXPECT_EQ(resource->mockMemoryCachePlan()->eligible_blocks, 3u);
+        EXPECT_EQ(resource->mockMemoryCachePlan()->planned_host_blocks, 0u);
+        const auto snapshot = manager_->coordinator_manager_->mock_memory_hit_controller_->snapshot();
+        EXPECT_EQ(snapshot.cumulative_eligible_blocks, 3u);
+        EXPECT_EQ(snapshot.cumulative_planned_host_blocks, 0u);
+        EXPECT_EQ(transfer_engine_->submittedDescriptorCount(), 0u);
+        manager_->free(FreeInfo{resource, tokens});
+        BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*manager_->blockTreeCache());
+        manager_.reset();
+        transfer_engine_.reset();
+    }
 }
 
 TEST_P(KVCacheManagerWithTierCacheTest, DSV4DevicePrefixHitKeepsLowerTiersUntouched) {

@@ -66,7 +66,6 @@ from rtp_llm.test.perf_test.cache_grid.runner.result_schema import (
 from rtp_llm.test.perf_test.cache_grid.runner.scheduler import configure_scheduler
 from rtp_llm.test.perf_test.perf_utils import _sanitize_nested_provenance
 
-
 _STARTUP_PRESSURE_RETRY_BUDGET_S = 10.0
 _STARTUP_PRESSURE_RETRY_DELAY_S = 0.25
 _TRANSIENT_PRESSURE_RANK_ERRORS = (
@@ -3231,15 +3230,12 @@ class CacheGridRunner:
                     json.dumps(startup_attempts, allow_nan=False, indent=2) + "\n"
                 )
                 try:
-                    decoded = decode_pressure_response(
-                        response, sent, received, ranks
-                    )
+                    decoded = decode_pressure_response(response, sent, received, ranks)
                     break
                 except ValueError as error:
                     remaining = retry_deadline - time.monotonic()
-                    if (
-                        remaining <= 0
-                        or not _is_transient_pressure_rank_failure(response, error)
+                    if remaining <= 0 or not _is_transient_pressure_rank_failure(
+                        response, error
                     ):
                         raise
                     logging.warning(

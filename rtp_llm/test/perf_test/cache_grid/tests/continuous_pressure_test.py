@@ -2281,7 +2281,8 @@ class RunnerIntegrationTest(unittest.TestCase):
             startup = not request.session_id
             if startup and (
                 startup_connect_failures
-                or fault in (
+                or fault
+                in (
                     "startup_connect_always",
                     "startup_nontransport",
                     "startup_malformed_connect",
@@ -2526,8 +2527,7 @@ class RunnerIntegrationTest(unittest.TestCase):
             self.assertTrue(submissions)
             attempts = json.loads(
                 (
-                    runner._pressure_epoch_dir
-                    / "startup_pressure_attempts.json"
+                    runner._pressure_epoch_dir / "startup_pressure_attempts.json"
                 ).read_text()
             )
             self.assertEqual(len(attempts), 2)
@@ -2545,8 +2545,7 @@ class RunnerIntegrationTest(unittest.TestCase):
             self.assertTrue(submissions)
             attempts = json.loads(
                 (
-                    runner._pressure_epoch_dir
-                    / "startup_pressure_attempts.json"
+                    runner._pressure_epoch_dir / "startup_pressure_attempts.json"
                 ).read_text()
             )
             self.assertEqual(len(attempts), 1)
@@ -2564,8 +2563,7 @@ class RunnerIntegrationTest(unittest.TestCase):
             self.assertEqual(submissions, [])
             attempts = json.loads(
                 (
-                    runner._pressure_epoch_dir
-                    / "startup_pressure_attempts.json"
+                    runner._pressure_epoch_dir / "startup_pressure_attempts.json"
                 ).read_text()
             )
             self.assertGreater(len(attempts), 1)
@@ -2584,8 +2582,7 @@ class RunnerIntegrationTest(unittest.TestCase):
             self.assertEqual(submissions, [])
             attempts = json.loads(
                 (
-                    runner._pressure_epoch_dir
-                    / "startup_pressure_attempts.json"
+                    runner._pressure_epoch_dir / "startup_pressure_attempts.json"
                 ).read_text()
             )
             self.assertEqual(len(attempts), 1)
@@ -2603,8 +2600,7 @@ class RunnerIntegrationTest(unittest.TestCase):
             self.assertEqual(submissions, [])
             attempts = json.loads(
                 (
-                    runner._pressure_epoch_dir
-                    / "startup_pressure_attempts.json"
+                    runner._pressure_epoch_dir / "startup_pressure_attempts.json"
                 ).read_text()
             )
             self.assertEqual(len(attempts), 1)

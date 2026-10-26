@@ -917,13 +917,16 @@ class LifecycleTest(unittest.TestCase):
         )
 
         self.assertIsNone(result["failure"])
-        self.assertEqual(result["rewarm"], {
-            "planned": 2,
-            "submitted": 2,
-            "completed": 2,
-            "failed": 0,
-            "pending": 0,
-        })
+        self.assertEqual(
+            result["rewarm"],
+            {
+                "planned": 2,
+                "submitted": 2,
+                "completed": 2,
+                "failed": 0,
+                "pending": 0,
+            },
+        )
         self.assertEqual(kinds.count("rewarm"), 2)
         dispatch = [event for event in events if event["event"] == "dispatch"]
         rewarm_indices = [
@@ -1102,10 +1105,7 @@ class LifecycleTest(unittest.TestCase):
                         self.value["success"] = False
 
             def done(self):
-                if (
-                    self.phase == "rewarm"
-                    and getattr(self, "rewarm_position", 0) == 2
-                ):
+                if self.phase == "rewarm" and getattr(self, "rewarm_position", 0) == 2:
                     self.done_checks += 1
                     return self.cancelled
                 return True
@@ -1120,7 +1120,9 @@ class LifecycleTest(unittest.TestCase):
         def observe(identity):
             active[0].phase = identity.rsplit(":", 2)[-2]
 
-        with patch.object(cp, "CancellableRequestHandle", FailedThenPendingRewarmHandle):
+        with patch.object(
+            cp, "CancellableRequestHandle", FailedThenPendingRewarmHandle
+        ):
             result, events, _, _ = self.run_session(
                 seed_count=8,
                 rate=0,

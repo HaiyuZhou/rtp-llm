@@ -231,9 +231,7 @@ class TieredRollingPlanner:
         return result
 
     def initial_device_assignments(self) -> tuple[TieredRollingAssignment, ...]:
-        return tuple(
-            self.assignment(lane) for lane in range(0, self.cohort_size, 2)
-        )
+        return tuple(self.assignment(lane) for lane in range(0, self.cohort_size, 2))
 
 
 def freeze_seed_families(seed_ids) -> int:
@@ -1145,9 +1143,7 @@ class PressureSession:
             if self.state.phase != "fill":
                 break
             if self.poll_future is not None:
-                evidence = self.poll_future.result(
-                    timeout=self.config.sample_period_s
-                )
+                evidence = self.poll_future.result(timeout=self.config.sample_period_s)
                 self.poll_future = None
                 self._consume_poll(evidence)
             if self.fill_headroom_reached:
@@ -1518,9 +1514,7 @@ class PressureSession:
         # cancellation immediately, then use the bounded drain to reap it.
         if self.state.failure and (
             self.state.failure == "sender_saturated"
-            or any(
-                kind in ("seed", "rewarm") for kind in self.job_kinds.values()
-            )
+            or any(kind in ("seed", "rewarm") for kind in self.job_kinds.values())
         ):
             self._cancel_pending()
         while self.clock() < deadline:

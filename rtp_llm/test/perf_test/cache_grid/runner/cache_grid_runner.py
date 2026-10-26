@@ -2099,9 +2099,7 @@ class CacheGridRunner:
         def get_tiered_planner():
             nonlocal tiered_planner
             if tiered_planner is None:
-                effective_seed_count = freeze_seed_families(
-                    self._continuous_seed_ids
-                )
+                effective_seed_count = freeze_seed_families(self._continuous_seed_ids)
                 tiered_planner = TieredRollingPlanner(
                     effective_seed_count=effective_seed_count,
                     cohort_size=(

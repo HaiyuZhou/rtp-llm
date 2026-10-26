@@ -37,6 +37,7 @@ public:
             return transfer_task.descriptors();
         }
 
+        void recordMockMemorySubmission(BlockTreeCacheMetricsReporter& metrics_reporter);
         void recordMockMemoryTransferOutcome(BlockTreeCacheMetricsReporter& metrics_reporter, bool success);
 
         Tier          target_tier{Tier::NONE};
@@ -44,9 +45,12 @@ public:
         TransferTask  transfer_task;
         Phase         phase{Phase::CREATED};
         bool          mock_memory_cache{false};
-        // Serializes accepted submission with terminal accounting, independently
-        // of the tree mutex and the deferred publication queue.
+
+    private:
+        // Either submit's return or a terminal callback can establish accepted
+        // admission first. No guard is held across submission or callbacks.
         std::mutex mock_memory_outcome_mutex;
+        bool       mock_memory_submission_recorded{false};
         bool       mock_memory_outcome_recorded{false};
     };
     using TaskPtr = std::shared_ptr<Task>;

@@ -127,11 +127,7 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
                             task->descriptors().size());
         scheduleStoreSettlement(task, ErrorInfo(ErrorCode::DEADLINE_EXCEEDED, "store business queue timeout"));
     };
-    const auto                   deadline = task->transfer_task.deadline();
-    std::unique_lock<std::mutex> outcome_lock(task->mock_memory_outcome_mutex, std::defer_lock);
-    if (task->mock_memory_cache && task->target_tier == Tier::HOST) {
-        outcome_lock.lock();
-    }
+    const auto deadline = task->transfer_task.deadline();
     if (!task_pool_->submit(
             BlockTreeTaskClass::BACKGROUND,
             [this, task, queue_begin]() {
@@ -150,11 +146,9 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
                             task->descriptors().size());
         return;
     }
-    // Only the task-local lock orders immediate terminal callbacks after the
-    // accepted submission; unrelated tree work cannot delay outcome evidence.
-    if (task->mock_memory_cache && task->target_tier == Tier::HOST) {
-        metrics_reporter_.recordMockMemoryD2HSubmitted(task->descriptors().size());
-    }
+    // A synchronous timeout or immediate physical callback may already have
+    // recorded admission. The task makes both entry points idempotent.
+    task->recordMockMemorySubmission(metrics_reporter_);
     prepare_guard.dismiss();
 }
 

@@ -11,11 +11,25 @@
 
 namespace rtp_llm {
 
+void StoreTaskRunner::Task::recordMockMemorySubmission(BlockTreeCacheMetricsReporter& metrics_reporter) {
+    if (!mock_memory_cache || target_tier != Tier::HOST) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mock_memory_outcome_mutex);
+    if (!mock_memory_submission_recorded) {
+        metrics_reporter.recordMockMemoryD2HSubmitted(descriptors().size());
+        mock_memory_submission_recorded = true;
+    }
+}
+
 void StoreTaskRunner::Task::recordMockMemoryTransferOutcome(BlockTreeCacheMetricsReporter& metrics_reporter,
                                                             bool                           success) {
     if (!mock_memory_cache || target_tier != Tier::HOST) {
         return;
     }
+    // A callback proves acceptance, even when an already-expired timeout runs
+    // synchronously before submit() returns. Publish submission before outcome.
+    recordMockMemorySubmission(metrics_reporter);
     std::lock_guard<std::mutex> lock(mock_memory_outcome_mutex);
     if (!mock_memory_outcome_recorded) {
         metrics_reporter.recordMockMemoryD2HFinished(descriptors().size(), success);

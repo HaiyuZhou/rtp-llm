@@ -1152,6 +1152,46 @@ public:
     std::shared_ptr<TransferBatchAsyncContext> completion = std::make_shared<TransferBatchAsyncContext>();
 };
 
+TEST(BlockTreeStorerTest, AlreadyExpiredMockStoreRecordsSubmissionAndOneFailureWithoutDeadlock) {
+    if (!cudaAvailable()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    auto env =
+        std::make_shared<StoreEnvironment>(makeStoreEnvironment("mock_store_already_expired", true, true, false));
+    env->cache->storer_.host_timeout_ms_ = -1;
+    auto       engine                    = installStoreTransferEngine(*env, TransferCopyAction::Succeed);
+    const auto sources                   = allocateDeviceBlocksForTest(*env->groups[0], 1);
+    ASSERT_EQ(sources.size(), 1u);
+    const auto before = env->cache->metrics_reporter_->mockMemoryMetricsSnapshot();
+    EXPECT_EQ(before.d2h_submitted_blocks, 0u);
+    EXPECT_EQ(before.d2h_failed_blocks, 0u);
+
+    // submit() invokes an already-expired timeout inline while insert owns the
+    // tree mutex. Retain the fixture if this regresses to a reentrant deadlock.
+    BoundedThread<void> submit([env, sources] {
+        env->cache->insert({100}, deviceSourceResources({sources.front()}), Tier::HOST, false, true);
+    });
+    ASSERT_EQ(submit.waitFor(std::chrono::seconds(5)), std::future_status::ready);
+    submit.get();
+    const auto terminal = env->cache->metrics_reporter_->mockMemoryMetricsSnapshot();
+    EXPECT_EQ(terminal.d2h_submitted_blocks, 1u);
+    EXPECT_EQ(terminal.d2h_completed_blocks, 0u);
+    EXPECT_EQ(terminal.d2h_failed_blocks, 1u);
+
+    BoundedThread<void> settle([env] { BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*env->cache); });
+    ASSERT_EQ(settle.waitFor(std::chrono::seconds(5)), std::future_status::ready);
+    settle.get();
+    const auto settled = env->cache->metrics_reporter_->mockMemoryMetricsSnapshot();
+    EXPECT_EQ(settled.d2h_submitted_blocks, 1u);
+    EXPECT_EQ(settled.d2h_completed_blocks, 0u);
+    EXPECT_EQ(settled.d2h_failed_blocks, 1u);
+    EXPECT_EQ(engine->submittedBatchCount(), 0u);
+    EXPECT_TRUE(env->cache->tree()->findNode({100}).empty());
+    EXPECT_EQ(env->storeRefCount(), 0u);
+    EXPECT_EQ(env->host_pools[0]->freeBlocksNum(), 2u);
+    releaseDeviceBlocks(*env->cache, env->device_pools[0], sources.front());
+}
+
 TEST(BlockTreeStorerTest, MockMemoryD2HTerminalCountersPrecedeDelayedSettlement) {
     if (!cudaAvailable()) {
         GTEST_SKIP() << "CUDA not available";

@@ -377,16 +377,16 @@ public:
     void report(const kmonitor::MetricsTags* tags, RtpLLMGrammarMetricsCollector* collector);
 
 public:
-    kmonitor::MutableMetric* compile_qps_metric                  = nullptr;
-    kmonitor::MutableMetric* compile_invalid_qps_metric          = nullptr;
-    kmonitor::MutableMetric* cache_hit_qps_metric                = nullptr;
-    kmonitor::MutableMetric* overload_qps_metric                 = nullptr;
-    kmonitor::MutableMetric* compile_latency_us_metric           = nullptr;
-    kmonitor::MutableMetric* compile_inflight_metric             = nullptr;
-    kmonitor::MutableMetric* verdict_cache_bytes_metric          = nullptr;
-    kmonitor::MutableMetric* total_cache_budget_bytes_metric     = nullptr;
-    kmonitor::MutableMetric* compiler_cache_budget_bytes_metric  = nullptr;
-    kmonitor::MutableMetric* verdict_cache_budget_bytes_metric   = nullptr;
+    kmonitor::MutableMetric* compile_qps_metric                 = nullptr;
+    kmonitor::MutableMetric* compile_invalid_qps_metric         = nullptr;
+    kmonitor::MutableMetric* cache_hit_qps_metric               = nullptr;
+    kmonitor::MutableMetric* overload_qps_metric                = nullptr;
+    kmonitor::MutableMetric* compile_latency_us_metric          = nullptr;
+    kmonitor::MutableMetric* compile_inflight_metric            = nullptr;
+    kmonitor::MutableMetric* verdict_cache_bytes_metric         = nullptr;
+    kmonitor::MutableMetric* total_cache_budget_bytes_metric    = nullptr;
+    kmonitor::MutableMetric* compiler_cache_budget_bytes_metric = nullptr;
+    kmonitor::MutableMetric* verdict_cache_budget_bytes_metric  = nullptr;
 
 private:
     AUTIL_LOG_DECLARE();
@@ -635,14 +635,14 @@ private:
     }
 
 private:
-    int64_t                                       context_token_num_            = 0;
-    int64_t                                       context_time_us_              = 0;
-    int64_t                                       context_token_num_with_cache_ = 0;
-    int64_t                                       context_time_us_with_cache_   = 0;
-    int64_t                                       generate_token_num_           = 0;
-    int64_t                                       total_token_num_              = 0;
-    int64_t                                       report_window_us_             = 0;
-    bool                                          report_zero_tps_              = false;
+    int64_t                                          context_token_num_            = 0;
+    int64_t                                          context_time_us_              = 0;
+    int64_t                                          context_token_num_with_cache_ = 0;
+    int64_t                                          context_time_us_with_cache_   = 0;
+    int64_t                                          generate_token_num_           = 0;
+    int64_t                                          total_token_num_              = 0;
+    int64_t                                          report_window_us_             = 0;
+    bool                                             report_zero_tps_              = false;
     std::map<int32_t, RtpLLMTokenPSMetricsCollector> priority_collectors_;
 };
 
@@ -1156,10 +1156,10 @@ public:
     void report(const kmonitor::MetricsTags* tags, RtpLLMCacheCopyErrorMetricsCollector* collector);
 
 private:
-    kmonitor::MutableMetric* transfer_qps_metric             = nullptr;
-    kmonitor::MutableMetric* transfer_failed_qps_metric      = nullptr;
+    kmonitor::MutableMetric* transfer_qps_metric                = nullptr;
+    kmonitor::MutableMetric* transfer_failed_qps_metric         = nullptr;
     kmonitor::MutableMetric* memory_cache_copy_error_qps_metric = nullptr;
-    kmonitor::MutableMetric* descriptors_per_transfer_metric = nullptr;
+    kmonitor::MutableMetric* descriptors_per_transfer_metric    = nullptr;
     // Compatibility alias retained while dashboards migrate to the clarified name.
     kmonitor::MutableMetric* transfer_descriptor_count_compat_metric    = nullptr;
     kmonitor::MutableMetric* transfer_latency_us_metric                 = nullptr;

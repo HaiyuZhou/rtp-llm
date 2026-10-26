@@ -399,8 +399,7 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
             return nullptr;
         }
         if (!std::isfinite(kv_cache_config.mock_memory_cache_hit_ratio)
-            || kv_cache_config.mock_memory_cache_hit_ratio < 0.0
-            || kv_cache_config.mock_memory_cache_hit_ratio > 1.0) {
+            || kv_cache_config.mock_memory_cache_hit_ratio < 0.0 || kv_cache_config.mock_memory_cache_hit_ratio > 1.0) {
             RTP_LLM_LOG_ERROR("mock_memory_cache_hit_ratio must be finite and in [0.0, 1.0], got %g",
                               kv_cache_config.mock_memory_cache_hit_ratio);
             return nullptr;
@@ -667,7 +666,7 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     config.mock_memory_cache             = kv_cache_config.mock_memory_cache;
     config.mock_memory_cache_hit_ratio   = kv_cache_config.mock_memory_cache_hit_ratio;
     config.mock_memory_cache_coordinator = owns_mutable_block_tree;
-    config.full_prefix_scan_interval_ms = owns_mutable_block_tree ? configured_scan_interval_ms : 0;
+    config.full_prefix_scan_interval_ms  = owns_mutable_block_tree ? configured_scan_interval_ms : 0;
 
     CachePressureOwnership ownership;
     const int              base_rank = parallelism_config.world_rank - parallelism_config.tp_rank;

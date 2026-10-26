@@ -491,7 +491,7 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
                 }
                 block_tree_cache_->reportMockMemoryPlan(mock_memory_hit_controller_->snapshot());
                 const size_t eligible_blocks = kv_resource->mockMemoryCachePlan()->eligible_blocks;
-                const size_t planned_blocks = kv_resource->mockMemoryCachePlan()->planned_host_blocks;
+                const size_t planned_blocks  = kv_resource->mockMemoryCachePlan()->planned_host_blocks;
                 RTP_LLM_LOG_DEBUG("mock_memory_cache request=%ld eligible=%zu planned=%zu successful_host=0 retry=%d",
                                   malloc_info.request_id,
                                   eligible_blocks,
@@ -915,7 +915,7 @@ void CoordinatorCacheManager::insertIntoCache(const InsertInfo& insert_info, siz
                     mapping_valid = false;
                     break;
                 }
-                const auto type           = config_.group(tag).policy.group_type;
+                const auto type = config_.group(tag).policy.group_type;
                 const bool sparse_logical =
                     cp_active && (type == CacheGroupType::LINEAR || type == CacheGroupType::SWA);
                 const auto& blocks = kv_cache_resource->blocks(batch_id, tag);

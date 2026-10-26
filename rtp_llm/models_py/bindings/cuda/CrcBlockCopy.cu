@@ -107,13 +107,13 @@ struct CrcBlockCopyBatch::Impl {
         size_t                   largest{0};
         nvcompBatchedCRC32Opts_t opts{};
     };
-    int          device;
-    size_t       max_items, max_payload, max_tiles, stride;
-    size_t       device_bytes{0};
-    cudaStream_t stream{nullptr};
-    Allocation   staging, tiles, inputs, lengths, checksums, statuses, results;
-    Allocation   host_tiles, host_inputs, host_lengths, host_results, host_failed;
-    bool*        device_failed{nullptr};
+    int                            device;
+    size_t                         max_items, max_payload, max_tiles, stride;
+    size_t                         device_bytes{0};
+    cudaStream_t                   stream{nullptr};
+    Allocation                     staging, tiles, inputs, lengths, checksums, statuses, results;
+    Allocation                     host_tiles, host_inputs, host_lengths, host_results, host_failed;
+    bool*                          device_failed{nullptr};
     std::vector<Configuration>     options;
     size_t                         next_option{0};
     std::mutex                     mutex;
@@ -316,7 +316,7 @@ struct CrcBlockCopyBatch::Impl {
                                       stream));
             checkCuda(cudaStreamSynchronize(stream));
             const auto& observed = host_results.as<Result>()[index];
-            const auto failure_status =
+            const auto  failure_status =
                 observed.status != nvcompSuccess ? CrcCopyStatus::CRC_COMPUTE_ERROR : CrcCopyStatus::CRC_MISMATCH;
             if (result == CrcCopyStatus::OK || failure_status == CrcCopyStatus::CRC_COMPUTE_ERROR)
                 result = failure_status;
@@ -408,13 +408,11 @@ CrcBlockCopyBatch::CrcBlockCopyBatch(
 
 CrcBlockCopyBatch::~CrcBlockCopyBatch() = default;
 
-CrcCopyStatus CrcBlockCopyBatch::store(const std::vector<CrcCopyItem>& items,
-                                       std::vector<CrcCopyFailure>*    failures) {
+CrcCopyStatus CrcBlockCopyBatch::store(const std::vector<CrcCopyItem>& items, std::vector<CrcCopyFailure>* failures) {
     return impl_->store(items, failures);
 }
 
-CrcCopyStatus CrcBlockCopyBatch::load(const std::vector<CrcCopyItem>& items,
-                                      std::vector<CrcCopyFailure>*    failures) {
+CrcCopyStatus CrcBlockCopyBatch::load(const std::vector<CrcCopyItem>& items, std::vector<CrcCopyFailure>* failures) {
     return impl_->load(items, failures);
 }
 

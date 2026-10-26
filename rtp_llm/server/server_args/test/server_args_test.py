@@ -170,10 +170,14 @@ class CacheConfigArgumentsTest(TestCase):
 
         config = self.parse_cache_config(
             [
-                "--mock_memory_cache", "0",
-                "--mock_memory_cache_hit_ratio", "0.0",
-                "--mock_memory_cache_seed", "0",
-                "--mock_memory_cache_source_blocks", "0",
+                "--mock_memory_cache",
+                "0",
+                "--mock_memory_cache_hit_ratio",
+                "0.0",
+                "--mock_memory_cache_seed",
+                "0",
+                "--mock_memory_cache_source_blocks",
+                "0",
             ],
             env,
         )

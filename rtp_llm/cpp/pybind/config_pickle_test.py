@@ -170,7 +170,6 @@ class _InvalidTypePDSepConfig:
         return _new_config, (PDSepConfig,), tuple(state)
 
 
-
 class MoeConfigPickleTest(unittest.TestCase):
     def test_non_default_fp4_moe_op_round_trip(self):
         config = MoeConfig()
@@ -197,7 +196,6 @@ class PDSepConfigPickleTest(unittest.TestCase):
 
         self.assertEqual(restored.prefill_stop_stream_wait_timeout_ms, 118)
         self.assertEqual(restored.prefill_prepare_resource_pool_size, 119)
-
 
     def test_rejects_invalid_state_length(self):
         for size in (20, 21, 23):

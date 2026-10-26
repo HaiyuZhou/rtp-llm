@@ -21,7 +21,7 @@ mergeCachePoolMetricsSnapshots(const std::vector<KVCachePoolMetricsSnapshot>&   
             continue;
         }
         CachePoolMetricsSnapshot report_snapshot;
-        report_snapshot.tier                   = tierName(Tier::DEVICE);
+        report_snapshot.tier                       = tierName(Tier::DEVICE);
         report_snapshot.pool_name                  = snapshot.pool_name;
         report_snapshot.block_size_bytes           = snapshot.block_size_bytes;
         report_snapshot.total_blocks               = snapshot.total_blocks;

@@ -218,13 +218,13 @@ protected:
     }
 
     // Own the immutable configuration binding for all dense manager/pool rows.
-    const CacheConfig                  config_;
-    AllocationType                     allocation_type_;
-    BlockTreeCachePtr                  block_tree_cache_;
+    const CacheConfig                        config_;
+    AllocationType                           allocation_type_;
+    BlockTreeCachePtr                        block_tree_cache_;
     std::unique_ptr<MockMemoryHitController> mock_memory_hit_controller_;
-    std::shared_ptr<CPSlotMapper>      cp_slot_mapper_;
-    const kmonitor::MetricsReporterPtr metrics_reporter_             = nullptr;
-    bool                               use_device_malloc_block_pool_ = false;
+    std::shared_ptr<CPSlotMapper>            cp_slot_mapper_;
+    const kmonitor::MetricsReporterPtr       metrics_reporter_             = nullptr;
+    bool                                     use_device_malloc_block_pool_ = false;
 
     size_t  reserve_block_num_{0};
     int64_t reserve_block_ratio_{0};

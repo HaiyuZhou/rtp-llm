@@ -654,7 +654,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
             },
             [](py::tuple t) {
                 const py::tuple event_state = t;
-                const bool has_mock_fields = t.size() == 73 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 8;
+                const bool has_mock_fields  = t.size() == 73 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 8;
                 const bool has_event_fields =
                     has_mock_fields || (t.size() == 69 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 7);
                 if (has_event_fields) {

@@ -347,10 +347,8 @@ bool RtpLLMGrammarMetrics::init(kmonitor::MetricsGroupManager* manager) {
     REGISTER_GAUGE_MUTABLE_METRIC(compile_inflight_metric, "rtp_llm_grammar_compile_inflight");
     REGISTER_GAUGE_MUTABLE_METRIC(verdict_cache_bytes_metric, "rtp_llm_grammar_verdict_cache_bytes");
     REGISTER_GAUGE_MUTABLE_METRIC(total_cache_budget_bytes_metric, "rtp_llm_grammar_total_cache_budget_bytes");
-    REGISTER_GAUGE_MUTABLE_METRIC(compiler_cache_budget_bytes_metric,
-                                  "rtp_llm_grammar_compiler_cache_budget_bytes");
-    REGISTER_GAUGE_MUTABLE_METRIC(verdict_cache_budget_bytes_metric,
-                                  "rtp_llm_grammar_verdict_cache_budget_bytes");
+    REGISTER_GAUGE_MUTABLE_METRIC(compiler_cache_budget_bytes_metric, "rtp_llm_grammar_compiler_cache_budget_bytes");
+    REGISTER_GAUGE_MUTABLE_METRIC(verdict_cache_budget_bytes_metric, "rtp_llm_grammar_verdict_cache_budget_bytes");
     return true;
 }
 

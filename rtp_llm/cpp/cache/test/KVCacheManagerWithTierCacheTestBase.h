@@ -1369,7 +1369,7 @@ protected:
                      std::optional<double> mock_hit_ratio      = std::nullopt,
                      int                   min_replay_tokens   = 1) {
         ASSERT_FALSE(disk_dir_.path().empty());
-        cache_config_ = makeCompactDsv4CacheConfig(device_blocks);
+        cache_config_                         = makeCompactDsv4CacheConfig(device_blocks);
         cache_config_.cache_min_replay_tokens = min_replay_tokens;
 
         auto tier_config = makeTierConfig(GetParam(), disk_dir_.path(), lower_cache_size_mb);
@@ -1698,9 +1698,9 @@ protected:
             ASSERT_TRUE(engine->armPause());
         }
         ScopedTransferRelease pending_release(engine);
-        const int    block_size     = static_cast<int>(cache_config_.seq_size_per_block);
+        const int             block_size      = static_cast<int>(cache_config_.seq_size_per_block);
         auto                  failed_resource = makeResource(cache_config_);
-        auto         tokens         = makeTokenIds(0, 2 * block_size, 2 * block_size, block_size);
+        auto                  tokens          = makeTokenIds(0, 2 * block_size, 2 * block_size, block_size);
         MallocInfo            failed_info{failed_resource, tokens};
         const auto            failed = manager_->malloc(failed_info);
         ASSERT_TRUE(failed.success);
@@ -1738,8 +1738,8 @@ protected:
         }
         if (waiting_child) {
             EXPECT_FALSE(waiting_child->done());
-            const size_t submits_before = engine->submittedDescriptorCount();
-            size_t                                                   expected_submits = 0;
+            const size_t submits_before   = engine->submittedDescriptorCount();
+            size_t       expected_submits = 0;
             std::vector<std::pair<DeviceBlockPoolPtr, BlockIdxType>> child_targets;
             if (corrupt_type == CacheGroupType::SWA) {
                 for (size_t i = 0; i < waiting_child->loadDescs().size(); ++i) {

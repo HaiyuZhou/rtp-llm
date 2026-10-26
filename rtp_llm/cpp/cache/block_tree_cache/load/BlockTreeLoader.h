@@ -56,7 +56,7 @@ public:
     bool                 abortPendingLoad(const std::shared_ptr<AsyncContext>& context);
     // The caller holds the shared cache mutex; no tree lookup or mutation.
     std::shared_ptr<LoadAsyncContext> mockMemoryLoad(size_t logical_blocks);
-    void                 shutdown();
+    void                              shutdown();
 
 private:
     bool                                                validMatch(std::vector<TreeNode*>&            path,
@@ -89,19 +89,19 @@ private:
                              GroupSetTransferState expected_state,
                              GroupSetTransferState target_state);
 
-    BlockTree*                              tree_;
-    BlockTreeEvictor&                       evictor_;
-    BlockTransferDispatcher*                transfer_dispatcher_;
-    BlockTreeTaskPool*                      task_pool_;
-    BlockTreeCacheMetricsReporter&          metrics_reporter_;
-    std::mutex&                             mutex_;
-    bool                                    enable_device_cache_{true};
-    std::shared_ptr<StorageBackend>         storage_backend_;
+    BlockTree*                                   tree_;
+    BlockTreeEvictor&                            evictor_;
+    BlockTransferDispatcher*                     transfer_dispatcher_;
+    BlockTreeTaskPool*                           task_pool_;
+    BlockTreeCacheMetricsReporter&               metrics_reporter_;
+    std::mutex&                                  mutex_;
+    bool                                         enable_device_cache_{true};
+    std::shared_ptr<StorageBackend>              storage_backend_;
     std::shared_ptr<const MockMemoryCacheSource> mock_memory_cache_source_;
-    SettledFn                               settled_;
-    LoadTaskRunner                          load_task_runner_;
-    LoadJoinRegistry                        load_join_registry_;
-    std::shared_ptr<LoadContextCoordinator> load_context_coordinator_;
+    SettledFn                                    settled_;
+    LoadTaskRunner                               load_task_runner_;
+    LoadJoinRegistry                             load_join_registry_;
+    std::shared_ptr<LoadContextCoordinator>      load_context_coordinator_;
 };
 
 }  // namespace rtp_llm

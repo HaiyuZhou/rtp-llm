@@ -257,8 +257,8 @@ public:
     }
 
 private:
-    std::vector<KVCacheResource> batch_resource;  // [batch_size]
-    bool                         cache_keys_initialized_{false};
+    std::vector<KVCacheResource>       batch_resource;  // [batch_size]
+    bool                               cache_keys_initialized_{false};
     std::optional<MockMemoryCachePlan> mock_memory_cache_plan_;
 };
 

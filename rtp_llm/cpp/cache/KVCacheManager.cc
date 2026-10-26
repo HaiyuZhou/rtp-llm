@@ -140,7 +140,7 @@ void reportPoolCacheMetrics(const kmonitor::MetricsReporterPtr& metrics_reporter
     pool_collector.mock_source_ref_blocks            = static_cast<int64_t>(pool_snapshot.mock_source_ref_blocks);
     pool_collector.mock_source_ref_bytes             = static_cast<int64_t>(
         std::min(pool_snapshot.mock_source_ref_bytes, static_cast<size_t>(std::numeric_limits<int64_t>::max())));
-    pool_collector.used_ratio                        = pool_snapshot.used_ratio;
+    pool_collector.used_ratio = pool_snapshot.used_ratio;
 
     kmonitor::MetricsTags pool_tags("pool_name", pool_snapshot.pool_name);
     pool_tags.AddTag("tier", pool_snapshot.tier);

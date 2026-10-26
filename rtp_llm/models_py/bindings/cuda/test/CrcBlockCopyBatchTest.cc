@@ -232,6 +232,7 @@ class CrcBatchTest: public ::testing::Test {
             std::filesystem::remove_all(dump_root_, ignored);
         }
     }
+
 protected:
     std::shared_ptr<CrcDumpWriter> makeDumpWriter(size_t backup_count = CrcDumpWriter::kBackupCount) {
         const char* temp    = std::getenv("TEST_TMPDIR");
@@ -493,7 +494,7 @@ TEST_F(CrcBatchTest, BatchedMixedRecordsInteroperateWithSingleRecordCopies) {
 TEST_F(CrcBatchTest, LargeBatchCorruptionRejectsEveryScatterAndRecovers) {
     auto              blocks = makeGuardedBlocks(32, {49157, 65535, 65536, 65537, 32769});
     CrcBlockCopyBatch copy(0, 32, 65537, 32 * 3);
-    const auto        items  = itemsFor(blocks, 32);
+    const auto        items = itemsFor(blocks, 32);
     for (auto& block : blocks)
         block->writeCpuRecord();
     ASSERT_EQ(copy.load(items), CrcCopyStatus::OK);
@@ -696,8 +697,8 @@ TEST_F(CrcBatchTest, ProductionFinishPreservesNvcompErrorsAndNeverResealsReads) 
             SCOPED_TRACE(i);
             const bool failure = injected[i] != nvcompSuccess || (!store && corrupt_footer);
             EXPECT_EQ(host_failed[i], failure);
-            const size_t footer = i * stride + CrcBlockCopyBatch::encodedBytes(sizes[i]) - 4;
-            uint32_t original_footer = 0;
+            const size_t footer          = i * stride + CrcBlockCopyBatch::encodedBytes(sizes[i]) - 4;
+            uint32_t     original_footer = 0;
             std::memcpy(&original_footer, input.data() + footer, 4);
             if (failure) {
                 EXPECT_EQ(actual[i].status, injected[i]);
@@ -705,8 +706,8 @@ TEST_F(CrcBatchTest, ProductionFinishPreservesNvcompErrorsAndNeverResealsReads) 
                 EXPECT_EQ(actual[i].expected, store ? whole_crc[i] : original_footer);
             } else {
                 EXPECT_TRUE(std::all_of(result_bytes.begin() + i * sizeof(internal::Result),
-                                       result_bytes.begin() + (i + 1) * sizeof(internal::Result),
-                                       [](uint8_t value) { return value == 0xac; }));
+                                        result_bytes.begin() + (i + 1) * sizeof(internal::Result),
+                                        [](uint8_t value) { return value == 0xac; }));
             }
             if (store) {
                 uint32_t stored_footer = 0;

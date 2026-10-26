@@ -47,20 +47,20 @@ private:
     using StoreTask    = StoreTaskRunner::Task;
     using StoreTaskPtr = std::shared_ptr<StoreTask>;
 
-    void             publishDeviceLocked(const CacheKeysType&                              cache_keys,
+    void           publishDeviceLocked(const CacheKeysType&                              cache_keys,
+                                       const std::vector<std::vector<GroupSetResource>>& resources,
+                                       bool                                              is_resident,
+                                       size_t&                                           resident_prefix_length);
+    StorageRequest makeStorageRequest(const CacheKeysType&                              cache_keys,
+                                      const std::vector<std::vector<GroupSetResource>>& resources) const;
+    void           submitLowerTierLocked(const CacheKeysType&                              cache_keys,
                                          const std::vector<std::vector<GroupSetResource>>& resources,
-                                         bool                                              is_resident,
-                                         size_t&                                           resident_prefix_length);
-    StorageRequest   makeStorageRequest(const CacheKeysType&                              cache_keys,
-                                        const std::vector<std::vector<GroupSetResource>>& resources) const;
-    void             submitLowerTierLocked(const CacheKeysType&                              cache_keys,
-                                           const std::vector<std::vector<GroupSetResource>>& resources,
-                                           Tier                                              target_tier,
-                                           bool                                              mock_memory_cache);
-    void             runStoreTask(const StoreTaskPtr& task);
-    void             scheduleStoreSettlement(const StoreTaskPtr& task, ErrorInfo error);
-    void             settleTask(const StoreTask& task, bool copy_success);
-    size_t           settleLocked(const StoreTask& task, bool publish);
+                                         Tier                                              target_tier,
+                                         bool                                              mock_memory_cache);
+    void           runStoreTask(const StoreTaskPtr& task);
+    void           scheduleStoreSettlement(const StoreTaskPtr& task, ErrorInfo error);
+    void           settleTask(const StoreTask& task, bool copy_success);
+    size_t         settleLocked(const StoreTask& task, bool publish);
 
     BlockTree*                      tree_;
     BlockTreeEvictor&               evictor_;

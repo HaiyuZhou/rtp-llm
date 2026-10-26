@@ -2209,8 +2209,8 @@ TEST_F(BlockTreeCacheFactoryTest, FullPrefixScanConfigPropagatesAndValidates) {
 }
 
 TEST_F(BlockTreeCacheFactoryTest, DisabledMockMemoryCachePreservesOrdinaryStartup) {
-    const auto config = makeSingleConfig();
-    auto allocator = initAllocator<CoordinatorCacheManager>(config);
+    const auto    config    = makeSingleConfig();
+    auto          allocator = initAllocator<CoordinatorCacheManager>(config);
     KVCacheConfig options;
     EXPECT_FALSE(options.mock_memory_cache);
     EXPECT_EQ(options.mock_memory_cache_hit_ratio, 0.0);
@@ -2339,12 +2339,12 @@ TEST_F(BlockTreeCacheFactoryTest, MockMemoryCacheAcceptsInclusiveRatioEndpoints)
     const auto config = makeSingleConfig();
     for (double ratio : {0.0, 1.0}) {
         SCOPED_TRACE(ratio);
-        auto allocator = initAllocator<CoordinatorCacheManager>(config);
+        auto          allocator = initAllocator<CoordinatorCacheManager>(config);
         KVCacheConfig options;
-        options.mock_memory_cache = true;
-        options.reuse_cache = true;
-        options.enable_memory_cache = true;
-        options.memory_cache_size_mb = 1;
+        options.mock_memory_cache           = true;
+        options.reuse_cache                 = true;
+        options.enable_memory_cache         = true;
+        options.memory_cache_size_mb        = 1;
         options.mock_memory_cache_hit_ratio = ratio;
         EXPECT_NE(createBlockTreeCache(config, options, allocator), nullptr);
     }
@@ -2352,15 +2352,18 @@ TEST_F(BlockTreeCacheFactoryTest, MockMemoryCacheAcceptsInclusiveRatioEndpoints)
 
 TEST_F(BlockTreeCacheFactoryTest, MockMemoryCacheRejectsInvalidRatios) {
     const auto config = makeSingleConfig();
-    for (double ratio : {-0.01, 1.01, std::numeric_limits<double>::quiet_NaN(),
-                         std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
+    for (double ratio : {-0.01,
+                         1.01,
+                         std::numeric_limits<double>::quiet_NaN(),
+                         std::numeric_limits<double>::infinity(),
+                         -std::numeric_limits<double>::infinity()}) {
         SCOPED_TRACE(ratio);
-        auto allocator = initAllocator<CoordinatorCacheManager>(config);
+        auto          allocator = initAllocator<CoordinatorCacheManager>(config);
         KVCacheConfig options;
-        options.mock_memory_cache = true;
-        options.reuse_cache = true;
-        options.enable_memory_cache = true;
-        options.memory_cache_size_mb = 1;
+        options.mock_memory_cache           = true;
+        options.reuse_cache                 = true;
+        options.enable_memory_cache         = true;
+        options.memory_cache_size_mb        = 1;
         options.mock_memory_cache_hit_ratio = ratio;
         BlockTreeCachePtr cache;
         EXPECT_NO_THROW(cache = createBlockTreeCache(config, options, allocator));
@@ -2373,12 +2376,12 @@ TEST_F(BlockTreeCacheFactoryTest, MockMemoryCacheRequiresReuseAndMemoryCapacityA
     const auto config = makeSingleConfig();
     for (int invalid_field = 0; invalid_field < 5; ++invalid_field) {
         SCOPED_TRACE(invalid_field);
-        auto allocator = initAllocator<CoordinatorCacheManager>(config);
+        auto          allocator = initAllocator<CoordinatorCacheManager>(config);
         KVCacheConfig options;
-        options.mock_memory_cache = true;
-        options.reuse_cache = invalid_field != 0;
-        options.enable_memory_cache = invalid_field != 1;
-        options.memory_cache_size_mb = invalid_field == 2 ? 0 : invalid_field == 3 ? -1 : 1;
+        options.mock_memory_cache               = true;
+        options.reuse_cache                     = invalid_field != 0;
+        options.enable_memory_cache             = invalid_field != 1;
+        options.memory_cache_size_mb            = invalid_field == 2 ? 0 : invalid_field == 3 ? -1 : 1;
         options.mock_memory_cache_source_blocks = invalid_field == 4 ? 0 : 64;
         BlockTreeCachePtr cache;
         EXPECT_NO_THROW(cache = createBlockTreeCache(config, options, allocator));
@@ -2388,12 +2391,12 @@ TEST_F(BlockTreeCacheFactoryTest, MockMemoryCacheRequiresReuseAndMemoryCapacityA
 }
 
 TEST_F(BlockTreeCacheFactoryTest, MockMemoryCacheWarnsThatOutputsAreInvalid) {
-    const auto config = makeSingleConfig();
-    auto allocator = initAllocator<CoordinatorCacheManager>(config);
+    const auto    config    = makeSingleConfig();
+    auto          allocator = initAllocator<CoordinatorCacheManager>(config);
     KVCacheConfig options;
-    options.mock_memory_cache = true;
-    options.reuse_cache = true;
-    options.enable_memory_cache = true;
+    options.mock_memory_cache    = true;
+    options.reuse_cache          = true;
+    options.enable_memory_cache  = true;
     options.memory_cache_size_mb = 1;
     test::TestLogCapture capture("mock_memory_cache_startup");
     ASSERT_NE(createBlockTreeCache(config, options, allocator), nullptr);

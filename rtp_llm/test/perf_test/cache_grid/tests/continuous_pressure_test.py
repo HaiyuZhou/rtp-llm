@@ -329,6 +329,67 @@ class InlineExecutor:
 
 
 class MockTerminalEvidenceTest(unittest.TestCase):
+    def test_hybrid_requires_mock_counters_and_keeps_real_tree_readiness(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        cfg = replace(config(), evidence_policy="tree_then_mock_memory")
+        sample = self.sample(1, 0.5)
+        for mock in (None, replace(sample.mock_memory, terminal_outcome_version=0)):
+            with self.subTest(mock=mock), self.assertRaisesRegex(
+                ValueError, "mock memory"
+            ):
+                PressureCoverage((replace(sample, mock_memory=mock),), cfg)
+        coverage = PressureCoverage((sample,), cfg)
+        self.assertFalse(coverage.target_valid(coverage.targets[0], (sample,)))
+
+    def test_hybrid_migration_uses_only_mock_outcomes_inside_measurement(self):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            PressureCoverage,
+        )
+
+        cfg = replace(config(), evidence_policy="tree_then_mock_memory")
+        for success_at, failure_at, valid in (
+            (1.0, None, False),
+            (2.0, None, True),
+            (2.0, 2.0, False),
+            (2.0, 1.0, True),
+        ):
+            with self.subTest(success_at=success_at, failure_at=failure_at):
+                coverage = PressureCoverage((self.sample(1, 0),), cfg)
+                for sequence, now in enumerate((0.5, 1.0, 1.5, 2.0, 2.5), 2):
+                    coverage.add(
+                        (
+                            self.sample(
+                                sequence,
+                                now,
+                                completed=4 if now >= success_at else 0,
+                                h2d_failed=int(
+                                    failure_at is not None and now >= failure_at
+                                ),
+                                d2h_failed=int(
+                                    failure_at is not None and now >= failure_at
+                                ),
+                            ),
+                        ),
+                        now,
+                    )
+                result = coverage.assess_migration(1.5, 2.5)
+                self.assertEqual(result.valid, valid, result.reasons)
+                if valid:
+                    group = result.groups[0]
+                    self.assertEqual(
+                        group.h2d_evidence[0].source,
+                        "mock_memory_successful_h2d_blocks",
+                    )
+                    self.assertEqual(
+                        group.d2h_evidence[0].source, "mock_memory_d2h_completed_blocks"
+                    )
+                if failure_at == 2.0:
+                    self.assertIn("failed_h2d:0:0", result.reasons)
+                    self.assertIn("failed_d2h:0:0", result.reasons)
+
     def test_mock_policy_requires_supported_terminal_counter_semantics(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             PressureCoverage,
@@ -436,6 +497,103 @@ class MockTerminalEvidenceTest(unittest.TestCase):
 
 
 class LifecycleTest(unittest.TestCase):
+    def hybrid_poll(self, evidence, sequence, clock):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
+            MockMemorySample,
+        )
+
+        return replace(
+            evidence,
+            samples=(
+                replace(
+                    evidence.samples[0],
+                    mock_memory=MockMemorySample(
+                        sequence * 8,
+                        sequence * 4,
+                        sequence * 4,
+                        0,
+                        sequence * 4,
+                        sequence * 4,
+                        0,
+                        terminal_outcome_version=1,
+                    ),
+                ),
+            ),
+        )
+
+    def hybrid_config(self, **changes):
+        return replace(
+            config(
+                family_schedule="tiered_rolling",
+                memory_reuse_ratio=0.5,
+                fill_host_max_ratio=0.8,
+                measure_s=1,
+                steady_s=0.5,
+                sample_period_s=0.1,
+                **changes,
+            ),
+            evidence_policy="tree_then_mock_memory",
+        )
+
+    def test_hybrid_runs_real_fill_without_rewarm_and_flags_only_measurement(self):
+        result, events, _, session = self.run_session(
+            seed_count=3,
+            rate=0,
+            cfg=self.hybrid_config(),
+            poll_transform=self.hybrid_poll,
+        )
+        self.assertIsNone(result["failure"], events)
+        self.assertEqual(result["rewarm"]["planned"], 0)
+        dispatches = [event for event in events if event["event"] == "dispatch"]
+        for phase in ("seed", "fill", "steady", "measurement"):
+            self.assertTrue(any(event["phase"] == phase for event in dispatches), phase)
+        for event in dispatches:
+            self.assertIs(
+                event["metadata"].get("mock_memory_cache_request"),
+                event["phase"] == "measurement",
+            )
+        self.assertTrue(result["pressure"]["valid"])
+        self.assertTrue(result["migration"]["valid"])
+        for group in result["migration"]["groups"]:
+            self.assertTrue(
+                all(
+                    item["source"].startswith("mock_memory_")
+                    for item in group["h2d_evidence"] + group["d2h_evidence"]
+                )
+            )
+
+    def test_hybrid_cannot_use_mock_outcomes_to_skip_real_fill(self):
+        result, events, _, _ = self.run_session(
+            seed_count=1,
+            valid=False,
+            rate=0,
+            cfg=self.hybrid_config(fill_max_requests=3),
+            poll_transform=self.hybrid_poll,
+        )
+        self.assertEqual(result["failure"], "pressure_not_reached")
+        self.assertIsNone(result["measurement_start"])
+
+    def test_hybrid_keeps_host_headroom_fail_closed(self):
+        def exhaust(evidence, sequence, clock):
+            evidence = self.hybrid_poll(evidence, sequence, clock)
+            sample = evidence.samples[0]
+            if sequence >= 3:
+                sample = replace(
+                    sample,
+                    pools=tuple(
+                        replace(pool, used=85) if pool.pool_id == "host" else pool
+                        for pool in sample.pools
+                    ),
+                )
+            return replace(evidence, samples=(sample,))
+
+        result, _, _, _ = self.run_session(
+            rate=0,
+            cfg=self.hybrid_config(),
+            poll_transform=exhaust,
+        )
+        self.assertEqual(result["failure"], "fill_headroom_exhausted")
+
     def test_mock_memory_policy_runs_formal_measurement_without_tree_pressure(self):
         from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
             MockMemorySample,
@@ -2272,6 +2430,142 @@ class CancellableRequestHandleTest(unittest.TestCase):
 
 
 class TransportRegistrationTest(unittest.TestCase):
+    def test_hybrid_preflight_requests_opt_out_without_changing_legacy_policies(self):
+        from rtp_llm.dash_sc.proto.predict_v2_pb2 import ModelStreamInferResponse
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            CacheGridRunner,
+        )
+
+        for policy in ("tree_pressure", "mock_memory", "tree_then_mock_memory"):
+            with self.subTest(policy=policy):
+                sent = []
+
+                def invoke(requests, **kwargs):
+                    request = next(requests)
+                    sent.append(request)
+                    response = ModelStreamInferResponse()
+                    response.infer_response.parameters[
+                        "prompt_token_num"
+                    ].int64_param = 2
+                    return iter((response,))
+
+                runner = object.__new__(CacheGridRunner)
+                runner.request_transport = "dashsc_input_ids"
+                runner.request_timeout = 2
+                runner._grpc_stub = SimpleNamespace(ModelStreamInfer=invoke)
+                runner.pressure_config = replace(config(), evidence_policy=policy)
+                result = runner._post_request("", [1, 2], "block_size_probe:seed")
+                self.assertTrue(result["success"], result)
+                self.assertEqual(
+                    "mock_memory_cache_request" in sent[0].parameters,
+                    policy == "tree_then_mock_memory",
+                )
+                if policy == "tree_then_mock_memory":
+                    self.assertFalse(
+                        sent[0].parameters["mock_memory_cache_request"].bool_param
+                    )
+
+    def test_hybrid_queued_request_resolves_mock_control_after_preparation(self):
+        from rtp_llm.dash_sc.client import build_model_infer_request
+        from rtp_llm.dash_sc.proto.predict_v2_pb2 import ModelStreamInferResponse
+        from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
+            _post_prefill_ids,
+        )
+
+        for target_phase, expected in (("measurement", True), ("support", False)):
+            with self.subTest(target_phase=target_phase):
+                pending, sent, order = [], [], []
+                clock = FakeClock()
+
+                class QueuedExecutor:
+                    def submit(self, fn, *args):
+                        future = Future()
+                        pending.append((future, fn, args))
+                        return future
+
+                def payload(*args):
+                    order.append("prepare")
+                    return {"input_ids": [1] * 16}
+
+                def build(**kwargs):
+                    self.assertEqual(
+                        session.state.phase, "steady" if expected else "measurement"
+                    )
+                    result = build_model_infer_request(**kwargs)
+                    order.append("build")
+                    # Preparation can cross a phase boundary even after the
+                    # queued worker starts. Resolve only after it finishes.
+                    session.state.phase = target_phase
+                    session.state.measurement_start = clock()
+                    session.state.measurement_end = clock() + 10
+                    session.profile_pending = target_phase == "support"
+                    return result
+
+                def invoke(requests, **kwargs):
+                    request = next(requests)
+                    self.assertIn("mock_memory_cache_request", request.parameters)
+                    sent.append(
+                        (
+                            request.id,
+                            request.parameters["mock_memory_cache_request"].bool_param,
+                        )
+                    )
+                    order.append("rpc")
+                    response = ModelStreamInferResponse()
+                    response.infer_response.parameters[
+                        "prompt_token_num"
+                    ].int64_param = 16
+                    return iter((response,))
+
+                def request(payload, register, before):
+                    def dispatch():
+                        order.append("dispatch")
+                        return before(payload)
+
+                    return _post_prefill_ids(
+                        SimpleNamespace(ModelStreamInfer=invoke),
+                        payload["input_ids"],
+                        2,
+                        "pending",
+                        register_call=register,
+                        before_dispatch=dispatch,
+                        resolve_mock_memory_cache_request=lambda: payload.get(
+                            "mock_memory_cache_request"
+                        ),
+                    )
+
+                session = cp.PressureSession(
+                    replace(config(), evidence_policy="tree_then_mock_memory"),
+                    session_id="queued",
+                    limits=cp.ExecutionLimits(128, 8, 256, 64, 16),
+                    concurrency=4,
+                    scheduler="fifo",
+                    batch_size=1,
+                    max_input_tokens=16,
+                    seed_plan=seed_plan(),
+                    startup_targets=(),
+                    make_payload=payload,
+                    request=request,
+                    poll=lambda timeout: None,
+                    sink=lambda event: None,
+                    set_batch=lambda *args, **kwargs: None,
+                    clock=clock,
+                )
+                session.executor = QueuedExecutor()
+                session.state = cp.PressurePhases(session.config, clock())
+                session.state.phase = "steady" if expected else "measurement"
+                self.assertTrue(session._submit("formal"))
+                self.assertEqual(order, [])
+                with patch(
+                    "rtp_llm.dash_sc.client.build_model_infer_request",
+                    side_effect=build,
+                ):
+                    for future, fn, args in pending:
+                        future.set_result(fn(*args))
+                session._collect()
+                self.assertEqual(sent, [(f"queued:{target_phase}:0", expected)])
+                self.assertEqual(order, ["prepare", "build", "dispatch", "rpc"])
+
     def test_empty_or_non_inference_stream_is_not_a_successful_request(self):
         from rtp_llm.dash_sc.proto.predict_v2_pb2 import ModelStreamInferResponse
         from rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner import (
@@ -2667,7 +2961,16 @@ class RunnerIntegrationTest(unittest.TestCase):
                 )
             return response
 
-        def post(stub, ids, timeout, request_id, *, register_call, before_dispatch):
+        def post(
+            stub,
+            ids,
+            timeout,
+            request_id,
+            *,
+            register_call,
+            before_dispatch,
+            resolve_mock_memory_cache_request,
+        ):
             self.assertIs(sessions[0].seed_plan, runner._pressure_seed_plan)
             self.assertEqual(observations[:2], ["startup", "probe"])
             identity = before_dispatch()

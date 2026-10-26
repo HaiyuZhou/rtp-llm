@@ -92,7 +92,10 @@ def pressure_settings(profile, args, *, direct=False):
     mock_enabled = str(mock_value).lower() in {"1", "true"}
     expected_policy = "mock_memory" if mock_enabled else "tree_pressure"
     policy = values.setdefault("evidence_policy", expected_policy)
-    if policy != expected_policy:
+    allowed_policies = (
+        {"mock_memory", "tree_then_mock_memory"} if mock_enabled else {"tree_pressure"}
+    )
+    if policy not in allowed_policies:
         raise ProfileError(
             "cache_grid.pressure.evidence_policy must match --mock_memory_cache"
         )

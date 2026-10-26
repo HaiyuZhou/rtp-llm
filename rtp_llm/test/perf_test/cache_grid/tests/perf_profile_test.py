@@ -140,7 +140,21 @@ class ValidateProfileTest(unittest.TestCase):
             pressure_settings(mock_profile, SimpleNamespace()).evidence_policy,
             "mock_memory",
         )
-        for engine_value, policy in ((1, "tree_pressure"), (0, "mock_memory")):
+        hybrid_profile = _minimal_profile(
+            engine_args={"--mock_memory_cache": 1},
+            cache_grid={
+                "pressure": dict(values, evidence_policy="tree_then_mock_memory")
+            },
+        )
+        self.assertEqual(
+            pressure_settings(hybrid_profile, SimpleNamespace()).evidence_policy,
+            "tree_then_mock_memory",
+        )
+        for engine_value, policy in (
+            (1, "tree_pressure"),
+            (0, "mock_memory"),
+            (0, "tree_then_mock_memory"),
+        ):
             with self.subTest(engine_value=engine_value, policy=policy):
                 profile = _minimal_profile(
                     engine_args={"--mock_memory_cache": engine_value},
@@ -296,6 +310,45 @@ class ValidateProfileTest(unittest.TestCase):
 
 
 class LoadProfileTest(unittest.TestCase):
+    def test_tree_then_mock_memory_example_remains_diagnostic_only(self):
+        from rtp_llm.test.perf_test.cache_grid.runner import cache_perf
+
+        config = Path(__file__).resolve().parents[1] / "config"
+        path = (
+            config / "continuous_full_pressure_dsv4.tree_then_mock_memory.example.jsonc"
+        )
+        self.assertTrue(
+            path.is_file(), "dedicated tree-fill/mock-measurement profile is missing"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            args = cache_perf.parser().parse_args(
+                [
+                    "profile",
+                    "--profile",
+                    str(path),
+                    "--grid",
+                    str(
+                        config
+                        / "continuous_full_pressure_grid.mock_memory.example.json"
+                    ),
+                    "--result-dir",
+                    str(Path(directory) / "result"),
+                    "--pressure-mode=continuous",
+                    "--pressure-preload",
+                ]
+            )
+            plan = cache_perf.build_plan(args, {})
+        frozen = json.loads(plan["artifacts"]["profile.snapshot.json"])
+        self.assertEqual(frozen["engine_args"]["--mock_memory_cache"], 1)
+        self.assertEqual(
+            frozen["cache_grid"]["pressure"]["evidence_policy"], "tree_then_mock_memory"
+        )
+        self.assertTrue(frozen["cache_grid"]["diagnostic_only"])
+        self.assertIn("OUTPUT CORRECTNESS INVALID", frozen["label"])
+        launch = json.loads(plan["artifacts"][cache_perf.MANIFEST])
+        self.assertFalse(launch["formal_candidate"])
+        self.assertEqual(launch["formal_candidate_reasons"], ["diagnostic_only"])
+
     def test_mock_memory_profile_freezes_all_engine_options_and_diagnostic_marker(self):
         from rtp_llm.test.perf_test.cache_grid.runner import cache_perf
 

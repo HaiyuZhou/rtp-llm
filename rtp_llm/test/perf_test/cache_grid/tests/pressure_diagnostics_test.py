@@ -3,6 +3,7 @@ import dataclasses
 import unittest
 from types import SimpleNamespace as NS
 
+from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import CachePressureRankPB
 from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
     GroupSample,
     PoolSample,
@@ -68,6 +69,10 @@ class PB(NS):
         return b"complete raw wire evidence including steps/activity"
 
 
+class RankPB(PB):
+    DESCRIPTOR = CachePressureRankPB.DESCRIPTOR
+
+
 def wire():
     gpu = PB(
         pool_id="gpu",
@@ -105,7 +110,7 @@ def wire():
         schema_version=1,
         requested_ranks=[0],
         ranks=[
-            PB(
+            RankPB(
                 world_rank=0,
                 service_instance="instance",
                 sequence=1,

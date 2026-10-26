@@ -221,8 +221,14 @@ def resolve_pressure_config(values: dict) -> PressureConfig:
         raise ValueError("family_schedule must be round_robin or tiered_rolling")
     if config.rate_control not in {"fixed", "adaptive_backlog"}:
         raise ValueError("rate_control must be fixed or adaptive_backlog")
-    if config.evidence_policy not in {"tree_pressure", "mock_memory"}:
-        raise ValueError("evidence_policy must be tree_pressure or mock_memory")
+    if config.evidence_policy not in {
+        "tree_pressure",
+        "mock_memory",
+        "tree_then_mock_memory",
+    }:
+        raise ValueError(
+            "evidence_policy must be tree_pressure, mock_memory or tree_then_mock_memory"
+        )
     adaptive_values = (
         config.request_rate_min,
         config.request_rate_max,
@@ -1023,12 +1029,12 @@ class PressureCoverage:
         self.ranks = tuple(sorted(s.rank for s in baselines))
         self.targets = select_targets(tuple(baselines), self.ranks)
         self.baselines = {s.rank: s for s in baselines}
-        if config.evidence_policy == "mock_memory" and any(
+        if config.evidence_policy in {"mock_memory", "tree_then_mock_memory"} and any(
             self.baselines[target.owner_rank].mock_memory is None
             for target in self.targets
         ):
             raise ValueError("mock memory pressure counters are unavailable")
-        if config.evidence_policy == "mock_memory" and any(
+        if config.evidence_policy in {"mock_memory", "tree_then_mock_memory"} and any(
             getattr(
                 self.baselines[target.owner_rank].mock_memory,
                 "terminal_outcome_version",
@@ -1082,7 +1088,7 @@ class PressureCoverage:
                 self.reasons.add("inventory_discontinuity")
                 continue
             if (
-                self.config.evidence_policy == "mock_memory"
+                self.config.evidence_policy in {"mock_memory", "tree_then_mock_memory"}
                 and any(target.owner_rank == sample.rank for target in self.targets)
                 and getattr(sample.mock_memory, "terminal_outcome_version", 0)
                 != MOCK_MEMORY_TERMINAL_OUTCOME_VERSION
@@ -1283,7 +1289,7 @@ class PressureCoverage:
             interval = possible_event_segment(
                 old.server_s, current.server_s, old_bounds, bounds
             )
-            if self.config.evidence_policy == "mock_memory":
+            if self.config.evidence_policy in {"mock_memory", "tree_then_mock_memory"}:
                 self._record_mock_memory_migration(
                     owner_rank, owner_group_id, old, current, interval
                 )

@@ -751,6 +751,8 @@ class PressureSession:
             ):
                 raise ValueError("generated input violates frozen token bound")
             self.limits.concurrency_for(len(ids))
+            if self.config.evidence_policy == "tree_then_mock_memory":
+                payload["mock_memory_cache_request"] = phase == "measurement"
             input_sha256 = hashlib.sha256(
                 struct.pack(f"<{len(ids)}i", *ids)
             ).hexdigest()

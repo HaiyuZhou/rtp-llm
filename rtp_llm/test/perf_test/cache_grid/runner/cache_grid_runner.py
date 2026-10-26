@@ -944,6 +944,7 @@ def _post_prefill_ids(
     *,
     register_call: Optional[Callable[[Any], None]] = None,
     before_dispatch: Optional[Callable[[], str]] = None,
+    resolve_mock_memory_cache_request: Optional[Callable[[], Optional[bool]]] = None,
 ) -> Dict[str, Any]:
     """Send token ids and optionally register the cancellable call before reading."""
     from rtp_llm.dash_sc.client import build_model_infer_request
@@ -962,6 +963,14 @@ def _post_prefill_ids(
         if before_dispatch is not None:
             request_id = before_dispatch()
             request.id = request_id
+        # Resolve after phase classification, while retaining token/protobuf
+        # preparation before the final dispatch permission check.
+        if resolve_mock_memory_cache_request is not None:
+            mock_request = resolve_mock_memory_cache_request()
+            if mock_request is not None:
+                request.parameters["mock_memory_cache_request"].bool_param = (
+                    mock_request
+                )
         responses = stub.ModelStreamInfer(
             iter((request,)),
             timeout=timeout,
@@ -1611,7 +1620,16 @@ class CacheGridRunner:
             if self._grpc_stub is None:
                 raise RuntimeError("Dash-SC gRPC transport is not initialized")
             return _post_prefill_ids(
-                self._grpc_stub, input_ids, self.request_timeout, request_id
+                self._grpc_stub,
+                input_ids,
+                self.request_timeout,
+                request_id,
+                resolve_mock_memory_cache_request=lambda: (
+                    False
+                    if self.pressure_config is not None
+                    and self.pressure_config.evidence_policy == "tree_then_mock_memory"
+                    else None
+                ),
             )
         return _post_prefill(
             self.port, prompt, self.request_timeout, request_id, self._http_session
@@ -2189,6 +2207,9 @@ class CacheGridRunner:
                 "pending",
                 register_call=register,
                 before_dispatch=lambda: before(payload),
+                resolve_mock_memory_cache_request=lambda: payload.get(
+                    "mock_memory_cache_request"
+                ),
             )
 
         def poll(timeout):

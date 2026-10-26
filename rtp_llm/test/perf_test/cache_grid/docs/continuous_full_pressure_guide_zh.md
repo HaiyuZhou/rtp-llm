@@ -258,7 +258,12 @@ python3 tools/cache_perf resume --result-dir /data0/zhouhaiyu.zhy/tmp/dsv4-forma
 
 [独立 mock profile](../config/continuous_full_pressure_dsv4.mock_memory.example.jsonc) 从 production 示例派生，保留 TP4/EP4、真实容量和工具链设置，不修改 production 或小池 smoke 的含义。它仅用于缓存迁移与 CPU 开销诊断：合成 KV 不对应输入 token，**模型输出正确性无效，不能做质量评测、exact-reuse 拟合或正式推理性能结论**。profile 的结构化 `cache_grid.diagnostic_only=true` 会冻结进 snapshot、live seed plan 和 classification，强制 `formal_candidate=false`，原因 `diagnostic_only`；标签同时写明 `DIAGNOSTIC ONLY; OUTPUT CORRECTNESS INVALID`。该可选布尔字段缺省为 false，与 `explicit_smoke` 是两个独立标记。
 
-该配置设定 `--mock_memory_cache=1`、`--mock_memory_cache_hit_ratio=0.5`、`--mock_memory_cache_seed=1`、`--mock_memory_cache_source_blocks=64`，并显式冻结 `cache_grid.pressure.evidence_policy=mock_memory`。profile schema 中 CLI 布尔参数使用整数 0/1；这里的 1 与服务端 `true` 等效。pressure frontend 会校验 evidence policy 与 `--mock_memory_cache` 一致，防止 mock 服务误用普通树压力判据，或普通服务误用 mock 判据。启动仍要求 reuse 和 Memory cache 已开启、Host 容量为正且足以预留 source。只改变 ratio 不会启用 mock。
+该配置设定 `--mock_memory_cache=1`、`--mock_memory_cache_hit_ratio=0.5`、`--mock_memory_cache_seed=1`、`--mock_memory_cache_source_blocks=64`，并显式冻结 `cache_grid.pressure.evidence_policy=mock_memory`。profile schema 中 CLI 布尔参数使用整数 0/1；这里的 1 与服务端 `true` 等效。pressure frontend 按下表校验服务开关与 evidence policy。启动仍要求 reuse 和 Memory cache 已开启、Host 容量为正且足以预留 source。只改变 ratio 不会启用 mock。
+
+| `--mock_memory_cache` | 允许的 evidence policy | 未指定 policy 时 |
+| --- | --- | --- |
+| 0 或未启用 | `tree_pressure` | `tree_pressure` |
+| 1 | `mock_memory`、`tree_then_mock_memory` | `mock_memory`，兼容既有配置 |
 
 ratio 指初始 prompt 分配中累计可复用 token 的覆盖率，按完整复用块计算，**不是命中请求占比**。设累计 eligible 逻辑块为 E，计划 Host 块为 P，目标为 `floor(E * ratio)`；请求长度变化、并发 admission 由同一控制器累计，必须符合模型允许的复用边界，尾部至少保留必要的未复用 token。合法前缀粒度可暂时留下不足一个有效复用单元的缺口，后续请求继续追赶。每个请求只在首次计划时收费，分配重试沿用计划；decode/后续扩容不参与比例控制。
 
@@ -283,6 +288,14 @@ python3 tools/cache_perf profile \
 独立 adaptive sender 使用 `adaptive_backlog`，速率范围 50–400 requests/s、backlog 低/高水位 64/192、在途上限 256；引擎 admission 仍为 16。`tiered_rolling` 的 `cohort_size=32` 只定义 family 调度单位，不能增加 32 请求全体完成屏障，不能按上一请求完成来决定下一请求发出时间。sender 的 `memory_reuse_ratio=0.5` 是工作集生成参数，与引擎按累计 eligible token 控制的 mock ratio 是两个概念，不能互作命中证据。
 
 mock 请求结束后会释放 request Device 引用并异步写回 Host，因此不能要求 fill 产生并持续保留普通 Device-tree 高水位。`mock_memory` evidence policy 在 seed 后重新采集 baseline，不发送 fill 请求，直接启动 steady/adaptive 正式流量；完整、连续、拓扑一致且携带 mock 计数的采样构成压力覆盖。measurement/profile 窗口内必须同时观察到 `successful_h2d_blocks` 和 `d2h_completed_blocks` 增长，任一 `failed_h2d_blocks` 或 `d2h_failed_blocks` 增长都会使 migration 验收失败。它不使用也不伪造普通 transfer tree 的 `published_blocks`。未配置该策略的 production/smoke profile 缺省为 `tree_pressure`，仍执行原 fill、Device/Host 常驻、水位触发和普通 H2D/D2H publication 判据，行为不变。
+
+需要先建立真实缓存压力、再测 mock 迁移时，使用新增的[混合 profile](../config/continuous_full_pressure_dsv4.tree_then_mock_memory.example.jsonc)，仍配对上述 reuse-only mock grid。它保留 `diagnostic_only=true` 和输出正确性无效标签，`formal_candidate=false`、原因 `diagnostic_only`，不能用于正式推理性能结论。可将上方命令中的 `--profile` 改为该文件，并使用新的结果目录。
+
+`tree_then_mock_memory` 严格执行 seed → real fill → steady → measurement → drain；有尚未完成的采集时，measurement 后可进入 support，再 drain。block-size probe、seed、fill、steady、support 请求显式发送 `mock_memory_cache_request=false`，只有在传输边界被归类为 measurement 的请求发送 `true`。先完成 token/protobuf 准备，再在 RPC 前判定阶段并写入该布尔值；排队请求跨越 steady/measurement 或 measurement/support 边界时，以实际发送阶段为准。这样准备流量不进入 mock 累计块控制器。
+
+混合策略不采用纯 mock 的 seed 后直接 steady 快捷路径，也不做 tiered rewarm（`rewarm.planned=0`）。fill 使用正常树分配和淘汰，建立真实 Device 高水位及 Host 占用；Host 达到 `fill_host_max_ratio=0.8` 时仍以 `fill_headroom_exhausted` 终止，不能为了跳过 rewarm 放宽余量。准备阶段的 readiness 和 measurement 压力覆盖均继续要求真实 Device/Host 驻留、水位触发及普通 D2H 发布。mock 计数的增长不能替代树压力。
+
+measurement mock H2D 读取服务启动时已有的不可变随机 Host reservoir（seed 决定 source ring offset，payload 实际清零并预建 CRC），**不会读取某条由 fill 产生的指定 tree entry**。成功完成的 mock 请求执行真实异步 D2H 写回；它不改变 reservoir。迁移验收要求 measurement 窗口内 mock `successful_h2d_blocks`、`d2h_completed_blocks` 均有成功增量，并且 `failed_h2d_blocks`、`d2h_failed_blocks` 无增量，同时真实树压力覆盖通过；seed/fill/steady 的普通迁移与窗口外完成都不能充当该窗口的 mock 成功证据。计数必须带受支持的 `terminal_outcome_version=1`，按物理终态记录，不能用稍后的 settlement poll 把事件移入窗口。比例仍按块对齐的 eligible token blocks 累计计算，不按请求数计算。
 
 验收必须保留 `profile.snapshot.json`、`grid.snapshot.json`、`cache_perf_launch.json`、原始指标、请求/采样 JSONL 和原始 timeline，并逐项记录：
 

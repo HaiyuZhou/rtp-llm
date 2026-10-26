@@ -619,6 +619,17 @@ class ModelRpcClientTest(TestCase):
             "max_new_tokens", {field.name for field, _ in config_pb.ListFields()}
         )
 
+    def test_trans_input_preserves_mock_memory_request_presence(self):
+        for value in (None, False, True):
+            with self.subTest(value=value):
+                config = GenerateConfig(mock_memory_cache_request=value)
+                config_pb = self._round_trip_generate_config(config)
+                self.assertEqual(
+                    config_pb.HasField("mock_memory_cache_request"), value is not None
+                )
+                if value is not None:
+                    self.assertIs(config_pb.mock_memory_cache_request.value, value)
+
     def test_trans_input_round_trips_zero_max_new_tokens_with_prefill_flag(self):
         config_pb = self._round_trip_generate_config(GenerateConfig(max_new_tokens=0))
 

@@ -733,6 +733,7 @@ class DashScRequestControls:
 
     return_input_ids: bool = False
     force_sp_accept: bool = False
+    mock_memory_cache_request: bool | None = None
     enable_thinking: bool | None = None
     max_new_think_tokens: int | None = None
     timeout_ms: int | None = None
@@ -830,6 +831,11 @@ class SamplingParams:
             stop_words_list=self.stop_words_list_py(),
             max_thinking_tokens=max_thinking_tokens,
             return_input_ids=return_input_ids,
+            mock_memory_cache_request=(
+                request_controls.mock_memory_cache_request
+                if request_controls is not None
+                else None
+            ),
             is_streaming=True,
             response_format=response_format,
             structural_tag=structural_tag,
@@ -1135,6 +1141,9 @@ def parse_request_controls(
     return DashScRequestControls(
         return_input_ids=return_input_ids,
         force_sp_accept=force_sp_accept,
+        mock_memory_cache_request=_parse_optional_parameter_bool(
+            request, "mock_memory_cache_request"
+        ),
         enable_thinking=enable_thinking,
         max_new_think_tokens=max_new_think_tokens,
         timeout_ms=timeout_ms,

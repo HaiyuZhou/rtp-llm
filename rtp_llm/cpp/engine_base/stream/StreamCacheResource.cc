@@ -124,7 +124,7 @@ int StreamCacheResource::tryReleaseKVBlock(size_t nums) {
                               tierName(target_tier));
             if (target_tier != Tier::NONE) {
                 InsertInfo insert_info{batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), false, target_tier};
-                insert_info.mock_memory_cache = resource_context_.cache_manager->mockMemoryCacheEnabled();
+                insert_info.mock_memory_cache = batch_kv_cache_resource_->mockMemoryCachePlan().has_value();
                 size_t resident_prefix_length = 0;
                 resource_context_.cache_manager->insertIntoCache(insert_info, resident_prefix_length);
             }
@@ -181,10 +181,11 @@ absl::Status StreamCacheResource::initKVBlock() {
     }
 
     MallocInfo malloc_info;
-    malloc_info.batch_kv_cache_resource = batch_kv_cache_resource_;
-    malloc_info.complete_token_ids      = stream_->completeTokenIdsPtr();
-    malloc_info.request_id              = stream_->streamId();
-    malloc_info.verbose                 = malloc_failed_times_ >= 10 ? malloc_failed_times_ % 100 == 0 : true;
+    malloc_info.batch_kv_cache_resource   = batch_kv_cache_resource_;
+    malloc_info.complete_token_ids        = stream_->completeTokenIdsPtr();
+    malloc_info.request_id                = stream_->streamId();
+    malloc_info.verbose                   = malloc_failed_times_ >= 10 ? malloc_failed_times_ % 100 == 0 : true;
+    malloc_info.mock_memory_cache_request = stream_->generateConfig()->mock_memory_cache_request;
 
     const bool disable_first_malloc_reuse =
         resource_context_.cache_manager->cacheConfig().disable_decode_first_malloc_device_reuse;
@@ -392,6 +393,7 @@ absl::Status StreamCacheResource::incrKVBlock(int seq_len_override) {
     malloc_info.enable_cache_lookup          = enableCacheLookup();
     malloc_info.enable_remove_skipped_blocks = true;
     malloc_info.incr_seq_len_override        = seq_len_override;
+    malloc_info.mock_memory_cache_request    = stream_->generateConfig()->mock_memory_cache_request;
 
     auto result = resource_context_.cache_manager->malloc(malloc_info);
     if (!result.success) {
@@ -535,7 +537,7 @@ Tier StreamCacheResource::storeTarget() const {
     if (!reuseCache()) {
         return Tier::NONE;
     }
-    if (resource_context_.cache_manager && resource_context_.cache_manager->mockMemoryCacheEnabled()) {
+    if (batch_kv_cache_resource_->mockMemoryCachePlan().has_value()) {
         return enableMemoryCache() && resource_context_.cache_manager->blockTreeCache()->isHostCacheEnabled() ?
                    Tier::HOST :
                    Tier::NONE;

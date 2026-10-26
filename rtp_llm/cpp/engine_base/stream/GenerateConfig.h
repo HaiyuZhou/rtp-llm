@@ -126,6 +126,9 @@ public:
     std::optional<int> group_timeout;
     std::string        unique_key;
 
+    // Missing inherits the service-global mock mode for legacy callers.
+    std::optional<bool> mock_memory_cache_request;
+
     // 生成式推荐：组合 token 粒度去重与曝光过滤
     // combo_token_size 表示一个商品由多少个连续 token 组成（0 表示关闭该功能）
     int combo_token_size = 0;
@@ -389,6 +392,7 @@ public:
         JSONIZE(profile_step);
         JSONIZE(profile_trace_name);
         JSONIZE(reuse_cache);
+        JSONIZE_OPTIONAL(mock_memory_cache_request);
         JSONIZE(enable_device_cache);
         JSONIZE(enable_memory_cache);
         JSONIZE(enable_disk_cache);

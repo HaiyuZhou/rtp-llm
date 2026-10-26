@@ -166,6 +166,7 @@ def build_model_infer_request(
     return_input_ids: bool = False,
     enable_thinking: bool | None = None,
     force_sp_accept: bool = False,
+    mock_memory_cache_request: bool | None = None,
 ) -> predict_v2_pb2.ModelInferRequest:
     """Build ``ModelInferRequest`` for ``ModelStreamInfer`` (sampling tensors + ``input_ids``)."""
     request = predict_v2_pb2.ModelInferRequest()
@@ -177,6 +178,10 @@ def build_model_infer_request(
         request.parameters["enable_thinking"].bool_param = bool(enable_thinking)
     if force_sp_accept:
         request.parameters["force_sp_accept"].bool_param = True
+    if mock_memory_cache_request is not None:
+        request.parameters["mock_memory_cache_request"].bool_param = (
+            mock_memory_cache_request
+        )
     append_input_ids_to_model_infer_request(request, input_ids)
     return request
 

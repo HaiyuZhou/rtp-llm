@@ -75,6 +75,41 @@ TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryColdPrefixLoadsFromReservedHos
     manager_->free(FreeInfo{resource, tokens});
 }
 
+TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryExplicitFalseUsesNaturalDeviceMatch) {
+    ASSERT_NO_FATAL_FAILURE(initManager(16, 8, 1.0));
+    auto seed = seedDevicePrefix(manager_, cache_config_, 0, 3);
+    ASSERT_TRUE(seed.has_value());
+    auto       resource     = makeResource(cache_config_);
+    const int  block_tokens = static_cast<int>(cache_config_.seq_size_per_block);
+    auto       tokens       = makeTokenIds(0, 3 * block_tokens, 3 * block_tokens, block_tokens);
+    MallocInfo info{resource, tokens};
+    info.mock_memory_cache_request = false;
+    const auto result              = manager_->malloc(info);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.reuse_len, 2 * block_tokens);
+    EXPECT_EQ(result.async_context, nullptr);
+    EXPECT_FALSE(resource->mockMemoryCachePlan().has_value());
+    EXPECT_EQ(transfer_engine_->submittedDescriptorCount(), 0u);
+    for (const auto& tag : kDsv4FullGroupTags) {
+        EXPECT_EQ(resource->blocks(0, tag)[0], seed->blocks_by_group.at(tag)[0]);
+    }
+    EXPECT_EQ(manager_->blockTreeCache()->metrics_reporter_->mock_memory_metrics_.eligible_blocks, 0);
+    manager_->free(FreeInfo{resource, tokens});
+}
+
+TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryExplicitTrueRequiresServiceSource) {
+    ASSERT_NO_FATAL_FAILURE(initManager(16, 8));
+    auto       resource     = makeResource(cache_config_);
+    const int  block_tokens = static_cast<int>(cache_config_.seq_size_per_block);
+    auto       tokens       = makeTokenIds(0, 3 * block_tokens, 3 * block_tokens, block_tokens);
+    MallocInfo info{resource, tokens};
+    info.mock_memory_cache_request = true;
+    ASSERT_TRUE(manager_->malloc(info).success);
+    EXPECT_FALSE(resource->mockMemoryCachePlan().has_value());
+    EXPECT_EQ(transfer_engine_->submittedDescriptorCount(), 0u);
+    manager_->free(FreeInfo{resource, tokens});
+}
+
 TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryZeroDecisionBypassesNaturalDeviceMatch) {
     ASSERT_NO_FATAL_FAILURE(initManager(16, 8, 0.0));
     auto maybe_seed = seedDevicePrefix(manager_, cache_config_, 0, 3);

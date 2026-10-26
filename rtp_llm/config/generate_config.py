@@ -269,6 +269,9 @@ class GenerateConfig(BaseModel):
     # 只有开启环境变量 REUSE_CACHE 时才生效
     reuse_cache: bool = True
 
+    # None preserves legacy service-global mock behavior; False opts into real cache reuse.
+    mock_memory_cache_request: Optional[bool] = None
+
     enable_device_cache: bool = True
 
     enable_memory_cache: bool = True

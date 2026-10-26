@@ -953,6 +953,34 @@ class DashScGrpcRequestTest(TestCase):
         op = parse_request_controls(req)
         self.assertEqual(op, DashScRequestControls(return_input_ids=False))
 
+    def test_mock_memory_request_control_preserves_absent_false_and_true(self) -> None:
+        for value in (None, False, True):
+            with self.subTest(value=value):
+                req = predict_v2_pb2.ModelInferRequest()
+                if value is not None:
+                    req.parameters["mock_memory_cache_request"].bool_param = value
+                controls = parse_request_controls(req)
+                config = SamplingParams().to_generate_config(request_controls=controls)
+                self.assertIs(config.mock_memory_cache_request, value)
+
+    def test_client_mock_memory_request_control_preserves_wire_presence(self) -> None:
+        for value in (None, False, True):
+            with self.subTest(value=value):
+                req = build_model_infer_request(
+                    request_id="mock-gate",
+                    model_name="",
+                    input_ids=[1],
+                    sampling=SamplingParams(),
+                    mock_memory_cache_request=value,
+                )
+                self.assertEqual(
+                    "mock_memory_cache_request" in req.parameters, value is not None
+                )
+                config = SamplingParams().to_generate_config(
+                    request_controls=parse_request_controls(req)
+                )
+                self.assertIs(config.mock_memory_cache_request, value)
+
     def test_parse_request_controls_bool(self) -> None:
         req = predict_v2_pb2.ModelInferRequest()
         _add_tensor(req, "return_input_ids", "BOOL", [1], b"\x01")

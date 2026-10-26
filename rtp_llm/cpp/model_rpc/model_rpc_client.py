@@ -673,6 +673,10 @@ def trans_input(input_py: GenerateInput):
     generate_config_pb.global_request_id = input_py.generate_config.global_request_id
     generate_config_pb.ignore_eos = input_py.generate_config.ignore_eos
     generate_config_pb.reuse_cache = input_py.generate_config.reuse_cache
+    if input_py.generate_config.mock_memory_cache_request is not None:
+        generate_config_pb.mock_memory_cache_request.value = (
+            input_py.generate_config.mock_memory_cache_request
+        )
     generate_config_pb.enable_memory_cache = (
         input_py.generate_config.enable_memory_cache
     )

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -72,6 +73,9 @@ struct MallocInfo {
     // Override for incrMalloc's seqLength read; -1 = fall back to complete_token_ids->seqLength().
     // Lets the state machine feed the publish-time value instead of racing with the async worker.
     int incr_seq_len_override = -1;
+
+    // Missing inherits service-global mock mode; false selects the real cache tree.
+    std::optional<bool> mock_memory_cache_request;
 
     int incrSeqLen() const;
 };

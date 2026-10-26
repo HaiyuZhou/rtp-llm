@@ -797,12 +797,51 @@ TEST_F(StreamCacheResourceTest, MockMemoryStoreForcesHostAndNeverFallsBackWhenHo
     resource.resource_context_.enable_device_cache = true;
     resource.resource_context_.enable_memory_cache = true;
     resource.resource_context_.enable_disk_cache   = true;
+    EXPECT_EQ(resource.storeTarget(), Tier::DEVICE);
+    resource.kvCacheMutable().setMockMemoryCachePlan({2, 0});
+    EXPECT_EQ(resource.storeTarget(), Tier::HOST);
+    cache_manager_->blockTreeCache()->config_.mock_memory_cache = false;
     EXPECT_EQ(resource.storeTarget(), Tier::HOST);
     resource.resource_context_.enable_memory_cache = false;
     EXPECT_EQ(resource.storeTarget(), Tier::NONE);
     resource.resource_context_.enable_memory_cache = true;
     stream_->generateConfig()->reuse_cache         = false;
     EXPECT_EQ(resource.storeTarget(), Tier::NONE);
+}
+
+TEST_F(StreamCacheResourceTest, MockMemoryExplicitFalseStoresDeviceWithoutMockAccounting) {
+    KVCacheConfig config;
+    config.reuse_cache                     = true;
+    config.enable_memory_cache             = true;
+    config.memory_cache_size_mb            = 1;
+    config.mock_memory_cache               = true;
+    config.mock_memory_cache_hit_ratio     = 1;
+    config.mock_memory_cache_source_blocks = 2;
+    prepareResourceWithCacheConfig(init_config(), {1, 2, 3, 4, 5, 6}, true, RoleType::PDFUSION, config);
+    auto& resource                                       = stream_->streamCacheResource();
+    resource.resource_context_.enable_device_cache       = true;
+    resource.resource_context_.enable_memory_cache       = true;
+    stream_->generateConfig()->mock_memory_cache_request = false;
+    ASSERT_TRUE(resource.initKVBlock().ok());
+    EXPECT_FALSE(resource.kvCache().mockMemoryCachePlan().has_value());
+    EXPECT_EQ(resource.storeTarget(), Tier::DEVICE);
+    const auto keys = resource.kvCache().cacheKeys(0);
+    // A later control change cannot reclassify an admitted real request.
+    stream_->generateConfig()->mock_memory_cache_request = true;
+    stream_->generate_status_->status                    = StreamState::FINISHED;
+    resource.releaseResource();
+    auto cache = cache_manager_->blockTreeCache();
+    block_tree_cache_test::BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+    const auto path = cache->tree()->findNode(keys);
+    ASSERT_FALSE(path.empty());
+    for (const auto* node : path) {
+        EXPECT_TRUE(node->group_set_resources[0].hasTier(Tier::DEVICE));
+        EXPECT_FALSE(node->group_set_resources[0].hasTier(Tier::HOST));
+    }
+    const auto metrics = cache->metrics_reporter_->mock_memory_metrics_;
+    EXPECT_EQ(metrics.eligible_blocks, 0);
+    EXPECT_EQ(metrics.d2h_submitted_blocks, 0);
+    EXPECT_EQ(metrics.d2h_completed_blocks, 0);
 }
 
 TEST_F(StreamCacheResourceTest, MockMemoryFinishedReleaseCopiesRealRequestToHostAsynchronously) {
@@ -824,12 +863,17 @@ TEST_F(StreamCacheResourceTest, MockMemoryFinishedReleaseCopiesRealRequestToHost
     auto                                   engine = std::make_shared<ControlledPerRankBlockTransferEngine>(
         cache->groupSets(), TransferCopyAction::Succeed, barrier);
     BlockTreeCacheTestPeer::setPerRankBlockTransferEngineForTest(*cache, engine);
-    auto& resource                                 = stream_->streamCacheResource();
-    resource.resource_context_.enable_device_cache = true;
-    resource.resource_context_.enable_memory_cache = true;
+    auto& resource                                       = stream_->streamCacheResource();
+    resource.resource_context_.enable_device_cache       = true;
+    resource.resource_context_.enable_memory_cache       = true;
+    stream_->generateConfig()->mock_memory_cache_request = true;
     ASSERT_TRUE(resource.initKVBlock().ok());
-    const auto keys                   = resource.kvCache().cacheKeys(0);
-    stream_->generate_status_->status = StreamState::FINISHED;
+    ASSERT_TRUE(resource.kvCache().mockMemoryCachePlan().has_value());
+    EXPECT_EQ(resource.kvCache().mockMemoryCachePlan()->planned_host_blocks, 0u);
+    // Completion follows the admission latch even after the request control changes.
+    stream_->generateConfig()->mock_memory_cache_request = false;
+    const auto keys                                      = resource.kvCache().cacheKeys(0);
+    stream_->generate_status_->status                    = StreamState::FINISHED;
     BoundedThread<void> release([stream = stream_] { stream->streamCacheResource().releaseResource(); });
     const auto          released_while_copy_blocked = release.waitFor(std::chrono::seconds(5));
     if (released_while_copy_blocked != std::future_status::ready) {

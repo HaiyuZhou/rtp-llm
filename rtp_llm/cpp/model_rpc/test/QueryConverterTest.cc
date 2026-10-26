@@ -21,6 +21,29 @@ namespace rtp_llm {
 
 class QueryConverterTest: public DeviceTestBase {};
 
+TEST_F(QueryConverterTest, MockMemoryRequestPreservesAbsentFalseAndTrue) {
+    for (const auto value : {std::optional<bool>{}, std::optional<bool>{false}, std::optional<bool>{true}}) {
+        GenerateInputPB input;
+        input.add_token_ids(0);
+        auto* config_pb = input.mutable_generate_config();
+        config_pb->set_max_new_tokens(1);
+        if (value.has_value()) {
+            config_pb->mutable_mock_memory_cache_request()->set_value(*value);
+        }
+        EXPECT_EQ(QueryConverter::transQuery(&input)->generate_config->mock_memory_cache_request, value);
+    }
+}
+
+TEST_F(QueryConverterTest, MockMemoryRequestJsonPreservesAbsentFalseAndTrue) {
+    GenerateConfig config;
+    EXPECT_FALSE(config.mock_memory_cache_request.has_value());
+    autil::legacy::FromJsonString(config, R"({"mock_memory_cache_request": false})");
+    ASSERT_TRUE(config.mock_memory_cache_request.has_value());
+    EXPECT_FALSE(*config.mock_memory_cache_request);
+    autil::legacy::FromJsonString(config, R"({"mock_memory_cache_request": true})");
+    EXPECT_EQ(config.mock_memory_cache_request, std::optional<bool>{true});
+}
+
 TEST_F(QueryConverterTest, PrefillOnlyFlagWithZeroMaxNewTokensMeansPrefillOnly) {
     for (const bool enable_disk_cache : {false, true}) {
         SCOPED_TRACE(enable_disk_cache);

@@ -2710,6 +2710,25 @@ class TransportRegistrationTest(unittest.TestCase):
 
 
 class RunnerIntegrationTest(unittest.TestCase):
+    def test_direct_hybrid_runner_requires_diagnostic_only(self):
+        for marker in (None, False, True):
+            with self.subTest(
+                marker=marker
+            ), tempfile.TemporaryDirectory() as directory:
+                profile = {"cache_grid": {}}
+                if marker is not None:
+                    profile["cache_grid"]["diagnostic_only"] = marker
+                options = dict(
+                    pressure_config=config(evidence_policy="tree_then_mock_memory"),
+                    profile=profile,
+                )
+                if marker is True:
+                    runner = self._startup_runner(directory, **options)
+                    self.assertTrue(runner.profile["cache_grid"]["diagnostic_only"])
+                else:
+                    with self.assertRaisesRegex(ValueError, "diagnostic_only"):
+                        self._startup_runner(directory, **options)
+
     def test_pressure_wire_decodes_mock_completion_and_failure_counters(self):
         clock = FakeClock()
         response = self._startup_pressure(clock, 1, startup=True)

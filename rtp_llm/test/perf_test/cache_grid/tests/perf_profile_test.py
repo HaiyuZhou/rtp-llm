@@ -29,6 +29,52 @@ def _minimal_profile(**overrides):
 
 
 class ValidateProfileTest(unittest.TestCase):
+    def test_hybrid_requires_explicit_diagnostic_only_at_profile_and_settings_boundaries(
+        self,
+    ):
+        from rtp_llm.test.perf_test.cache_grid.runner.pressure_seed_plan import (
+            formal_config_reasons,
+        )
+
+        config_dir = Path(__file__).resolve().parents[1] / "config"
+        base = load_profile(
+            config_dir
+            / "continuous_full_pressure_dsv4.tree_then_mock_memory.example.jsonc"
+        )
+        for marker in (None, False, True):
+            profile = json.loads(json.dumps(base))
+            if marker is None:
+                profile["cache_grid"].pop("diagnostic_only")
+            else:
+                profile["cache_grid"]["diagnostic_only"] = marker
+            for direct in (False, True):
+                with self.subTest(marker=marker, direct=direct):
+                    if marker is not True:
+                        with self.assertRaisesRegex(ProfileError, "diagnostic_only"):
+                            pressure_settings(profile, SimpleNamespace(), direct=direct)
+                        with self.assertRaisesRegex(ProfileError, "diagnostic_only"):
+                            validate_profile(profile)
+                    else:
+                        validate_profile(profile)
+                        settings = pressure_settings(
+                            profile, SimpleNamespace(), direct=direct
+                        )
+                        self.assertEqual(
+                            settings.evidence_policy, "tree_then_mock_memory"
+                        )
+                        self.assertEqual(
+                            formal_config_reasons(
+                                manual_seed_count=None,
+                                client_inflight=16,
+                                test_block_num=0,
+                                fill_target_tokens=settings.fill_input_tokens,
+                                diagnostic_only=profile["cache_grid"][
+                                    "diagnostic_only"
+                                ],
+                            ),
+                            ("diagnostic_only",),
+                        )
+
     def test_diagnostic_only_requires_an_actual_boolean(self):
         for value in (True, False):
             validate_profile(_minimal_profile(cache_grid=dict(diagnostic_only=value)))
@@ -143,7 +189,8 @@ class ValidateProfileTest(unittest.TestCase):
         hybrid_profile = _minimal_profile(
             engine_args={"--mock_memory_cache": 1},
             cache_grid={
-                "pressure": dict(values, evidence_policy="tree_then_mock_memory")
+                "diagnostic_only": True,
+                "pressure": dict(values, evidence_policy="tree_then_mock_memory"),
             },
         )
         self.assertEqual(

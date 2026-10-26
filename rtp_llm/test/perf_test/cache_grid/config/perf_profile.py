@@ -76,6 +76,18 @@ PRESSURE_OPTIONS = (
 )
 
 
+def _validate_hybrid_diagnostic_only(cache_grid):
+    pressure = cache_grid.get("pressure", {})
+    if (
+        isinstance(pressure, dict)
+        and pressure.get("evidence_policy") == "tree_then_mock_memory"
+        and cache_grid.get("diagnostic_only") is not True
+    ):
+        raise ProfileError(
+            "tree_then_mock_memory requires cache_grid.diagnostic_only=true"
+        )
+
+
 def pressure_settings(profile, args, *, direct=False):
     from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
         resolve_pressure_config,
@@ -99,6 +111,7 @@ def pressure_settings(profile, args, *, direct=False):
         raise ProfileError(
             "cache_grid.pressure.evidence_policy must match --mock_memory_cache"
         )
+    _validate_hybrid_diagnostic_only(profile.get("cache_grid", {}))
     prefix = "cache_pressure_" if direct else "pressure_"
     for option, field, _ in PRESSURE_OPTIONS:
         value = getattr(args, prefix + option.replace("-", "_"), None)
@@ -239,6 +252,7 @@ def validate_profile(profile: Any) -> None:
         for name in ("explicit_smoke", "diagnostic_only"):
             if name in cache_grid and type(cache_grid[name]) is not bool:
                 raise ProfileError(f"cache_grid.{name} must be a boolean")
+        _validate_hybrid_diagnostic_only(cache_grid)
     if isinstance(cache_grid, dict) and "expected_block_size" in cache_grid:
         raise ProfileError(
             "cache_grid.expected_block_size was removed; set grid.generator.cache_alignment"

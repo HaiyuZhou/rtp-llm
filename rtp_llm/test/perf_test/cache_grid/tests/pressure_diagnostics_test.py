@@ -6,6 +6,7 @@ from types import SimpleNamespace as NS
 from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import CachePressureRankPB
 from rtp_llm.test.perf_test.cache_grid.runner.pressure_diagnostics import (
     GroupSample,
+    MockMemorySample,
     PoolSample,
     PressureCoverage,
     RankSample,
@@ -633,6 +634,136 @@ class MigrationTest(unittest.TestCase):
         return PressureCoverage(
             migration_page(9, participants=participants), configured(), max_segments
         )
+
+    def mock_page(self, t, *, failed=0, completed=0, participants=1):
+        samples = migration_page(t, t, t, participants=participants)
+        return tuple(
+            dataclasses.replace(
+                sample,
+                mock_memory=MockMemorySample(
+                    16,
+                    8,
+                    completed,
+                    failed,
+                    completed,
+                    completed,
+                    failed,
+                    terminal_outcome_version=1,
+                ),
+                groups=tuple(
+                    dataclasses.replace(group, triggers=0) if t == 0 else group
+                    for group in sample.groups
+                ),
+            )
+            for sample in samples
+        )
+
+    def test_mock_failures_survive_incomplete_partial_and_gapped_observations(self):
+        for policy in ("mock_memory", "tree_then_mock_memory"):
+            for gap in ("incomplete", "partial_owner", "missing_owner", "empty", "gap"):
+                with self.subTest(policy=policy, gap=gap):
+                    participants = 2 if gap in ("partial_owner", "missing_owner") else 1
+                    evaluator = PressureCoverage(
+                        self.mock_page(0, participants=participants),
+                        configured(evidence_policy=policy, max_sample_gap_s=1),
+                    )
+                    for t in range(1, 62):
+                        page = self.mock_page(
+                            t,
+                            failed=int(t >= 30),
+                            completed=4 if t >= 11 else 0,
+                            participants=participants,
+                        )
+                        if t == 30:
+                            if gap == "gap":
+                                continue
+                            if gap == "partial_owner":
+                                page = page[:1]
+                            elif gap == "missing_owner":
+                                page = page[1:]
+                            elif gap == "empty":
+                                page = ()
+                        evaluator.add(
+                            page, t, complete=not (t == 30 and gap == "incomplete")
+                        )
+                    self.assertTrue(evaluator.assess(1, 61).valid)
+                    assessment = evaluator.assess_migration(1, 61)
+                    self.assertFalse(assessment.valid)
+                    self.assertIn("failed_h2d:0:0", assessment.reasons)
+                    self.assertIn("failed_d2h:0:0", assessment.reasons)
+                    expected_end = (
+                        31 if gap in ("missing_owner", "empty", "gap") else 30
+                    )
+                    for evidence in (
+                        assessment.groups[0].h2d_failure_evidence,
+                        assessment.groups[0].d2h_failure_evidence,
+                    ):
+                        self.assertEqual(len(evidence), 1)
+                        self.assertEqual(evidence[0].interval, (29, expected_end))
+                        self.assertEqual(
+                            (evidence[0].before_blocks, evidence[0].after_blocks),
+                            (0, 1),
+                        )
+
+    def test_mock_failure_observations_outside_window_do_not_reject(self):
+        for failure_at in (2, 30):
+            with self.subTest(failure_at=failure_at):
+                evaluator = PressureCoverage(
+                    self.mock_page(0),
+                    configured(evidence_policy="tree_then_mock_memory"),
+                )
+                for t in range(1, 42):
+                    evaluator.add(
+                        self.mock_page(
+                            t,
+                            failed=int(t >= failure_at),
+                            completed=4 if t >= 15 else 0,
+                        ),
+                        t,
+                        complete=t != failure_at,
+                    )
+                self.assertTrue(evaluator.assess_migration(10, 20).valid)
+
+    def test_mock_successes_from_incomplete_or_partial_samples_do_not_qualify(self):
+        for gap in ("incomplete", "partial"):
+            with self.subTest(gap=gap):
+                participants = 2 if gap == "partial" else 1
+                evaluator = PressureCoverage(
+                    self.mock_page(0, participants=participants),
+                    configured(evidence_policy="tree_then_mock_memory"),
+                )
+                for t in range(1, 6):
+                    page = self.mock_page(
+                        t, completed=4 if t >= 3 else 0, participants=participants
+                    )
+                    if t == 3 and gap == "partial":
+                        page = page[:1]
+                    evaluator.add(
+                        page, t, complete=not (t == 3 and gap == "incomplete")
+                    )
+                result = evaluator.assess_migration(1, 5)
+                self.assertFalse(result.valid)
+                self.assertIn("missing_h2d_load:0:0", result.reasons)
+                self.assertIn("missing_d2h:0:0", result.reasons)
+
+    def test_mock_failure_counter_reset_and_restart_during_gap_fail_closed(self):
+        for fault in ("reset", "restart"):
+            with self.subTest(fault=fault):
+                evaluator = PressureCoverage(
+                    self.mock_page(0),
+                    configured(evidence_policy="tree_then_mock_memory"),
+                )
+                evaluator.add(self.mock_page(1, failed=1), 1, complete=False)
+                sample = self.mock_page(2, failed=0 if fault == "reset" else 1)[0]
+                if fault == "restart":
+                    sample = dataclasses.replace(sample, instance="restarted")
+                evaluator.add((sample,), 2, complete=False)
+                self.assertFalse(evaluator.epoch_valid)
+                self.assertFalse(evaluator.assess_migration(1, 3).valid)
+                self.assertIn(
+                    "counter_reset" if fault == "reset" else "inventory_discontinuity",
+                    evaluator.reasons,
+                )
 
     def test_settled_store_or_evict_and_load_qualify_each_direction(self):
         for operation in (2, 3):

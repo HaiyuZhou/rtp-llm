@@ -625,6 +625,15 @@ class PressureEvidence:
             if kind == "frozen":
                 plan = deepcopy(event["seed_plan"])
                 self.duration = event["config"]["measure_s"]
+                if event["config"].get("evidence_policy") == "tree_then_mock_memory":
+                    self.nonformal_reasons.append("diagnostic_only")
+                    self.writer.manifest["formal_candidate"] = False
+                    self.writer.manifest["formal_candidate_reasons"] = list(
+                        dict.fromkeys(
+                            self.writer.manifest.get("formal_candidate_reasons", [])
+                            + ["diagnostic_only"]
+                        )
+                    )
                 self.writer.manifest.update(
                     session_id=event["session_id"],
                     frozen=deepcopy(event),

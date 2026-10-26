@@ -230,6 +230,44 @@ class StepEvidenceTest(unittest.TestCase):
 
 
 class PressureResultsTest(unittest.TestCase):
+    def test_hybrid_frozen_policy_cannot_be_formal_with_missing_or_false_marker(self):
+        for marker in (None, False, True):
+            with self.subTest(
+                marker=marker
+            ), tempfile.TemporaryDirectory() as directory:
+                plan = self.plan()
+                if marker is not None:
+                    plan["diagnostic_only"] = marker
+                writer = PressureWriter(Path(directory), {"formal_candidate": True})
+                sink = PressureEvidence(writer)
+                sink(
+                    dict(
+                        event="frozen",
+                        session_id="s",
+                        config=dict(
+                            measure_s=60, evidence_policy="tree_then_mock_memory"
+                        ),
+                        seed_plan=plan,
+                    )
+                )
+                sink(self.finished())
+                writer.close()
+                for name in ("summary.json", "manifest.json"):
+                    artifact = json.loads(
+                        (Path(directory) / "pressure" / name).read_text()
+                    )
+                    self.assertFalse(artifact["classification"]["formal_config_valid"])
+                    self.assertFalse(artifact["validity"]["formal_acceptance_valid"])
+                    self.assertIn(
+                        "diagnostic_only",
+                        artifact["classification"]["nonformal_reasons"],
+                    )
+                    if name == "manifest.json":
+                        self.assertFalse(artifact["formal_candidate"])
+                        self.assertIn(
+                            "diagnostic_only", artifact["formal_candidate_reasons"]
+                        )
+
     def plan(self, **changes):
         return dict(
             dict(seed_count=2, formal_config_valid=True, nonformal_reasons=[]),

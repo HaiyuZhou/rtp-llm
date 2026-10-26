@@ -1094,6 +1094,14 @@ class CacheGridRunner:
                 marker = (profile or {}).get("cache_grid", {}).get(name, False)
                 if type(marker) is not bool:
                     raise ValueError(f"cache_grid.{name} must be a boolean")
+            if (
+                pressure_config.evidence_policy == "tree_then_mock_memory"
+                and (profile or {}).get("cache_grid", {}).get("diagnostic_only")
+                is not True
+            ):
+                raise ValueError(
+                    "tree_then_mock_memory requires cache_grid.diagnostic_only=true"
+                )
             from dataclasses import asdict
 
             from .pressure_diagnostics import resolve_pressure_config

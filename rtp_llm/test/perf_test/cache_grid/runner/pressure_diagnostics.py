@@ -1061,6 +1061,11 @@ class PressureCoverage:
         }
         self.migration_evidence = {key: [] for key in self.migration_intervals}
         self.migration_failure_evidence = {key: [] for key in self.migration_intervals}
+        # Failure observations survive rejected/partial pages and freshness gaps.
+        # Successful migration evidence still requires complete adjacency.
+        self.mock_failure_previous = {
+            rank: self.baselines[rank] for rank, _ in self.owner_groups
+        }
         self.migration_history_overflow = False
         self.open_segments = {}
         self.max_segments = max_segments
@@ -1121,6 +1126,8 @@ class PressureCoverage:
             if sample.sequence <= reference.sequence:
                 self.epoch_valid = False
                 self.reasons.add("sequence_reset")
+        if self.epoch_valid:
+            self._observe_mock_memory_failures(samples, now)
         if not self.epoch_valid:
             for rank in self.ranks:
                 self._break(rank)
@@ -1343,38 +1350,87 @@ class PressureCoverage:
                     self.migration_history_overflow = True
                     self.reasons.add("history_overflow")
 
+    def _observe_mock_memory_failures(self, samples, now):
+        if self.config.evidence_policy not in {"mock_memory", "tree_then_mock_memory"}:
+            return
+        for current in samples:
+            old = self.mock_failure_previous.get(current.rank)
+            if old is None or old.mock_memory is None or current.mock_memory is None:
+                continue
+            if any(
+                getattr(current.mock_memory, field) < getattr(old.mock_memory, field)
+                for field in ("failed_h2d_blocks", "d2h_failed_blocks")
+            ):
+                self.epoch_valid = False
+                self.reasons.add("counter_reset")
+                continue
+            bounds = tuple(
+                sample.offset_bounds
+                or (
+                    sample.client_send_s - sample.server_s,
+                    sample.client_receive_s - sample.server_s,
+                )
+                for sample in (old, current)
+            )
+            if (
+                all(math.isfinite(v) for pair in bounds for v in pair)
+                and all(low <= high for low, high in bounds)
+                and old.server_s <= current.server_s
+            ):
+                interval = possible_event_segment(
+                    old.server_s, current.server_s, *bounds
+                )
+            else:
+                # Unknown server-clock mapping cannot erase an observed failure.
+                # Client RPC envelopes conservatively bound the observation gap.
+                interval = (
+                    min(old.client_send_s, current.client_send_s),
+                    max(now, old.client_receive_s, current.client_receive_s),
+                )
+            for owner_rank, owner_group_id in self.owner_groups:
+                if owner_rank == current.rank:
+                    self._record_mock_memory_migration(
+                        owner_rank,
+                        owner_group_id,
+                        old,
+                        current,
+                        interval,
+                        failures=True,
+                    )
+            self.mock_failure_previous[current.rank] = current
+
     def _record_mock_memory_migration(
-        self, owner_rank, owner_group_id, old, current, interval
+        self, owner_rank, owner_group_id, old, current, interval, *, failures=False
     ):
         if old.mock_memory is None or current.mock_memory is None:
             return
         fields = {
-            "h2d": ("successful_h2d_blocks", "failed_h2d_blocks"),
-            "d2h": ("d2h_completed_blocks", "d2h_failed_blocks"),
+            "h2d": "failed_h2d_blocks" if failures else "successful_h2d_blocks",
+            "d2h": "d2h_failed_blocks" if failures else "d2h_completed_blocks",
         }
-        for direction, (success_field, failure_field) in fields.items():
+        evidence = (
+            self.migration_failure_evidence if failures else self.migration_evidence
+        )
+        for direction, field in fields.items():
             key = owner_rank, owner_group_id, direction
-            for field, destination in (
-                (success_field, self.migration_evidence[key]),
-                (failure_field, self.migration_failure_evidence[key]),
-            ):
-                before = getattr(old.mock_memory, field)
-                after = getattr(current.mock_memory, field)
-                if after <= before:
-                    continue
-                destination.append(
-                    MigrationPublicationEvidence(
-                        interval,
-                        before,
-                        after,
-                        ((("mock_memory", field), before, after),),
-                        source=f"mock_memory_{field}",
-                    )
+            destination = evidence[key]
+            before = getattr(old.mock_memory, field)
+            after = getattr(current.mock_memory, field)
+            if after <= before:
+                continue
+            destination.append(
+                MigrationPublicationEvidence(
+                    interval,
+                    before,
+                    after,
+                    ((("mock_memory", field), before, after),),
+                    source=f"mock_memory_{field}",
                 )
-                if len(destination) > self.max_segments:
-                    destination.pop(0)
-                    self.migration_history_overflow = True
-                    self.reasons.add("history_overflow")
+            )
+            if len(destination) > self.max_segments:
+                destination.pop(0)
+                self.migration_history_overflow = True
+                self.reasons.add("history_overflow")
 
     def assess_migration(self, start: float, end: float) -> MigrationAssessment:
         coverage([], start, end)

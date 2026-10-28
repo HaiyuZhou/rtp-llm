@@ -203,11 +203,8 @@ bool PDFusionRatioScheduler::waitPredicate() {
 
 absl::StatusOr<list<GenerateStreamPtr>> PDFusionRatioScheduler::schedule() {
     unique_lock<mutex> lock(lock_);
-    if (need_fill_fake_stream_) {
-        cond_.wait_for(lock, poll_interval_, [this] { return waitPredicate(); });
-    } else {
-        cond_.wait(lock, [this] { return waitPredicate(); });
-    }
+    const auto timeout = need_fill_fake_stream_ ? poll_interval_ : std::chrono::milliseconds::max();
+    scheduler_sync_state_->wait(lock, [this] { return waitPredicate(); }, timeout);
 
     schedule_trigger_ = false;
 
@@ -251,10 +248,10 @@ absl::StatusOr<list<GenerateStreamPtr>> PDFusionRatioScheduler::schedule() {
         schedule_trigger_ = true;
     }
     if (running_streams_.empty() && !made_progress && !waiting_streams_.empty()) {
-        cond_.wait_for(lock, kNoProgressScheduleGap, [this] {
+        scheduler_sync_state_->wait(lock, [this] {
             return stop_ || schedule_trigger_ || !loading_cache_streams_.empty() || !running_streams_.empty()
                    || !pending_decode_streams_.empty();
-        });
+        }, kNoProgressScheduleGap);
     }
 
     reportMetrics();

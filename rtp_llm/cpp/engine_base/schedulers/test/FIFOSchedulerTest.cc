@@ -289,7 +289,7 @@ TEST(SchedulerPollIntervalTest, ReadyPredicateWakesTimedPolling) {
             std::lock_guard<std::mutex> lock(scheduler->lock_);
             scheduler->schedule_trigger_ = true;
         }
-        scheduler->cond_.notify_all();
+        scheduler->scheduler_sync_state_->notify();
         const auto status = poll.wait_for(std::chrono::seconds(5));
         EXPECT_EQ(status, std::future_status::ready);
         if (status != std::future_status::ready) {

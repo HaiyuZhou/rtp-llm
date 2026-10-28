@@ -13,8 +13,6 @@
 using namespace std;
 namespace rtp_llm {
 
-thread_local const SchedulerSynchronizationState* SchedulerSynchronizationState::lock_owner_ = nullptr;
-
 FIFOSchedulerBase::FIFOSchedulerBase(const RuntimeConfig&                   runtime_config,
                                      const ModelConfig&                     model_config,
                                      const PDSepConfig&                     pd_sep_config,
@@ -50,14 +48,13 @@ absl::Status FIFOSchedulerBase::stop() {
     RTP_LLM_LOG_INFO("stop %s", schedulerName());
     {
         lock_guard<mutex> lock(lock_);
-        SchedulerSynchronizationState::LockOwnerScope lock_owner(*scheduler_sync_state_);
         stop_ = true;
         cancelStreams(waiting_streams_);
         cancelStreams(loading_cache_streams_);
         cancelStreams(running_streams_);
         cancelExtraStreams();
     }
-    cond_.notify_all();
+    scheduler_sync_state_->notify();
     return absl::OkStatus();
 }
 
@@ -101,7 +98,7 @@ absl::Status FIFOSchedulerBase::enqueue(const GenerateStreamPtr& stream) {
         waiting_streams_.emplace_back(stream);
         schedule_trigger_ = true;
     }
-    cond_.notify_all();
+    scheduler_sync_state_->notify();
     return absl::OkStatus();
 }
 
@@ -137,7 +134,7 @@ FIFOSchedulerBase::enqueueGroup(const vector<GenerateStreamPtr>& streams) {
         waiting_streams_.insert(waiting_streams_.end(), valid_streams.begin(), valid_streams.end());
         schedule_trigger_ = true;
     }
-    cond_.notify_all();
+    scheduler_sync_state_->notify();
     return {std::move(enqueue_successes), streams};
 }
 

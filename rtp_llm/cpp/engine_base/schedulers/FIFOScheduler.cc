@@ -136,7 +136,7 @@ FIFOScheduler::enqueueGroup(const vector<GenerateStreamPtr>& streams) {
         }
         schedule_trigger_ = true;
     }
-    cond_.notify_all();
+    scheduler_sync_state_->notify();
     return {std::move(enqueue_successes), streams};
 }
 
@@ -323,36 +323,13 @@ void FIFOScheduler::onLoadingStream(const GenerateStreamPtr& stream) {
             return;
         }
 
-        // onDone() may run inline while schedule()/stop() already owns this
-        // mutex. In that case the active scheduler round will observe the
-        // predicate directly; recursively acquiring a non-recursive mutex
-        // would deadlock. Async callbacks acquire the mutex before publishing
-        // the predicate, closing the condition-variable check-to-park window.
-        if (sync_state->lockOwnedByCurrentThread()) {
-            if (sync_state->pending_cache_load_count.load(std::memory_order_acquire) == 0) {
-                sync_state->cache_load_completion_trigger = true;
-                if (wake_debug_on) {
-                    RTP_LLM_LOG_INFO(
-                        "scheduler_cache_load_complete pending_after=0 notify=0 inline_with_scheduler_lock=1");
-                }
-            }
-            return;
-        }
-
-        bool notify = false;
-        {
-            std::lock_guard<std::mutex> lock(sync_state->mutex);
-            if (sync_state->pending_cache_load_count.load(std::memory_order_acquire) == 0) {
-                sync_state->cache_load_completion_trigger = true;
-                notify                                        = true;
-            }
-        }
-        if (notify) {
-            sync_state->cond.notify_all();
-            if (wake_debug_on) {
-                RTP_LLM_LOG_INFO("scheduler_cache_load_complete pending_after=0 notify=1 "
-                                 "inline_with_scheduler_lock=0");
-            }
+        // May run inline under scheduler or allocator locks; only acquire the wake mutex.
+        const bool notified = sync_state->notifyCacheLoadCompletion();
+        if (wake_debug_on) {
+            RTP_LLM_LOG_INFO("scheduler_cache_load_complete pending_after=%zu notify=%d "
+                             "scheduler_lock_acquired=0",
+                             sync_state->pending_cache_load_count.load(std::memory_order_acquire),
+                             notified);
         }
     });
     if (!registered) {
@@ -668,7 +645,6 @@ void FIFOScheduler::evaluateWaitingGroupQueue() {
 
 absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
     unique_lock<mutex> lock(lock_);
-    SchedulerSynchronizationState::LockOwnerScope lock_owner(*scheduler_sync_state_);
     const uint64_t round_id = ++schedule_round_id_;
     const size_t   pending_before =
         scheduler_sync_state_->pending_cache_load_count.load(std::memory_order_acquire);
@@ -679,31 +655,36 @@ absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
     const size_t loading_group_before = groupQueueStreamsSize(loading_cache_group_queue_);
     const auto   wait_begin            = std::chrono::steady_clock::now();
     const char*  wait_mode             = "idle";
-    bool         predicate_satisfied   = true;
+    auto         timeout               = std::chrono::milliseconds::max();
     if (need_fill_fake_stream_ || !loading_cache_streams_.empty() || !loading_cache_group_queue_.empty()
         || !waiting_group_queue_.empty()) {
-        wait_mode           = "cache_poll";
-        predicate_satisfied = cond_.wait_for(lock, poll_interval_, [this] { return waitPredicate(); });
+        wait_mode = "cache_poll";
+        timeout   = poll_interval_;
     } else if (!waiting_streams_.empty()) {
         // No running work can release capacity. Poll PD-held block releases without turning a
         // large retryable queue into a tight malloc/eviction loop.
-        wait_mode           = "capacity_poll";
-        predicate_satisfied =
-            cond_.wait_for(lock, std::chrono::milliseconds(100), [this] { return waitPredicate(); });
-    } else {
-        cond_.wait(lock, [this] { return waitPredicate(); });
+        wait_mode = "capacity_poll";
+        timeout   = std::chrono::milliseconds(100);
     }
+    scheduler_sync_state_->wait(lock, [this] { return waitPredicate(); }, timeout);
 
     const auto wait_us =
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_begin).count();
-    const size_t pending_after_wait =
-        scheduler_sync_state_->pending_cache_load_count.load(std::memory_order_acquire);
+    size_t pending_after_wait;
+    bool   predicate_satisfied;
+    bool   cache_completion_triggered;
+    {
+        std::lock_guard<std::mutex> wake_lock(scheduler_sync_state_->wake_mutex);
+        pending_after_wait = scheduler_sync_state_->pending_cache_load_count.load(std::memory_order_acquire);
+        predicate_satisfied = waitPredicate();
+        cache_completion_triggered =
+            scheduler_sync_state_->cache_load_completion_trigger && pending_after_wait == 0;
+        scheduler_sync_state_->cache_load_completion_trigger = false;
+    }
     const size_t completed_during_wait =
         pending_before >= pending_after_wait ? pending_before - pending_after_wait : 0;
-    const bool stop_triggered             = stop_.load(std::memory_order_acquire);
-    const bool enqueue_triggered          = schedule_trigger_;
-    const bool cache_completion_triggered = scheduler_sync_state_->cache_load_completion_trigger
-                                            && pending_after_wait == 0;
+    const bool stop_triggered    = stop_.load(std::memory_order_acquire);
+    const bool enqueue_triggered = schedule_trigger_;
     const bool running_triggered = !running_streams_.empty();
     if (scheduler_wake_debug_enabled_) {
         RTP_LLM_LOG_INFO(
@@ -737,7 +718,6 @@ absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
     }
 
     schedule_trigger_ = false;
-    scheduler_sync_state_->cache_load_completion_trigger = false;
     last_admitted_context_batch_size_ = 0;
     last_admitted_context_token_size_ = 0;
     last_waiting_oldest_age_us_       = 0;

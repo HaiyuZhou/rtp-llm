@@ -127,11 +127,13 @@ private:
     // excluded). 0 disables it.
     const size_t max_batch_tokens_without_cache_ = 0;
     const size_t prefill_cp_size_                = 1;
+    const bool   scheduler_wake_debug_enabled_   = false;
 
     // Consumed (exchanged to 0) from the const fillExtraMetrics() reporting hook.
     mutable std::atomic<int64_t> pending_group_fallback_count_ = 0;
     AdmissionLane                active_admission_lane_        = AdmissionLane::NONE;
     bool                         prefer_group_next_            = false;
+    uint64_t                     schedule_round_id_            = 0;
 
     // TODO @wangyin support different beams run togather
 };

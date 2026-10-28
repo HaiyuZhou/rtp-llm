@@ -3,6 +3,8 @@
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "rtp_llm/cpp/utils/TimeUtil.h"
+
+#include "autil/EnvUtil.h"
 #include "rtp_llm/cpp/cache/AsyncContext.h"
 #include "rtp_llm/cpp/cache/CacheTopology.h"
 #include "rtp_llm/cpp/cache/MHAKVCacheSpec.h"
@@ -278,12 +280,17 @@ absl::Status StreamCacheResource::finalizeAllocatorLoad() {
     const auto error         = allocator_load_context_->errorInfo();
     const auto load_context  = std::dynamic_pointer_cast<LoadAsyncContext>(allocator_load_context_);
     const auto malloc_status = load_context == nullptr ? MallocStatus::NONE : load_context->mallocStatus();
+    size_t     total         = 0;
+    size_t     local         = 0;
+    size_t     host          = 0;
+    size_t     disk          = 0;
+    size_t     backend       = 0;
     if (load_success) {
         RTP_LLM_CHECK(load_context != nullptr);
-        const size_t total = load_context->matchedBlocks();
-        const size_t local = load_context->localMatchedBlocks();
-        const size_t host  = load_context->matchedBlocks(Tier::HOST);
-        const size_t disk  = load_context->matchedBlocks(Tier::DISK);
+        total = load_context->matchedBlocks();
+        local = load_context->localMatchedBlocks();
+        host  = load_context->matchedBlocks(Tier::HOST);
+        disk  = load_context->matchedBlocks(Tier::DISK);
         RTP_LLM_CHECK_WITH_INFO(total >= local && host <= local && disk <= local - host,
                                 "invalid allocator reuse counts: total=%zu local=%zu host=%zu disk=%zu",
                                 total,
@@ -295,8 +302,8 @@ absl::Status StreamCacheResource::finalizeAllocatorLoad() {
                                 "allocator reuse token count exceeds int range: blocks=%zu tokens=%d",
                                 total,
                                 tokens);
-        const size_t backend  = total - local;
-        auto&        resource = batch_kv_cache_resource_->cacheResource(0);
+        backend = total - local;
+        auto& resource = batch_kv_cache_resource_->cacheResource(0);
         resource.setDeviceReuseBlockNum(local - host - disk);
         resource.setMemoryReuseBlockNum(host);
         resource.setDiskReuseBlockNum(disk);
@@ -316,6 +323,21 @@ absl::Status StreamCacheResource::finalizeAllocatorLoad() {
         cache_reuse_metrics_.load_wait_latency_us = std::max<int64_t>(load_end_time_us - load_wait_begin_time_us_, 0);
         cache_reuse_metrics_.match_to_ready_latency_us = std::max<int64_t>(load_end_time_us - malloc_begin_time_us_, 0);
         cache_reuse_metrics_.report_match_to_ready_latency = true;
+    }
+    if (autil::EnvUtil::getEnv("RTP_LLM_SCHEDULER_WAKE_DEBUG", 0) == 1) {
+        RTP_LLM_LOG_INFO("scheduler_cache_load_latency request_id=%ld load_success=%d "
+                         "load_wait_latency_us=%ld load_prepare_latency_us=%ld match_to_ready_latency_us=%ld "
+                         "total_blocks=%zu device_blocks=%zu host_blocks=%zu disk_blocks=%zu backend_blocks=%zu",
+                         stream_->streamId(),
+                         load_success,
+                         cache_reuse_metrics_.load_wait_latency_us,
+                         cache_reuse_metrics_.load_prepare_latency_us,
+                         cache_reuse_metrics_.match_to_ready_latency_us,
+                         total,
+                         local - host - disk,
+                         host,
+                         disk,
+                         backend);
     }
     allocator_load_context_.reset();
 

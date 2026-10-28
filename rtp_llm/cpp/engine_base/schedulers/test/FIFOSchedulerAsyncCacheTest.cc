@@ -26,6 +26,7 @@
 #include "rtp_llm/cpp/cache/test/mock/MockCoordinatorCacheManager.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
+#include "rtp_llm/cpp/testing/TestLogCapture.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
 
 using namespace std;
@@ -426,6 +427,40 @@ TEST_F(FIFOSchedulerAsyncCacheTest, testLastAllocatorLoadCompletionWakesTimedSch
     EXPECT_EQ(result.value().front(), stream);
 }
 
+TEST_F(FIFOSchedulerAsyncCacheTest, testCacheLoadDiagnosticReportsFinalizedLatency) {
+    autil::EnvGuard      poll_interval("RTP_LLM_SCHEDULER_POLL_INTERVAL_MS", "60000");
+    autil::EnvGuard      wake_debug("RTP_LLM_SCHEDULER_WAKE_DEBUG", "1");
+    test::TestLogCapture log_capture("scheduler_cache_load_latency");
+    auto                 scheduler = createScheduler();
+    auto                 stream    = createStream({1, 2, 3}, /*reuse_cache=*/true);
+    auto                 context   = makeControlledAllocatorContext();
+    ASSERT_TRUE(scheduler->enqueue(stream).ok());
+    installReadinessAllocator([context](const MallocInfo&) { return context; });
+
+    auto first = scheduler->schedule();
+    ASSERT_TRUE(first.ok());
+    ASSERT_EQ(stream->getStatus(), StreamState::LOADING_CACHE);
+
+    auto poll = std::async(std::launch::async, [scheduler] { return scheduler->schedule(); });
+    ASSERT_EQ(poll.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+    ASSERT_TRUE(context->completeTransfers(1, true));
+    ASSERT_EQ(poll.wait_for(std::chrono::milliseconds(500)), std::future_status::ready);
+    auto result = poll.get();
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(result.value().size(), 1);
+
+    ASSERT_TRUE(log_capture.waitFor("scheduler_cache_load_latency"));
+    const auto logs = log_capture.content();
+    EXPECT_THAT(logs, testing::HasSubstr("request_id=" + std::to_string(stream->streamId())));
+    EXPECT_THAT(logs, testing::HasSubstr("load_success=1"));
+    EXPECT_THAT(logs, testing::HasSubstr("load_wait_latency_us="));
+    EXPECT_THAT(logs, testing::HasSubstr("load_prepare_latency_us="));
+    EXPECT_THAT(logs, testing::HasSubstr("match_to_ready_latency_us="));
+    EXPECT_THAT(logs, testing::HasSubstr("total_blocks=1"));
+    EXPECT_THAT(logs, testing::HasSubstr("host_blocks=1"));
+    EXPECT_THAT(logs, testing::HasSubstr("disk_blocks=0"));
+}
+
 TEST_F(FIFOSchedulerAsyncCacheTest, testPartialAllocatorLoadCompletionDoesNotWakeTimedSchedule) {
     autil::EnvGuard poll_interval("RTP_LLM_SCHEDULER_POLL_INTERVAL_MS", "60000");
     auto            scheduler = createScheduler(/*max_generate_batch_size=*/2);
@@ -457,6 +492,42 @@ TEST_F(FIFOSchedulerAsyncCacheTest, testPartialAllocatorLoadCompletionDoesNotWak
     auto result = poll.get();
     ASSERT_TRUE(result.ok());
     EXPECT_EQ(result.value().size(), 2);
+}
+
+TEST_F(FIFOSchedulerAsyncCacheTest, testCacheLoadWaitDiagnosticReportsPartialCompletionAndTimeout) {
+    autil::EnvGuard       poll_interval("RTP_LLM_SCHEDULER_POLL_INTERVAL_MS", "100");
+    autil::EnvGuard       wake_debug("RTP_LLM_SCHEDULER_WAKE_DEBUG", "1");
+    test::TestLogCapture  log_capture("scheduler_cache_load_wait");
+    auto                  scheduler = createScheduler(/*max_generate_batch_size=*/2);
+    auto                  stream1   = createStream({1}, /*reuse_cache=*/true);
+    auto                  stream2   = createStream({2}, /*reuse_cache=*/true);
+    auto                  context1  = makeControlledAllocatorContext();
+    auto                  context2  = makeControlledAllocatorContext();
+    const std::unordered_map<int64_t, std::shared_ptr<AsyncContext>> contexts{
+        {stream1->streamId(), context1}, {stream2->streamId(), context2}};
+    installReadinessAllocator([contexts](const MallocInfo& info) { return contexts.at(info.request_id); });
+    ASSERT_TRUE(scheduler->enqueue(stream1).ok());
+    ASSERT_TRUE(scheduler->enqueue(stream2).ok());
+
+    auto first = scheduler->schedule();
+    ASSERT_TRUE(first.ok());
+    ASSERT_EQ(scheduler->scheduler_sync_state_->pending_cache_load_count.load(), 2);
+
+    auto poll = std::async(std::launch::async, [scheduler] { return scheduler->schedule(); });
+    ASSERT_EQ(poll.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    ASSERT_TRUE(context1->completeTransfers(1, true));
+
+    ASSERT_EQ(poll.wait_for(std::chrono::milliseconds(500)), std::future_status::ready);
+    ASSERT_TRUE(poll.get().ok());
+    const auto logs = log_capture.content();
+    EXPECT_THAT(logs, testing::HasSubstr("scheduler_cache_load_wait"));
+    EXPECT_THAT(logs, testing::HasSubstr("pending_before=2"));
+    EXPECT_THAT(logs, testing::HasSubstr("pending_after=1"));
+    EXPECT_THAT(logs, testing::HasSubstr("completed_during_wait=1"));
+    EXPECT_THAT(logs, testing::HasSubstr("outcome=timeout"));
+
+    ASSERT_TRUE(context2->completeTransfers(1, true));
+    EXPECT_TRUE(log_capture.waitFor("scheduler_cache_load_complete pending_after=0 notify=1"));
 }
 
 TEST_F(FIFOSchedulerAsyncCacheTest, testTransientZeroDuringAdmissionDoesNotWakeTimedSchedule) {

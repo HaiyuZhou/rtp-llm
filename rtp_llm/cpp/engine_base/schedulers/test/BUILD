@@ -31,6 +31,7 @@ test_deps = [
 async_cache_test_deps = test_deps + [
     "//rtp_llm/cpp/cache/test:cache_config_test_utils",
     "//rtp_llm/cpp/cache/test/mock:mock_allocator_lib",
+    "//rtp_llm/cpp/testing:test_log_capture",
 ]
 
 cc_test(

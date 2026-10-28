@@ -6,6 +6,8 @@
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 
+#include "autil/EnvUtil.h"
+
 #include <algorithm>
 #include <chrono>
 #include <mutex>
@@ -34,18 +36,20 @@ FIFOScheduler::FIFOScheduler(const RuntimeConfig&                   runtime_conf
         static_cast<size_t>(std::max<int64_t>(runtime_config.fifo_scheduler_config.max_batch_tokens_without_cache, 0))),
     prefill_cp_size_(parallelism_config.prefill_cp_config.is_enabled() ?
                          static_cast<size_t>(std::max<int64_t>(parallelism_config.tp_size, 1)) :
-                         1) {
+                         1),
+    scheduler_wake_debug_enabled_(autil::EnvUtil::getEnv("RTP_LLM_SCHEDULER_WAKE_DEBUG", 0) == 1) {
     RTP_LLM_LOG_INFO("max_generate_batch_size is [%zu], max_batch_tokens_size is [%zu], "
                      "max_batch_tokens_without_cache is [%zu], cp_force_single_prefill is [%d], "
                      "prefill_cp_size is [%zu], max_inited_kv_cache_streams is [%zu], "
-                     "scheduler_poll_interval_ms is [%lld]",
+                     "scheduler_poll_interval_ms is [%lld], scheduler_wake_debug_enabled is [%d]",
                      max_generate_batch_size_,
                      max_batch_tokens_size_,
                      max_batch_tokens_without_cache_,
                      cp_force_single_prefill_,
                      prefill_cp_size_,
                      max_inited_kv_cache_streams_,
-                     static_cast<long long>(poll_interval_.count()));
+                     static_cast<long long>(poll_interval_.count()),
+                     scheduler_wake_debug_enabled_);
 }
 
 FIFOScheduler::~FIFOScheduler() {
@@ -309,9 +313,10 @@ void FIFOScheduler::onRunningStream(const GenerateStreamPtr& stream) {
 }
 
 void FIFOScheduler::onLoadingStream(const GenerateStreamPtr& stream) {
-    const auto sync_state = scheduler_sync_state_;
+    const auto sync_state    = scheduler_sync_state_;
+    const bool wake_debug_on = scheduler_wake_debug_enabled_;
     sync_state->pending_cache_load_count.fetch_add(1, std::memory_order_acq_rel);
-    const bool registered = stream->streamCacheResource().onAllocatorLoadDone([sync_state] {
+    const bool registered = stream->streamCacheResource().onAllocatorLoadDone([sync_state, wake_debug_on] {
         const size_t previous = sync_state->pending_cache_load_count.fetch_sub(1, std::memory_order_acq_rel);
         RTP_LLM_CHECK_WITH_INFO(previous > 0, "allocator load completion count underflow");
         if (previous != 1) {
@@ -326,6 +331,10 @@ void FIFOScheduler::onLoadingStream(const GenerateStreamPtr& stream) {
         if (sync_state->lockOwnedByCurrentThread()) {
             if (sync_state->pending_cache_load_count.load(std::memory_order_acquire) == 0) {
                 sync_state->cache_load_completion_trigger = true;
+                if (wake_debug_on) {
+                    RTP_LLM_LOG_INFO(
+                        "scheduler_cache_load_complete pending_after=0 notify=0 inline_with_scheduler_lock=1");
+                }
             }
             return;
         }
@@ -340,6 +349,10 @@ void FIFOScheduler::onLoadingStream(const GenerateStreamPtr& stream) {
         }
         if (notify) {
             sync_state->cond.notify_all();
+            if (wake_debug_on) {
+                RTP_LLM_LOG_INFO("scheduler_cache_load_complete pending_after=0 notify=1 "
+                                 "inline_with_scheduler_lock=0");
+            }
         }
     });
     if (!registered) {
@@ -656,15 +669,71 @@ void FIFOScheduler::evaluateWaitingGroupQueue() {
 absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
     unique_lock<mutex> lock(lock_);
     SchedulerSynchronizationState::LockOwnerScope lock_owner(*scheduler_sync_state_);
+    const uint64_t round_id = ++schedule_round_id_;
+    const size_t   pending_before =
+        scheduler_sync_state_->pending_cache_load_count.load(std::memory_order_acquire);
+    const size_t waiting_before       = waiting_streams_.size();
+    const size_t loading_before       = loading_cache_streams_.size();
+    const size_t running_before       = running_streams_.size();
+    const size_t waiting_group_before = groupQueueStreamsSize(waiting_group_queue_);
+    const size_t loading_group_before = groupQueueStreamsSize(loading_cache_group_queue_);
+    const auto   wait_begin            = std::chrono::steady_clock::now();
+    const char*  wait_mode             = "idle";
+    bool         predicate_satisfied   = true;
     if (need_fill_fake_stream_ || !loading_cache_streams_.empty() || !loading_cache_group_queue_.empty()
         || !waiting_group_queue_.empty()) {
-        cond_.wait_for(lock, poll_interval_, [this] { return waitPredicate(); });
+        wait_mode           = "cache_poll";
+        predicate_satisfied = cond_.wait_for(lock, poll_interval_, [this] { return waitPredicate(); });
     } else if (!waiting_streams_.empty()) {
         // No running work can release capacity. Poll PD-held block releases without turning a
         // large retryable queue into a tight malloc/eviction loop.
-        cond_.wait_for(lock, std::chrono::milliseconds(100), [this] { return waitPredicate(); });
+        wait_mode           = "capacity_poll";
+        predicate_satisfied =
+            cond_.wait_for(lock, std::chrono::milliseconds(100), [this] { return waitPredicate(); });
     } else {
         cond_.wait(lock, [this] { return waitPredicate(); });
+    }
+
+    const auto wait_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_begin).count();
+    const size_t pending_after_wait =
+        scheduler_sync_state_->pending_cache_load_count.load(std::memory_order_acquire);
+    const size_t completed_during_wait =
+        pending_before >= pending_after_wait ? pending_before - pending_after_wait : 0;
+    const bool stop_triggered             = stop_.load(std::memory_order_acquire);
+    const bool enqueue_triggered          = schedule_trigger_;
+    const bool cache_completion_triggered = scheduler_sync_state_->cache_load_completion_trigger
+                                            && pending_after_wait == 0;
+    const bool running_triggered = !running_streams_.empty();
+    if (scheduler_wake_debug_enabled_) {
+        RTP_LLM_LOG_INFO(
+            "scheduler_cache_load_wait round=%llu mode=%s wait_us=%lld outcome=%s "
+            "pending_before=%zu pending_after=%zu completed_during_wait=%zu "
+            "stop_trigger=%d enqueue_trigger=%d cache_completion_trigger=%d running_trigger=%d "
+            "waiting_before=%zu waiting_after=%zu loading_before=%zu loading_after=%zu "
+            "running_before=%zu running_after=%zu waiting_group_before=%zu waiting_group_after=%zu "
+            "loading_group_before=%zu loading_group_after=%zu",
+            static_cast<unsigned long long>(round_id),
+            wait_mode,
+            static_cast<long long>(wait_us),
+            predicate_satisfied ? "predicate" : "timeout",
+            pending_before,
+            pending_after_wait,
+            completed_during_wait,
+            stop_triggered,
+            enqueue_triggered,
+            cache_completion_triggered,
+            running_triggered,
+            waiting_before,
+            waiting_streams_.size(),
+            loading_before,
+            loading_cache_streams_.size(),
+            running_before,
+            running_streams_.size(),
+            waiting_group_before,
+            groupQueueStreamsSize(waiting_group_queue_),
+            loading_group_before,
+            groupQueueStreamsSize(loading_cache_group_queue_));
     }
 
     schedule_trigger_ = false;
@@ -770,6 +839,19 @@ absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
 
     reportMetrics();
     last_schedule_time_ = autil::TimeUtility::currentTimeInMilliSeconds();
+    if (scheduler_wake_debug_enabled_) {
+        RTP_LLM_LOG_INFO(
+            "scheduler_cache_load_schedule_end round=%llu returned_streams=%zu pending=%zu waiting=%zu loading=%zu "
+            "running=%zu waiting_group=%zu loading_group=%zu",
+            static_cast<unsigned long long>(round_id),
+            running_streams_.size(),
+            scheduler_sync_state_->pending_cache_load_count.load(std::memory_order_acquire),
+            waiting_streams_.size(),
+            loading_cache_streams_.size(),
+            running_streams_.size(),
+            groupQueueStreamsSize(waiting_group_queue_),
+            groupQueueStreamsSize(loading_cache_group_queue_));
+    }
     return running_streams_;
 }
 

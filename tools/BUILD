@@ -3,6 +3,17 @@ load("@pip_gpu_cuda12_9_torch//:requirements.bzl", requirement_gpu_cuda12_9 = "r
 load("@pip_gpu_cuda12_torch//:requirements.bzl", requirement_gpu_cuda12 = "requirement")
 load("@pip_gpu_cuda13_torch//:requirements.bzl", requirement_gpu_cuda13 = "requirement")
 
+exports_files(
+    ["perf_test"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "perf_test_script",
+    srcs = ["perf_test"],
+    visibility = ["//visibility:public"],
+)
+
 sh_binary(
     name = "nvidia_wheel_env",
     srcs = ["nvidia_wheel_env.sh"],
@@ -21,13 +32,4 @@ sh_test(
     srcs = ["nvidia_wheel_env_test.sh"],
     data = ["nvidia_wheel_env.sh"],
     env = {"GPU_COUNT": "0"},
-)
-
-sh_test(
-    name = "cache_perf_collect_env_test",
-    srcs = ["cache_perf_collect_env_test.sh"],
-    data = [
-        "cache_perf_collect_env.sh",
-        "//rtp_llm/test/perf_test:requirements_plotly_lock.txt",
-    ],
 )

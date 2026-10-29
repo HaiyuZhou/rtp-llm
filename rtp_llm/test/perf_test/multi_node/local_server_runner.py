@@ -27,7 +27,7 @@ from rtp_llm.config.py_config_modules import PyEnvConfigs
 from rtp_llm.config.server_config_setup import setup_and_configure_server
 from rtp_llm.distribute.distributed_server import members_from_test_env
 from rtp_llm.server.server_args.server_args import setup_args
-from rtp_llm.test.perf_test.batch_decode_test import run_single
+from rtp_llm.test.perf_test.decode.grid_runner import run_single
 from rtp_llm.test.perf_test.test_util import create_query
 from rtp_llm.test.utils.maga_server_manager import MagaServerManager
 from rtp_llm.utils.fuser import fetch_remote_file_to_local

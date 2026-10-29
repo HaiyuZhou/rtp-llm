@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "model": {
+    "label": "qwen2.5-7b-decode-tpot",
+    "type": "qwen_2",
+    "checkpoint": "/data/models/Qwen2.5-7B-Instruct",
+    "tokenizer": "/data/models/Qwen2.5-7B-Instruct",
+    "topology": {
+      "tp": 1,
+      "dp": 2,
+      "pp": 1,
+      "ep": 1
+    }
+  },
+  "engine": {
+    "max_seq_len": 4097,
+    "max_batch_tokens": 32768,
+    "concurrency_limit": 16,
+    "args": {},
+    "env": {}
+  },
+  "workload": {
+    "kind": "grid",
+    "input_lengths": [
+      128,
+      512,
+      1024
+    ],
+    "output_length": 128,
+    "batch_sizes": [
+      32
+    ],
+    "measure_runs": 5,
+    "warmup_runs": 1,
+    "target_tpot_ms": 10.0,
+    "generate_config": {
+      "top_k": 1
+    }
+  },
+  "execution": {
+    "backend": "local",
+    "devices": [
+      0,
+      1
+    ]
+  },
+  "output": {
+    "result_root": "perf_test_results"
+  },
+  "regression": {},
+  "publish": {}
+}

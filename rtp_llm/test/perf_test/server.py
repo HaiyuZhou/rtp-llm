@@ -5,8 +5,8 @@ from typing import Dict, List, Optional
 
 import requests
 
-from rtp_llm.test.perf_test.cache_grid.runner.scheduler import configure_scheduler
 from rtp_llm.test.perf_test.dataset import extract_arg
+from rtp_llm.test.perf_test.execution.scheduler import configure_scheduler
 from rtp_llm.test.utils.maga_server_manager import MagaServerManager
 
 EXISTING_SERVER_PORT_ENV = "CACHE_PERF_EXISTING_SERVER_PORT"

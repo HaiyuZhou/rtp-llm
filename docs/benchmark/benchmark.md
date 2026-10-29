@@ -1,138 +1,32 @@
-# RTP-LLM Performance Benchmark Tool
-In this chapter, I will present the performance testing tools developed in RTP-LLM, including standalone measurement of model prefill and decode performance under various batch sizes with single-node and multi-node parallelism, timeline recording, and their usage methods.
-## Design Principle
-RTP-LLM employs a special batch scheduler that accumulates requests until the specified batch size is reached, then all requests enter the engine simultaneously. The scheduler supports both prefill and decode modes; in decode mode, requests are only allocated KV cache without prefill, enabling accurate and efficient measurement of engine performance.
-In detail, the batch-scheduler profiler is executed three times for a single input:
- - Warm-up run, to account for one-time setup such as JIT compilation.
- - Timing run, to measure engine performance.
- - Profiling run, to capture a timeline for subsequent analysis; this step may degrade end-to-end performance.
+# RTP-LLM Unified Performance Benchmark
 
-For every run we use min_new_tokens and max_new_tokens to ensure that all requests perform the same number of decode steps.
+RTP-LLM uses one strict performance-test entry for local prefill and decode:
+`tools/perf_test`. New runs accept one versioned JSON config; engine arguments,
+environment, topology, workload, output, regression, and publishing policy are
+declared in that file rather than forwarded as command-line flags.
 
-Since in decode mode, we not prefill the KVCache, so hidden_states after every forward step is not real. So we also hack moe gate select for moe model and speculative accept func for mtp. In that way, we get stable result for analyse result.
 ## Single-Node Benchmark
 
-Single-node perf tests share the same entrypoint: `rtp_llm/test/perf_test/batch_decode_test.py`. There are two **mutually exclusive** modes:
+Preview cache-aware prefill without starting a model:
 
-1. **Grid mode** — fix a list of batch sizes and input lengths (`--batch_size`, `--input_len`, comma-separated). Do **not** pass `--dataset_name`, `--dataset_path`, `--dataset`, or `--test_json`.
-2. **Distribution mode** — load or build a length histogram from a dataset or CSV, then sample workloads. Pass one of: `--dataset_name`, `--dataset_path`, `--dataset` (distribution CSV), or `--test_json`.
-
-### Checkpoint / tokenizer and Hub
-
-For this perf entrypoint only, if `--checkpoint_path` or `--tokenizer_path` is a ModelScope/HuggingFace **repo id** (e.g. `Qwen/Qwen3.5-35B-A3B`) or an **`https://huggingface.co/...` / `https://www.modelscope.cn/...` page URL**, `batch_decode_test` resolves it to a **local directory** (ModelScope first, then HuggingFace) before starting the engine, and rewrites argv so the child process never calls `AutoTokenizer.from_pretrained` on a remote id. Ordinary `start_server` / production paths do **not** perform that automatic download; use local paths or prefetch there.
-
-Set **`--model_type`** explicitly for grid mode (and whenever `model_type` cannot be inferred from local `config.json`). Engine flags use **`--checkpoint_path`** (binds to internal `ckpt_path`), not `--ckpt_path`, for this tool.
-
-`batch_size` is the batch on **each** DP rank when `dp_size` > 1.
-
-### Bazel targets (manual)
-
-Repository defaults (see `rtp_llm/test/perf_test/BUILD`):
-
-- **`//rtp_llm/test/perf_test:grid_perf_test`** — grid example with `qwen35_moe`, small `batch_size` / `input_len`, decode-only (`--partial 1`), `seq_size_per_block=1024`.
-- **`//rtp_llm/test/perf_test:distribution_perf_test`** — distribution sampling with ShareGPT (`--dataset_name sharegpt`), tunable `max_seq_len` / `concurrency_limit`.
-- **`//rtp_llm/test/perf_test:model_perf_test`** — model-agnostic entrypoint with no baked-in checkpoint or topology. Use this target for a new model; supply all model and engine values at invocation time.
-
-#### Reusable model target
-
-`model_perf_test` exposes model, workload, engine, repetition, and output
-settings independently:
-
-| Group | Interface | Meaning |
-| --- | --- | --- |
-| Model | `--test_arg=--model_type=...`, `--test_arg=--checkpoint_path=...`, `--test_arg=--tokenizer_path=...` | Model implementation and local/Hub paths. |
-| Workload | `--test_arg=--batch_size=1,2,4`, `--test_arg=--input_len=1024,4096`, `--test_arg=--partial=2` | Grid shape and phase (`0` both, `1` decode, `2` prefill). |
-| Engine | `--test_arg=--engine_arg=NAME=VALUE` | Any engine flag, repeatable; e.g. `tp_size=8`, `ep_size=8`, `fp8_kv_cache=1`. |
-| Engine environment | `--test_arg=--engine_env=NAME=VALUE` | Repeatable environment default. An explicit Bazel `--test_env` value wins. |
-| Repetitions | `--test_arg=--warmup_runs=1`, `--test_arg=--measure_runs=3`, `--test_arg=--profile_runs=0` | Per-case warmup, measurement, and optional profiling runs. |
-| Output | `--test_arg=--result_dir=...` | Defaults to Bazel's `TEST_UNDECLARED_OUTPUTS_DIR`. |
-
-Example for a new prefill model:
-
-```shell
-bazelisk test //rtp_llm/test/perf_test:model_perf_test \
-    --config=cuda13 \
-    --test_arg=--model_type=deepseek_v4 \
-    --test_arg=--checkpoint_path=/models/DeepSeek-V4 \
-    --test_arg=--tokenizer_path=/models/DeepSeek-V4 \
-    --test_arg=--batch_size=1,2,4,8 \
-    --test_arg=--input_len=1024,4096,16384,65536 \
-    --test_arg=--partial=2 \
-    --test_arg=--decode_test_length=1 \
-    --test_arg=--engine_arg=tp_size=8 \
-    --test_arg=--engine_arg=ep_size=8 \
-    --test_arg=--engine_arg=world_size=8 \
-    --test_arg=--engine_arg=fp8_kv_cache=1 \
-    --test_arg=--engine_arg=load_method=fastsafetensors \
-    --test_arg=--measure_runs=3 \
-    --test_arg=--profile_runs=0 \
-    --test_env=PERF_GRID_WARMUP_RUNS=1
+```bash
+./tools/perf_test --mode=prefill --action=run --config=rtp_llm/test/perf_test/examples/prefill_local.json --dry-run
 ```
 
-`--engine_arg=NAME=VALUE` is forwarded as the normal engine CLI pair
-`--NAME VALUE`. Existing raw engine flags remain supported, so old targets do
-not change. Keep a given engine flag in one form in a command to avoid
-ambiguous duplicate values.
+Preview an input-length by global-batch decode grid:
 
-#### Output contract
-
-Every run writes under the result directory:
-
-* `test_info.json` (schema version 2): model paths/type, workload settings,
-  effective repetition counts, redacted invocation, forwarded engine
-  arguments, and engine environment variable names. Secret-like values are
-  not persisted. It is written once before server startup (`status=running`)
-  and again on successful completion (`status=completed`).
-* `Prefill_Result.json` and/or `Decode_Result.json`: one record per
-  batch-size/input-length point, with success rate, wait time, prefill/decode
-  timing, and `generate_config`.
-* Profiler JSON files, when enabled, are moved into `timelines/`.
-
-The test exits non-zero if server startup or requests fail while preserving
-the output directory for diagnosis. The generic target does not infer a
-model-specific topology: pass every required engine flag explicitly and keep
-`test_info.json` with the result.
-
-Example (SM90; adjust configs for your stack e.g. `cuda13`):
-
-```shell
-# Grid: override sizes and run decode + prefill (partial=0) or decode-only
-bazelisk test //rtp_llm/test/perf_test:grid_perf_test \
-    --config=cuda13 \
-    --test_arg=--batch_size=1,2,4,8 \
-    --test_arg=--input_len=128,1024,2048 \
-    --test_arg=--partial=0
-
-# Grid: custom local checkpoint and model type
-bazelisk test //rtp_llm/test/perf_test:grid_perf_test \
-    --config=cuda13 \
-    --test_arg=--checkpoint_path=/path/to/local/ckpt \
-    --test_arg=--tokenizer_path=/path/to/local/tokenizer \
-    --test_arg=--model_type=qwen35_moe
-
-# Distribution mode (use distribution_perf_test or pass dataset flags via test_arg)
-bazelisk test //rtp_llm/test/perf_test:distribution_perf_test \
-    --config=cuda13 \
-    --test_arg=--model_type=qwen35_moe
+```bash
+./tools/perf_test --mode=decode --action=run --config=rtp_llm/test/perf_test/examples/decode_grid_local.json --dry-run
 ```
 
-Optional environment for the engine, e.g. `INT8_MODE=1`:
+Remove `--dry-run` to execute. Prefill supports local run, resume, profile,
+and offline report. Decode supports local run only. AOne and the CI macro support
+prefill only. Model and tokenizer paths must already be available in the runtime.
 
-```shell
-bazelisk test //rtp_llm/test/perf_test:grid_perf_test \
-    --config=cuda13 \
-    --test_env=INT8_MODE=1
-```
-
-### Prefill vs decode only
-
-When prefill and decode need different engine configs, restrict phases with **`--partial`**: `0` = both (default), `1` = decode grid only, `2` = prefill only. Example decode-only:
-
-```shell
-bazelisk test //rtp_llm/test/perf_test:grid_perf_test \
-    --config=cuda13 \
-    --test_arg=--partial=1
-```
+See `rtp_llm/test/perf_test/docs/reference.md` for the capability matrix,
+run-directory layout, result contract, exit codes, AOne delivery, regression,
+and publishers. Mode-specific examples are in the adjacent `docs/` and
+`examples/` directories.
 
 ## Multi Node Benchmark
 We also provide a Python script to enable multi-node benchmark, but since it requires setting up the environment and starting the script on multiple machines, it still involves more steps than single-node testing.

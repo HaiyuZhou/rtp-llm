@@ -44,16 +44,15 @@ class AOneExamplesTest(unittest.TestCase):
         self.assertEqual("aone", preview["backend"])
         self.assertEqual(2, preview["shards"]["count"])
         self.assertEqual(
-            [
-                "//generated/perf_test:shard_0000",
-                "//generated/perf_test:shard_0001",
-            ],
-            [
-                command["argv"][-1]
-                for command in preview["commands"]
-                if command["stage"] == "build-shard"
-            ],
+            ["build", "remote-test"],
+            [command["stage"] for command in preview["commands"]],
         )
+        targets = [
+            "//generated/perf_test:shard_0000",
+            "//generated/perf_test:shard_0001",
+        ]
+        for command in preview["commands"]:
+            self.assertTrue(all(target in command["argv"] for target in targets))
         owned = [
             case_id
             for shard in preview["shards"]["items"]

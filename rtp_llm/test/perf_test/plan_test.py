@@ -18,7 +18,7 @@ def _config(backend="local"):
     if backend == "aone":
         execution = {
             "backend": "aone",
-            "resource": "gpu",
+            "resource": "daily",
             "gpu_type": "H20",
             "max_parallel": 2,
             "shard_count": 2,
@@ -204,6 +204,23 @@ class ExecutionPlanTest(unittest.TestCase):
                 cases=_cases(),
                 result_directory="runs/example",
             )
+
+    def test_aone_resource_plan_rejects_unknown_remote_configuration(self):
+        for field, value, diagnostic in (
+            ("resource", "staging", "supported resources"),
+            ("gpu_type", "UNKNOWN", "supported GPU types"),
+        ):
+            with self.subTest(field=field):
+                payload = _config("aone")
+                payload["execution"][field] = value
+                with self.assertRaisesRegex(ResourceError, diagnostic):
+                    build_execution_plan(
+                        mode="prefill",
+                        action="run",
+                        resolved=resolve_config(payload),
+                        cases=_cases(),
+                        result_directory="runs/example",
+                    )
 
 
 if __name__ == "__main__":

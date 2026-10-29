@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -8,6 +9,7 @@ from rtp_llm.test.perf_test.aone.executor import RemoteShardExecutor
 from rtp_llm.test.perf_test.aone.package import generate_aone_package
 from rtp_llm.test.perf_test.aone.worker import load_remote_inputs
 from rtp_llm.test.perf_test.aone.worker import main as worker_main
+from rtp_llm.test.perf_test.aone.worker import resolve_remote_runtime_inputs
 from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.execution.engine_session import EngineDiagnostics
 from rtp_llm.test.perf_test.modes.prefill import PrefillAdapter
@@ -113,6 +115,88 @@ def _result(case):
 
 
 class AOneWorkerTest(unittest.TestCase):
+    def test_remote_runtime_paths_are_resolved_without_changing_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan = _plan(root)
+            package = generate_aone_package(
+                root / "generated",
+                plan,
+                run_id="run-paths",
+                ownership=[[case.case_id for case in plan.cases]],
+            )
+            inputs = load_remote_inputs(
+                resolved_config=package.resolved_config,
+                resolved_workload=package.resolved_workload,
+                shard_plan=package.shard_plan,
+                shard_id="shard-0000",
+            )
+
+            runtime = resolve_remote_runtime_inputs(
+                inputs, fetcher=lambda path: f"/runtime-cache/{path.strip('/')}"
+            )
+
+            self.assertEqual("/m", inputs.config["model"]["checkpoint"])
+            self.assertEqual("/runtime-cache/m", runtime.config["model"]["checkpoint"])
+            self.assertEqual("/runtime-cache/m", runtime.config["model"]["tokenizer"])
+            self.assertEqual(inputs.run_id, runtime.run_id)
+            self.assertEqual(inputs.config_fingerprint, runtime.config_fingerprint)
+            self.assertEqual(inputs.workload_fingerprint, runtime.workload_fingerprint)
+
+            repo_config = json.loads(json.dumps(inputs.config))
+            repo_config["model"]["checkpoint"] = "Qwen/model"
+            repo_config["model"]["tokenizer"] = "Qwen/model"
+            hub_inputs = replace(inputs, config=repo_config)
+            hub_calls = []
+            hub_runtime = resolve_remote_runtime_inputs(
+                hub_inputs,
+                fetcher=lambda path: path,
+                hub_fetcher=lambda repo: hub_calls.append(repo) or "/hub-cache/model",
+            )
+            self.assertEqual(["Qwen/model"], hub_calls)
+            self.assertEqual(
+                "/hub-cache/model", hub_runtime.config["model"]["checkpoint"]
+            )
+            self.assertEqual(
+                "/hub-cache/model", hub_runtime.config["model"]["tokenizer"]
+            )
+
+    def test_worker_setup_failure_still_writes_an_owned_failure_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan = _plan(root)
+            package = generate_aone_package(
+                root / "generated",
+                plan,
+                run_id="run-setup-failure",
+                ownership=[[case.case_id for case in plan.cases]],
+            )
+            output = root / "remote-output"
+
+            exit_code = worker_main(
+                [
+                    f"--resolved-config={package.resolved_config}",
+                    f"--resolved-workload={package.resolved_workload}",
+                    f"--shard-plan={package.shard_plan}",
+                    "--shard-id=shard-0000",
+                    f"--output-dir={output}",
+                ],
+                executor_factory=Mock(side_effect=RuntimeError("tokenizer missing")),
+            )
+
+            self.assertEqual(5, exit_code)
+            result = json.loads((output / "shard_result.json").read_text())
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("run-setup-failure", result["run_id"])
+            self.assertEqual("shard-0000", result["shard_id"])
+            self.assertEqual(
+                [case.case_id for case in plan.cases], result["owned_case_ids"]
+            )
+            self.assertEqual([], result["completed_case_ids"])
+            self.assertEqual([], result["cases"])
+            self.assertEqual("RuntimeError", result["failure"]["type"])
+            self.assertEqual("tokenizer missing", result["failure"]["message"])
+
     def test_worker_entry_executes_loaded_shard_into_declared_output(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

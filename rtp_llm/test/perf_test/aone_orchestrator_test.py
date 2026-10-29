@@ -1,14 +1,18 @@
 import json
+import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.aone.sharding import plan_shards
 from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.errors import ReportError
 from rtp_llm.test.perf_test.execution.aone import AOneExecutor
+from rtp_llm.test.perf_test.execution.aone_bazel import create_default_aone_executor
 from rtp_llm.test.perf_test.plan import build_execution_plan, thaw
+from rtp_llm.test.perf_test.results import parse_result_envelope
 from rtp_llm.test.perf_test.run_directory import (
     initialize_run_directory,
     inspect_run_directory,
@@ -160,6 +164,10 @@ class AOneOrchestratorTest(unittest.TestCase):
                 self.assertEqual(shard_count, result_collector.call_count)
                 manifest = inspect_run_directory(root).manifest
                 self.assertEqual("completed", manifest["state"])
+                result = json.loads(
+                    (root / "results" / "result.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual("aone", parse_result_envelope(result).backend)
                 self.assertEqual(
                     {
                         "build": "completed",
@@ -172,6 +180,10 @@ class AOneOrchestratorTest(unittest.TestCase):
                         for name, stage in manifest["stages"].items()
                     },
                 )
+                offline_report = create_default_aone_executor(
+                    replace(plan, action="report")
+                )
+                self.assertEqual("formal", offline_report["report_kind"])
 
     def test_remote_failure_keeps_valid_cases_and_generates_diagnostic_report(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -197,6 +209,12 @@ class AOneOrchestratorTest(unittest.TestCase):
             self.assertEqual("partial", manifest["state"])
             self.assertEqual("partial", manifest["stages"]["collect"]["status"])
             self.assertEqual("completed", manifest["stages"]["report"]["status"])
+            result = json.loads(
+                (root / "results" / "result.json").read_text(encoding="utf-8")
+            )
+            parsed = parse_result_envelope(result)
+            self.assertEqual(RunState.PARTIAL, parsed.status)
+            self.assertEqual(2, len(parsed.cases))
 
     def test_report_failure_is_exit_six_and_does_not_remove_collected_cases(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -221,6 +239,56 @@ class AOneOrchestratorTest(unittest.TestCase):
             manifest = json.loads((root / "manifest.json").read_text())
             self.assertEqual("failed", manifest["state"])
             self.assertEqual("failed", manifest["stages"]["report"]["status"])
+            result = json.loads(
+                (root / "results" / "result.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(RunState.FAILED, parse_result_envelope(result).status)
+            summary = json.loads(
+                (root / "results" / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual("run-aone", summary["run_id"])
+
+    def test_default_adapter_configuration_failure_is_persisted_as_build_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            root = workspace / "runs" / "bad-adapter-config"
+            plan = _setup(root, 1)
+            with patch.dict(
+                os.environ,
+                {
+                    "PERF_TEST_WORKSPACE_ROOT": str(workspace),
+                    "PERF_TEST_BAZEL_BUILD_JOBS": "not-an-integer",
+                },
+            ):
+                outcome = create_default_aone_executor(plan)
+
+            self.assertEqual(RunState.FAILED, outcome.state)
+            self.assertEqual(6, outcome.exit_code)
+            manifest = inspect_run_directory(root).manifest
+            self.assertEqual("failed", manifest["state"])
+            self.assertEqual("failed", manifest["stages"]["build"]["status"])
+
+    def test_collection_interrupt_marks_run_and_result_before_propagating(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            root = workspace / "runs" / "interrupted"
+            plan = _setup(root, 1)
+            executor = AOneExecutor(
+                workspace_root=workspace,
+                builder=Mock(),
+                submitter=Mock(side_effect=lambda _target, shard_id: shard_id),
+                result_collector=Mock(side_effect=KeyboardInterrupt()),
+            )
+
+            with self.assertRaises(KeyboardInterrupt):
+                executor.execute(plan)
+
+            manifest = inspect_run_directory(root).manifest
+            self.assertEqual("interrupted", manifest["state"])
+            result = json.loads(
+                (root / "results" / "result.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(RunState.INTERRUPTED, parse_result_envelope(result).status)
 
 
 if __name__ == "__main__":

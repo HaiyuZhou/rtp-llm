@@ -114,6 +114,16 @@ class AOneResourcePlan:
 
 ResourcePlan = Union[LocalResourcePlan, AOneResourcePlan]
 
+AONE_GPU_PLATFORMS = {
+    "H20": "cuda13",
+    "H20_CU13": "cuda13",
+    "L20D_DEV": "cuda13",
+    "L20_CU13": "cuda13",
+    "SM100_ARM_CU13": "cuda13_arm",
+    "SM103_CU13": "cuda13",
+}
+AONE_RESOURCES = ("daily", "online")
+
 
 @dataclass(frozen=True)
 class ExecutionPlan:
@@ -220,6 +230,18 @@ def _aone_resource_plan(
     resolved_config: Mapping[str, Any], world_size: int, case_count: int
 ) -> AOneResourcePlan:
     execution = resolved_config["execution"]
+    if execution["resource"] not in AONE_RESOURCES:
+        supported = ", ".join(AONE_RESOURCES)
+        raise ResourceError(
+            f"unsupported AOne resource {execution['resource']!r}; "
+            f"supported resources: {supported}"
+        )
+    if execution["gpu_type"] not in AONE_GPU_PLATFORMS:
+        supported = ", ".join(sorted(AONE_GPU_PLATFORMS))
+        raise ResourceError(
+            f"unsupported GPU type {execution['gpu_type']!r}; "
+            f"supported GPU types: {supported}"
+        )
     shard_count = execution["shard_count"]
     max_parallel = execution["max_parallel"]
     if shard_count > case_count:

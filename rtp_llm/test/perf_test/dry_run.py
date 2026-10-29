@@ -6,29 +6,45 @@ from pathlib import PurePath
 from typing import Any, Callable, Dict, List
 
 from rtp_llm.test.perf_test.aone.sharding import plan_shards
-from rtp_llm.test.perf_test.plan import AOneResourcePlan, ExecutionPlan
+from rtp_llm.test.perf_test.plan import (
+    AONE_GPU_PLATFORMS,
+    AOneResourcePlan,
+    ExecutionPlan,
+)
 
 
 def _command_preview(plan: ExecutionPlan) -> List[Dict[str, Any]]:
     if isinstance(plan.resource_plan, AOneResourcePlan):
-        commands = []
-        for shard in range(plan.resource_plan.shard_count):
-            target = f"//generated/perf_test:shard_{shard:04d}"
-            commands.extend(
-                [
-                    {
-                        "stage": "build-shard",
-                        "shard": shard,
-                        "argv": ["bazel", "build", target],
-                    },
-                    {
-                        "stage": "submit-shard",
-                        "shard": shard,
-                        "argv": ["aone", "submit", "--target", target],
-                    },
-                ]
-            )
-        return commands
+        resource = plan.resource_plan
+        targets = [
+            f"//generated/perf_test:shard_{shard:04d}"
+            for shard in range(resource.shard_count)
+        ]
+        common = [f"--config={AONE_GPU_PLATFORMS[resource.gpu_type]}", "--config=cicd"]
+        return [
+            {
+                "stage": "build",
+                "argv": [
+                    "bazelisk",
+                    "build",
+                    *targets,
+                    *common,
+                    f"--config={resource.resource}_aone_bazel_cache",
+                ],
+            },
+            {
+                "stage": "remote-test",
+                "argv": [
+                    "bazelisk",
+                    "test",
+                    *targets,
+                    *common,
+                    f"--config={resource.resource}_aone_bazel_remote",
+                    "--strategy=TestRunner=remote",
+                    f"--jobs={resource.max_parallel}",
+                ],
+            },
+        ]
     plan_path = str(PurePath(plan.result_directory) / "execution_plan.json")
     return [
         {

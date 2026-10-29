@@ -141,6 +141,62 @@ Generation and validation exited 0. The golden SHA-256 remained
 `9e1f1b60ca2de220b78ce7cf047466e94361541cd8a7415cb50c65488d316c39`
 before and after validation, proving the validation gate is read-only.
 
+## 2026-10-29: AOne prefill smoke
+
+The production unified entry built all generated shard targets in one Bazel
+invocation, submitted them in one remote Bazel test invocation, collected the
+undeclared-output ZIPs, finalized the common result envelope, and generated the
+offline prefill report. Remote workers resolved the model repository
+`Qwen/Qwen2.5-0.5B-Instruct` to a worker-local Hugging Face snapshot; generated
+runfiles contained the normalized config, resolved workload, and shard plan but
+did not contain or read the submit-host source-config path.
+
+Single-shard evidence:
+
+- Result directory:
+  `perf_test_results_aone_single_hf_v4_20261029/prefill-20261029T080213050307Z`
+- Build invocation: `709eb3bb-04a5-4a1f-8e2b-dcfe66ac8c91`
+- Remote test invocation: `aabab163-12f2-4680-8b7d-c8216953920e`
+- Outcome: the remote target passed in 77.9 seconds; build, submit, collect, and
+  report stages completed; all 4 cases were valid; the cache case observed 256
+  reused tokens for 256 expected tokens; the offline report was formal with 4
+  planned, 4 valid, and 0 excluded cases.
+- Config fingerprint:
+  `708a3958c94add02ca10e1d4eed721cd029ac29e253ffe1613a4053a5dc087cf`
+- Workload fingerprint:
+  `15c0bfb6a2672b366ce77252af644a0fe0ded609bea7eacefe69e7a120ae5c67`
+
+Multi-shard evidence:
+
+- Result directory:
+  `perf_test_results_aone_multi_hf_v3_20261029/prefill-20261029T082246425419Z`
+- Build invocation: `913df686-1a43-4ebb-b46f-0463d96a0c45`
+- Remote test invocation: `ff9a58c8-e654-4051-9778-b5b8571b632f`
+- Outcome: both remote targets passed, in 42.3 and 41.4 seconds. The run used
+  two shards and `max_parallel=1` for the final infrastructure-stable retry.
+  `shard-0000` exclusively owned one case and `shard-0001` exclusively owned
+  three; their union exactly matched the four planned and collected cases.
+- Both raw `shard_result.json` files declared `completed`, returned only owned
+  cases, and matched config fingerprint
+  `f9c99f6f4cf4cd84b8eb2fc505cfed93682574b70a2a0562afff911e696b8792`
+  and workload fingerprint
+  `15c0bfb6a2672b366ce77252af644a0fe0ded609bea7eacefe69e7a120ae5c67`.
+- The merged common result completed with 4/4 successful cases and exact reuse
+  pairs `(0, 0)`, `(0, 0)`, `(0, 0)`, and `(256, 256)`. The offline report was
+  formal with 4 planned, 4 valid, and 0 excluded cases.
+
+The first concurrent two-shard attempt proved that `max_parallel=2` launched
+both remote actions together, but one worker exposed an engine automatic-memory
+boundary failure: 4,865 MiB available versus 4,867 MiB required after warmup.
+The smoke config was made deterministic with an explicit 512 MiB KV-cache
+budget, sufficient for this 385-token model workload. A second concurrent
+attempt completed one shard while the other ended with Bazel `NO STATUS` after
+the AOne gRPC connection was reset by the remote peer. The final sequential
+retry changed only parallelism and completed both shards. The partial attempts
+also verified that setup/engine failures produce structured shard diagnostics,
+strict collection does not report completion, and the offline report is marked
+diagnostic.
+
 ## 2026-10-29: Final static and affected-suite gates
 
 - `openspec validate unify-perf-test --type change --strict --no-interactive`
@@ -157,5 +213,48 @@ before and after validation, proving the validation gate is read-only.
   strict collection, decode fixed/distribution/TPOT, regression/golden, and
   publisher targets.
 
-The change is not yet complete because the production unified entry still
-needs the real AOne remote Bazel adapter and single/multi-shard smoke evidence.
+The production AOne adapter and real single/multi-shard smoke evidence were
+added after this initial full-suite gate. The final focused verification ran 37
+direct unit/integration tests successfully and passed all 10 affected Bazel
+targets under invocation `4655266b-c517-44a8-b4a9-7b4c7050424b`:
+
+```text
+aone_bazel_integration_test  aone_worker_test       aone_collector_test
+aone_orchestrator_test       aone_examples_test     runtime_adapter_test
+dry_run_test                 plan_test              prefill_finalize_test
+entry_test
+```
+
+The first focused Bazel command timed out before test execution because the
+CUDA test wrapper waited for idle GPUs that were occupied by unrelated jobs.
+The successful command propagated `RTP_GPU_FREE_MEMORY_MIB=-1` through
+`--test_env`, retaining the CUDA wheel environment while bypassing the
+irrelevant idle-memory gate for these CPU-only tests. Final pre-commit hooks,
+`git diff --check`, the boundary-aware removed-entry scan, and strict OpenSpec
+validation all passed after the evidence update.
+
+## 2026-10-29: Final review fixes
+
+The post-implementation review identified terminal-state and production-adapter
+edge cases. AOne now writes the common result envelope only after report outcome
+is known, including `partial`, `failed`, and `interrupted` runs; missing cases
+receive explicit diagnostic case records. An empty collection is `failed`
+rather than `partial`, report failure is reflected consistently in manifest,
+result, summary, and exit code, and summaries retain `run_id`.
+
+The Bazel adapter now preserves a nonzero batched test exit even when shard JSON
+was downloaded, while retaining those shard cases for diagnostics. Adapter
+environment parsing is performed inside the persisted build stage, generated
+targets cannot escape `bazel-testlogs`, archive/direct JSON reads enforce member,
+size, total-uncompressed-size, and compression-ratio bounds, and an interrupted
+wait terminates the Bazel client before propagating the interrupt.
+
+Verification after these fixes:
+
+- 45 direct affected unit/integration tests passed.
+- The complete pre-commit hook set passed for all changed files.
+- Strict OpenSpec validation, `git diff --check`, and the removed-entry scan
+  passed.
+- All 10 affected Bazel targets passed under invocation
+  `e97a1267-0970-4e2b-b8ee-f1d95c025560` (`Executed 9 out of 10 tests: 10 tests
+  pass`; one target was a cache hit).

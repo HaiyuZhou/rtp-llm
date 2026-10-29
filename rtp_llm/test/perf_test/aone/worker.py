@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 from rtp_llm.test.perf_test.config_resolver import canonical_json
 from rtp_llm.test.perf_test.errors import ConfigurationError
+from rtp_llm.test.perf_test.storage import atomic_write_json
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,43 @@ class RemoteInputs:
     config: Dict[str, Any]
     owned_case_ids: Tuple[str, ...]
     owned_cases: Tuple[Dict[str, Any], ...]
+
+
+def resolve_remote_runtime_inputs(
+    inputs: RemoteInputs,
+    *,
+    fetcher: Optional[Callable[[str], str]] = None,
+    hub_fetcher: Optional[Callable[[str], str]] = None,
+) -> RemoteInputs:
+    """Resolve external model references without changing collected identity."""
+    if fetcher is None:
+        from rtp_llm.utils.fuser import fetch_remote_file_to_local
+
+        fetcher = fetch_remote_file_to_local
+    config = copy.deepcopy(inputs.config)
+    model = config.get("model")
+    if not isinstance(model, dict):
+        raise ConfigurationError("remote resolved config model must be an object")
+    resolved: Dict[str, str] = {}
+    for key in ("checkpoint", "tokenizer"):
+        value = model.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigurationError(f"remote model.{key} must be a non-empty string")
+        if value not in resolved:
+            expanded = os.path.expanduser(value.strip())
+            candidate = fetcher(expanded)
+            if candidate == expanded and not os.path.exists(candidate):
+                from rtp_llm.test.perf_test.hub_download import is_model_repo_id
+
+                if is_model_repo_id(expanded):
+                    if hub_fetcher is None:
+                        from huggingface_hub import snapshot_download
+
+                        hub_fetcher = snapshot_download
+                    candidate = hub_fetcher(expanded)
+            resolved[value] = candidate
+        model[key] = resolved[value]
+    return replace(inputs, config=config)
 
 
 def _load_object(path: Union[str, Path], name: str) -> Dict[str, Any]:
@@ -114,7 +153,8 @@ def _default_executor(inputs: RemoteInputs):
     from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
     from rtp_llm.test.perf_test.test_util import _load_tokenizer
 
-    model = inputs.config["model"]
+    runtime_inputs = resolve_remote_runtime_inputs(inputs)
+    model = runtime_inputs.config["model"]
     tokenizer = _load_tokenizer(
         model["tokenizer"],
         checkpoint_path=model["checkpoint"],
@@ -128,9 +168,47 @@ def _default_executor(inputs: RemoteInputs):
             commit_tail_tokens=commit_tail,
         )
     )
-    return RemoteShardExecutor(
-        session_factory=_default_session_factory,
-        adapter=adapter,
+    executor = RemoteShardExecutor(
+        session_factory=_default_session_factory, adapter=adapter
+    )
+    return _BoundRemoteExecutor(executor, runtime_inputs)
+
+
+class _BoundRemoteExecutor:
+    def __init__(self, executor: Any, inputs: RemoteInputs):
+        self._executor = executor
+        self._inputs = inputs
+
+    def execute(self, _inputs: RemoteInputs, output_directory: Path):
+        return self._executor.execute(self._inputs, output_directory)
+
+
+def _write_setup_failure(
+    inputs: RemoteInputs, output_directory: Path, error: Exception
+) -> None:
+    output_directory.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        output_directory / "shard_result.json",
+        {
+            "schema_version": 1,
+            "run_id": inputs.run_id,
+            "shard_id": inputs.shard_id,
+            "mode": "prefill",
+            "status": "failed",
+            "config_fingerprint": inputs.config_fingerprint,
+            "workload_fingerprint": inputs.workload_fingerprint,
+            "owned_case_ids": list(inputs.owned_case_ids),
+            "completed_case_ids": [],
+            "cases": [],
+            "engine_diagnostics": {
+                "log_path": None,
+                "timeline_files": [],
+                "coredumps": {},
+                "exit_code": None,
+                "collection_errors": [f"setup: {type(error).__name__}: {error}"],
+            },
+            "failure": {"type": type(error).__name__, "message": str(error)},
+        },
     )
 
 
@@ -161,7 +239,13 @@ def main(
             )
         output_dir = str(Path(undeclared) / f"perf_test_{loaded.shard_id}")
     factory = _default_executor if executor_factory is None else executor_factory
-    result = factory(loaded).execute(loaded, Path(output_dir))
+    output_path = Path(output_dir)
+    try:
+        result = factory(loaded).execute(loaded, output_path)
+        exit_code = int(result.exit_code)
+    except Exception as error:
+        _write_setup_failure(loaded, output_path, error)
+        exit_code = 5
     print(
         json.dumps(
             {
@@ -169,9 +253,9 @@ def main(
                 "shard_id": loaded.shard_id,
                 "case_ids": loaded.owned_case_ids,
                 "output_dir": output_dir,
-                "exit_code": result.exit_code,
+                "exit_code": exit_code,
             },
             sort_keys=True,
         )
     )
-    return int(result.exit_code)
+    return exit_code

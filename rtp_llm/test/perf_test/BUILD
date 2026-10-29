@@ -32,10 +32,14 @@ py_library(
 py_library(
     name = "perf_test_runtime_lib",
     srcs = [
+        "aone/collector.py",
+        "aone/package.py",
         "decode/finalize.py",
         "decode/fixed.py",
         "decode/http_batch.py",
         "execution/defaults.py",
+        "execution/aone.py",
+        "execution/aone_bazel.py",
         "execution/engine_session.py",
         "execution/local.py",
         "execution/runtime.py",
@@ -90,6 +94,7 @@ py_library(
         "errors.py",
         "execution/engine_session.py",
         "execution/aone.py",
+        "execution/aone_bazel.py",
         "execution/defaults.py",
         "execution/local.py",
         "execution/runtime.py",
@@ -475,6 +480,14 @@ py_test(
 py_test(
     name = "aone_orchestrator_test",
     srcs = ["aone_orchestrator_test.py"],
+    deps = [
+        ":perf_test_lib",
+    ],
+)
+
+py_test(
+    name = "aone_bazel_integration_test",
+    srcs = ["aone_bazel_integration_test.py"],
     deps = [
         ":perf_test_lib",
     ],

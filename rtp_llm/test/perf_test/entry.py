@@ -123,22 +123,16 @@ def build_request_plan(request: CliRequest) -> tuple[ExecutionPlan, Dict[str, An
     return _new_plan(request) if request.action == "run" else _persisted_plan(request)
 
 
-def _unsupported_aone(_plan: ExecutionPlan) -> Any:
-    raise ConfigurationError(
-        "AOne submission requires an installed CI integration; generated shard "
-        "targets use the unified AOne worker directly"
-    )
-
-
 def _default_executors(
     request: Optional[CliRequest] = None,
 ) -> Mapping[str, Callable[[ExecutionPlan], Any]]:
+    from rtp_llm.test.perf_test.execution.aone_bazel import create_default_aone_executor
     from rtp_llm.test.perf_test.execution.defaults import create_default_local_executor
 
     selected = () if request is None else request.cases
     return {
         "local": create_default_local_executor(selected_case_ids=selected),
-        "aone": _unsupported_aone,
+        "aone": create_default_aone_executor,
     }
 
 

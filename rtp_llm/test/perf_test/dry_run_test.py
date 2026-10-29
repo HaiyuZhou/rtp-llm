@@ -13,7 +13,7 @@ def _config(backend):
     if backend == "aone":
         execution = {
             "backend": "aone",
-            "resource": "gpu",
+            "resource": "daily",
             "gpu_type": "H20",
             "max_parallel": 2,
             "shard_count": 2,
@@ -108,14 +108,17 @@ class DryRunTest(unittest.TestCase):
     def test_aone_dry_run_is_complete_and_side_effect_free(self):
         preview = self._assert_side_effect_free_preview("aone")
 
-        self.assertEqual(4, len(preview["commands"]))
+        self.assertEqual(2, len(preview["commands"]))
         self.assertEqual(
-            ["build-shard", "submit-shard", "build-shard", "submit-shard"],
+            ["build", "remote-test"],
             [command["stage"] for command in preview["commands"]],
         )
-        self.assertEqual(
-            [0, 0, 1, 1], [command["shard"] for command in preview["commands"]]
-        )
+        for command in preview["commands"]:
+            for shard in range(2):
+                self.assertIn(
+                    f"//generated/perf_test:shard_{shard:04d}", command["argv"]
+                )
+        self.assertIn("--jobs=2", preview["commands"][1]["argv"])
 
     def test_non_dry_run_delegates_to_executor(self):
         plan = build_execution_plan(

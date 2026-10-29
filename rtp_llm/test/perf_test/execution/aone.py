@@ -19,6 +19,7 @@ from rtp_llm.test.perf_test.aone.package import (
 from rtp_llm.test.perf_test.aone.sharding import plan_shards
 from rtp_llm.test.perf_test.errors import PerfTestError, PostExecutionError, ReportError
 from rtp_llm.test.perf_test.plan import AOneResourcePlan, ExecutionPlan
+from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock, inspect_run_directory
 from rtp_llm.test.perf_test.state import RunOutcome, RunState
@@ -196,6 +197,54 @@ class AOneExecutor:
                     result = self._result_collector(job, shard_id)
                     if result is not None:
                         remote_results.append(result)
+                        remote_failure = result.get("failure")
+                        if (
+                            result.get("status") != "completed"
+                            and isinstance(remote_failure, Mapping)
+                            and isinstance(remote_failure.get("message"), str)
+                        ):
+                            collection_errors[shard_id] = remote_failure["message"]
+                except KeyboardInterrupt:
+                    interrupted = collect_aone_results(
+                        plan,
+                        run_id=run_id,
+                        shard_plan=shard_plan,
+                        results=remote_results,
+                    )
+                    for case in interrupted.cases:
+                        store.write_case(case["case_id"], case)
+                    self._write_manifest(
+                        store,
+                        manifest,
+                        state=RunState.INTERRUPTED,
+                        stage="collect",
+                        status="interrupted",
+                        details={
+                            "missing_shards": list(interrupted.missing_shard_ids),
+                            "errors": collection_errors,
+                        },
+                    )
+                    finalize_prefill_run(
+                        root,
+                        plan=plan,
+                        run_id=run_id,
+                        case_results=interrupted.cases,
+                        terminal_state=RunState.INTERRUPTED,
+                        missing_error={
+                            "code": "interrupted",
+                            "message": "AOne collection was interrupted",
+                        },
+                    )
+                    store.write_summary(
+                        self._summary(
+                            run_id,
+                            plan,
+                            interrupted,
+                            RunState.INTERRUPTED,
+                            None,
+                        )
+                    )
+                    raise
                 except Exception as error:
                     collection_errors[shard_id] = str(error)
             collection = collect_aone_results(
@@ -225,42 +274,61 @@ class AOneExecutor:
                 stage="report",
                 status="running",
             )
+            report: Optional[Mapping[str, Any]] = None
+            final_state = collection.state
+            final_failure = collection.failure
             try:
                 report = self._reporter(root)
             except Exception as error:
-                failure = ReportError(f"AOne offline report failed: {error}")
+                final_failure = ReportError(f"AOne offline report failed: {error}")
+                final_state = RunState.FAILED
                 self._write_manifest(
                     store,
                     manifest,
-                    state=RunState.FAILED,
                     stage="report",
                     status="failed",
                     details={"error": str(error)},
                 )
-                store.write_summary(
-                    self._summary(plan, collection, RunState.FAILED, None)
+            else:
+                self._write_manifest(
+                    store,
+                    manifest,
+                    stage="report",
+                    status="completed",
+                    details={"report_kind": report.get("report_kind")},
                 )
-                return AOneExecutionOutcome(
-                    state=RunState.FAILED,
-                    failure=failure,
-                    collection=collection,
+
+            try:
+                finalize_prefill_run(
+                    root,
+                    plan=plan,
+                    run_id=run_id,
+                    case_results=collection.cases,
+                    terminal_state=final_state,
+                    missing_error={
+                        "code": "collection_incomplete",
+                        "message": str(
+                            collection.failure
+                            or "AOne collection did not return the planned case"
+                        ),
+                    },
+                )
+            except Exception as error:
+                return self._stage_failure(
+                    store=store,
+                    manifest=manifest,
+                    stage="report",
+                    error=error,
                     package=package,
                 )
 
-            self._write_manifest(
-                store,
-                manifest,
-                state=collection.state,
-                stage="report",
-                status="completed",
-                details={"report_kind": report.get("report_kind")},
-            )
+            self._write_manifest(store, manifest, state=final_state)
             store.write_summary(
-                self._summary(plan, collection, collection.state, report)
+                self._summary(run_id, plan, collection, final_state, report)
             )
             return AOneExecutionOutcome(
-                state=collection.state,
-                failure=collection.failure,
+                state=final_state,
+                failure=final_failure,
                 collection=collection,
                 report=report,
                 package=package,
@@ -268,6 +336,7 @@ class AOneExecutor:
 
     @staticmethod
     def _summary(
+        run_id: str,
         plan: ExecutionPlan,
         collection: CollectionOutcome,
         state: RunState,
@@ -276,6 +345,7 @@ class AOneExecutor:
         successful = sum(case.get("status") == "ok" for case in collection.cases)
         return {
             "schema_version": 1,
+            "run_id": run_id,
             "mode": "prefill",
             "backend": "aone",
             "status": state.value,

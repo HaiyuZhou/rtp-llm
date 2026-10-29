@@ -113,6 +113,15 @@ class AOneCollectorTest(unittest.TestCase):
         self.assertEqual(RunState.PARTIAL, outcome.state)
         self.assertEqual(5, outcome.exit_code)
 
+    def test_missing_all_shards_is_failed_without_acceptable_cases(self):
+        outcome = collect_aone_results(
+            self.plan, run_id="run-1", shard_plan=self.shards, results=[]
+        )
+
+        self.assertEqual(RunState.FAILED, outcome.state)
+        self.assertEqual(6, outcome.exit_code)
+        self.assertEqual((), outcome.cases)
+
         partial = copy.deepcopy(self.results)
         partial[1]["status"] = "partial"
         partial[1]["completed_case_ids"] = []

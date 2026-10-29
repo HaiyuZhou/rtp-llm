@@ -6,6 +6,7 @@ from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.plan import build_execution_plan
 from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
 from rtp_llm.test.perf_test.results import parse_result_envelope
+from rtp_llm.test.perf_test.state import RunState
 
 
 def _plan(root):
@@ -86,6 +87,30 @@ class PrefillFinalizeTest(unittest.TestCase):
             self.assertEqual("completed", parsed.status.value)
             self.assertTrue((root / "results" / "result.json").is_file())
             self.assertTrue((root / "results" / "summary.json").is_file())
+
+    def test_terminal_override_fills_missing_cases_for_diagnostic_envelope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "results" / "cases").mkdir(parents=True)
+            plan = _plan(root)
+
+            envelope = finalize_prefill_run(
+                root,
+                plan=plan,
+                run_id="prefill-run",
+                case_results=[],
+                terminal_state=RunState.FAILED,
+                missing_error={
+                    "code": "collection_missing",
+                    "message": "no acceptable shard result",
+                },
+            )
+
+            parsed = parse_result_envelope(envelope)
+            self.assertEqual(RunState.FAILED, parsed.status)
+            self.assertEqual(1, len(parsed.cases))
+            self.assertEqual("request_failed", parsed.cases[0].status.value)
+            self.assertEqual("collection_missing", parsed.cases[0].errors[0]["code"])
 
 
 if __name__ == "__main__":

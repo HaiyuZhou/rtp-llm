@@ -70,7 +70,7 @@
 
 - [x] 8.1 Run all focused unit and integration targets for config, planning, state, engine session, prefill, AOne, decode, reports, regression, golden, and publishers; verify the complete target set passes with no skipped required coverage.
 - [x] 8.2 Run local GPU prefill smoke for run/resume/profile/report and validate the common envelope, exact reuse, profile isolation, and report artifacts; record the command and result directory in the change evidence.
-- [ ] 8.3 Run single-shard and multi-shard AOne prefill smoke and validate runfiles independence, ownership/fingerprints, strict collection, and offline report; record remote job and collected result evidence.
+- [x] 8.3 Run single-shard and multi-shard AOne prefill smoke and validate runfiles independence, ownership/fingerprints, strict collection, and offline report; record remote job and collected result evidence.
 - [x] 8.4 Run local GPU decode fixed-grid smoke and, after the core path is stable, distribution and TPOT smoke; validate scalar output length, global DP batch accounting, metric envelope, and search trajectory.
 - [x] 8.5 Run baseline/golden CI gates plus fake required/optional OSS and ODPS failure workflows; verify exit codes, state, and secret-redaction expectations match the specs.
 - [x] 8.6 Run strict OpenSpec validation, formatting/linting, the repository-wide old-reference scan, and the complete affected Bazel test suite; verify all release gates pass before marking the implementation complete.

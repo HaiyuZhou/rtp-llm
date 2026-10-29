@@ -176,6 +176,15 @@ def collect_aone_results(
     order = {case.case_id: index for index, case in enumerate(plan.cases)}
     merged.sort(key=lambda case: order[case["case_id"]])
     if incomplete:
+        if not merged:
+            return CollectionOutcome(
+                state=RunState.FAILED,
+                cases=(),
+                missing_shard_ids=missing,
+                failure=CollectionError(
+                    "AOne collection produced no acceptable case results"
+                ),
+            )
         return CollectionOutcome(
             state=RunState.PARTIAL,
             cases=tuple(merged),

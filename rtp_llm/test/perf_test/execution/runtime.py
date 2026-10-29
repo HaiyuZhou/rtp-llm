@@ -10,7 +10,12 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 import requests
 
 from rtp_llm.test.perf_test.errors import PlanningError
-from rtp_llm.test.perf_test.plan import ExecutionPlan, LocalResourcePlan, thaw
+from rtp_llm.test.perf_test.plan import (
+    AOneResourcePlan,
+    ExecutionPlan,
+    LocalResourcePlan,
+    thaw,
+)
 
 
 @dataclass(frozen=True)
@@ -35,8 +40,12 @@ def _option_value(value: Any) -> str:
 
 def build_engine_launch_spec(plan: ExecutionPlan) -> EngineLaunchSpec:
     """Project an immutable local plan onto the model server launch contract."""
-    if not isinstance(plan.resource_plan, LocalResourcePlan):
-        raise PlanningError("engine launch requires a local resource plan")
+    if isinstance(plan.resource_plan, LocalResourcePlan):
+        device_ids = plan.resource_plan.devices
+    elif isinstance(plan.resource_plan, AOneResourcePlan):
+        device_ids = tuple(range(plan.resource_plan.gpus_per_shard))
+    else:
+        raise PlanningError("engine launch requires an executable resource plan")
     config = thaw(plan.resolved_config)
     model = config["model"]
     engine = config["engine"]
@@ -71,7 +80,7 @@ def build_engine_launch_spec(plan: ExecutionPlan) -> EngineLaunchSpec:
     return EngineLaunchSpec(
         argv=argv,
         environment=environment,
-        device_ids=plan.resource_plan.devices,
+        device_ids=device_ids,
         checkpoint=model["checkpoint"],
         model_type=model["type"],
         tokenizer=model["tokenizer"],

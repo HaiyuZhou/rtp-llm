@@ -10,7 +10,7 @@ from rtp_llm.test.perf_test.execution.runtime import (
 from rtp_llm.test.perf_test.plan import build_execution_plan
 
 
-def _plan():
+def _plan(backend="local"):
     source = {
         "schema_version": 1,
         "model": {
@@ -36,7 +36,17 @@ def _plan():
             "batch_sizes": [1],
             "cache_lengths": [0],
         },
-        "execution": {"backend": "local", "devices": [3, 5]},
+        "execution": (
+            {"backend": "local", "devices": [3, 5]}
+            if backend == "local"
+            else {
+                "backend": "aone",
+                "resource": "daily",
+                "gpu_type": "H20_CU13",
+                "max_parallel": 1,
+                "shard_count": 1,
+            }
+        ),
         "output": {"result_root": "/tmp/results"},
         "regression": {},
         "publish": {},
@@ -53,6 +63,12 @@ def _plan():
 
 
 class RuntimeAdapterTest(unittest.TestCase):
+    def test_aone_launch_spec_uses_action_local_visible_devices(self):
+        spec = build_engine_launch_spec(_plan("aone"))
+
+        self.assertEqual((0, 1), spec.device_ids)
+        self.assertEqual("2", spec.environment["WORLD_SIZE"])
+
     def test_launch_spec_is_derived_only_from_resolved_plan(self):
         spec = build_engine_launch_spec(_plan())
 

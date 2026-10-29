@@ -1,10 +1,10 @@
-"""Finalize local prefill measurements into the common result envelope."""
+"""Finalize prefill measurements into the common result envelope."""
 
 from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.plan import ExecutionPlan, thaw
@@ -19,13 +19,15 @@ def finalize_prefill_run(
     plan: ExecutionPlan,
     run_id: str,
     case_results: Sequence[Mapping[str, Any]],
+    terminal_state: Optional[RunState] = None,
+    missing_error: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     if (
         plan.mode != "prefill"
         or plan.action not in {"run", "resume"}
-        or plan.backend != "local"
+        or plan.backend not in {"local", "aone"}
     ):
-        raise PlanningError("prefill finalization requires a local prefill run plan")
+        raise PlanningError("prefill finalization requires a prefill run plan")
     if not isinstance(run_id, str) or not run_id:
         raise PlanningError("prefill run_id must be a non-empty string")
 
@@ -40,19 +42,55 @@ def finalize_prefill_run(
             raise PlanningError(f"duplicate prefill case result: {case_id}")
         provided[case_id] = copy.deepcopy(dict(result))
     planned_ids = {case.case_id for case in plan.cases}
-    if set(provided) != planned_ids:
+    if not set(provided).issubset(planned_ids):
+        unknown = sorted(set(provided) - planned_ids)[0]
+        raise PlanningError(f"unknown prefill case result: {unknown}")
+    if terminal_state is None and set(provided) != planned_ids:
         raise PlanningError(
             "prefill results must cover every planned case exactly once"
         )
+    if terminal_state is not None and terminal_state not in {
+        RunState.COMPLETED,
+        RunState.PARTIAL,
+        RunState.FAILED,
+        RunState.INTERRUPTED,
+    }:
+        raise PlanningError("prefill finalization requires a terminal run state")
+    error = dict(
+        missing_error
+        or {
+            "code": "missing_result",
+            "message": "case did not produce an acceptable result",
+        }
+    )
+    if set(error) != {"code", "message"} or any(
+        not isinstance(error[name], str) or not error[name]
+        for name in ("code", "message")
+    ):
+        raise PlanningError("missing_error requires non-empty code and message")
 
     ordered = []
     for case in plan.cases:
-        result = provided[case.case_id]
+        result = provided.get(case.case_id)
+        if result is None:
+            result = {
+                "case_id": case.case_id,
+                "identity": thaw(case.identity),
+                "status": "request_failed",
+                "runs": 0,
+                "errors": [copy.deepcopy(error)],
+                "metrics": None,
+            }
         if result.get("identity") != thaw(case.identity):
             raise PlanningError(f"prefill case identity mismatch: {case.case_id}")
         ordered.append(result)
     successful = sum(result.get("status") == "ok" for result in ordered)
-    state = RunState.COMPLETED if successful == len(ordered) else RunState.PARTIAL
+    derived_state = (
+        RunState.COMPLETED if successful == len(ordered) else RunState.PARTIAL
+    )
+    state = terminal_state or derived_state
+    if state == RunState.COMPLETED and derived_state != RunState.COMPLETED:
+        raise PlanningError("completed prefill result requires every case to succeed")
     summary = {
         "planned_cases": len(ordered),
         "successful_cases": successful,
@@ -63,7 +101,7 @@ def finalize_prefill_run(
         "schema_version": RESULT_SCHEMA_VERSION,
         "run_id": run_id,
         "mode": "prefill",
-        "backend": "local",
+        "backend": plan.backend,
         "status": state.value,
         "config_fingerprint": plan.config_fingerprint,
         "workload_fingerprint": plan.workload_fingerprint,
@@ -85,7 +123,7 @@ def finalize_prefill_run(
             "schema_version": 1,
             "run_id": run_id,
             "mode": "prefill",
-            "backend": "local",
+            "backend": plan.backend,
             "status": state.value,
             **summary,
         }

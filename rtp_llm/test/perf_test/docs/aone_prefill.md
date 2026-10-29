@@ -35,4 +35,17 @@ Collection rejects missing or duplicate shard claims, unknown or out-of-scope
 cases, mismatched fingerprints, and completion claims without case files. A
 remote measurement failure preserves valid cases and produces a diagnostic
 offline report with a nonzero exit. Only complete valid ownership produces a
-formal report.
+formal report and the common `results/result.json` envelope with backend
+`aone`.
+
+The submit host runs one Bazel build for all generated shard targets, followed
+by one remote Bazel test with `execution.max_parallel` as its job limit. The
+adapter selects the platform config from `execution.gpu_type` and expands
+`execution.resource` to the matching `daily` or `online` cache/remote configs.
+`PERF_TEST_BAZEL` can override the `bazelisk` executable;
+`PERF_TEST_BAZEL_BUILD_JOBS` controls build concurrency;
+`PERF_TEST_BAZEL_STARTUP_ARGS` supplies startup options such as an isolated
+`--output_user_root`;
+`PERF_TEST_BAZEL_ARGS` supplies additional Bazel command arguments; and
+`PERF_TEST_BAZEL_TESTLOGS` overrides the default workspace `bazel-testlogs`
+collection root.

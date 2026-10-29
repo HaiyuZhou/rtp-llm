@@ -106,3 +106,56 @@ model. Global DP accounting remains covered by `decode_scheduler_test`, includin
 uneven DP=2 allocation and idle-worker DP=4 allocation, while the real fixed
 run verifies that the persisted global batch is not replaced by a worker-local
 field.
+
+## 2026-10-29: Regression, golden, and publisher gates
+
+The following Bazel targets passed together under invocation
+`c0c2fc44-d7af-4b15-a9e4-dc6f511220fc`:
+
+```text
+//rtp_llm/test/perf_test:baseline_regression_test
+//rtp_llm/test/perf_test:golden_test
+//rtp_llm/test/perf_test:publisher_policy_test
+//rtp_llm/test/perf_test:archive_publisher_test
+//rtp_llm/test/perf_test:odps_publisher_test
+```
+
+These gates cover higher/lower-is-better thresholds, missing/ineligible
+baseline inputs, deterministic candidate and golden output, required publisher
+exit code 6, optional publisher failure preserving measurement success, and
+OSS/ODPS credential redaction from results, manifests, exceptions, and logs.
+
+The explicit Bazel golden binaries were also run against the successful prefill
+GPU result:
+
+```bash
+bazelisk run //rtp_llm/test/perf_test:generate_perf_test_golden -- \
+  --result=<prefill result>/results/result.json \
+  --output=/tmp/unify_perf_golden_20261029.json
+bazelisk run //rtp_llm/test/perf_test:validate_perf_test_golden -- \
+  --result=<prefill result>/results/result.json \
+  --golden=/tmp/unify_perf_golden_20261029.json
+```
+
+Generation and validation exited 0. The golden SHA-256 remained
+`9e1f1b60ca2de220b78ce7cf047466e94361541cd8a7415cb50c65488d316c39`
+before and after validation, proving the validation gate is read-only.
+
+## 2026-10-29: Final static and affected-suite gates
+
+- `openspec validate unify-perf-test --type change --strict --no-interactive`
+  passed with zero issues.
+- The full repository pre-commit hook set passed for every file changed by the
+  runtime fixes and integration work.
+- The production entry, CI, and current user-documentation scan found no
+  references to deleted entry files, commands, flags, macros, or old import
+  paths. Negative compatibility tests and historical design/OpenSpec documents
+  were intentionally outside that scan.
+- `bazelisk test //rtp_llm/test/perf_test:all` passed all 48 test targets under
+  invocation `b4ffff8a-1a21-49a8-beb6-3a4a8e1dbb57`. This included config,
+  planning, storage/state, engine lifecycle, prefill actions, AOne packaging and
+  strict collection, decode fixed/distribution/TPOT, regression/golden, and
+  publisher targets.
+
+The change is not yet complete because the production unified entry still
+needs the real AOne remote Bazel adapter and single/multi-shard smoke evidence.

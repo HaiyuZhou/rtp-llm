@@ -68,7 +68,7 @@
 
 ## 8. Integration and release gates
 
-- [ ] 8.1 Run all focused unit and integration targets for config, planning, state, engine session, prefill, AOne, decode, reports, regression, golden, and publishers; verify the complete target set passes with no skipped required coverage.
+- [x] 8.1 Run all focused unit and integration targets for config, planning, state, engine session, prefill, AOne, decode, reports, regression, golden, and publishers; verify the complete target set passes with no skipped required coverage.
 - [ ] 8.2 Run local GPU prefill smoke for run/resume/profile/report and validate the common envelope, exact reuse, profile isolation, and report artifacts; record the command and result directory in the change evidence.
 - [ ] 8.3 Run single-shard and multi-shard AOne prefill smoke and validate runfiles independence, ownership/fingerprints, strict collection, and offline report; record remote job and collected result evidence.
 - [ ] 8.4 Run local GPU decode fixed-grid smoke and, after the core path is stable, distribution and TPOT smoke; validate scalar output length, global DP batch accounting, metric envelope, and search trajectory.

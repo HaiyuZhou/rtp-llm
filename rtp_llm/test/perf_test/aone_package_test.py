@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from rtp_llm.test.perf_test.aone.package import generate_aone_package
 from rtp_llm.test.perf_test.aone.worker import load_remote_inputs
@@ -73,6 +74,11 @@ def _plan(config_path, result_directory):
         cases=cases,
         result_directory=str(result_directory),
     )
+
+
+class _SuccessfulExecutor:
+    def execute(self, _inputs, _output_dir):
+        return SimpleNamespace(exit_code=0)
 
 
 class AOnePackageTest(unittest.TestCase):
@@ -148,7 +154,9 @@ class AOnePackageTest(unittest.TestCase):
                             "--resolved-workload=resolved_workload.json",
                             "--shard-plan=shard_plan.json",
                             "--shard-id=shard-0001",
-                        ]
+                            "--output-dir=worker-output",
+                        ],
+                        executor_factory=lambda _inputs: _SuccessfulExecutor(),
                     )
                 loaded = load_remote_inputs(
                     resolved_config=Path("resolved_config.json"),
@@ -160,7 +168,9 @@ class AOnePackageTest(unittest.TestCase):
                 os.chdir(previous)
 
             self.assertEqual(0, exit_code)
-            self.assertEqual("shard-0001", json.loads(output.getvalue())["shard_id"])
+            worker_output = json.loads(output.getvalue())
+            self.assertEqual("shard-0001", worker_output["shard_id"])
+            self.assertEqual("worker-output", worker_output["output_dir"])
             self.assertEqual("run-123", loaded.run_id)
             self.assertEqual(plan.config_fingerprint, loaded.config_fingerprint)
             self.assertEqual(plan.workload_fingerprint, loaded.workload_fingerprint)

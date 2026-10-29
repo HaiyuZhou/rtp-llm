@@ -163,6 +163,63 @@ class DecodeDistributionTest(unittest.TestCase):
         self.assertEqual((64, 256), batch_runner.call_args.kwargs["input_lengths"])
         self.assertEqual(32, batch_runner.call_args.kwargs["output_length"])
 
+    def test_target_tpot_searches_distribution_prefix_batches(self):
+        def execute(**kwargs):
+            measurements = []
+            for run in range(kwargs["measure_runs"]):
+                measurements.append(
+                    {
+                        "run": run,
+                        "throughput_tokens_per_second": 100.0,
+                        "worker_allocations": kwargs["worker_allocations"],
+                        "requests": [
+                            {
+                                "request_index": index,
+                                "success": True,
+                                "input_length": input_length,
+                                "output_length": kwargs["output_length"],
+                                "latency_ms": {
+                                    "wait": 1.0,
+                                    "prefill": 2.0,
+                                    "decode": 3.0,
+                                    "tpot": 5.0,
+                                    "total": 5.0,
+                                },
+                            }
+                            for index, input_length in enumerate(
+                                kwargs["input_lengths"]
+                            )
+                        ],
+                    }
+                )
+            return {"measurements": measurements}
+
+        batch_runner = Mock(side_effect=execute)
+        case = {
+            "case_id": "decode-distribution-tpot",
+            "workload_kind": "distribution",
+            "input_lengths": (64, 128, 256, 512),
+            "output_length": 32,
+            "global_batch_size": 4,
+            "measure_runs": 1,
+            "warmup_runs": 0,
+            "generate_config": {},
+            "target_tpot_ms": 10.0,
+            "distribution": {"source_kind": "sequence_lengths"},
+        }
+
+        result = DistributionDecodeCaseRunner(batch_runner).run_case(case)
+
+        self.assertEqual(4, result["metrics"]["search"]["best_batch_size"])
+        self.assertEqual(
+            [(64,), (64, 128, 256, 512)],
+            [call.kwargs["input_lengths"] for call in batch_runner.call_args_list],
+        )
+        self.assertEqual(
+            [64, 128, 256, 512],
+            result["metrics"]["distribution"]["actual_sequence_lengths"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

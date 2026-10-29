@@ -69,3 +69,40 @@ adapter now omits the unsupported argument, and the default executor preserves
 typed failed/interrupted outcomes without finalization. Focused direct tests and
 the Bazel `runtime_adapter_test` and `default_executor_test` targets passed
 before the successful smoke run.
+
+## 2026-10-29: Local GPU decode smoke
+
+All successful runs used the same Qwen2.5-0.5B model and L20D GPU setup as the
+prefill smoke, with the required pre-build check and GPU lock. The Bazel command
+was the common local command above with `WORLD_SIZE=1` and these action
+arguments:
+
+| Workload | Config | Result directory | Outcome |
+| --- | --- | --- | --- |
+| fixed grid | `/tmp/unify_perf_decode_fixed_smoke_20261029.json` | `/tmp/unify_perf_decode_fixed_smoke_results_20261029/decode-20261029T070036070965Z` | Exit 0; 2/2 cases succeeded for scalar output length 8 and global batches 1 and 3. |
+| distribution | `/tmp/unify_perf_decode_distribution_smoke_20261029.json` | `/tmp/unify_perf_decode_distribution_smoke_results_20261029/decode-20261029T070226575066Z` | Exit 0; 2/2 cases succeeded and retained actual sequence lengths `[32]` and `[32, 48, 64]`. |
+| target TPOT | `/tmp/unify_perf_decode_tpot_smoke_20261029.json` | `/tmp/unify_perf_decode_tpot_smoke_results_20261029/decode-20261029T071003771024Z` | Exit 0; bounded search measured batches 1 and 4, selected batch 4, and retained the complete trajectory. |
+
+The fixed and distribution results retained scalar output length, global batch,
+worker allocation, successful/failed request counts, wait/prefill/decode/TPOT/
+total latency, throughput, topology, and the common result envelope. The TPOT
+target was 10 ms; measured observations were 5.4533 ms at batch 1 and 5.49 ms
+at batch 4, both with success rate 1.0. The final search result reported
+`outcome: found`, `best_batch_size: 4`, and throughput 267.3888 output tokens/s.
+
+The real smoke exposed that `target_tpot_ms` was planned but not connected to
+the production fixed or distribution runners. A shared runner integration now
+executes the bounded candidates, uses deterministic DP scheduling, preserves
+every observation, and makes a no-satisfying-candidate result non-successful.
+Nineteen focused direct tests passed. The Bazel targets `decode_fixed_test`,
+`decode_distribution_test`, `decode_scheduler_test`, `decode_tpot_test`, and
+`decode_metrics_test` also passed (invocation
+`dc4ee26d-cdbc-4981-b846-25abfda49b0a`).
+
+A DP=2 smoke was attempted first with the same dense Qwen model and correctly
+returned engine exit code 4. The server rejects pure dense `ep_size=1` startup
+with `dp_size=2`; a real DP engine smoke therefore requires an EP/DP-capable MoE
+model. Global DP accounting remains covered by `decode_scheduler_test`, including
+uneven DP=2 allocation and idle-worker DP=4 allocation, while the real fixed
+run verifies that the persisted global batch is not replaced by a worker-local
+field.

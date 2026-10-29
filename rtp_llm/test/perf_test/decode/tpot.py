@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import math
+import statistics
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+from rtp_llm.test.perf_test.decode.scheduler import schedule_decode_requests
 
 
 class DecodeCapacityError(RuntimeError):
@@ -189,3 +193,96 @@ def search_target_tpot(
         throughput_tokens_per_second=best_throughput,
         observations=tuple(observations),
     )
+
+
+def _search_measurement(raw: Mapping[str, Any]) -> Dict[str, Any]:
+    status = raw.get("status")
+    if status == "capacity_failed":
+        raise DecodeCapacityError(str(raw.get("error", "capacity failure")))
+    measurements = raw.get("measurements")
+    if not isinstance(measurements, (list, tuple)) or not measurements:
+        raise ValueError("TPOT search batch returned no measurements")
+    requests = []
+    throughputs = []
+    for measurement in measurements:
+        if not isinstance(measurement, Mapping):
+            raise ValueError("TPOT search measurement must be an object")
+        current = measurement.get("requests")
+        if not isinstance(current, list) or not current:
+            raise ValueError("TPOT search measurement returned no requests")
+        requests.extend(current)
+        throughput = measurement.get("throughput_tokens_per_second")
+        if isinstance(throughput, bool) or not isinstance(throughput, (int, float)):
+            raise ValueError("TPOT search throughput must be a finite number")
+        parsed_throughput = float(throughput)
+        if not math.isfinite(parsed_throughput) or parsed_throughput < 0:
+            raise ValueError("TPOT search throughput must be a finite number")
+        throughputs.append(parsed_throughput)
+    successful = [request for request in requests if request.get("success") is True]
+    tpot_values = []
+    for request in successful:
+        latency = request.get("latency_ms")
+        if not isinstance(latency, Mapping):
+            raise ValueError("TPOT search successful request has no latency")
+        tpot_values.append(
+            _finite_number("tpot_ms", latency.get("tpot"), allow_zero=False)
+        )
+    if not tpot_values:
+        raise ValueError("TPOT search batch has no successful request timing")
+    return {
+        "tpot_ms": statistics.fmean(tpot_values),
+        "success_rate": len(successful) / len(requests),
+        "throughput_tokens_per_second": statistics.fmean(throughputs),
+    }
+
+
+def run_batch_with_optional_tpot_search(
+    batch_runner: Callable[..., Mapping[str, Any]],
+    *,
+    case: Mapping[str, Any],
+    topology: Mapping[str, int],
+    input_lengths: Tuple[int, ...],
+) -> Dict[str, Any]:
+    """Execute one planned batch, optionally measuring bounded TPOT candidates."""
+    max_batch_size = int(case["global_batch_size"])
+    if len(input_lengths) != max_batch_size:
+        raise ValueError("decode TPOT input lengths do not match global batch")
+    measured: Dict[int, Dict[str, Any]] = {}
+
+    def execute(batch_size: int) -> Dict[str, Any]:
+        if case["workload_kind"] == "distribution":
+            candidate_lengths = input_lengths[:batch_size]
+        else:
+            candidate_lengths = (input_lengths[0],) * batch_size
+        schedule = schedule_decode_requests(
+            candidate_lengths, dp_size=int(topology["dp"])
+        )
+        raw = batch_runner(
+            case_id=case["case_id"],
+            input_lengths=candidate_lengths,
+            output_length=int(case["output_length"]),
+            global_batch_size=batch_size,
+            worker_allocations=[worker.to_dict() for worker in schedule.workers],
+            warmup_runs=int(case["warmup_runs"]),
+            measure_runs=int(case["measure_runs"]),
+            generate_config=copy.deepcopy(case["generate_config"]),
+        )
+        if not isinstance(raw, Mapping):
+            raise ValueError("decode batch runner must return an object")
+        measured[batch_size] = copy.deepcopy(dict(raw))
+        return measured[batch_size]
+
+    target = case.get("target_tpot_ms")
+    if target is None:
+        return execute(max_batch_size)
+
+    search = search_target_tpot(
+        lambda batch_size: _search_measurement(execute(batch_size)),
+        target_tpot_ms=float(target),
+        max_batch_size=max_batch_size,
+    )
+    if max_batch_size not in measured:
+        execute(max_batch_size)
+    result = measured[max_batch_size]
+    result["search"] = search.to_dict()
+    return result

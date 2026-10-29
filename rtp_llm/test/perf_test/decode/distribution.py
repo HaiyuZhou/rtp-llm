@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Tuple
 from rtp_llm.test.perf_test.config_schema import EngineConfig
 from rtp_llm.test.perf_test.decode.metrics import build_decode_case_result
 from rtp_llm.test.perf_test.decode.scheduler import schedule_decode_requests
+from rtp_llm.test.perf_test.decode.tpot import run_batch_with_optional_tpot_search
 from rtp_llm.test.perf_test.errors import PlanningError
 
 
@@ -151,26 +152,32 @@ class DistributionDecodeCaseRunner:
         output_length = case["output_length"]
         if type(output_length) is not int or output_length <= 0:
             raise ValueError("distribution output_length must be one scalar")
-        schedule = schedule_decode_requests(input_lengths, dp_size=self._topology["dp"])
-        worker_allocations = [worker.to_dict() for worker in schedule.workers]
-        raw = self._batch_runner(
-            case_id=case["case_id"],
+        raw = run_batch_with_optional_tpot_search(
+            self._batch_runner,
+            case=case,
+            topology=self._topology,
             input_lengths=input_lengths,
-            output_length=output_length,
-            global_batch_size=int(case["global_batch_size"]),
-            worker_allocations=copy.deepcopy(worker_allocations),
-            warmup_runs=int(case["warmup_runs"]),
-            measure_runs=int(case["measure_runs"]),
-            generate_config=copy.deepcopy(case["generate_config"]),
         )
-        if not isinstance(raw, Mapping):
-            raise ValueError("distribution batch runner must return an object")
         distribution = copy.deepcopy(dict(case.get("distribution", {})))
         distribution["actual_sequence_lengths"] = list(input_lengths)
-        return build_decode_case_result(
+        result = build_decode_case_result(
             case,
             measurements=raw.get("measurements"),
             topology=self._topology,
             search=raw.get("search"),
             distribution=distribution,
         )
+        search = raw.get("search")
+        if (
+            result["status"] == "ok"
+            and isinstance(search, Mapping)
+            and search.get("best_batch_size") is None
+        ):
+            result["status"] = "request_failed"
+            result["errors"].append(
+                {
+                    "code": "target_tpot_not_met",
+                    "message": "no measured batch satisfied target_tpot_ms",
+                }
+            )
+        return result

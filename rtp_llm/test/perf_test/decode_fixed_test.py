@@ -135,6 +135,64 @@ class DecodeFixedTest(unittest.TestCase):
             )
             self.assertEqual(4, len(RunStore(root).read_committed_cases()))
 
+    def test_target_tpot_executes_bounded_search_and_preserves_trajectory(self):
+        def execute(**kwargs):
+            raw = _raw_batch(**kwargs)
+            tpot = 8.0 if kwargs["global_batch_size"] <= 4 else 12.0
+            for measurement in raw["measurements"]:
+                for request in measurement["requests"]:
+                    request["latency_ms"]["tpot"] = tpot
+            return raw
+
+        batch_runner = Mock(side_effect=execute)
+        case = {
+            "case_id": "decode-tpot-case",
+            "workload_kind": "grid",
+            "input_length": 128,
+            "output_length": 32,
+            "global_batch_size": 8,
+            "measure_runs": 2,
+            "warmup_runs": 0,
+            "generate_config": {"top_k": 1},
+            "target_tpot_ms": 10.0,
+        }
+
+        result = FixedDecodeCaseRunner(batch_runner).run_case(case)
+
+        search = result["metrics"]["search"]
+        self.assertEqual("found", search["outcome"])
+        self.assertEqual(4, search["best_batch_size"])
+        self.assertEqual(
+            [4, 8], [item["batch_size"] for item in search["observations"]]
+        )
+        self.assertEqual(
+            [4, 8],
+            [call.kwargs["global_batch_size"] for call in batch_runner.call_args_list],
+        )
+        self.assertEqual(8, result["metrics"]["global_batch_size"])
+
+    def test_target_tpot_without_satisfying_batch_is_not_successful(self):
+        batch_runner = Mock(side_effect=_raw_batch)
+        case = {
+            "case_id": "decode-tpot-miss",
+            "workload_kind": "grid",
+            "input_length": 128,
+            "output_length": 32,
+            "global_batch_size": 4,
+            "measure_runs": 2,
+            "warmup_runs": 0,
+            "generate_config": {},
+            "target_tpot_ms": 0.05,
+        }
+
+        result = FixedDecodeCaseRunner(batch_runner).run_case(case)
+
+        self.assertEqual("request_failed", result["status"])
+        self.assertEqual(
+            "no_satisfying_candidate", result["metrics"]["search"]["outcome"]
+        )
+        self.assertEqual("target_tpot_not_met", result["errors"][-1]["code"])
+
 
 if __name__ == "__main__":
     unittest.main()

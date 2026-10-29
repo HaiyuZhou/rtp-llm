@@ -14,6 +14,7 @@ py_library(
         "decode/metrics.py",
         "decode/planner.py",
         "decode/scheduler.py",
+        "decode/tpot.py",
         "dry_run.py",
         "entry.py",
         "errors.py",

@@ -1,10 +1,13 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
 from rtp_llm.test.perf_test.config_resolver import resolve_config
+from rtp_llm.test.perf_test.errors import EngineLifecycleError
 from rtp_llm.test.perf_test.execution.defaults import UnifiedLocalExecutor
+from rtp_llm.test.perf_test.execution.engine_session import EngineDiagnostics
 from rtp_llm.test.perf_test.plan import build_execution_plan
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.state import RunState
@@ -41,6 +44,16 @@ class _Session:
 
     def __exit__(self, _type, _value, _traceback):
         self.exited += 1
+
+
+class _FailingSession:
+    diagnostics = EngineDiagnostics(log_path="failed-engine.log", exit_code=2)
+
+    def __enter__(self):
+        raise EngineLifecycleError("engine failed readiness check")
+
+    def __exit__(self, _type, _value, _traceback):
+        return None
 
 
 def _source(result_root):
@@ -113,6 +126,48 @@ class DefaultExecutorTest(unittest.TestCase):
             self.assertTrue((root / "results" / "result.json").is_file())
             self.assertTrue((root / "results" / "summary.json").is_file())
             self.assertTrue((root / "reports" / "prefill_report.json").is_file())
+
+    def test_engine_failure_preserves_typed_outcome_without_finalizing_cases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            source = _source(root.parent)
+            plan = build_execution_plan(
+                mode="prefill",
+                action="run",
+                resolved=resolve_config(source),
+                cases=[
+                    {
+                        "input_len": 16,
+                        "cache_len": 0,
+                        "compute_len": 16,
+                        "batch_size": 1,
+                        "measure_runs": 1,
+                        "seed": 1,
+                        "prefix_policy": "shared_seed",
+                    }
+                ],
+                result_directory=str(root),
+            )
+            initialize_run_directory(
+                root,
+                source_config=source,
+                plan=plan,
+                run_id="run-engine-failure",
+                code_version="test",
+            )
+            executor = UnifiedLocalExecutor(
+                session_factory=Mock(return_value=_FailingSession()),
+                tokenizer_loader=lambda _plan: _Tokenizer(),
+                query_builder=lambda _plan, _lengths: {},
+            )
+
+            outcome = executor(plan)
+
+            self.assertEqual(RunState.FAILED, outcome.state)
+            self.assertEqual(4, outcome.exit_code)
+            self.assertFalse((root / "results" / "result.json").exists())
+            manifest = json.loads((root / "manifest.json").read_text())
+            self.assertEqual("failed", manifest["state"])
 
 
 if __name__ == "__main__":

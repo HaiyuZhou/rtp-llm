@@ -47,7 +47,6 @@ def build_engine_launch_spec(plan: ExecutionPlan) -> EngineLaunchSpec:
         "tokenizer_path": model["tokenizer"],
         "tp_size": topology["tp"],
         "dp_size": topology["dp"],
-        "pp_size": topology["pp"],
         "ep_size": topology["ep"],
         "world_size": topology["tp"] * topology["dp"] * topology["pp"],
         "max_seq_len": engine["max_seq_len"],

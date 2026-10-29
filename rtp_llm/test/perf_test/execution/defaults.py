@@ -23,6 +23,7 @@ from rtp_llm.test.perf_test.prefill.profile import PrefillProfiler
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
 from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock, inspect_run_directory
+from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.storage import RunStore
 
 SessionFactory = Callable[[ExecutionPlan], Any]
@@ -162,6 +163,9 @@ class UnifiedLocalExecutor:
                 snapshot = inspect_run_directory(root)
                 _write_manifest_state(root, "running")
                 outcome = self._execute_measurement(plan)
+                if outcome.state in {RunState.FAILED, RunState.INTERRUPTED}:
+                    _write_manifest_state(root, outcome.state.value)
+                    return outcome
                 if plan.mode == "prefill":
                     finalize_prefill_run(
                         root,
@@ -183,6 +187,9 @@ class UnifiedLocalExecutor:
         snapshot = inspect_run_directory(root)
         _write_manifest_state(root, "running")
         outcome = self._execute_measurement(plan)
+        if outcome.state in {RunState.FAILED, RunState.INTERRUPTED}:
+            _write_manifest_state(root, outcome.state.value)
+            return outcome
         finalize_prefill_run(
             root,
             plan=plan,

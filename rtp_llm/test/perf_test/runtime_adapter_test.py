@@ -65,6 +65,7 @@ class RuntimeAdapterTest(unittest.TestCase):
         self.assertIn("--tokenizer_path=/models/qwen-tokenizer", spec.argv)
         self.assertIn("--tp_size=2", spec.argv)
         self.assertIn("--ep_size=2", spec.argv)
+        self.assertNotIn("--pp_size=1", spec.argv)
         self.assertIn("--max_batch_tokens_size=8192", spec.argv)
         self.assertIn("--enable_cuda_graph=0", spec.argv)
 

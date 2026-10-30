@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from rtp_llm.test.perf_test.config_schema import EngineConfig
 from rtp_llm.test.perf_test.decode.metrics import build_decode_case_result
 from rtp_llm.test.perf_test.decode.model import DecodeBatchMeasurement, DecodeCaseSpec
-from rtp_llm.test.perf_test.decode.profiling import DecodeProfiler
+from rtp_llm.test.perf_test.decode.profiling import DecodeProfiler, sanitize_error
 from rtp_llm.test.perf_test.decode.scheduler import (
     DecodeBatchSchedule,
     schedule_decode_requests,
@@ -127,12 +127,20 @@ class DecodeBatchExecutor:
                 "profile_trace_name": trace_name,
             }
         )
-        for _ in range(case.profiling.runs):
-            self._transport.run_round(
+        for run_index in range(case.profiling.runs):
+            requests = self._transport.run_round(
                 input_lengths=inputs,
                 output_length=case.output_length,
                 generate_config=profile_config,
             )
+            for request in requests:
+                if not request["success"]:
+                    error = RuntimeError(
+                        f"decode profile round {run_index} request "
+                        f"{request['request_index']} failed: "
+                        f"{request.get('error', 'request failed')}"
+                    )
+                    raise RuntimeError(sanitize_error(error))
 
 
 class DecodeCaseExecutor:

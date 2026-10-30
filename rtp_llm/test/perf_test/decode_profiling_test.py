@@ -158,6 +158,67 @@ class DecodeProfilingTest(unittest.TestCase):
         batch_executor.profile.assert_not_called()
         self.assertEqual("disabled", result["metrics"]["profiling"]["status"])
 
+    def test_failed_profile_request_with_trace_keeps_performance_ok(self):
+        for failed_run in (0, 1):
+            for failed_request in (0, 1):
+                with self.subTest(run=failed_run, request=failed_request):
+                    with tempfile.TemporaryDirectory() as directory:
+                        trace = Path(directory) / "trace.json"
+                        trace.write_text("{}", encoding="utf-8")
+                        case = replace(
+                            _exact_case(batch=2, profile=True),
+                            profiling=DecodeProfilingConfig(enabled=True, runs=2),
+                        )
+                        successful = _measurement(2).measurements[0]["requests"]
+                        failed = _measurement(2).measurements[0]["requests"]
+                        failed[failed_request].update(
+                            success=False, error="HTTP 503\n" + "x" * 600
+                        )
+                        profile_rounds = [successful, successful]
+                        profile_rounds[failed_run] = failed
+                        transport = Mock()
+                        transport.run_round.side_effect = [
+                            successful
+                        ] * 3 + profile_rounds
+                        batch_executor = DecodeBatchExecutor(
+                            transport,
+                            engine=EngineConfig(
+                                max_seq_len=512,
+                                max_batch_tokens=512,
+                                concurrency_limit=2,
+                            ),
+                            dp_size=1,
+                            monotonic=Mock(side_effect=[0.0, 1.0, 2.0, 3.0]),
+                        )
+                        profiler = DecodeProfiler(
+                            batch_executor,
+                            run_root=Path(directory),
+                            log_path=None,
+                            artifact_discoverer=lambda *_args: (str(trace),),
+                        )
+                        result = DecodeCaseExecutor(
+                            batch_executor, topology=TOPOLOGY, profiler=profiler
+                        ).execute(_case_payload(case))
+                        self.assertEqual("ok", result["status"])
+                        self.assertEqual([], result["errors"])
+                        self.assertEqual(4, result["metrics"]["successful_requests"])
+                        manifest = result["metrics"]["profiling"]
+                        self.assertEqual("failed", manifest["status"])
+                        self.assertEqual([], manifest["artifacts"])
+                        self.assertIn(f"round {failed_run}", manifest["error"])
+                        self.assertIn(f"request {failed_request}", manifest["error"])
+                        self.assertIn("HTTP 503", manifest["error"])
+                        self.assertNotIn("\n", manifest["error"])
+                        self.assertLessEqual(len(manifest["error"]), 500)
+                        self.assertEqual(
+                            manifest,
+                            json.loads(
+                                (
+                                    Path(directory) / manifest["manifest_path"]
+                                ).read_text()
+                            ),
+                        )
+
     def test_enabled_profile_requires_configured_profiler(self):
         batch_executor = Mock()
         batch_executor.measure.return_value = _measurement(1)
@@ -293,6 +354,7 @@ class DecodeProfilingTest(unittest.TestCase):
 class DecodeBatchProfilingTest(unittest.TestCase):
     def test_profile_prepares_selected_batch_and_uses_only_profile_rounds(self):
         transport = Mock()
+        transport.run_round.return_value = _measurement(3).measurements[0]["requests"]
         executor = DecodeBatchExecutor(
             transport,
             engine=EngineConfig(

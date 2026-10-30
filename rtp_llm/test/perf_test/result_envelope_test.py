@@ -320,6 +320,55 @@ class ResultEnvelopeTest(unittest.TestCase):
         with self.assertRaisesRegex(ResultSchemaError, "schema_version"):
             parse_result_envelope(value)
 
+    def test_formal_tpot_metrics_satisfy_target_and_match_selected_observation(self):
+        value = _decode_result()
+        case = value["cases"][0]
+        case["identity"]["batch_policy"] = {
+            "strategy": "target_tpot",
+            "max_size": 4,
+            "candidate_step": 2,
+            "target_tpot_ms": 10.0,
+        }
+        case["metrics"]["search"] = {
+            "target_tpot_ms": 10.0,
+            "max_size": 4,
+            "candidate_step": 2,
+            "outcome": "found",
+            "best_batch_size": 4,
+            "observations": [
+                {
+                    "batch_size": 4,
+                    "outcome": "satisfied",
+                    "tpot_ms": 0.5,
+                    "success_rate": 1.0,
+                    "throughput_tokens_per_second": 8000.0,
+                }
+            ],
+        }
+        self.assertEqual(value, parse_result_envelope(value).to_dict())
+        for field, bad in (
+            ("tpot", 11.0),
+            ("requests", 1),
+            ("observation_tpot", 0.6),
+            ("observation_throughput", 7999.0),
+        ):
+            with self.subTest(field=field):
+                invalid = copy.deepcopy(value)
+                metrics = invalid["cases"][0]["metrics"]
+                if field == "tpot":
+                    metrics["latency_ms"]["tpot"] = bad
+                elif field == "requests":
+                    metrics.update(successful_requests=3, failed_requests=bad)
+                else:
+                    name = (
+                        "tpot_ms"
+                        if field == "observation_tpot"
+                        else "throughput_tokens_per_second"
+                    )
+                    metrics["search"]["observations"][0][name] = bad
+                with self.assertRaisesRegex(ResultSchemaError, "selected"):
+                    parse_result_envelope(invalid)
+
     def test_prefill_envelope_round_trips_as_golden_schema(self):
         source = _prefill_result()
 

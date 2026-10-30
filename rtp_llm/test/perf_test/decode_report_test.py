@@ -254,6 +254,76 @@ class DecodeReportTest(unittest.TestCase):
             ],
         )
 
+    def test_malformed_tpot_search_retains_diagnostic_cell(self):
+        for location in ("metrics", "error_search", "error_details"):
+            with self.subTest(location=location):
+                cases = _tpot_cases((128,), (16, 64))[:1]
+                case = cases[0]
+                if location == "metrics":
+                    case["metrics"]["search"] = [1]
+                else:
+                    details = (
+                        {"search": [1]} if location == "error_search" else ["search"]
+                    )
+                    case.update(
+                        status="target_tpot_not_met",
+                        metrics=None,
+                        errors=[
+                            {
+                                "code": "target_tpot_not_met",
+                                "message": "bad search",
+                                "details": details,
+                            }
+                        ],
+                    )
+                report = generate_decode_report(cases)
+                self.assertEqual("diagnostic", report["report_kind"])
+                self.assertEqual(1, len(report["matrices"][0]["cells"]))
+                cell = report["matrices"][0]["cells"][0]
+                self.assertEqual(case["case_id"], cell["case_id"])
+                self.assertIsNone(cell["search_outcome"])
+                self.assertIsNone(cell["best_batch_size"])
+                self.assertIsNone(cell["tpot_ms"])
+                self.assertEqual("invalid_result", cell["errors"][-1]["code"])
+
+    def test_exact_batches_share_axes_when_one_batch_lacks_a_dimension(self):
+        for missing_dimension, missing_value in (
+            ("output_length", 64),
+            ("input_length", 512),
+        ):
+            with self.subTest(dimension=missing_dimension):
+                cases = _exact_cases((128, 512), (16, 64), (1, 4))
+                cases = [
+                    case
+                    for case in cases
+                    if not (
+                        case["identity"]["batch_policy"]["size"] == 4
+                        and (
+                            case["identity"]["output_length"]
+                            if missing_dimension == "output_length"
+                            else case["identity"]["input_lengths"][0]
+                        )
+                        == missing_value
+                    )
+                ]
+                report = generate_decode_report(cases)
+                self.assertEqual("diagnostic", report["report_kind"])
+                self.assertEqual(6, len(report["observations"]))
+                first, second = report["matrices"]
+                self.assertEqual([128, 512], first["input_lengths"])
+                self.assertEqual([128, 512], second["input_lengths"])
+                self.assertEqual([16, 64], first["output_lengths"])
+                self.assertEqual([16, 64], second["output_lengths"])
+                self.assertEqual(4, len(second["cells"]))
+                missing = [
+                    cell for cell in second["cells"] if cell["status"] == "missing"
+                ]
+                self.assertEqual(2, len(missing))
+                self.assertEqual(
+                    [missing_value, missing_value],
+                    [cell[missing_dimension] for cell in missing],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

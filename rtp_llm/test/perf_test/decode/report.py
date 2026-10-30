@@ -30,8 +30,9 @@ def _observation(index: int, result: Mapping[str, Any]) -> Dict[str, Any]:
     search = copy.deepcopy(metrics.get("search"))
     if search is None:
         for error in errors:
-            if "search" in error.get("details", {}):
-                search = copy.deepcopy(error["details"]["search"])
+            details = error.get("details") if isinstance(error, Mapping) else None
+            if isinstance(details, Mapping) and "search" in details:
+                search = copy.deepcopy(details["search"])
                 break
     policy = copy.deepcopy(identity.get("batch_policy", {}))
     lengths = list(identity.get("input_lengths", []))
@@ -65,9 +66,10 @@ def _observation(index: int, result: Mapping[str, Any]) -> Dict[str, Any]:
             success_rate=metrics["successful_requests"] / total,
         )
     if policy.get("strategy") == "target_tpot":
+        search_record = search if isinstance(search, Mapping) else {}
         row.update(
-            best_batch_size=search.get("best_batch_size") if valid and search else None,
-            search_outcome=search.get("outcome") if search else None,
+            best_batch_size=search_record.get("best_batch_size") if valid else None,
+            search_outcome=search_record.get("outcome"),
         )
     return row
 
@@ -80,6 +82,7 @@ def generate_decode_report(case_results: Sequence[Mapping[str, Any]]) -> Dict[st
     valid = sum(row["status"] == "ok" for row in observations)
     all_valid = bool(observations) and valid == len(observations)
     groups: Dict[tuple, Dict[str, Any]] = {}
+    exact_axes = {"input_lengths": [], "output_lengths": []}
     distribution_rows = []
     for row in observations:
         if row["workload_kind"] == "distribution":
@@ -104,9 +107,13 @@ def generate_decode_report(case_results: Sequence[Mapping[str, Any]]) -> Dict[st
         ):
             if value not in matrix[name]:
                 matrix[name].append(value)
+            if policy.get("strategy") == "fixed" and value not in exact_axes[name]:
+                exact_axes[name].append(value)
         matrix["cells"].append(copy.deepcopy(row))
 
     for matrix in groups.values():
+        if matrix["batch_policy"].get("strategy") == "fixed":
+            matrix.update(copy.deepcopy(exact_axes))
         positions = {}
         for cell in matrix["cells"]:
             position = (cell["input_length"], cell["output_length"])

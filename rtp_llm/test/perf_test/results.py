@@ -607,6 +607,32 @@ def _parse_case(index: int, mode: str, value: Any) -> CaseResult:
                 raise ResultSchemaError(
                     f"{path}.metrics.search: must describe selected best batch"
                 )
+            if policy["strategy"] == "target_tpot":
+                if (
+                    metrics.latency_ms["tpot"] > policy["target_tpot_ms"]
+                    or metrics.failed_requests != 0
+                ):
+                    raise ResultSchemaError(
+                        f"{path}.metrics: selected batch must satisfy target with full success"
+                    )
+                selected_observation = next(
+                    observation
+                    for observation in search["observations"]
+                    if observation["batch_size"] == batch
+                )
+                selected_values = {
+                    "tpot_ms": metrics.latency_ms["tpot"],
+                    "success_rate": 1.0,
+                    "throughput_tokens_per_second": metrics.throughput_tokens_per_second,
+                }
+                for name, measured_value in selected_values.items():
+                    observed_value = selected_observation.get(name)
+                    if observed_value is not None and not math.isclose(
+                        observed_value, measured_value
+                    ):
+                        raise ResultSchemaError(
+                            f"{path}.metrics.search: selected observation {name} must match formal metrics"
+                        )
     return CaseResult(
         case_id=_string(f"{path}.case_id", raw["case_id"]),
         identity=copy.deepcopy(dict(identity)),

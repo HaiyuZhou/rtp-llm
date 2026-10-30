@@ -105,3 +105,19 @@ class DecodeCaseSpec:
                 else copy.deepcopy(dict(value["distribution"]))
             ),
         )
+
+
+@dataclass(frozen=True)
+class DecodeBatchMeasurement:
+    batch_size: int
+    input_lengths: Tuple[int, ...]
+    worker_allocations: Tuple[Dict[str, Any], ...]
+    measurements: Tuple[Dict[str, Any], ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "batch_size": self.batch_size,
+            "input_lengths": list(self.input_lengths),
+            "worker_allocations": copy.deepcopy(list(self.worker_allocations)),
+            "measurements": copy.deepcopy(list(self.measurements)),
+        }

@@ -35,9 +35,11 @@ py_library(
     srcs = [
         "aone/collector.py",
         "aone/package.py",
+        "decode/executor.py",
         "decode/finalize.py",
         "decode/fixed.py",
         "decode/http_batch.py",
+        "decode/transport.py",
         "execution/defaults.py",
         "execution/aone.py",
         "execution/aone_bazel.py",
@@ -81,9 +83,11 @@ py_library(
         "config_schema.py",
         "dataclass.py",
         "dataset.py",
+        "decode/executor.py",
         "decode/fixed.py",
         "decode/grid_runner.py",
         "decode/http_batch.py",
+        "decode/transport.py",
         "decode/distribution.py",
         "decode/finalize.py",
         "decode/planner.py",
@@ -327,6 +331,18 @@ py_test(
     deps = [
         ":perf_test_lib",
     ],
+)
+
+py_test(
+    name = "decode_transport_test",
+    srcs = ["decode_transport_test.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
+    name = "decode_executor_test",
+    srcs = ["decode_executor_test.py"],
+    deps = [":perf_test_lib"],
 )
 
 py_test(

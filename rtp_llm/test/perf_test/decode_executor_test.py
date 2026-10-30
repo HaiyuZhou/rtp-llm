@@ -318,6 +318,52 @@ class DecodeCaseExecutorTest(unittest.TestCase):
             [4, 1], [item["batch_size"] for item in search["observations"]]
         )
 
+    def test_invalid_higher_candidate_keeps_valid_lower_batch_and_trajectory(self):
+        for invalid in ("output", "input", "timing", "throughput", "batch"):
+            with self.subTest(invalid=invalid):
+                attempted = []
+
+                def measure(spec, batch):
+                    attempted.append(batch)
+                    selected = self._measure(spec, batch)
+                    for run in selected.measurements:
+                        for request in run["requests"]:
+                            request["latency_ms"]["tpot"] = 8.0 if batch < 16 else 12.0
+                    if batch == 12:
+                        request = selected.measurements[1]["requests"][0]
+                        if invalid == "output":
+                            request["output_length"] = 1
+                        elif invalid == "input":
+                            request["input_length"] = 1
+                        elif invalid == "timing":
+                            request["latency_ms"]["wait"] = -1.0
+                        elif invalid == "throughput":
+                            selected.measurements[1]["throughput_tokens_per_second"] = (
+                                float("nan")
+                            )
+                        else:
+                            selected = self._measure(spec, 8)
+                    return selected
+
+                spec = replace(
+                    _exact_case(batch=16, runs=2),
+                    batch_policy=TargetTPOTPolicy("target_tpot", 16, 4, 10.0),
+                )
+                result = self._executor(measure).execute(
+                    {"case_id": "malformed-candidate", **spec.to_identity()}
+                )
+                self.assertEqual("ok", result["status"])
+                self.assertEqual(8, result["metrics"]["global_batch_size"])
+                self.assertEqual(16, result["metrics"]["successful_requests"])
+                self.assertEqual([8, 12], attempted)
+                search = result["metrics"]["search"]
+                self.assertEqual(8, search["best_batch_size"])
+                self.assertEqual(
+                    ["satisfied", "measurement_failed"],
+                    [item["outcome"] for item in search["observations"]],
+                )
+                self.assertTrue(search["observations"][1]["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -249,6 +249,35 @@ class DecodeMetricsTest(unittest.TestCase):
                 self.assertEqual("invalid_shape", result["status"])
                 self.assertIsNone(result["metrics"])
 
+    def test_result_validation_failure_preserves_independent_search_details(self):
+        search = {
+            "outcome": "found",
+            "best_batch_size": 2,
+            "observations": [{"batch_size": 2, "outcome": "satisfied"}],
+        }
+        for invalid in ("shape", "timing", "topology"):
+            with self.subTest(invalid=invalid):
+                measurements = _measurements()
+                topology = TOPOLOGY
+                if invalid == "shape":
+                    measurements[0]["requests"][1]["output_length"] = 1
+                elif invalid == "timing":
+                    measurements[0]["requests"][0]["latency_ms"]["total"] = -1.0
+                else:
+                    topology = {"dp": 1}
+                result = build_decode_case_result(
+                    _case(),
+                    selected=_selected(measurements),
+                    topology=topology,
+                    search=search,
+                )
+                self.assertIn(result["status"], ("invalid_shape", "invalid_timing"))
+                self.assertIsNone(result["metrics"])
+                details = result["errors"][0].get("details", {})
+                self.assertEqual(search, details.get("search"))
+                details["search"]["observations"][0]["outcome"] = "changed"
+                self.assertEqual("satisfied", search["observations"][0]["outcome"])
+
 
 if __name__ == "__main__":
     unittest.main()

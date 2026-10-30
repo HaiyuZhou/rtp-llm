@@ -6,6 +6,7 @@ import statistics
 from typing import Any, Callable, Dict, Tuple, Union
 
 from rtp_llm.test.perf_test.decode.executor import DecodeCapacityError
+from rtp_llm.test.perf_test.decode.metrics import validate_decode_measurement
 from rtp_llm.test.perf_test.decode.model import (
     CaseBatchPolicy,
     DecodeBatchMeasurement,
@@ -73,6 +74,9 @@ class TargetTPOTStrategy:
             try:
                 if batch_size not in cache:
                     cache[batch_size] = measure(case, batch_size)
+                validate_decode_measurement(
+                    case.to_identity(), cache[batch_size], batch_size=batch_size
+                )
                 observation = _summarize(cache[batch_size], policy.target_tpot_ms)
             except DecodeCapacityError as error:
                 observation = {

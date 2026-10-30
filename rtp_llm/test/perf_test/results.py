@@ -10,7 +10,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 from rtp_llm.test.perf_test.state import CaseState, RunState
 
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -118,6 +118,7 @@ class DecodeMetrics:
     measurements: Tuple[Dict[str, Any], ...]
     search: Optional[Dict[str, Any]]
     distribution: Optional[Dict[str, Any]]
+    profiling: Dict[str, Any]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -133,6 +134,7 @@ class DecodeMetrics:
             "measurements": copy.deepcopy(list(self.measurements)),
             "search": copy.deepcopy(self.search),
             "distribution": copy.deepcopy(self.distribution),
+            "profiling": copy.deepcopy(self.profiling),
         }
 
 
@@ -145,7 +147,7 @@ class CaseResult:
     identity: Dict[str, Any]
     status: CaseState
     runs: int
-    errors: Tuple[Dict[str, str], ...]
+    errors: Tuple[Dict[str, Any], ...]
     metrics: Optional[ModeMetrics]
 
     def to_dict(self) -> Dict[str, Any]:
@@ -231,6 +233,195 @@ def _parse_prefill_metrics(path: str, value: Any) -> PrefillMetrics:
     )
 
 
+def _decode_identity(path: str, value: Mapping[str, Any]) -> None:
+    _exact_fields(
+        path,
+        value,
+        {
+            "workload_kind",
+            "input_lengths",
+            "output_length",
+            "batch_policy",
+            "measure_runs",
+            "warmup_runs",
+            "generate_config",
+            "profiling",
+            "distribution",
+        },
+    )
+    if value["workload_kind"] not in {"grid", "distribution"}:
+        raise ResultSchemaError(f"{path}.workload_kind: expected grid or distribution")
+    lengths = value["input_lengths"]
+    if not isinstance(lengths, list) or not lengths:
+        raise ResultSchemaError(f"{path}.input_lengths: expected a non-empty array")
+    for index, item in enumerate(lengths):
+        _positive_int(f"{path}.input_lengths[{index}]", item)
+    if value["workload_kind"] == "grid" and len(set(lengths)) != 1:
+        raise ResultSchemaError(f"{path}.input_lengths: grid inputs must be uniform")
+    _positive_int(f"{path}.output_length", value["output_length"])
+    _positive_int(f"{path}.measure_runs", value["measure_runs"])
+    _count(f"{path}.warmup_runs", value["warmup_runs"])
+    _object(f"{path}.generate_config", value["generate_config"])
+    policy_path = f"{path}.batch_policy"
+    policy = _object(policy_path, value["batch_policy"])
+    if policy.get("strategy") == "fixed":
+        _exact_fields(policy_path, policy, {"strategy", "size"})
+        size = _positive_int(f"{policy_path}.size", policy["size"])
+    elif policy.get("strategy") == "target_tpot":
+        _exact_fields(
+            policy_path,
+            policy,
+            {"strategy", "max_size", "candidate_step", "target_tpot_ms"},
+        )
+        size = _positive_int(f"{policy_path}.max_size", policy["max_size"])
+        _positive_int(f"{policy_path}.candidate_step", policy["candidate_step"])
+        _number(
+            f"{policy_path}.target_tpot_ms", policy["target_tpot_ms"], positive=True
+        )
+    else:
+        raise ResultSchemaError(f"{policy_path}.strategy: unknown batch strategy")
+    if len(lengths) != size:
+        raise ResultSchemaError(f"{path}.input_lengths: must match batch policy size")
+    profile_path = f"{path}.profiling"
+    profile = _object(profile_path, value["profiling"])
+    _exact_fields(
+        profile_path,
+        profile,
+        {"enabled", "runs", "steps", "enable_all_ranks", "flush_timeout_seconds"},
+    )
+    for name in ("enabled", "enable_all_ranks"):
+        if type(profile[name]) is not bool:
+            raise ResultSchemaError(f"{profile_path}.{name}: expected boolean")
+    for name in ("runs", "steps", "flush_timeout_seconds"):
+        _positive_int(f"{profile_path}.{name}", profile[name])
+    distribution = value["distribution"]
+    if value["workload_kind"] == "distribution":
+        _object(f"{path}.distribution", distribution)
+    elif distribution is not None:
+        raise ResultSchemaError(f"{path}.distribution: expected null for grid")
+
+
+def _parse_search(path: str, value: Any) -> Dict[str, Any]:
+    raw = _object(path, value)
+    _exact_fields(
+        path,
+        raw,
+        {
+            "target_tpot_ms",
+            "max_size",
+            "candidate_step",
+            "outcome",
+            "best_batch_size",
+            "observations",
+        },
+    )
+    target = _number(f"{path}.target_tpot_ms", raw["target_tpot_ms"], positive=True)
+    maximum = _positive_int(f"{path}.max_size", raw["max_size"])
+    step = _positive_int(f"{path}.candidate_step", raw["candidate_step"])
+    if raw["outcome"] not in {"found", "no_satisfying_candidate"}:
+        raise ResultSchemaError(f"{path}.outcome: unknown search outcome")
+    observations = _record_list(f"{path}.observations", raw["observations"])
+    if not observations:
+        raise ResultSchemaError(f"{path}.observations: expected at least one candidate")
+    seen, satisfied = set(), []
+    for index, observation in enumerate(observations):
+        observation_path = f"{path}.observations[{index}]"
+        _required(observation_path, observation, {"batch_size", "outcome"})
+        allowed = {
+            "batch_size",
+            "outcome",
+            "tpot_ms",
+            "success_rate",
+            "throughput_tokens_per_second",
+            "error",
+        }
+        _exact_fields(observation_path, observation, set(observation) & allowed)
+        batch = _positive_int(
+            f"{observation_path}.batch_size", observation["batch_size"]
+        )
+        if (
+            batch > maximum
+            or (batch not in (1, maximum) and batch % step != 0)
+            or batch in seen
+        ):
+            raise ResultSchemaError(
+                f"{observation_path}.batch_size: invalid or duplicate candidate"
+            )
+        seen.add(batch)
+        outcome = observation["outcome"]
+        if outcome not in {
+            "satisfied",
+            "target_exceeded",
+            "capacity_failed",
+            "measurement_failed",
+        }:
+            raise ResultSchemaError(
+                f"{observation_path}.outcome: unknown candidate outcome"
+            )
+        for name in ("tpot_ms", "success_rate", "throughput_tokens_per_second"):
+            if observation.get(name) is not None:
+                _number(f"{observation_path}.{name}", observation[name])
+        if (
+            observation.get("success_rate") is not None
+            and observation["success_rate"] > 1
+        ):
+            raise ResultSchemaError(
+                f"{observation_path}.success_rate: must not exceed one"
+            )
+        if "error" in observation:
+            _string(f"{observation_path}.error", observation["error"])
+        if outcome == "satisfied":
+            tpot = observation.get("tpot_ms", target)
+            if tpot is None or tpot > target or observation.get("success_rate", 1) != 1:
+                raise ResultSchemaError(
+                    f"{observation_path}: satisfied candidate must meet target with full success"
+                )
+            satisfied.append(batch)
+    best = raw["best_batch_size"]
+    if raw["outcome"] == "found":
+        _positive_int(f"{path}.best_batch_size", best)
+        if not satisfied or best != max(satisfied):
+            raise ResultSchemaError(
+                f"{path}.best_batch_size: must select largest satisfied candidate"
+            )
+    elif best is not None or satisfied:
+        raise ResultSchemaError(
+            f"{path}.best_batch_size: failed search cannot select a batch"
+        )
+    return copy.deepcopy(dict(raw))
+
+
+def _parse_profiling(path: str, value: Any) -> Dict[str, Any]:
+    raw = _object(path, value)
+    _required(path, raw, {"status", "manifest_path", "error"})
+    # Profiles may embed the complete manifest or just its status and reference.
+    allowed = {
+        "status",
+        "manifest_path",
+        "error",
+        "schema_version",
+        "case_id",
+        "batch_size",
+        "input_lengths",
+        "output_length",
+        "runs",
+        "steps",
+        "enable_all_ranks",
+        "trace_name",
+        "artifacts",
+    }
+    _exact_fields(path, raw, set(raw) & allowed)
+    if raw["status"] not in {"disabled", "completed", "failed"}:
+        raise ResultSchemaError(f"{path}.status: unknown profiling status")
+    if raw["status"] != "disabled":
+        _string(f"{path}.manifest_path", raw["manifest_path"])
+    elif raw["manifest_path"] is not None:
+        raise ResultSchemaError(f"{path}.manifest_path: disabled profile must be null")
+    if raw["error"] is not None:
+        _string(f"{path}.error", raw["error"])
+    return copy.deepcopy(dict(raw))
+
+
 def _parse_decode_metrics(path: str, value: Any) -> DecodeMetrics:
     raw = _object(path, value)
     fields = {
@@ -246,6 +437,7 @@ def _parse_decode_metrics(path: str, value: Any) -> DecodeMetrics:
         "measurements",
         "search",
         "distribution",
+        "profiling",
     }
     _exact_fields(path, raw, fields)
     kind = raw["workload_kind"]
@@ -265,9 +457,10 @@ def _parse_decode_metrics(path: str, value: Any) -> DecodeMetrics:
         )
     successful = _count(f"{path}.successful_requests", raw["successful_requests"])
     failed = _count(f"{path}.failed_requests", raw["failed_requests"])
-    if successful + failed != global_batch:
+    measurements = _record_list(f"{path}.measurements", raw["measurements"])
+    if not measurements or successful + failed != global_batch * len(measurements):
         raise ResultSchemaError(
-            f"{path}: request outcomes must equal global_batch_size"
+            f"{path}: request outcomes must equal global_batch_size times measurement rounds"
         )
     topology = _object(f"{path}.topology", raw["topology"])
     _exact_fields(f"{path}.topology", topology, {"tp", "dp", "pp", "ep"})
@@ -301,9 +494,14 @@ def _parse_decode_metrics(path: str, value: Any) -> DecodeMetrics:
             f"{path}.throughput_tokens_per_second",
             raw["throughput_tokens_per_second"],
         ),
-        measurements=_record_list(f"{path}.measurements", raw["measurements"]),
-        search=optional_records["search"],
+        measurements=measurements,
+        search=(
+            None
+            if raw["search"] is None
+            else _parse_search(f"{path}.search", raw["search"])
+        ),
         distribution=optional_records["distribution"],
+        profiling=_parse_profiling(f"{path}.profiling", raw["profiling"]),
     )
 
 
@@ -317,17 +515,29 @@ def _parse_case(index: int, mode: str, value: Any) -> CaseResult:
     except ValueError as error:
         raise ResultSchemaError(f"{path}.status: unknown case state") from error
     identity = _object(f"{path}.identity", raw["identity"])
+    if mode == "decode":
+        _decode_identity(f"{path}.identity", identity)
     errors = _record_list(f"{path}.errors", raw["errors"])
     parsed_errors = []
     for error_index, item in enumerate(errors):
         error_path = f"{path}.errors[{error_index}]"
-        _exact_fields(error_path, item, {"code", "message"})
+        error_fields = {"code", "message"}
+        if mode == "decode" and "details" in item:
+            error_fields.add("details")
+        _exact_fields(error_path, item, error_fields)
         parsed_errors.append(
             {
                 "code": _string(f"{error_path}.code", item["code"]),
                 "message": _string(f"{error_path}.message", item["message"]),
             }
         )
+        if "details" in item:
+            details_path = f"{error_path}.details"
+            details = _object(details_path, item["details"])
+            _exact_fields(details_path, details, {"search"})
+            parsed_errors[-1]["details"] = {
+                "search": _parse_search(f"{details_path}.search", details["search"])
+            }
     metrics_value = raw["metrics"]
     if status == CaseState.OK and metrics_value is None:
         raise ResultSchemaError(f"{path}.metrics: required for ok case")
@@ -338,11 +548,70 @@ def _parse_case(index: int, mode: str, value: Any) -> CaseResult:
             if mode == "prefill"
             else _parse_decode_metrics(f"{path}.metrics", metrics_value)
         )
+    runs = _count(f"{path}.runs", raw["runs"])
+    if mode == "decode":
+        if runs != identity["measure_runs"] or (
+            metrics is not None and len(metrics.measurements) != runs
+        ):
+            raise ResultSchemaError(
+                f"{path}.runs: must match planned and measured rounds"
+            )
+        policy = identity["batch_policy"]
+        search = metrics.search if metrics is not None else None
+        if status == CaseState.TARGET_TPOT_NOT_MET:
+            if metrics is not None:
+                raise ResultSchemaError(
+                    f"{path}.metrics: failed search cannot have formal metrics"
+                )
+            if not parsed_errors or "details" not in parsed_errors[0]:
+                raise ResultSchemaError(
+                    f"{path}.errors[0].details.search: required for failed search"
+                )
+            search = parsed_errors[0]["details"]["search"]
+            if search["outcome"] != "no_satisfying_candidate":
+                raise ResultSchemaError(
+                    f"{path}.errors[0].details.search.outcome: expected failed search"
+                )
+        if search is not None:
+            if policy["strategy"] != "target_tpot" or any(
+                search[name] != policy[name]
+                for name in ("target_tpot_ms", "max_size", "candidate_step")
+            ):
+                raise ResultSchemaError(
+                    f"{path}: search must match identity.batch_policy"
+                )
+        if metrics is not None:
+            batch = metrics.global_batch_size
+            if (
+                metrics.workload_kind != identity["workload_kind"]
+                or list(metrics.input_lengths) != identity["input_lengths"][:batch]
+                or metrics.output_length != identity["output_length"]
+            ):
+                raise ResultSchemaError(
+                    f"{path}.metrics: selected shape must match identity"
+                )
+            if metrics.workload_kind == "grid" and metrics.distribution is not None:
+                raise ResultSchemaError(
+                    f"{path}.metrics.distribution: expected null for grid"
+                )
+            if policy["strategy"] == "fixed":
+                if batch != policy["size"] or search is not None:
+                    raise ResultSchemaError(
+                        f"{path}.metrics: fixed batch must match policy without search"
+                    )
+            elif (
+                search is None
+                or search["outcome"] != "found"
+                or search["best_batch_size"] != batch
+            ):
+                raise ResultSchemaError(
+                    f"{path}.metrics.search: must describe selected best batch"
+                )
     return CaseResult(
         case_id=_string(f"{path}.case_id", raw["case_id"]),
         identity=copy.deepcopy(dict(identity)),
         status=status,
-        runs=_count(f"{path}.runs", raw["runs"]),
+        runs=runs,
         errors=tuple(parsed_errors),
         metrics=metrics,
     )
@@ -400,6 +669,8 @@ def parse_result_envelope(value: Any) -> ResultEnvelope:
     }
     summary = _object("summary", raw["summary"])
     summary_fields = {"planned_cases", "successful_cases", "failed_cases"}
+    if mode == "decode":
+        summary_fields.add("profiling_failed_cases")
     _exact_fields("summary", summary, summary_fields)
     parsed_summary = {
         name: _count(f"summary.{name}", summary[name]) for name in summary_fields
@@ -416,6 +687,20 @@ def parse_result_envelope(value: Any) -> ResultEnvelope:
         cases
     ):
         raise ResultSchemaError("summary: successful plus failed must equal case count")
+    if mode == "decode":
+        successful = sum(case.status == CaseState.OK for case in cases)
+        profiling_failed = sum(
+            case.metrics is not None and case.metrics.profiling["status"] == "failed"
+            for case in cases
+        )
+        if parsed_summary["successful_cases"] != successful:
+            raise ResultSchemaError(
+                "summary.successful_cases: must match case outcomes"
+            )
+        if parsed_summary["profiling_failed_cases"] != profiling_failed:
+            raise ResultSchemaError(
+                "summary.profiling_failed_cases: must match profile outcomes"
+            )
     return ResultEnvelope(
         schema_version=RESULT_SCHEMA_VERSION,
         run_id=_string("run_id", raw["run_id"]),

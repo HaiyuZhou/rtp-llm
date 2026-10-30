@@ -1,4 +1,4 @@
-"""Finalize local decode runs with common results, summary, and basic report."""
+"""Finalize local decode runs with common results, summary, and matrix report."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import copy
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence, Union
 
+from rtp_llm.test.perf_test.decode.report import generate_decode_report
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.plan import ExecutionPlan, thaw
 from rtp_llm.test.perf_test.results import RESULT_SCHEMA_VERSION, parse_result_envelope
@@ -51,6 +52,10 @@ def finalize_decode_run(
         "planned_cases": len(ordered),
         "successful_cases": successful,
         "failed_cases": len(ordered) - successful,
+        "profiling_failed_cases": sum(
+            (result.get("metrics") or {}).get("profiling", {}).get("status") == "failed"
+            for result in ordered
+        ),
     }
     resolved_model = plan.to_dict()["resolved_config"]["model"]
     model = {
@@ -70,6 +75,7 @@ def finalize_decode_run(
         "cases": ordered,
     }
     parse_result_envelope(envelope)
+    report = generate_decode_report(ordered)
 
     root_path = Path(root)
     store = RunStore(root_path)
@@ -85,21 +91,5 @@ def finalize_decode_run(
         **summary,
     }
     store.write_summary(summary_artifact)
-    report = {
-        "schema_version": 1,
-        "mode": "decode",
-        "report_kind": "basic",
-        "status": state.value,
-        "summary": summary,
-        "cases": [
-            {
-                "case_id": result["case_id"],
-                "status": result["status"],
-                "metrics": copy.deepcopy(result["metrics"]),
-                "errors": copy.deepcopy(result["errors"]),
-            }
-            for result in ordered
-        ],
-    }
     atomic_write_json(root_path / "reports" / "decode_report.json", report)
     return envelope

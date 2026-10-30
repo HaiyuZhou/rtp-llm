@@ -11,7 +11,7 @@ from rtp_llm.test.perf_test.results import (
 
 def _base_result(mode):
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": "run-001",
         "mode": mode,
         "backend": "local",
@@ -57,12 +57,29 @@ def _prefill_result():
 
 def _decode_result():
     value = _base_result("decode")
+    value["summary"]["profiling_failed_cases"] = 0
     value["cases"] = [
         {
             "case_id": "decode-case-a",
-            "identity": {"input_len": 128, "output_len": 16, "batch_size": 4},
+            "identity": {
+                "workload_kind": "grid",
+                "input_lengths": [128] * 4,
+                "output_length": 16,
+                "batch_policy": {"strategy": "fixed", "size": 4},
+                "measure_runs": 1,
+                "warmup_runs": 0,
+                "generate_config": {},
+                "profiling": {
+                    "enabled": False,
+                    "runs": 1,
+                    "steps": 3,
+                    "enable_all_ranks": True,
+                    "flush_timeout_seconds": 60,
+                },
+                "distribution": None,
+            },
             "status": "ok",
-            "runs": 3,
+            "runs": 1,
             "errors": [],
             "metrics": {
                 "workload_kind": "grid",
@@ -83,6 +100,11 @@ def _decode_result():
                 "measurements": [{"run": 0, "successful_requests": 4}],
                 "search": None,
                 "distribution": None,
+                "profiling": {
+                    "status": "disabled",
+                    "manifest_path": None,
+                    "error": None,
+                },
             },
         }
     ]
@@ -90,6 +112,214 @@ def _decode_result():
 
 
 class ResultEnvelopeTest(unittest.TestCase):
+    def test_decode_v2_selected_batch_search_and_profiling(self):
+        value = _decode_result()
+        case = copy.deepcopy(value["cases"][0])
+        case["case_id"] = "decode-tpot"
+        case["identity"]["input_lengths"] = [128] * 16
+        case["identity"]["batch_policy"] = {
+            "strategy": "target_tpot",
+            "max_size": 16,
+            "candidate_step": 4,
+            "target_tpot_ms": 10.0,
+        }
+        case["identity"]["profiling"]["enabled"] = True
+        case["metrics"].update(
+            input_lengths=[128] * 8,
+            global_batch_size=8,
+            successful_requests=8,
+            search={
+                "target_tpot_ms": 10.0,
+                "max_size": 16,
+                "candidate_step": 4,
+                "outcome": "found",
+                "best_batch_size": 8,
+                "observations": [{"batch_size": 8, "outcome": "satisfied"}],
+            },
+            profiling={
+                "status": "failed",
+                "manifest_path": "profiles/decode-tpot/profile_manifest.json",
+                "error": "trace flush timeout",
+            },
+        )
+        value["cases"].append(case)
+        value["summary"].update(
+            planned_cases=2, successful_cases=2, profiling_failed_cases=1
+        )
+        parsed = parse_result_envelope(value)
+        self.assertEqual(value, parsed.to_dict())
+        self.assertEqual(8, parsed.cases[1].metrics.global_batch_size)
+
+    def test_decode_identity_requires_every_shape_field(self):
+        for name in _decode_result()["cases"][0]["identity"]:
+            with self.subTest(name=name):
+                value = _decode_result()
+                del value["cases"][0]["identity"][name]
+                with self.assertRaisesRegex(ResultSchemaError, "identity." + name):
+                    parse_result_envelope(value)
+
+    def test_decode_counts_all_rounds_and_requires_case_runs(self):
+        value = _decode_result()
+        case = value["cases"][0]
+        case["runs"] = case["identity"]["measure_runs"] = 2
+        case["metrics"]["measurements"].append({"run": 1})
+        case["metrics"]["successful_requests"] = 8
+        self.assertEqual(value, parse_result_envelope(value).to_dict())
+        case["runs"] = 1
+        with self.assertRaisesRegex(ResultSchemaError, "runs"):
+            parse_result_envelope(value)
+        case["runs"] = 2
+        case["metrics"]["successful_requests"] = 4
+        with self.assertRaisesRegex(ResultSchemaError, "request outcomes"):
+            parse_result_envelope(value)
+
+    def test_failed_tpot_keeps_only_structured_search_diagnostics(self):
+        value = _decode_result()
+        case = value["cases"][0]
+        case["identity"]["batch_policy"] = {
+            "strategy": "target_tpot",
+            "max_size": 4,
+            "candidate_step": 4,
+            "target_tpot_ms": 10.0,
+        }
+        search = {
+            "target_tpot_ms": 10.0,
+            "max_size": 4,
+            "candidate_step": 4,
+            "outcome": "no_satisfying_candidate",
+            "best_batch_size": None,
+            "observations": [{"batch_size": 1, "outcome": "target_exceeded"}],
+        }
+        case.update(
+            status="target_tpot_not_met",
+            metrics=None,
+            errors=[
+                {
+                    "code": "target_tpot_not_met",
+                    "message": "no candidate",
+                    "details": {"search": search},
+                }
+            ],
+        )
+        value["status"] = "partial"
+        value["summary"].update(successful_cases=0, failed_cases=1)
+        self.assertEqual(value, parse_result_envelope(value).to_dict())
+        for key, bad in (
+            ("candidate_step", 0),
+            ("max_size", -1),
+            ("target_tpot_ms", float("nan")),
+            ("outcome", "unknown"),
+            ("best_batch_size", 4),
+            ("observations", [{"batch_size": 5, "outcome": "satisfied"}]),
+        ):
+            with self.subTest(key=key):
+                invalid = copy.deepcopy(value)
+                invalid["cases"][0]["errors"][0]["details"]["search"][key] = bad
+                with self.assertRaises(ResultSchemaError):
+                    parse_result_envelope(invalid)
+
+    def test_decode_profiling_status_and_manifest_are_validated(self):
+        for profile in (
+            {"status": "unknown", "manifest_path": None, "error": None},
+            {"status": "completed", "manifest_path": None, "error": None},
+            {"status": "failed", "manifest_path": "", "error": "timeout"},
+        ):
+            with self.subTest(profile=profile):
+                value = _decode_result()
+                value["cases"][0]["metrics"]["profiling"] = profile
+                with self.assertRaisesRegex(ResultSchemaError, "profiling"):
+                    parse_result_envelope(value)
+
+    def test_decode_v2_rejects_unknown_nested_fields(self):
+        for path in (
+            ("identity",),
+            ("identity", "batch_policy"),
+            ("identity", "profiling"),
+            ("metrics",),
+            ("metrics", "profiling"),
+        ):
+            with self.subTest(path=path):
+                value = _decode_result()
+                record = value["cases"][0]
+                for name in path:
+                    record = record[name]
+                record["extra"] = True
+                with self.assertRaisesRegex(ResultSchemaError, "extra"):
+                    parse_result_envelope(value)
+
+    def test_decode_summary_counts_match_performance_and_profile_outcomes(self):
+        for changes in (
+            {"successful_cases": 0, "failed_cases": 1},
+            {"profiling_failed_cases": 1},
+        ):
+            with self.subTest(changes=changes):
+                value = _decode_result()
+                value["summary"].update(changes)
+                with self.assertRaisesRegex(ResultSchemaError, "summary"):
+                    parse_result_envelope(value)
+
+    def test_decode_search_and_selected_shape_must_agree_with_policy(self):
+        value = _decode_result()
+        case = value["cases"][0]
+        case["identity"]["batch_policy"] = {
+            "strategy": "target_tpot",
+            "max_size": 4,
+            "candidate_step": 2,
+            "target_tpot_ms": 10.0,
+        }
+        case["metrics"]["search"] = {
+            "target_tpot_ms": 10.0,
+            "max_size": 4,
+            "candidate_step": 2,
+            "outcome": "found",
+            "best_batch_size": 4,
+            "observations": [{"batch_size": 4, "outcome": "satisfied"}],
+        }
+        self.assertEqual(value, parse_result_envelope(value).to_dict())
+        for key, bad in (
+            ("best_batch_size", 2),
+            ("candidate_step", 3),
+            ("max_size", 8),
+            ("target_tpot_ms", 9.0),
+            (
+                "observations",
+                [{"batch_size": 4, "outcome": "satisfied", "extra": True}],
+            ),
+            (
+                "observations",
+                [{"batch_size": 4, "outcome": "satisfied", "tpot_ms": None}],
+            ),
+            ("observations", [{"batch_size": 4, "outcome": "capacity_failed"}]),
+            ("observations", [{"batch_size": 4, "outcome": "satisfied"}] * 2),
+        ):
+            with self.subTest(key=key, bad=bad):
+                invalid = copy.deepcopy(value)
+                invalid["cases"][0]["metrics"]["search"][key] = bad
+                with self.assertRaises(ResultSchemaError):
+                    parse_result_envelope(invalid)
+        for key, bad in (
+            ("output_length", 20),
+            ("input_lengths", [64] * 4),
+            ("distribution", {"actual_sequence_lengths": [128] * 4}),
+        ):
+            with self.subTest(key=key):
+                invalid = copy.deepcopy(value)
+                invalid["cases"][0]["metrics"][key] = bad
+                with self.assertRaises(ResultSchemaError):
+                    parse_result_envelope(invalid)
+
+    def test_prefill_summary_retains_three_counts_and_v1_is_rejected(self):
+        value = _prefill_result()
+        value["summary"]["profiling_failed_cases"] = 0
+        with self.assertRaisesRegex(
+            ResultSchemaError, "summary.profiling_failed_cases"
+        ):
+            parse_result_envelope(value)
+        value = _prefill_result()
+        value["schema_version"] = 1
+        with self.assertRaisesRegex(ResultSchemaError, "schema_version"):
+            parse_result_envelope(value)
+
     def test_prefill_envelope_round_trips_as_golden_schema(self):
         source = _prefill_result()
 

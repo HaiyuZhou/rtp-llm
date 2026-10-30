@@ -7,6 +7,12 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
+from rtp_llm.test.perf_test.decode.model import (
+    DecodeBatchConfig,
+    DecodeProfilingConfig,
+    FixedBatchConfig,
+    TargetTPOTConfig,
+)
 from rtp_llm.test.perf_test.errors import ConfigurationError
 
 SCHEMA_VERSION = 1
@@ -192,12 +198,12 @@ class PrefillWorkloadConfig:
 class DecodeGridWorkloadConfig:
     kind: str
     input_lengths: Tuple[int, ...]
-    output_length: int
-    batch_sizes: Tuple[int, ...]
+    output_lengths: Tuple[int, ...]
+    batch: DecodeBatchConfig
     measure_runs: int = 3
     warmup_runs: int = 1
-    target_tpot_ms: Optional[float] = None
     generate_config: Dict[str, Any] = field(default_factory=dict)
+    profiling: DecodeProfilingConfig = field(default_factory=DecodeProfilingConfig)
 
 
 @dataclass(frozen=True)
@@ -205,11 +211,11 @@ class DecodeDistributionWorkloadConfig:
     kind: str
     distribution_file: str
     output_length: int
-    batch_sizes: Tuple[int, ...]
+    batch: DecodeBatchConfig
     measure_runs: int = 3
     warmup_runs: int = 1
-    target_tpot_ms: Optional[float] = None
     generate_config: Dict[str, Any] = field(default_factory=dict)
+    profiling: DecodeProfilingConfig = field(default_factory=DecodeProfilingConfig)
 
 
 WorkloadConfig = Union[
@@ -413,26 +419,79 @@ def _parse_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
     )
 
 
+def _parse_decode_batch(value: Any) -> DecodeBatchConfig:
+    raw = _object("workload.batch", value)
+    strategy = _non_empty_string(
+        "workload.batch.strategy", _required("workload.batch", raw, "strategy")
+    )
+    if strategy == "fixed":
+        _reject_unknown("workload.batch", raw, {"strategy", "sizes"})
+        return FixedBatchConfig(
+            strategy="fixed",
+            sizes=_int_tuple(
+                "workload.batch.sizes", _required("workload.batch", raw, "sizes")
+            ),
+        )
+    if strategy == "target_tpot":
+        _reject_unknown(
+            "workload.batch",
+            raw,
+            {"strategy", "max_size", "candidate_step", "target_tpot_ms"},
+        )
+        return TargetTPOTConfig(
+            strategy="target_tpot",
+            max_size=_positive_int(
+                "workload.batch.max_size",
+                _required("workload.batch", raw, "max_size"),
+            ),
+            candidate_step=_positive_int(
+                "workload.batch.candidate_step",
+                _required("workload.batch", raw, "candidate_step"),
+            ),
+            target_tpot_ms=_positive_number(
+                "workload.batch.target_tpot_ms",
+                _required("workload.batch", raw, "target_tpot_ms"),
+            ),
+        )
+    raise ConfigError("workload.batch.strategy: expected one of: fixed, target_tpot")
+
+
+def _parse_decode_profiling(value: Any) -> DecodeProfilingConfig:
+    defaults = DecodeProfilingConfig()
+    if value is None:
+        return defaults
+    raw = _object("workload.profiling", value)
+    fields = {"enabled", "runs", "steps", "enable_all_ranks", "flush_timeout_seconds"}
+    _reject_unknown("workload.profiling", raw, fields)
+    return DecodeProfilingConfig(
+        enabled=_boolean(
+            "workload.profiling.enabled", raw.get("enabled", defaults.enabled)
+        ),
+        runs=_positive_int("workload.profiling.runs", raw.get("runs", defaults.runs)),
+        steps=_positive_int(
+            "workload.profiling.steps", raw.get("steps", defaults.steps)
+        ),
+        enable_all_ranks=_boolean(
+            "workload.profiling.enable_all_ranks",
+            raw.get("enable_all_ranks", defaults.enable_all_ranks),
+        ),
+        flush_timeout_seconds=_positive_int(
+            "workload.profiling.flush_timeout_seconds",
+            raw.get("flush_timeout_seconds", defaults.flush_timeout_seconds),
+        ),
+    )
+
+
 def _decode_common(raw: Mapping[str, Any]) -> Dict[str, Any]:
-    target = raw.get("target_tpot_ms")
     return {
-        "output_length": _positive_int(
-            "workload.output_length", _required("workload", raw, "output_length")
-        ),
-        "batch_sizes": _int_tuple(
-            "workload.batch_sizes", _required("workload", raw, "batch_sizes")
-        ),
+        "batch": _parse_decode_batch(_required("workload", raw, "batch")),
         "measure_runs": _positive_int(
             "workload.measure_runs", raw.get("measure_runs", 3)
         ),
         "warmup_runs": _non_negative_int(
             "workload.warmup_runs", raw.get("warmup_runs", 1)
         ),
-        "target_tpot_ms": (
-            None
-            if target is None
-            else _positive_number("workload.target_tpot_ms", target)
-        ),
+        "profiling": _parse_decode_profiling(raw.get("profiling")),
         "generate_config": _extension_map(
             "workload.generate_config",
             raw.get("generate_config", {}),
@@ -448,30 +507,37 @@ def _parse_workload(value: Any) -> WorkloadConfig:
         return _parse_prefill_workload(raw)
     common = {
         "kind",
-        "output_length",
-        "batch_sizes",
+        "batch",
         "measure_runs",
         "warmup_runs",
-        "target_tpot_ms",
+        "profiling",
         "generate_config",
     }
     if kind == "grid":
-        _reject_unknown("workload", raw, common | {"input_lengths"})
+        _reject_unknown("workload", raw, common | {"input_lengths", "output_lengths"})
         return DecodeGridWorkloadConfig(
             kind=kind,
             input_lengths=_int_tuple(
                 "workload.input_lengths",
                 _required("workload", raw, "input_lengths"),
             ),
+            output_lengths=_int_tuple(
+                "workload.output_lengths", _required("workload", raw, "output_lengths")
+            ),
             **_decode_common(raw),
         )
     if kind == "distribution":
-        _reject_unknown("workload", raw, common | {"distribution_file"})
+        _reject_unknown(
+            "workload", raw, common | {"distribution_file", "output_length"}
+        )
         return DecodeDistributionWorkloadConfig(
             kind=kind,
             distribution_file=_non_empty_string(
                 "workload.distribution_file",
                 _required("workload", raw, "distribution_file"),
+            ),
+            output_length=_positive_int(
+                "workload.output_length", _required("workload", raw, "output_length")
             ),
             **_decode_common(raw),
         )

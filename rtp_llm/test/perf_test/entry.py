@@ -19,8 +19,7 @@ from rtp_llm.test.perf_test.config_schema import (
     PrefillWorkloadConfig,
     parse_config,
 )
-from rtp_llm.test.perf_test.decode.distribution import plan_decode_distribution_cases
-from rtp_llm.test.perf_test.decode.planner import plan_decode_grid_cases
+from rtp_llm.test.perf_test.decode.planner import plan_decode_cases
 from rtp_llm.test.perf_test.dry_run import create_preview
 from rtp_llm.test.perf_test.errors import ConfigurationError, PerfTestError
 from rtp_llm.test.perf_test.orchestrator import Orchestrator
@@ -67,15 +66,14 @@ def _planned_cases(
         if not isinstance(workload, PrefillWorkloadConfig):
             raise ConfigurationError("--mode=prefill requires workload.kind=cache_grid")
         return plan_prefill_cases(workload, config.engine)
-    if isinstance(workload, DecodeGridWorkloadConfig):
-        return plan_decode_grid_cases(
-            workload, config.engine, dp_size=config.model.topology.dp
-        )
-    if isinstance(workload, DecodeDistributionWorkloadConfig):
-        return plan_decode_distribution_cases(
-            resolved.resolved_config["workload"],
+    if isinstance(
+        workload, (DecodeGridWorkloadConfig, DecodeDistributionWorkloadConfig)
+    ):
+        return plan_decode_cases(
+            workload,
             config.engine,
             dp_size=config.model.topology.dp,
+            resolved_workload=resolved.resolved_config["workload"],
         )
     raise ConfigurationError(
         "--mode=decode requires workload.kind=grid or distribution"

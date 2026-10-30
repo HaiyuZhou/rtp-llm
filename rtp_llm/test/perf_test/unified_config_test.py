@@ -9,6 +9,11 @@ from rtp_llm.test.perf_test.config_schema import (
     PrefillWorkloadConfig,
     parse_config,
 )
+from rtp_llm.test.perf_test.decode.model import (
+    DecodeProfilingConfig,
+    FixedBatchConfig,
+    TargetTPOTConfig,
+)
 
 
 def _base_config():
@@ -68,8 +73,8 @@ class UnifiedConfigTest(unittest.TestCase):
         payload["workload"] = {
             "kind": "grid",
             "input_lengths": [128, 256],
-            "output_length": 32,
-            "batch_sizes": [1, 4],
+            "output_lengths": [32],
+            "batch": {"strategy": "fixed", "sizes": [1, 4]},
             "generate_config": {
                 "top_k": 1,
                 "stop_words_list": [[1, 2]],
@@ -80,7 +85,7 @@ class UnifiedConfigTest(unittest.TestCase):
 
         self.assertIsInstance(config.workload, DecodeGridWorkloadConfig)
         self.assertEqual((128, 256), config.workload.input_lengths)
-        self.assertEqual(32, config.workload.output_length)
+        self.assertEqual((32,), config.workload.output_lengths)
         self.assertEqual({"reuse_cache": 1, "act_type": "BF16"}, config.engine.args)
         self.assertEqual({"TOKENIZERS_PARALLELISM": "false"}, config.engine.env)
         self.assertEqual(
@@ -94,8 +99,12 @@ class UnifiedConfigTest(unittest.TestCase):
             "kind": "distribution",
             "distribution_file": "workloads/requests.json",
             "output_length": 16,
-            "batch_sizes": [8],
-            "target_tpot_ms": 20.0,
+            "batch": {
+                "strategy": "target_tpot",
+                "max_size": 8,
+                "candidate_step": 2,
+                "target_tpot_ms": 20.0,
+            },
         }
         payload["execution"] = {
             "backend": "aone",
@@ -108,7 +117,16 @@ class UnifiedConfigTest(unittest.TestCase):
         config = parse_config(payload)
 
         self.assertEqual("distribution", config.workload.kind)
-        self.assertEqual(20.0, config.workload.target_tpot_ms)
+        self.assertEqual(
+            TargetTPOTConfig(
+                strategy="target_tpot",
+                max_size=8,
+                candidate_step=2,
+                target_tpot_ms=20.0,
+            ),
+            config.workload.batch,
+        )
+        self.assertEqual(DecodeProfilingConfig(), config.workload.profiling)
         self.assertIsInstance(config.execution, AOneExecutionConfig)
         self.assertEqual(4, config.execution.max_parallel)
         self.assertEqual(2, config.execution.shard_count)
@@ -168,17 +186,148 @@ class UnifiedConfigTest(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, path):
                     parse_config(payload)
 
-    def test_output_length_must_be_one_positive_scalar(self):
-        for value in ([8, 16], {"min": 8, "max": 16}, 0, True):
-            with self.subTest(value=value):
+    def test_decode_grid_uses_output_axis_and_fixed_batch_policy(self):
+        payload = _base_config()
+        payload["workload"] = {
+            "kind": "grid",
+            "input_lengths": [128, 256],
+            "output_lengths": [16, 64],
+            "batch": {"strategy": "fixed", "sizes": [1, 4]},
+            "profiling": {"enabled": True, "runs": 2, "steps": 3},
+            "generate_config": {"top_k": 1},
+        }
+        workload = parse_config(payload).workload
+        self.assertEqual((16, 64), workload.output_lengths)
+        self.assertEqual(
+            FixedBatchConfig(strategy="fixed", sizes=(1, 4)), workload.batch
+        )
+        self.assertEqual(
+            DecodeProfilingConfig(enabled=True, runs=2, steps=3), workload.profiling
+        )
+
+    def test_decode_batch_strategies_are_mutually_exclusive(self):
+        for batch, path in (
+            (
+                {
+                    "strategy": "target_tpot",
+                    "sizes": [4],
+                    "max_size": 16,
+                    "candidate_step": 4,
+                    "target_tpot_ms": 10.0,
+                },
+                "workload.batch.sizes",
+            ),
+            (
+                {"strategy": "fixed", "sizes": [4], "target_tpot_ms": 10.0},
+                "workload.batch.target_tpot_ms",
+            ),
+        ):
+            with self.subTest(path=path):
                 payload = _base_config()
                 payload["workload"] = {
                     "kind": "grid",
                     "input_lengths": [128],
+                    "output_lengths": [16],
+                    "batch": batch,
+                }
+                with self.assertRaisesRegex(ConfigError, path):
+                    parse_config(payload)
+
+    def test_fixed_scalar_and_distribution_array_outputs_are_rejected(self):
+        fixed = _base_config()
+        fixed["workload"] = {
+            "kind": "grid",
+            "input_lengths": [128],
+            "output_length": 16,
+            "batch": {"strategy": "fixed", "sizes": [1]},
+        }
+        distribution = copy.deepcopy(fixed)
+        distribution["workload"] = {
+            "kind": "distribution",
+            "distribution_file": "requests.json",
+            "output_lengths": [16],
+            "batch": {"strategy": "fixed", "sizes": [1]},
+        }
+        for payload, path in (
+            (fixed, "workload.output_length"),
+            (distribution, "workload.output_lengths"),
+        ):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ConfigError, path):
+                    parse_config(payload)
+
+    def test_distribution_output_length_must_be_one_positive_scalar(self):
+        for value in ([8, 16], {"min": 8, "max": 16}, 0, True):
+            with self.subTest(value=value):
+                payload = _base_config()
+                payload["workload"] = {
+                    "kind": "distribution",
+                    "distribution_file": "requests.json",
                     "output_length": value,
-                    "batch_sizes": [1],
+                    "batch": {"strategy": "fixed", "sizes": [1]},
                 }
                 with self.assertRaisesRegex(ConfigError, "workload.output_length"):
+                    parse_config(payload)
+
+    def test_decode_batch_and_profiling_fields_are_strictly_validated(self):
+        cases = [
+            ({"batch": {"strategy": "other"}}, "workload.batch.strategy"),
+            ({"batch": {"strategy": "fixed", "sizes": []}}, "workload.batch.sizes"),
+            ({"batch": {"strategy": "fixed", "sizes": [True]}}, "workload.batch.sizes"),
+            (
+                {"batch": {"strategy": "target_tpot", "max_size": 4}},
+                "workload.batch.candidate_step",
+            ),
+            ({"output_lengths": []}, "workload.output_lengths"),
+            ({"output_lengths": [0]}, "workload.output_lengths"),
+            ({"profiling": {"extra": 1}}, "workload.profiling.extra"),
+            ({"profiling": {"enabled": 1}}, "workload.profiling.enabled"),
+            ({"profiling": {"runs": 0}}, "workload.profiling.runs"),
+            ({"profiling": {"steps": True}}, "workload.profiling.steps"),
+            (
+                {"profiling": {"enable_all_ranks": 0}},
+                "workload.profiling.enable_all_ranks",
+            ),
+            (
+                {"profiling": {"flush_timeout_seconds": -1}},
+                "workload.profiling.flush_timeout_seconds",
+            ),
+        ]
+        for overrides, path in cases:
+            with self.subTest(path=path, overrides=overrides):
+                payload = _base_config()
+                payload["workload"] = {
+                    "kind": "grid",
+                    "input_lengths": [128],
+                    "output_lengths": [16],
+                    "batch": {"strategy": "fixed", "sizes": [1]},
+                    **overrides,
+                }
+                with self.assertRaisesRegex(ConfigError, path):
+                    parse_config(payload)
+
+    def test_target_tpot_parameters_require_positive_finite_values(self):
+        for field, value in (
+            ("max_size", 0),
+            ("candidate_step", True),
+            ("target_tpot_ms", 0),
+            ("target_tpot_ms", float("inf")),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = _base_config()
+                payload["workload"] = {
+                    "kind": "grid",
+                    "input_lengths": [128],
+                    "output_lengths": [16],
+                    "batch": {
+                        "strategy": "target_tpot",
+                        "max_size": 4,
+                        "candidate_step": 1,
+                        "target_tpot_ms": 10.0,
+                        field: value,
+                    },
+                }
+                with self.assertRaisesRegex(ConfigError, f"workload.batch.{field}"):
                     parse_config(payload)
 
     def test_interpolation_include_shell_and_secret_forms_are_rejected(self):

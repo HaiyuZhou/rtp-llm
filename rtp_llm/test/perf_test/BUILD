@@ -12,6 +12,7 @@ py_library(
         "decode/__init__.py",
         "decode/distribution.py",
         "decode/metrics.py",
+        "decode/model.py",
         "decode/planner.py",
         "decode/scheduler.py",
         "decode/tpot.py",
@@ -87,6 +88,7 @@ py_library(
         "decode/finalize.py",
         "decode/planner.py",
         "decode/metrics.py",
+        "decode/model.py",
         "decode/scheduler.py",
         "decode/tpot.py",
         "dry_run.py",
@@ -511,6 +513,12 @@ py_test(
     deps = [
         ":perf_test_lib",
     ],
+)
+
+py_test(
+    name = "decode_planner_test",
+    srcs = ["decode_planner_test.py"],
+    deps = [":perf_test_lib"],
 )
 
 py_test(

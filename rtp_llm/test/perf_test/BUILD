@@ -39,6 +39,7 @@ py_library(
         "decode/finalize.py",
         "decode/fixed.py",
         "decode/http_batch.py",
+        "decode/profiling.py",
         "decode/strategy.py",
         "decode/transport.py",
         "execution/defaults.py",
@@ -88,6 +89,7 @@ py_library(
         "decode/fixed.py",
         "decode/grid_runner.py",
         "decode/http_batch.py",
+        "decode/profiling.py",
         "decode/strategy.py",
         "decode/transport.py",
         "decode/distribution.py",
@@ -344,6 +346,12 @@ py_test(
 py_test(
     name = "decode_strategy_test",
     srcs = ["decode_strategy_test.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
+    name = "decode_profiling_test",
+    srcs = ["decode_profiling_test.py"],
     deps = [":perf_test_lib"],
 )
 

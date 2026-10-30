@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import copy
 import time
-from typing import Any, Callable, Dict, Mapping
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from rtp_llm.test.perf_test.config_schema import EngineConfig
 from rtp_llm.test.perf_test.decode.metrics import build_decode_case_result
 from rtp_llm.test.perf_test.decode.model import DecodeBatchMeasurement, DecodeCaseSpec
-from rtp_llm.test.perf_test.decode.scheduler import schedule_decode_requests
+from rtp_llm.test.perf_test.decode.profiling import DecodeProfiler
+from rtp_llm.test.perf_test.decode.scheduler import (
+    DecodeBatchSchedule,
+    schedule_decode_requests,
+)
 from rtp_llm.test.perf_test.decode.transport import DecodeHttpTransport
 from rtp_llm.test.perf_test.errors import PlanningError
 
@@ -32,7 +36,9 @@ class DecodeBatchExecutor:
         self._dp_size = dp_size
         self._monotonic = monotonic
 
-    def measure(self, case: DecodeCaseSpec, batch_size: int) -> DecodeBatchMeasurement:
+    def _prepare(
+        self, case: DecodeCaseSpec, batch_size: int
+    ) -> Tuple[Tuple[int, ...], DecodeBatchSchedule]:
         inputs = case.input_lengths[:batch_size]
         if len(inputs) != batch_size:
             raise DecodeCapacityError(
@@ -53,6 +59,10 @@ class DecodeBatchExecutor:
                     f"{sum(worker.input_lengths)} exceeds max_batch_tokens "
                     f"{self._engine.max_batch_tokens}"
                 )
+        return inputs, schedule
+
+    def measure(self, case: DecodeCaseSpec, batch_size: int) -> DecodeBatchMeasurement:
+        inputs, schedule = self._prepare(case, batch_size)
         self._transport.configure_scheduler(
             tuple(worker.to_dict() for worker in schedule.workers)
         )
@@ -93,13 +103,49 @@ class DecodeBatchExecutor:
             measurements=tuple(measurements),
         )
 
+    def profile(
+        self,
+        case: DecodeCaseSpec,
+        batch_size: int,
+        *,
+        trace_name: str,
+        steps: int,
+        enable_all_ranks: bool,
+    ) -> None:
+        inputs, schedule = self._prepare(case, batch_size)
+        self._transport.configure_scheduler(
+            tuple(worker.to_dict() for worker in schedule.workers)
+        )
+        self._transport.start_profile(
+            trace_name=trace_name, steps=steps, enable_all_ranks=enable_all_ranks
+        )
+        profile_config = copy.deepcopy(case.generate_config)
+        profile_config.update(
+            {
+                "gen_timeline": True,
+                "profile_step": steps,
+                "profile_trace_name": trace_name,
+            }
+        )
+        for _ in range(case.profiling.runs):
+            self._transport.run_round(
+                input_lengths=inputs,
+                output_length=case.output_length,
+                generate_config=profile_config,
+            )
+
 
 class DecodeCaseExecutor:
     def __init__(
-        self, batch_executor: DecodeBatchExecutor, *, topology: Mapping[str, int]
+        self,
+        batch_executor: DecodeBatchExecutor,
+        *,
+        topology: Mapping[str, int],
+        profiler: Optional[DecodeProfiler] = None,
     ):
         self._batch_executor = batch_executor
         self._topology = dict(topology)
+        self._profiler = profiler
 
     def execute(self, case: Mapping[str, Any]) -> Dict[str, Any]:
         # Strategies depend on DecodeCapacityError; resolve after module loading.
@@ -130,10 +176,19 @@ class DecodeCaseExecutor:
                 "metrics": None,
             }
         profiling = {"status": "disabled", "manifest_path": None, "error": None}
-        return build_decode_case_result(
+        result = build_decode_case_result(
             case,
             selected=outcome.selected,
             topology=self._topology,
             search=outcome.search,
             profiling=profiling,
         )
+        if result["status"] == "ok" and spec.profiling.enabled:
+            if self._profiler is None:
+                raise RuntimeError(
+                    "decode profiling is enabled but no profiler is configured"
+                )
+            result["metrics"]["profiling"] = copy.deepcopy(
+                self._profiler.profile(spec, outcome.selected.batch_size)
+            )
+        return result

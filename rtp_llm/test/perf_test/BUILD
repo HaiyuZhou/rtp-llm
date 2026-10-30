@@ -4,9 +4,12 @@ py_test(
     name = "decode_multi_node_analyzer_test",
     srcs = [
         "decode_multi_node_analyzer_test.py",
+        "errors.py",
         "multi_node/analyzer/batch_analyze.py",
         "multi_node/analyzer/merge_decode_results.py",
         "multi_node/analyzer/trace_analyze.py",
+        "results.py",
+        "state.py",
     ],
     data = glob(["multi_node/analyzer/configs/*.py"]),
 )

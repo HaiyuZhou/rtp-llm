@@ -506,7 +506,8 @@ def _parse_decode_metrics(path: str, value: Any) -> DecodeMetrics:
     )
 
 
-def _parse_case(index: int, mode: str, value: Any) -> CaseResult:
+def parse_case_result(index: int, mode: str, value: Any) -> CaseResult:
+    """Validate one case independently, allowing diagnostic consumers to isolate failures."""
     path = f"cases[{index}]"
     raw = _object(path, value)
     fields = {"case_id", "identity", "status", "runs", "errors", "metrics"}
@@ -706,7 +707,7 @@ def parse_result_envelope(value: Any) -> ResultEnvelope:
     if not isinstance(cases_value, list):
         raise ResultSchemaError("cases: expected an array")
     cases = tuple(
-        _parse_case(index, mode, item) for index, item in enumerate(cases_value)
+        parse_case_result(index, mode, item) for index, item in enumerate(cases_value)
     )
     if parsed_summary["planned_cases"] != len(cases):
         raise ResultSchemaError("summary.planned_cases: must equal case count")

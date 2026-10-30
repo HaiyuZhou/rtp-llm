@@ -8,7 +8,7 @@ from typing import Any, Dict, Mapping, Sequence
 from rtp_llm.test.perf_test.results import (
     RESULT_SCHEMA_VERSION,
     ResultSchemaError,
-    _parse_case,
+    parse_case_result,
 )
 
 
@@ -18,7 +18,7 @@ def _observation(index: int, result: Mapping[str, Any]) -> Dict[str, Any]:
     errors = copy.deepcopy(result.get("errors", []))
     valid = False
     try:
-        parsed = _parse_case(index, "decode", result)
+        parsed = parse_case_result(index, "decode", result)
         valid = parsed.status.value == "ok"
     except ResultSchemaError as error:
         if status == "ok":

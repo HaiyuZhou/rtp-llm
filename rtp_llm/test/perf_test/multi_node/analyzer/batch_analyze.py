@@ -111,7 +111,7 @@ def extract_dp_size_from_path(task_dir_name: str) -> int:
     从Task目录名中提取dp_size
     例如：Task_dp_size-8 -> 8
     """
-    match = re.search(r"dp_size-(\d+)", task_dir_name)
+    match = re.search(r"(?:^|_)dp_size-([1-9]\d*)(?=_|$)", task_dir_name)
     if match:
         return int(match.group(1))
     return None
@@ -129,7 +129,7 @@ class TraceConfig:
 def scan_trace_files(benchmark_dir: str) -> list:
     """Read completed profile manifests; filenames never supply workload shape."""
     configs = []
-    for task in sorted(Path(benchmark_dir).glob("Task_dp_size-*")):
+    for task in sorted(Path(benchmark_dir).glob("Task_*")):
         if not task.is_dir():
             continue
         dp_size = extract_dp_size_from_path(task.name)
@@ -177,12 +177,14 @@ def scan_trace_files(benchmark_dir: str) -> list:
                     if trace is None:
                         raise ValueError("no listed profile artifact is available")
                     configs.append(
-                        TraceConfig(dp_size, inputs[0], output, batch, str(trace))
+                        TraceConfig(
+                            dp_size, inputs[0], output, batch, str(trace.resolve())
+                        )
                     )
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     print(f"Skipping {path}: {error}")
     return sorted(
-        configs,
+        set(configs),
         key=lambda item: (
             item.dp_size,
             item.input_length,
@@ -989,7 +991,7 @@ def main():
     )
 
     parser.add_argument(
-        "benchmark_dir", help="Benchmark目录路径（包含Task_dp_size-*子目录）"
+        "benchmark_dir", help="Benchmark目录路径（包含名称中声明dp_size的Task_*子目录）"
     )
 
     parser.add_argument(

@@ -178,6 +178,172 @@ def _write_profile_manifest(
 
 
 class DecodeMultiNodeAnalyzerTest(unittest.TestCase):
+    def test_merger_isolates_malformed_envelopes_from_valid_files(self):
+        for malformed in (
+            [],
+            {"schema_version": 2, "mode": "decode"},
+            {**_decode_envelope_v2(), "cases": None},
+            {**_decode_envelope_v2(), "config_fingerprint": "invalid"},
+            {**_decode_envelope_v2(), "summary": {"planned_cases": -1}},
+        ):
+            with self.subTest(
+                malformed=malformed
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_collected_run(root)
+                bad_path = root / "Task_dp_size-1" / "results" / "result.json"
+                bad_path.parent.mkdir(parents=True)
+                bad_path.write_text(json.dumps(malformed))
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    try:
+                        rows = merge.merge_all_results(
+                            merge.scan_result_files(directory)
+                        )
+                    except (KeyError, TypeError, AttributeError) as error:
+                        self.fail(
+                            f"Malformed file must be diagnosed and isolated: {error}"
+                        )
+                self.assertEqual(1, sum(len(metrics) for _, metrics in rows))
+                self.assertIn(str(bad_path), output.getvalue())
+
+    def test_merger_isolates_invalid_cases_and_metric_values(self):
+        invalid_cases = [None, [], "invalid", {}, {"case_id": "invalid"}]
+        for field, invalid_values in (
+            ("successful_requests", (-1, True, "4", float("nan"))),
+            ("failed_requests", (-1, False, 0.5, float("inf"))),
+            ("global_batch_size", (-1, True, "4")),
+            ("output_length", (0, False, "16")),
+            (
+                "throughput_tokens_per_second",
+                (-1, True, "10", float("nan"), float("inf")),
+            ),
+            ("latency_ms", (None, [])),
+        ):
+            for invalid_value in invalid_values:
+                case = copy.deepcopy(_decode_envelope_v2()["cases"][0])
+                case["metrics"][field] = invalid_value
+                invalid_cases.append(case)
+        for field in ("wait", "prefill", "decode", "tpot", "total"):
+            for invalid_value in (-1, True, "1", float("nan"), float("inf")):
+                case = copy.deepcopy(_decode_envelope_v2()["cases"][0])
+                case["metrics"]["latency_ms"][field] = invalid_value
+                invalid_cases.append(case)
+        for case in invalid_cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                path = _write_collected_run(Path(directory))
+                envelope = _decode_envelope_v2()
+                envelope["cases"][0] = case
+                path.write_text(json.dumps(envelope))
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    try:
+                        rows = merge.merge_all_results(
+                            merge.scan_result_files(directory)
+                        )
+                    except (KeyError, TypeError, AttributeError) as error:
+                        self.fail(
+                            f"Invalid case must be diagnosed and isolated: {error}"
+                        )
+                metrics = [metric for _, group in rows for metric in group]
+                self.assertEqual(1, len(metrics))
+                self.assertEqual(8, metrics[0]["global_batch_size"])
+                self.assertIn("cases[0]", output.getvalue())
+
+    def test_merger_deduplicates_copied_run_identity_but_keeps_distinct_runs(self):
+        for same_run in (False, True):
+            with self.subTest(
+                same_run=same_run
+            ), tempfile.TemporaryDirectory() as directory:
+                path = _write_collected_run(Path(directory))
+                envelope = json.loads(path.read_text())
+                if not same_run:
+                    envelope["run_id"] = "another-run"
+                nested = path.parents[1] / "run" / "results" / "result.json"
+                nested.parent.mkdir(parents=True)
+                nested.write_text(json.dumps(envelope))
+                rows = merge.merge_all_results(merge.scan_result_files(directory))
+                self.assertEqual(
+                    1 if same_run else 2, sum(len(metrics) for _, metrics in rows)
+                )
+
+    def test_result_discovery_deduplicates_canonical_symlink_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_collected_run(Path(directory), nested=True)
+            task = path.parents[2]
+            (task / "results").symlink_to(path.parent, target_is_directory=True)
+            files = merge.scan_result_files(directory)
+            self.assertEqual(1, len(files))
+
+    def test_diagnostic_only_copy_does_not_hide_formal_metrics_in_another_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_collected_run(Path(directory))
+            envelope = json.loads(path.read_text())
+            nested = path.parents[1] / "run" / "results" / "result.json"
+            nested.parent.mkdir(parents=True)
+            nested.write_text(json.dumps(envelope))
+            envelope["status"] = "partial"
+            envelope["summary"].update(
+                successful_cases=0, failed_cases=1, profiling_failed_cases=0
+            )
+            envelope["cases"][0].update(
+                status="request_failed",
+                metrics=None,
+                errors=[{"code": "request_failed", "message": "interrupted"}],
+            )
+            path.write_text(json.dumps(envelope))
+            rows = merge.merge_all_results(merge.scan_result_files(directory))
+            self.assertEqual(1, sum(len(metrics) for _, metrics in rows))
+
+    def test_merger_diagnoses_outcome_summary_mismatch_without_losing_valid_cases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_collected_run(Path(directory))
+            envelope = json.loads(path.read_text())
+            envelope["summary"].update(
+                successful_cases=0, failed_cases=1, profiling_failed_cases=0
+            )
+            path.write_text(json.dumps(envelope))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                rows = merge.merge_all_results(merge.scan_result_files(directory))
+            self.assertEqual(1, sum(len(metrics) for _, metrics in rows))
+            self.assertIn("summary.successful_cases", output.getvalue())
+
+    def test_trace_scan_accepts_composite_task_name_and_rejects_invalid_dp(self):
+        for task_name, expected_dp in (
+            ("Task_hack_layer_num-4_dp_size-2", [2]),
+            ("Task_hack_layer_num-4_dp_size-0", []),
+            ("Task_hack_layer_num-4_dp_size-invalid", []),
+        ):
+            with self.subTest(
+                task=task_name
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = _write_profile_manifest(root)
+                manifest = json.loads(path.read_text())
+                old_task = root / "Task_dp_size-2"
+                new_task = root / task_name
+                old_task.rename(new_task)
+                moved = new_task / path.relative_to(old_task)
+                manifest["artifacts"] = [
+                    str(new_task / "trace_files" / Path(manifest["artifacts"][0]).name)
+                ]
+                moved.write_text(json.dumps(manifest))
+                configs = batch_analyze.scan_trace_files(directory)
+                self.assertEqual(expected_dp, [item.dp_size for item in configs])
+
+    def test_trace_scan_deduplicates_direct_and_nested_copies_of_one_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nested = _write_profile_manifest(root, nested=True)
+            direct = (
+                root / "Task_dp_size-2" / "profiles" / nested.parent.name / nested.name
+            )
+            direct.parent.mkdir(parents=True)
+            direct.write_text(nested.read_text())
+            configs = batch_analyze.scan_trace_files(directory)
+            self.assertEqual(1, len(configs))
+
     def test_result_merger_reads_standard_decode_envelope(self):
         for nested in (False, True):
             with self.subTest(
@@ -204,9 +370,28 @@ class DecodeMultiNodeAnalyzerTest(unittest.TestCase):
                 case_id="failed-case",
                 status="target_tpot_not_met",
                 metrics=None,
-                errors=[{"code": "target_tpot_not_met", "message": "no candidate"}],
+                errors=[
+                    {
+                        "code": "target_tpot_not_met",
+                        "message": "no candidate",
+                        "details": {
+                            "search": {
+                                "target_tpot_ms": 10.0,
+                                "max_size": 16,
+                                "candidate_step": 4,
+                                "outcome": "no_satisfying_candidate",
+                                "best_batch_size": None,
+                                "observations": [
+                                    {"batch_size": 8, "outcome": "target_exceeded"}
+                                ],
+                            }
+                        },
+                    }
+                ],
             )
             envelope["cases"].append(failed)
+            envelope["status"] = "partial"
+            envelope["summary"].update(planned_cases=2, failed_cases=1)
             path.write_text(json.dumps(envelope))
             output = io.StringIO()
             with redirect_stdout(output):
@@ -230,6 +415,8 @@ class DecodeMultiNodeAnalyzerTest(unittest.TestCase):
             value["cases"][0]["metrics"].update(
                 successful_requests=3, failed_requests=1
             )
+            value["status"] = "partial"
+            value["summary"].update(successful_cases=1, failed_cases=1)
             path.write_text(json.dumps(value))
             rows = merge.merge_all_results(merge.scan_result_files(directory))
             self.assertEqual(1, len(rows))

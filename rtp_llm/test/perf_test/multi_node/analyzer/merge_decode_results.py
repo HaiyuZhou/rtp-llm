@@ -7,6 +7,12 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from rtp_llm.test.perf_test.results import (
+    ResultSchemaError,
+    parse_case_result,
+    parse_result_envelope,
+)
+
 DECODE_FIELDS = [
     "input_length",
     "output_length",
@@ -38,12 +44,14 @@ def extract_task_params_from_path(task_dir_name: str) -> dict:
 
 def scan_result_files(benchmark_dir: str) -> list:
     result_files = []
+    seen_paths = set()
     for task in sorted(Path(benchmark_dir).glob("Task_*")):
         if not task.is_dir():
             continue
         for run in (task, task / "run"):
             path = run / "results" / "result.json"
-            if path.is_file():
+            if path.is_file() and path.resolve() not in seen_paths:
+                seen_paths.add(path.resolve())
                 result_files.append(
                     (extract_task_params_from_path(task.name), str(path))
                 )
@@ -66,18 +74,80 @@ def load_result_json(json_file: str) -> Optional[dict]:
         return None
 
 
+def _validate_envelope_header(envelope):
+    """Validate metadata and summary without rejecting unrelated valid cases."""
+    if not isinstance(envelope, dict):
+        raise ResultSchemaError("result: expected an object")
+    if (
+        type(envelope.get("schema_version")) is not int
+        or envelope.get("mode") != "decode"
+    ):
+        raise ResultSchemaError("expected a decode schema_version=2 envelope")
+    cases = envelope.get("cases")
+    if not isinstance(cases, list):
+        raise ResultSchemaError("cases: expected an array")
+    fields = {
+        "planned_cases",
+        "successful_cases",
+        "failed_cases",
+        "profiling_failed_cases",
+    }
+    summary = envelope.get("summary")
+    if not isinstance(summary, dict) or set(summary) != fields:
+        raise ResultSchemaError("summary: expected decode case counts")
+    for field, count in summary.items():
+        if type(count) is not int or count < 0:
+            raise ResultSchemaError(f"summary.{field}: expected a non-negative integer")
+    if (
+        summary["planned_cases"] != len(cases)
+        or summary["successful_cases"] + summary["failed_cases"] != len(cases)
+        or summary["profiling_failed_cases"] > summary["successful_cases"]
+    ):
+        raise ResultSchemaError("summary: case counts are inconsistent")
+    # Empty cases permit the shared parser to validate all metadata independently.
+    return parse_result_envelope(
+        {
+            **envelope,
+            "cases": [],
+            "summary": {field: 0 for field in fields},
+        }
+    )
+
+
 def merge_all_results(result_files: list) -> list:
     """Return (task parameters, normalized case rows); print excluded diagnostics."""
     merged = []
+    seen_cases = set()
     for params, path in result_files:
         envelope = load_result_json(path)
-        if not isinstance(envelope, dict):
+        try:
+            header = _validate_envelope_header(envelope)
+        except (ResultSchemaError, TypeError, OverflowError) as error:
+            print(f"Skipping {path}: {error}")
             continue
-        if envelope.get("schema_version") != 2 or envelope.get("mode") != "decode":
-            print(f"Skipping {path}: expected decode schema_version=2")
-            continue
+        try:
+            parse_result_envelope(envelope)
+        except (ResultSchemaError, TypeError, OverflowError) as error:
+            print(f"Diagnostic {path}: {error}; validating cases independently")
+        run_identity = (
+            tuple(sorted(params.items())),
+            header.run_id,
+            header.config_fingerprint,
+            header.workload_fingerprint,
+        )
         rows = []
-        for case in envelope["cases"]:
+        for index, value in enumerate(envelope["cases"]):
+            try:
+                case = parse_case_result(index, "decode", value).to_dict()
+            except (ResultSchemaError, TypeError, OverflowError) as error:
+                print(f"Skipping {path}: cases[{index}]: {error}")
+                continue
+            key = (run_identity, case["case_id"])
+            if key in seen_cases:
+                print(
+                    f"Skipping duplicate {path}: case={case['case_id']} run={header.run_id}"
+                )
+                continue
             metrics = case.get("metrics")
             if case.get("errors") or not metrics:
                 print(
@@ -86,6 +156,7 @@ def merge_all_results(result_files: list) -> list:
                 )
             if not metrics:
                 continue
+            seen_cases.add(key)
             profiling = metrics.get("profiling") or {}
             if profiling.get("status") == "failed":
                 print(

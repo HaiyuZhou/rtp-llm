@@ -129,6 +129,10 @@ class UnifiedLocalExecutor:
                 batch_executor,
                 run_root=Path(plan.result_directory),
                 log_path=session.log_path,
+                trace_directory=(
+                    config["engine"]["args"].get("torch_cuda_profiler_dir")
+                    or config["engine"]["env"].get("TORCH_CUDA_PROFILER_DIR")
+                ),
             )
             return DecodeCaseExecutor(
                 batch_executor,

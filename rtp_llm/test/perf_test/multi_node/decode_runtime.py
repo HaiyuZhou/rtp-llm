@@ -91,7 +91,13 @@ def execute_master_decode(
             dp_size=int(topology["dp"]),
         )
         profiler = DecodeProfiler(
-            batch_executor, run_root=root, log_path=server_log_path
+            batch_executor,
+            run_root=root,
+            log_path=server_log_path,
+            trace_directory=(
+                resolved["engine"]["args"].get("torch_cuda_profiler_dir")
+                or resolved["engine"]["env"].get("TORCH_CUDA_PROFILER_DIR")
+            ),
         )
         case_executor = DecodeCaseExecutor(
             batch_executor, topology=topology, profiler=profiler

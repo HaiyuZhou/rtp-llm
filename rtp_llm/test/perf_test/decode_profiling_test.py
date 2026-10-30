@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -84,6 +85,44 @@ def _measurement(batch, tpot=1.0):
 
 
 class DecodeProfilingTest(unittest.TestCase):
+    def test_profile_discovers_fresh_complete_trace_without_stdout_save_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "process.log"
+            log.write_text("server ready\n")
+            case = replace(
+                _exact_case(batch=1, profile=True),
+                profiling=DecodeProfilingConfig(enabled=True, flush_timeout_seconds=1),
+            )
+            name = f"decode_in128_out16_bs1_{case_id('decode', case.to_identity()).rsplit('-', 1)[-1]}"
+            stale = root / f"{name}_wr0_99.json"
+            stale.write_text(json.dumps({"traceEvents": []}))
+            fresh = root / f"{name}_wr0_1.json"
+            partial = root / f"{name}_wr0_2.json"
+
+            def export_trace(*_args, **_kwargs):
+                fresh.write_text(json.dumps({"traceEvents": [{"name": "kernel"}]}))
+                partial.write_text('{"traceEvents": [')
+
+            executor = Mock()
+            executor.profile.side_effect = export_trace
+            with patch.dict(os.environ, {"MAGA_SERVER_WORK_DIR": directory}):
+                profiler = DecodeProfiler(
+                    executor,
+                    run_root=root / "run",
+                    log_path=str(log),
+                    monotonic=Mock(side_effect=[0.0, 0.0, 2.0]),
+                    sleep=lambda _seconds: None,
+                )
+                manifest = profiler.profile(case, 1)
+            self.assertEqual("completed", manifest["status"])
+            retained = root / "run/traces" / fresh.name
+            self.assertEqual([str(retained.resolve())], manifest["artifacts"])
+            self.assertEqual(
+                json.loads(fresh.read_text()), json.loads(retained.read_text())
+            )
+            self.assertIsNone(manifest["error"])
+
     def test_tpot_profiles_only_selected_batch_after_search(self):
         with tempfile.TemporaryDirectory() as directory:
             trace = Path(directory) / "trace.json"

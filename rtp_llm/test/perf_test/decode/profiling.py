@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -41,6 +43,7 @@ class DecodeProfiler:
         *,
         run_root: Path,
         log_path: Optional[str],
+        trace_directory: Optional[Path] = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         artifact_discoverer: Callable[
@@ -50,9 +53,44 @@ class DecodeProfiler:
         self._batch_executor = batch_executor
         self._run_root = run_root
         self._log_path = log_path
+        work_directory = Path(os.environ.get("MAGA_SERVER_WORK_DIR", "."))
+        trace_directory = Path(
+            trace_directory or os.environ.get("TORCH_CUDA_PROFILER_DIR") or "."
+        )
+        self._trace_directory = (
+            trace_directory
+            if trace_directory.is_absolute()
+            else work_directory / trace_directory
+        )
         self._monotonic = monotonic
         self._sleep = sleep
         self._artifact_discoverer = artifact_discoverer
+
+    def _trace_files(self, trace_name: str) -> Dict[Path, Tuple[int, int]]:
+        files = {}
+        for path in self._trace_directory.glob(f"{trace_name}_wr[0-9]*_[0-9]*.json"):
+            try:
+                stat = path.stat()
+                files[path] = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                continue
+        return files
+
+    def _complete_new_traces(self, trace_name: str, before) -> Tuple[str, ...]:
+        artifacts = []
+        for path, signature in self._trace_files(trace_name).items():
+            if signature == before.get(path):
+                continue
+            try:
+                trace = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if isinstance(trace, dict) and isinstance(trace.get("traceEvents"), list):
+                retained = self._run_root / "traces" / path.name
+                retained.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(retained, trace)
+                artifacts.append(str(retained.resolve()))
+        return tuple(sorted(artifacts))
 
     def profile(self, case: DecodeCaseSpec, batch_size: int) -> Dict[str, Any]:
         identity = case.to_identity()
@@ -67,6 +105,7 @@ class DecodeProfiler:
         error_message = None
         artifacts: Tuple[str, ...] = ()
         try:
+            before_traces = self._trace_files(trace_name)
             log_offset = (
                 Path(self._log_path).stat().st_size
                 if self._log_path and Path(self._log_path).is_file()
@@ -84,6 +123,8 @@ class DecodeProfiler:
                 artifacts = self._artifact_discoverer(
                     self._log_path, log_offset, trace_name
                 )
+                if not artifacts:
+                    artifacts = self._complete_new_traces(trace_name, before_traces)
                 if artifacts:
                     break
                 self._sleep(0.2)

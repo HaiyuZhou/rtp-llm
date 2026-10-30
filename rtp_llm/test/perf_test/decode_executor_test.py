@@ -6,8 +6,14 @@ from rtp_llm.test.perf_test.config_schema import EngineConfig
 from rtp_llm.test.perf_test.decode.executor import (
     DecodeBatchExecutor,
     DecodeCapacityError,
+    DecodeCaseExecutor,
 )
-from rtp_llm.test.perf_test.decode.model import DecodeCaseSpec, ExactBatchPolicy
+from rtp_llm.test.perf_test.decode.model import (
+    DecodeBatchMeasurement,
+    DecodeCaseSpec,
+    ExactBatchPolicy,
+    TargetTPOTPolicy,
+)
 from rtp_llm.test.perf_test.errors import PlanningError
 
 
@@ -215,6 +221,101 @@ class DecodeBatchExecutorTest(unittest.TestCase):
         self.assertEqual([128], measurement.worker_allocations[0]["input_lengths"])
         self.assertEqual(
             1.0, measurement.measurements[0]["requests"][0]["latency_ms"]["tpot"]
+        )
+
+
+class DecodeCaseExecutorTest(unittest.TestCase):
+    def _executor(self, measure):
+        batch_executor = Mock()
+        batch_executor.measure.side_effect = measure
+        return DecodeCaseExecutor(
+            batch_executor, topology={"tp": 1, "dp": 1, "pp": 1, "ep": 1}
+        )
+
+    def _measure(self, spec, batch):
+        inputs = spec.input_lengths[:batch]
+        return DecodeBatchMeasurement(
+            batch_size=batch,
+            input_lengths=inputs,
+            worker_allocations=(),
+            measurements=tuple(
+                {
+                    "run": run,
+                    "throughput_tokens_per_second": 100.0,
+                    "requests": list(_request_round(inputs, spec.output_length)),
+                }
+                for run in range(spec.measure_runs)
+            ),
+        )
+
+    def test_case_executor_uses_one_path_for_grid_and_distribution(self):
+        executor = self._executor(self._measure)
+        grid = _exact_case(batch=2)
+        distribution = replace(
+            grid,
+            workload_kind="distribution",
+            input_lengths=(64, 192),
+            distribution={"source_kind": "sequence_lengths"},
+        )
+        fixed = executor.execute({"case_id": "grid", **grid.to_identity()})
+        result = executor.execute(
+            {"case_id": "distribution", **distribution.to_identity()}
+        )
+        self.assertEqual("ok", fixed["status"])
+        self.assertEqual("ok", result["status"])
+        self.assertIsNone(fixed["metrics"]["distribution"])
+        self.assertEqual(
+            [64, 192], result["metrics"]["distribution"]["actual_sequence_lengths"]
+        )
+        self.assertEqual(
+            {"status": "disabled", "manifest_path": None, "error": None},
+            result["metrics"]["profiling"],
+        )
+
+    def test_search_promotes_selected_rounds_without_rerun(self):
+        attempted = []
+
+        def measure(spec, batch):
+            attempted.append(batch)
+            selected = self._measure(spec, batch)
+            for run in selected.measurements:
+                run["throughput_tokens_per_second"] = float(batch * 100)
+                for request in run["requests"]:
+                    request["latency_ms"]["tpot"] = 8.0 if batch <= 8 else 12.0
+            return selected
+
+        spec = replace(
+            _exact_case(batch=16, runs=2),
+            batch_policy=TargetTPOTPolicy("target_tpot", 16, 4, 10.0),
+        )
+        payload = {"case_id": "search", **spec.to_identity()}
+        result = self._executor(measure).execute(payload)
+        self.assertEqual([8, 12], attempted)
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(8, result["metrics"]["global_batch_size"])
+        self.assertEqual(16, result["metrics"]["successful_requests"])
+        self.assertEqual(2, len(result["metrics"]["measurements"]))
+        self.assertEqual(800.0, result["metrics"]["throughput_tokens_per_second"])
+        self.assertEqual(16, result["identity"]["batch_policy"]["max_size"])
+        result["identity"]["input_lengths"][0] = 999
+        self.assertEqual(128, payload["input_lengths"][0])
+
+    def test_search_failure_keeps_trajectory_only_in_error_details(self):
+        spec = replace(
+            _exact_case(batch=8, runs=2),
+            batch_policy=TargetTPOTPolicy("target_tpot", 8, 4, 0.1),
+        )
+        result = self._executor(self._measure).execute(
+            {"case_id": "miss", **spec.to_identity()}
+        )
+        self.assertEqual("target_tpot_not_met", result["status"])
+        self.assertIsNone(result["metrics"])
+        self.assertEqual(2, result["runs"])
+        self.assertEqual("target_tpot_not_met", result["errors"][0]["code"])
+        search = result["errors"][0]["details"]["search"]
+        self.assertEqual("no_satisfying_candidate", search["outcome"])
+        self.assertEqual(
+            [4, 1], [item["batch_size"] for item in search["observations"]]
         )
 
 

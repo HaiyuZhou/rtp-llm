@@ -1,10 +1,16 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.decode.finalize import finalize_decode_run
 from rtp_llm.test.perf_test.decode.metrics import build_decode_case_result
+from rtp_llm.test.perf_test.decode.model import (
+    DecodeBatchMeasurement,
+    DecodeCaseSpec,
+    ExactBatchPolicy,
+)
 from rtp_llm.test.perf_test.decode.tpot import search_target_tpot
 from rtp_llm.test.perf_test.plan import build_execution_plan
 from rtp_llm.test.perf_test.results import parse_result_envelope
@@ -14,18 +20,25 @@ TOPOLOGY = {"tp": 2, "dp": 2, "pp": 1, "ep": 1}
 
 
 def _case():
-    return {
-        "case_id": "decode-case",
-        "workload_kind": "distribution",
-        "input_lengths": (64, 128),
-        "output_length": 4,
-        "global_batch_size": 2,
-        "measure_runs": 1,
-        "warmup_runs": 0,
-        "generate_config": {},
-        "target_tpot_ms": 10.0,
-        "distribution": {"source_kind": "sequence_lengths"},
-    }
+    spec = DecodeCaseSpec(
+        workload_kind="distribution",
+        input_lengths=(64, 128),
+        output_length=4,
+        batch_policy=ExactBatchPolicy("fixed", 2),
+        measure_runs=1,
+        warmup_runs=0,
+        distribution={"source_kind": "sequence_lengths"},
+    )
+    return {"case_id": "decode-case", **spec.to_identity()}
+
+
+def _selected(measurements=None):
+    return DecodeBatchMeasurement(
+        batch_size=2,
+        input_lengths=(64, 128),
+        worker_allocations=(),
+        measurements=tuple(_measurements() if measurements is None else measurements),
+    )
 
 
 def _request(index, input_length, *, success=True):
@@ -82,8 +95,8 @@ def _source():
         "workload": {
             "kind": "grid",
             "input_lengths": [64],
-            "output_length": 4,
-            "batch_sizes": [2],
+            "output_lengths": [4],
+            "batch": {"strategy": "fixed", "sizes": [2]},
         },
         "execution": {"backend": "local", "devices": [0, 1, 2, 3]},
         "output": {},
@@ -95,7 +108,7 @@ def _source():
 class DecodeMetricsTest(unittest.TestCase):
     def test_valid_and_partially_failed_batches_preserve_all_metrics(self):
         valid = build_decode_case_result(
-            _case(), measurements=_measurements(), topology=TOPOLOGY
+            _case(), selected=_selected(), topology=TOPOLOGY
         )
 
         self.assertEqual("ok", valid["status"])
@@ -108,7 +121,9 @@ class DecodeMetricsTest(unittest.TestCase):
         self.assertEqual(640.0, valid["metrics"]["throughput_tokens_per_second"])
 
         partial = build_decode_case_result(
-            _case(), measurements=_measurements(second_success=False), topology=TOPOLOGY
+            _case(),
+            selected=_selected(_measurements(second_success=False)),
+            topology=TOPOLOGY,
         )
 
         self.assertEqual("request_failed", partial["status"])
@@ -122,7 +137,7 @@ class DecodeMetricsTest(unittest.TestCase):
         shape = _measurements()
         shape[0]["requests"][1]["output_length"] = 5
         result = build_decode_case_result(
-            _case(), measurements=shape, topology=TOPOLOGY
+            _case(), selected=_selected(shape), topology=TOPOLOGY
         )
         self.assertEqual("invalid_shape", result["status"])
         self.assertIsNone(result["metrics"])
@@ -130,7 +145,7 @@ class DecodeMetricsTest(unittest.TestCase):
         timing = _measurements()
         timing[0]["requests"][0]["latency_ms"]["decode"] = -1.0
         result = build_decode_case_result(
-            _case(), measurements=timing, topology=TOPOLOGY
+            _case(), selected=_selected(timing), topology=TOPOLOGY
         )
         self.assertEqual("invalid_timing", result["status"])
         self.assertIsNone(result["metrics"])
@@ -158,13 +173,9 @@ class DecodeMetricsTest(unittest.TestCase):
             ).to_dict()
             result = build_decode_case_result(
                 case,
-                measurements=_measurements(),
+                selected=_selected(),
                 topology=TOPOLOGY,
                 search=search,
-                distribution={
-                    "source_kind": "sequence_lengths",
-                    "actual_sequence_lengths": [64, 128],
-                },
             )
             initialize_run_directory(
                 root,
@@ -197,6 +208,46 @@ class DecodeMetricsTest(unittest.TestCase):
             self.assertEqual(
                 "basic", __import__("json").loads(report.read_text())["report_kind"]
             )
+
+    def test_metrics_count_every_formal_round_and_use_selected_shape(self):
+        case = _case()
+        case["measure_runs"] = 2
+        case["input_lengths"] = [64, 128, 256, 512]
+        case["batch_policy"] = {
+            "strategy": "target_tpot",
+            "max_size": 4,
+            "candidate_step": 2,
+            "target_tpot_ms": 10.0,
+        }
+        measurements = _measurements() + _measurements(second_success=False)
+        measurements[1]["run"] = 1
+        selected = _selected(measurements)
+        result = build_decode_case_result(case, selected=selected, topology=TOPOLOGY)
+        self.assertEqual("request_failed", result["status"])
+        metrics = result["metrics"]
+        self.assertEqual(2, metrics["global_batch_size"])
+        self.assertEqual([64, 128], metrics["input_lengths"])
+        self.assertEqual(3, metrics["successful_requests"])
+        self.assertEqual(1, metrics["failed_requests"])
+        self.assertEqual(2, len(metrics["measurements"]))
+        self.assertEqual([64, 128], metrics["distribution"]["actual_sequence_lengths"])
+        measurements[0]["requests"][0]["latency_ms"]["tpot"] = 999.0
+        self.assertEqual(
+            2.0, metrics["measurements"][0]["requests"][0]["latency_ms"]["tpot"]
+        )
+
+    def test_selected_batch_and_every_request_shape_are_validated(self):
+        for selected in (
+            replace(_selected(), batch_size=3),
+            replace(_selected(), input_lengths=(64, 256)),
+            replace(_selected(), measurements=()),
+        ):
+            with self.subTest(selected=selected):
+                result = build_decode_case_result(
+                    _case(), selected=selected, topology=TOPOLOGY
+                )
+                self.assertEqual("invalid_shape", result["status"])
+                self.assertIsNone(result["metrics"])
 
 
 if __name__ == "__main__":

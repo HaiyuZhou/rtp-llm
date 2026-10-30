@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import copy
 import time
-from typing import Callable
+from typing import Any, Callable, Dict, Mapping
 
 from rtp_llm.test.perf_test.config_schema import EngineConfig
+from rtp_llm.test.perf_test.decode.metrics import build_decode_case_result
 from rtp_llm.test.perf_test.decode.model import DecodeBatchMeasurement, DecodeCaseSpec
 from rtp_llm.test.perf_test.decode.scheduler import schedule_decode_requests
 from rtp_llm.test.perf_test.decode.transport import DecodeHttpTransport
@@ -90,4 +91,49 @@ class DecodeBatchExecutor:
             input_lengths=inputs,
             worker_allocations=tuple(worker.to_dict() for worker in schedule.workers),
             measurements=tuple(measurements),
+        )
+
+
+class DecodeCaseExecutor:
+    def __init__(
+        self, batch_executor: DecodeBatchExecutor, *, topology: Mapping[str, int]
+    ):
+        self._batch_executor = batch_executor
+        self._topology = dict(topology)
+
+    def execute(self, case: Mapping[str, Any]) -> Dict[str, Any]:
+        # Strategies depend on DecodeCapacityError; resolve after module loading.
+        from rtp_llm.test.perf_test.decode.strategy import strategy_for
+
+        identity = {
+            name: copy.deepcopy(value)
+            for name, value in case.items()
+            if name != "case_id"
+        }
+        spec = DecodeCaseSpec.from_identity(identity)
+        outcome = strategy_for(spec.batch_policy).execute(
+            spec, self._batch_executor.measure
+        )
+        if outcome.selected is None:
+            return {
+                "case_id": case["case_id"],
+                "identity": identity,
+                "status": "target_tpot_not_met",
+                "runs": spec.measure_runs,
+                "errors": [
+                    {
+                        "code": outcome.error_code or "target_tpot_not_met",
+                        "message": "no candidate batch satisfied target_tpot_ms",
+                        "details": {"search": copy.deepcopy(outcome.search)},
+                    }
+                ],
+                "metrics": None,
+            }
+        profiling = {"status": "disabled", "manifest_path": None, "error": None}
+        return build_decode_case_result(
+            case,
+            selected=outcome.selected,
+            topology=self._topology,
+            search=outcome.search,
+            profiling=profiling,
         )

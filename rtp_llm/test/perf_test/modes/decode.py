@@ -1,4 +1,4 @@
-"""Decode mode adapter for fixed and distribution case runners."""
+"""Decode mode adapter for the shared case executor."""
 
 from __future__ import annotations
 
@@ -28,14 +28,14 @@ class DecodeAdapter:
     def __call__(self, context: ModeExecutionContext) -> ModeExecutionResult:
         if context.plan.mode != "decode":
             raise ValueError("DecodeAdapter requires a decode execution plan")
-        runner = self._runner_factory(context)
+        executor = self._runner_factory(context)
         results: List[Dict[str, Any]] = []
         statuses: Dict[str, str] = {}
         for planned_case in context.plan.cases:
             case = thaw(planned_case.identity)
             case["case_id"] = planned_case.case_id
             try:
-                result = runner.run_case(case)
+                result = executor.execute(case)
             except Exception as error:
                 result = self._request_failure(case, error)
             context.store.write_case(planned_case.case_id, result)

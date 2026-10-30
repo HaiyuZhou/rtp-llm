@@ -6,10 +6,14 @@ from unittest.mock import Mock
 
 from rtp_llm.test.perf_test.config_resolver import load_resolved_config
 from rtp_llm.test.perf_test.config_schema import parse_config
-from rtp_llm.test.perf_test.decode.distribution import (
-    DistributionDecodeCaseRunner,
-    plan_decode_distribution_cases,
+from rtp_llm.test.perf_test.decode.executor import DecodeCaseExecutor
+from rtp_llm.test.perf_test.decode.model import (
+    DecodeBatchMeasurement,
+    DecodeCaseSpec,
+    ExactBatchPolicy,
+    TargetTPOTPolicy,
 )
+from rtp_llm.test.perf_test.decode.planner import plan_decode_cases
 from rtp_llm.test.perf_test.errors import PlanningError
 
 
@@ -26,7 +30,7 @@ def _source(distribution_file="requests.json"):
             "kind": "distribution",
             "distribution_file": distribution_file,
             "output_length": 32,
-            "batch_sizes": [2, 3],
+            "batch": {"strategy": "fixed", "sizes": [2, 3]},
             "measure_runs": 2,
             "warmup_runs": 1,
             "generate_config": {"top_k": 1},
@@ -36,6 +40,41 @@ def _source(distribution_file="requests.json"):
         "regression": {},
         "publish": {},
     }
+
+
+def _executor(batch_runner):
+    def measure(spec, batch):
+        inputs = spec.input_lengths[:batch]
+        raw = batch_runner(
+            input_lengths=inputs,
+            output_length=spec.output_length,
+            measure_runs=spec.measure_runs,
+            worker_allocations=[],
+        )
+        return DecodeBatchMeasurement(batch, inputs, (), tuple(raw["measurements"]))
+
+    batch_executor = Mock()
+    batch_executor.measure.side_effect = measure
+    return DecodeCaseExecutor(
+        batch_executor, topology={"tp": 1, "dp": 1, "pp": 1, "ep": 1}
+    )
+
+
+def _payload(*, search=False):
+    spec = DecodeCaseSpec(
+        workload_kind="distribution",
+        input_lengths=(64, 128, 256, 512) if search else (64, 256),
+        output_length=32,
+        batch_policy=(
+            TargetTPOTPolicy("target_tpot", 4, 2, 10.0)
+            if search
+            else ExactBatchPolicy("fixed", 2)
+        ),
+        measure_runs=1 if search else 2,
+        warmup_runs=0,
+        distribution={"source_kind": "sequence_lengths"},
+    )
+    return {"case_id": "distribution", **spec.to_identity()}
 
 
 class DecodeDistributionTest(unittest.TestCase):
@@ -51,18 +90,24 @@ class DecodeDistributionTest(unittest.TestCase):
             resolved = load_resolved_config(config_path)
             parsed = parse_config(_source())
 
-            first = plan_decode_distribution_cases(
-                resolved.resolved_config["workload"], parsed.engine, dp_size=1
+            first = plan_decode_cases(
+                parsed.workload,
+                parsed.engine,
+                dp_size=1,
+                resolved_workload=resolved.resolved_config["workload"],
             )
-            second = plan_decode_distribution_cases(
-                resolved.resolved_config["workload"], parsed.engine, dp_size=1
+            second = plan_decode_cases(
+                parsed.workload,
+                parsed.engine,
+                dp_size=1,
+                resolved_workload=resolved.resolved_config["workload"],
             )
 
             self.assertEqual(first, second)
             self.assertEqual(
-                [(64, 128), (64, 128, 256)], [case["input_lengths"] for case in first]
+                [[64, 128], [64, 128, 256]], [case["input_lengths"] for case in first]
             )
-            self.assertEqual([2, 3], [case["global_batch_size"] for case in first])
+            self.assertEqual([2, 3], [case["batch_policy"]["size"] for case in first])
             self.assertEqual({32}, {case["output_length"] for case in first})
 
     def test_legacy_batch_map_is_sorted_and_validated_against_config(self):
@@ -75,10 +120,12 @@ class DecodeDistributionTest(unittest.TestCase):
         }
         workload.pop("distribution_file")
 
-        cases = plan_decode_distribution_cases(workload, parsed.engine, dp_size=1)
+        cases = plan_decode_cases(
+            parsed.workload, parsed.engine, dp_size=1, resolved_workload=workload
+        )
 
         self.assertEqual(
-            [(512, 1024), (64, 128, 256)], [case["input_lengths"] for case in cases]
+            [[512, 1024], [64, 128, 256]], [case["input_lengths"] for case in cases]
         )
 
     def test_malformed_empty_and_invalid_distributions_fail_planning(self):
@@ -101,9 +148,14 @@ class DecodeDistributionTest(unittest.TestCase):
                 }
                 workload.pop("distribution_file")
                 with self.assertRaises(PlanningError):
-                    plan_decode_distribution_cases(workload, parsed.engine, dp_size=1)
+                    plan_decode_cases(
+                        parsed.workload,
+                        parsed.engine,
+                        dp_size=1,
+                        resolved_workload=workload,
+                    )
 
-    def test_runner_preserves_actual_lengths_and_request_outcomes(self):
+    def test_executor_preserves_actual_lengths_and_request_outcomes(self):
         def execute(**kwargs):
             measurements = []
             for run in range(kwargs["measure_runs"]):
@@ -137,20 +189,7 @@ class DecodeDistributionTest(unittest.TestCase):
             return {"measurements": measurements}
 
         batch_runner = Mock(side_effect=execute)
-        case = {
-            "case_id": "decode-case",
-            "workload_kind": "distribution",
-            "input_lengths": (64, 256),
-            "output_length": 32,
-            "global_batch_size": 2,
-            "measure_runs": 2,
-            "warmup_runs": 1,
-            "generate_config": {"top_k": 1},
-            "target_tpot_ms": None,
-            "distribution": {"source_kind": "sequence_lengths"},
-        }
-
-        result = DistributionDecodeCaseRunner(batch_runner).run_case(case)
+        result = _executor(batch_runner).execute(_payload())
 
         self.assertEqual([64, 256], result["metrics"]["input_lengths"])
         self.assertEqual(
@@ -162,6 +201,11 @@ class DecodeDistributionTest(unittest.TestCase):
         )
         self.assertEqual((64, 256), batch_runner.call_args.kwargs["input_lengths"])
         self.assertEqual(32, batch_runner.call_args.kwargs["output_length"])
+        self.assertEqual(2, result["metrics"]["successful_requests"])
+        self.assertEqual(2, result["metrics"]["failed_requests"])
+        self.assertEqual(
+            [64, 256], result["metrics"]["distribution"]["actual_sequence_lengths"]
+        )
 
     def test_target_tpot_searches_distribution_prefix_batches(self):
         def execute(**kwargs):
@@ -195,24 +239,11 @@ class DecodeDistributionTest(unittest.TestCase):
             return {"measurements": measurements}
 
         batch_runner = Mock(side_effect=execute)
-        case = {
-            "case_id": "decode-distribution-tpot",
-            "workload_kind": "distribution",
-            "input_lengths": (64, 128, 256, 512),
-            "output_length": 32,
-            "global_batch_size": 4,
-            "measure_runs": 1,
-            "warmup_runs": 0,
-            "generate_config": {},
-            "target_tpot_ms": 10.0,
-            "distribution": {"source_kind": "sequence_lengths"},
-        }
-
-        result = DistributionDecodeCaseRunner(batch_runner).run_case(case)
+        result = _executor(batch_runner).execute(_payload(search=True))
 
         self.assertEqual(4, result["metrics"]["search"]["best_batch_size"])
         self.assertEqual(
-            [(64,), (64, 128, 256, 512)],
+            [(64, 128), (64, 128, 256, 512)],
             [call.kwargs["input_lengths"] for call in batch_runner.call_args_list],
         )
         self.assertEqual(

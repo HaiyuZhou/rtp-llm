@@ -121,3 +121,10 @@ class DecodeBatchMeasurement:
             "worker_allocations": copy.deepcopy(list(self.worker_allocations)),
             "measurements": copy.deepcopy(list(self.measurements)),
         }
+
+
+@dataclass(frozen=True)
+class DecodeStrategyOutcome:
+    selected: Optional[DecodeBatchMeasurement]
+    search: Optional[Dict[str, Any]]
+    error_code: Optional[str] = None

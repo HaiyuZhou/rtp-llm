@@ -5,9 +5,10 @@ from __future__ import annotations
 import copy
 import math
 import statistics
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
+from rtp_llm.test.perf_test.decode.model import DecodeBatchMeasurement
 from rtp_llm.test.perf_test.plan import freeze, thaw
 
 _LATENCIES = ("wait", "prefill", "decode", "tpot", "total")
@@ -53,14 +54,11 @@ def _failure(case: Mapping[str, Any], status: str, message: str) -> Dict[str, An
     }
 
 
-def _planned_lengths(case: Mapping[str, Any]) -> List[int]:
-    if case["workload_kind"] == "distribution":
-        lengths = list(case["input_lengths"])
-    else:
-        lengths = [int(case["input_length"])] * int(case["global_batch_size"])
-    if len(lengths) != int(case["global_batch_size"]):
+def _planned_lengths(selected: DecodeBatchMeasurement) -> List[int]:
+    lengths = list(selected.input_lengths)
+    if selected.batch_size <= 0 or len(lengths) != selected.batch_size:
         raise _MeasurementError(
-            "invalid_shape", "planned input lengths do not match global batch"
+            "invalid_shape", "selected input lengths do not match global batch"
         )
     return lengths
 
@@ -68,14 +66,15 @@ def _planned_lengths(case: Mapping[str, Any]) -> List[int]:
 def build_decode_case_result(
     case: Mapping[str, Any],
     *,
-    measurements: Sequence[Mapping[str, Any]],
+    selected: DecodeBatchMeasurement,
     topology: Mapping[str, int],
     search: Optional[Mapping[str, Any]] = None,
-    distribution: Optional[Mapping[str, Any]] = None,
+    profiling: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Validate raw runs and produce one common-schema decode case result."""
     try:
-        expected_lengths = _planned_lengths(case)
+        expected_lengths = _planned_lengths(selected)
+        measurements = selected.measurements
         expected_runs = int(case["measure_runs"])
         if (
             not isinstance(measurements, (list, tuple))
@@ -190,17 +189,13 @@ def build_decode_case_result(
     }
     distribution_details = None
     if case["workload_kind"] == "distribution":
-        distribution_details = copy.deepcopy(
-            dict(distribution or case.get("distribution", {}))
-        )
-        distribution_details.setdefault(
-            "actual_sequence_lengths", list(expected_lengths)
-        )
+        distribution_details = copy.deepcopy(dict(case.get("distribution") or {}))
+        distribution_details["actual_sequence_lengths"] = list(expected_lengths)
     metrics = {
         "workload_kind": case["workload_kind"],
         "input_lengths": list(expected_lengths),
         "output_length": int(case["output_length"]),
-        "global_batch_size": int(case["global_batch_size"]),
+        "global_batch_size": selected.batch_size,
         "topology": parsed_topology,
         "successful_requests": successful,
         "failed_requests": failed,
@@ -210,6 +205,8 @@ def build_decode_case_result(
         "search": None if search is None else copy.deepcopy(dict(search)),
         "distribution": distribution_details,
     }
+    if profiling is not None:
+        metrics["profiling"] = copy.deepcopy(dict(profiling))
     status = "ok" if failed == 0 else "request_failed"
     return {
         "case_id": case["case_id"],

@@ -26,15 +26,23 @@
       512,
       1024
     ],
-    "output_length": 128,
-    "batch_sizes": [
-      32
+    "output_lengths": [
+      64,
+      128
     ],
+    "batch": {
+      "strategy": "target_tpot",
+      "max_size": 32,
+      "candidate_step": 4,
+      "target_tpot_ms": 10.0
+    },
     "measure_runs": 5,
     "warmup_runs": 1,
-    "target_tpot_ms": 10.0,
     "generate_config": {
       "top_k": 1
+    },
+    "profiling": {
+      "enabled": false
     }
   },
   "execution": {

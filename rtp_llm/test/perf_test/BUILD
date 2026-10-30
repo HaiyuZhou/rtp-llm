@@ -383,7 +383,7 @@ py_test(
     name = "default_executor_test",
     srcs = ["default_executor_test.py"],
     deps = [
-        ":perf_test_lib",
+        ":perf_test_runtime_lib",
     ],
 )
 
@@ -612,7 +612,7 @@ py_test(
         "examples/decode_tpot_local.json",
     ],
     deps = [
-        ":perf_test_lib",
+        ":perf_test_entry_lib",
     ],
 )
 

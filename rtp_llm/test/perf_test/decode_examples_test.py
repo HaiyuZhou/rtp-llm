@@ -9,8 +9,7 @@ from rtp_llm.test.perf_test.capabilities import validate_capability
 from rtp_llm.test.perf_test.cli import parse_cli
 from rtp_llm.test.perf_test.config_resolver import load_resolved_config
 from rtp_llm.test.perf_test.config_schema import parse_config
-from rtp_llm.test.perf_test.decode.distribution import plan_decode_distribution_cases
-from rtp_llm.test.perf_test.decode.planner import plan_decode_grid_cases
+from rtp_llm.test.perf_test.decode.planner import plan_decode_cases
 from rtp_llm.test.perf_test.dry_run import create_preview
 from rtp_llm.test.perf_test.errors import CapabilityError
 from rtp_llm.test.perf_test.plan import build_execution_plan
@@ -37,17 +36,23 @@ class DecodeExamplesTest(unittest.TestCase):
             parsed = parse_config(source)
             resolved = load_resolved_config(config_path)
             dp_size = parsed.model.topology.dp
-            if parsed.workload.kind == "grid":
-                cases = plan_decode_grid_cases(
-                    parsed.workload, parsed.engine, dp_size=dp_size
-                )
-            else:
-                cases = plan_decode_distribution_cases(
-                    resolved.resolved_config["workload"],
-                    parsed.engine,
-                    dp_size=dp_size,
-                )
+            cases = plan_decode_cases(
+                parsed.workload,
+                parsed.engine,
+                dp_size=dp_size,
+                resolved_workload=resolved.resolved_config["workload"],
+            )
+            if parsed.workload.kind == "distribution":
                 self.assertIn("distribution", resolved.resolved_config["workload"])
+                self.assertEqual(2, len(cases))
+            else:
+                expected_count = len(parsed.workload.input_lengths) * len(
+                    parsed.workload.output_lengths
+                )
+                if parsed.workload.batch.strategy == "fixed":
+                    expected_count *= len(parsed.workload.batch.sizes)
+                self.assertEqual(expected_count, len(cases))
+                self.assertEqual(18 if index == 0 else 6, len(cases))
             plan = build_execution_plan(
                 mode="decode",
                 action="run",

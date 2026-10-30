@@ -23,14 +23,17 @@
     "kind": "distribution",
     "distribution_file": "decode_distribution_requests.json",
     "output_length": 64,
-    "batch_sizes": [
-      2,
-      5
-    ],
+    "batch": {
+      "strategy": "fixed",
+      "sizes": [2, 5]
+    },
     "measure_runs": 3,
     "warmup_runs": 1,
     "generate_config": {
       "top_k": 1
+    },
+    "profiling": {
+      "enabled": false
     }
   },
   "execution": {

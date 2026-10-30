@@ -59,15 +59,22 @@ class CapabilitiesTest(unittest.TestCase):
         start_engine = Mock()
         submit_job = Mock()
 
-        def admitted_operation():
-            validate_capability("decode", "run", "aone")
+        def admitted_operation(action, backend):
+            validate_capability("decode", action, backend)
             create_filesystem()
             build_target()
             start_engine()
             submit_job()
 
-        with self.assertRaises(CapabilityError):
-            admitted_operation()
+        for action, backend in (
+            ("resume", "local"),
+            ("profile", "local"),
+            ("report", "local"),
+            ("run", "aone"),
+        ):
+            with self.subTest(action=action, backend=backend):
+                with self.assertRaises(CapabilityError):
+                    admitted_operation(action, backend)
 
         create_filesystem.assert_not_called()
         build_target.assert_not_called()

@@ -7,10 +7,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Sequence
 
-from rtp_llm.test.perf_test.decode.distribution import DistributionDecodeCaseRunner
+from rtp_llm.test.perf_test.config_schema import EngineConfig
+from rtp_llm.test.perf_test.decode.executor import (
+    DecodeBatchExecutor,
+    DecodeCaseExecutor,
+)
 from rtp_llm.test.perf_test.decode.finalize import finalize_decode_run
-from rtp_llm.test.perf_test.decode.fixed import FixedDecodeCaseRunner
-from rtp_llm.test.perf_test.decode.http_batch import DecodeHttpBatchRunner
+from rtp_llm.test.perf_test.decode.profiling import DecodeProfiler
+from rtp_llm.test.perf_test.decode.transport import DecodeHttpTransport
 from rtp_llm.test.perf_test.execution.engine_session import EngineSession
 from rtp_llm.test.perf_test.execution.local import LocalExecutor
 from rtp_llm.test.perf_test.execution.runtime import create_maga_handle
@@ -29,6 +33,7 @@ from rtp_llm.test.perf_test.storage import RunStore
 SessionFactory = Callable[[ExecutionPlan], Any]
 TokenizerLoader = Callable[[ExecutionPlan], Any]
 QueryBuilder = Callable[[ExecutionPlan, Sequence[int]], Mapping[int, str]]
+DecodeBatchExecutorFactory = Callable[..., DecodeBatchExecutor]
 
 
 def _default_session_factory(plan: ExecutionPlan) -> EngineSession:
@@ -77,11 +82,13 @@ class UnifiedLocalExecutor:
         session_factory: SessionFactory = _default_session_factory,
         tokenizer_loader: TokenizerLoader = _default_tokenizer_loader,
         query_builder: QueryBuilder = _default_query_builder,
+        decode_batch_executor_factory: DecodeBatchExecutorFactory = DecodeBatchExecutor,
         selected_case_ids: Sequence[str] = (),
     ):
         self._session_factory = session_factory
         self._tokenizer_loader = tokenizer_loader
         self._query_builder = query_builder
+        self._decode_batch_executor_factory = decode_batch_executor_factory
         self._selected_case_ids = tuple(selected_case_ids)
 
     def _prefill_adapter(self, plan: ExecutionPlan) -> PrefillAdapter:
@@ -97,30 +104,39 @@ class UnifiedLocalExecutor:
 
     def _decode_adapter(self, plan: ExecutionPlan) -> DecodeAdapter:
         config = thaw(plan.resolved_config)
-        workload_kind = config["workload"]["kind"]
         topology = config["model"]["topology"]
-        input_lengths = []
-        for planned_case in plan.cases:
-            identity = thaw(planned_case.identity)
-            if workload_kind == "distribution":
-                input_lengths.extend(identity["input_lengths"])
-            else:
-                input_lengths.append(identity["input_length"])
-        prompts = self._query_builder(plan, input_lengths)
+        input_lengths = sorted(
+            {
+                int(length)
+                for planned_case in plan.cases
+                for length in thaw(planned_case.identity)["input_lengths"]
+            }
+        )
+        queries = self._query_builder(plan, input_lengths)
 
-        def runner_factory(context):
-            batch_runner = DecodeHttpBatchRunner(
-                context.session.client.port,
-                prompt_for_length=lambda length: prompts[length],
+        def executor_factory(context):
+            session = context.session
+            transport = DecodeHttpTransport(
+                endpoint=f"http://127.0.0.1:{session.client.port}",
+                prompt_for_length=lambda length: queries[length],
             )
-            runner_type = (
-                DistributionDecodeCaseRunner
-                if workload_kind == "distribution"
-                else FixedDecodeCaseRunner
+            batch_executor = self._decode_batch_executor_factory(
+                transport,
+                engine=EngineConfig(**config["engine"]),
+                dp_size=int(topology["dp"]),
             )
-            return runner_type(batch_runner, topology=topology)
+            profiler = DecodeProfiler(
+                batch_executor,
+                run_root=Path(plan.result_directory),
+                log_path=session.log_path,
+            )
+            return DecodeCaseExecutor(
+                batch_executor,
+                topology=topology,
+                profiler=profiler,
+            )
 
-        return DecodeAdapter(runner_factory)
+        return DecodeAdapter(executor_factory)
 
     def _execute_measurement(self, plan: ExecutionPlan):
         if plan.mode == "prefill":

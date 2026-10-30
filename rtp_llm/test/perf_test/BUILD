@@ -1,6 +1,17 @@
 package(default_visibility = ["//visibility:public"])
 
 py_test(
+    name = "decode_multi_node_analyzer_test",
+    srcs = [
+        "decode_multi_node_analyzer_test.py",
+        "multi_node/analyzer/batch_analyze.py",
+        "multi_node/analyzer/merge_decode_results.py",
+        "multi_node/analyzer/trace_analyze.py",
+    ],
+    data = glob(["multi_node/analyzer/configs/*.py"]),
+)
+
+py_test(
     name = "decode_multi_node_test",
     srcs = ["decode_multi_node_test.py"],
     data = [
@@ -27,7 +38,6 @@ py_library(
         "decode/model.py",
         "decode/planner.py",
         "decode/scheduler.py",
-        "decode/tpot.py",
         "dry_run.py",
         "entry.py",
         "errors.py",
@@ -49,8 +59,6 @@ py_library(
         "aone/package.py",
         "decode/executor.py",
         "decode/finalize.py",
-        "decode/fixed.py",
-        "decode/http_batch.py",
         "decode/profiling.py",
         "decode/report.py",
         "decode/strategy.py",
@@ -87,7 +95,6 @@ py_library(
 py_library(
     name = "perf_test_lib",
     srcs = [
-        "batch_perf_impl.py",
         "aone/package.py",
         "aone/collector.py",
         "aone/executor.py",
@@ -98,12 +105,8 @@ py_library(
         "cli.py",
         "config_resolver.py",
         "config_schema.py",
-        "dataclass.py",
         "dataset.py",
         "decode/executor.py",
-        "decode/fixed.py",
-        "decode/grid_runner.py",
-        "decode/http_batch.py",
         "decode/profiling.py",
         "decode/report.py",
         "decode/strategy.py",
@@ -114,7 +117,6 @@ py_library(
         "decode/metrics.py",
         "decode/model.py",
         "decode/scheduler.py",
-        "decode/tpot.py",
         "dry_run.py",
         "entry.py",
         "errors.py",
@@ -346,14 +348,6 @@ py_test(
 )
 
 py_test(
-    name = "decode_http_batch_test",
-    srcs = ["decode_http_batch_test.py"],
-    deps = [
-        ":perf_test_lib",
-    ],
-)
-
-py_test(
     name = "decode_transport_test",
     srcs = ["decode_transport_test.py"],
     deps = [":perf_test_lib"],
@@ -556,14 +550,6 @@ py_test(
 )
 
 py_test(
-    name = "decode_grid_api_test",
-    srcs = ["decode_grid_api_test.py"],
-    deps = [
-        ":perf_test_lib",
-    ],
-)
-
-py_test(
     name = "decode_planner_test",
     srcs = ["decode_planner_test.py"],
     deps = [":perf_test_lib"],
@@ -588,14 +574,6 @@ py_test(
 py_test(
     name = "decode_scheduler_test",
     srcs = ["decode_scheduler_test.py"],
-    deps = [
-        ":perf_test_lib",
-    ],
-)
-
-py_test(
-    name = "decode_tpot_test",
-    srcs = ["decode_tpot_test.py"],
     deps = [
         ":perf_test_lib",
     ],

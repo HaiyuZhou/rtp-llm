@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.config_resolver import resolve_config
+from rtp_llm.test.perf_test.decode.model import DecodeCaseSpec, ExactBatchPolicy
 from rtp_llm.test.perf_test.errors import CaseExecutionError, EngineLifecycleError
 from rtp_llm.test.perf_test.execution.engine_session import EngineDiagnostics
 from rtp_llm.test.perf_test.execution.local import LocalExecutor
@@ -24,8 +25,8 @@ def _config(mode):
         workload = {
             "kind": "grid",
             "input_lengths": [128],
-            "output_length": 16,
-            "batch_sizes": [1],
+            "output_lengths": [16],
+            "batch": {"strategy": "fixed", "sizes": [1]},
         }
     return {
         "schema_version": 1,
@@ -46,7 +47,14 @@ def _config(mode):
 def _plan(mode):
     identity = {"input_len": 512, "cache_len": 0, "batch_size": 1}
     if mode == "decode":
-        identity = {"input_len": 128, "output_len": 16, "batch_size": 1}
+        identity = DecodeCaseSpec(
+            workload_kind="grid",
+            input_lengths=(128,),
+            output_length=16,
+            batch_policy=ExactBatchPolicy("fixed", 1),
+            measure_runs=1,
+            warmup_runs=0,
+        ).to_identity()
     return build_execution_plan(
         mode=mode,
         action="run",

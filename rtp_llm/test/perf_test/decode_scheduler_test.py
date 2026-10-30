@@ -1,7 +1,12 @@
 import unittest
 from unittest.mock import Mock
 
-from rtp_llm.test.perf_test.decode.fixed import FixedDecodeCaseRunner
+from rtp_llm.test.perf_test.config_schema import EngineConfig
+from rtp_llm.test.perf_test.decode.executor import (
+    DecodeBatchExecutor,
+    DecodeCaseExecutor,
+)
+from rtp_llm.test.perf_test.decode.model import DecodeCaseSpec, ExactBatchPolicy
 from rtp_llm.test.perf_test.decode.scheduler import schedule_decode_requests
 
 
@@ -31,53 +36,45 @@ class DecodeSchedulerTest(unittest.TestCase):
                 self.assertEqual(list(range(global_batch)), indices)
                 self.assertEqual(len(indices), len(set(indices)))
 
-    def test_fixed_runner_reports_global_batch_topology_and_worker_allocation(self):
-        def execute(**kwargs):
-            return {
-                "measurements": [
-                    {
-                        "run": 0,
-                        "throughput_tokens_per_second": 1000.0,
-                        "worker_allocations": kwargs["worker_allocations"],
-                        "requests": [
-                            {
-                                "request_index": index,
-                                "success": True,
-                                "input_length": input_length,
-                                "output_length": kwargs["output_length"],
-                                "latency_ms": {
-                                    "wait": 1.0,
-                                    "prefill": 2.0,
-                                    "decode": 3.0,
-                                    "tpot": 0.1,
-                                    "total": 5.0,
-                                },
-                            }
-                            for index, input_length in enumerate(
-                                kwargs["input_lengths"]
-                            )
-                        ],
-                    }
-                ]
+    def test_executor_reports_global_batch_topology_and_worker_allocation(self):
+        transport = Mock()
+        transport.run_round.return_value = tuple(
+            {
+                "request_index": index,
+                "success": True,
+                "input_length": 128,
+                "output_length": 32,
+                "latency_ms": {
+                    "wait": 1.0,
+                    "prefill": 2.0,
+                    "decode": 3.0,
+                    "tpot": 0.1,
+                    "total": 5.0,
+                },
             }
-
-        batch_runner = Mock(side_effect=execute)
+            for index in range(5)
+        )
         topology = {"tp": 2, "dp": 2, "pp": 1, "ep": 1}
-        case = {
-            "case_id": "decode-case",
-            "workload_kind": "grid",
-            "input_length": 128,
-            "output_length": 32,
-            "global_batch_size": 5,
-            "measure_runs": 1,
-            "warmup_runs": 0,
-            "generate_config": {},
-            "target_tpot_ms": None,
-        }
+        case = DecodeCaseSpec(
+            workload_kind="grid",
+            input_lengths=(128,) * 5,
+            output_length=32,
+            batch_policy=ExactBatchPolicy("fixed", 5),
+            measure_runs=1,
+            warmup_runs=0,
+        )
+        batch_executor = DecodeBatchExecutor(
+            transport,
+            engine=EngineConfig(
+                max_seq_len=512, max_batch_tokens=512, concurrency_limit=3
+            ),
+            dp_size=2,
+        )
+        result = DecodeCaseExecutor(batch_executor, topology=topology).execute(
+            {"case_id": "decode-case", **case.to_identity()}
+        )
 
-        result = FixedDecodeCaseRunner(batch_runner, topology=topology).run_case(case)
-
-        self.assertEqual(5, result["identity"]["global_batch_size"])
+        self.assertEqual(5, len(result["identity"]["input_lengths"]))
         self.assertEqual(5, result["metrics"]["global_batch_size"])
         self.assertEqual(topology, result["metrics"]["topology"])
         self.assertEqual(
@@ -87,12 +84,12 @@ class DecodeSchedulerTest(unittest.TestCase):
                 for worker in result["metrics"]["measurements"][0]["worker_allocations"]
             ],
         )
-        self.assertEqual(5, batch_runner.call_args.kwargs["global_batch_size"])
+        self.assertEqual(5, len(transport.run_round.call_args.kwargs["input_lengths"]))
         self.assertEqual(
             [3, 2],
             [
                 worker["local_batch_size"]
-                for worker in batch_runner.call_args.kwargs["worker_allocations"]
+                for worker in transport.configure_scheduler.call_args.args[0]
             ],
         )
 

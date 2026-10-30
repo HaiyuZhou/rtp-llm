@@ -122,6 +122,7 @@ def _persist_run(plan, source, root, state, run_id):
                 endpoint="http://test",
                 prompt_for_length=str,
                 server_log_path=None,
+                profiler_directory=root / "traces",
             )
 
 
@@ -947,6 +948,7 @@ class DecodeMultiNodeTest(unittest.TestCase):
                     endpoint="http://external:12333",
                     prompt_for_length=lambda length: f"prompt-{length}",
                     server_log_path=str(log),
+                    profiler_directory=root / "traces",
                 )
             run = root / "run"
             self.assertEqual(RunState.COMPLETED, result.state)
@@ -1008,6 +1010,7 @@ class DecodeMultiNodeTest(unittest.TestCase):
                             endpoint="http://external",
                             prompt_for_length=str,
                             server_log_path=None,
+                            profiler_directory=root / "traces",
                         )
             self.assertEqual(
                 "failed", json.loads((root / "run/manifest.json").read_text())["state"]

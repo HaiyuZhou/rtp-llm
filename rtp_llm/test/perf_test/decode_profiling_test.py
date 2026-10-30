@@ -123,6 +123,35 @@ class DecodeProfilingTest(unittest.TestCase):
             )
             self.assertIsNone(manifest["error"])
 
+    def test_profile_uses_test_undeclared_outputs_as_default_work_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = replace(
+                _exact_case(batch=1, profile=True),
+                profiling=DecodeProfilingConfig(enabled=True, flush_timeout_seconds=1),
+            )
+            name = f"decode_in128_out16_bs1_{case_id('decode', case.to_identity()).rsplit('-', 1)[-1]}"
+            trace = root / f"{name}_wr0_1.json"
+            payload = {"traceEvents": [{"name": "kernel"}]}
+            executor = Mock()
+            executor.profile.side_effect = lambda *_args, **_kwargs: trace.write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            with patch.dict(
+                os.environ, {"TEST_UNDECLARED_OUTPUTS_DIR": directory}, clear=True
+            ):
+                manifest = DecodeProfiler(
+                    executor,
+                    run_root=root / "run",
+                    log_path=None,
+                    monotonic=Mock(side_effect=[0.0, 0.0, 2.0]),
+                    sleep=lambda _seconds: None,
+                ).profile(case, 1)
+            retained = root / "run/traces" / trace.name
+            self.assertEqual("completed", manifest["status"])
+            self.assertEqual([str(retained.resolve())], manifest["artifacts"])
+            self.assertEqual(payload, json.loads(retained.read_text(encoding="utf-8")))
+
     def test_tpot_profiles_only_selected_batch_after_search(self):
         with tempfile.TemporaryDirectory() as directory:
             trace = Path(directory) / "trace.json"

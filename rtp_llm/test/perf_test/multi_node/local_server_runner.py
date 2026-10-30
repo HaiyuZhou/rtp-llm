@@ -142,6 +142,7 @@ if __name__ == "__main__":
     run_id = os.environ.setdefault("PERF_TEST_RUN_ID", f"decode-{time.time_ns()}")
     log_dir_name = f"TEST_OUTPUT_{run_id}_{world_rank}"
     log_dir_path = os.path.abspath(log_dir_name)
+    runtime_profiler_directory = pathlib.Path(log_dir_path)
     parallelism = py_env_configs.parallelism_config
     plan, source = build_external_decode_plan(
         config_path,
@@ -162,7 +163,7 @@ if __name__ == "__main__":
     os.environ["MAX_BATCH_TOKENS_SIZE"] = str(engine["max_batch_tokens"])
     os.environ["CONCURRENCY_LIMIT"] = str(engine["concurrency_limit"])
     os.makedirs(log_dir_path, exist_ok=True)
-    os.environ["TORCH_CUDA_PROFILER_DIR"] = log_dir_path
+    os.environ["TORCH_CUDA_PROFILER_DIR"] = str(runtime_profiler_directory)
     # for maga server files
     os.environ["TEST_UNDECLARED_OUTPUTS_DIR"] = log_dir_path
     os.environ["MAGA_SERVER_WORK_DIR"] = os.getcwd()
@@ -202,6 +203,7 @@ if __name__ == "__main__":
                 endpoint=f"http://127.0.0.1:{port}",
                 prompt_for_length=lambda length: input_query_dict[length],
                 server_log_path=server.log_file_path,
+                profiler_directory=runtime_profiler_directory,
             ),
         )
         if result is not None:

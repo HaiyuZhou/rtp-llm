@@ -53,7 +53,12 @@ class DecodeProfiler:
         self._batch_executor = batch_executor
         self._run_root = run_root
         self._log_path = log_path
-        work_directory = Path(os.environ.get("MAGA_SERVER_WORK_DIR", "."))
+        work_directory = Path(
+            os.environ.get(
+                "MAGA_SERVER_WORK_DIR",
+                os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR", os.getcwd()),
+            )
+        )
         trace_directory = Path(
             trace_directory or os.environ.get("TORCH_CUDA_PROFILER_DIR") or "."
         )

@@ -63,7 +63,13 @@ def run_external_rank(*, world_rank, wait_for_master, execute_master):
 
 
 def execute_master_decode(
-    plan, *, source_config, endpoint, prompt_for_length, server_log_path
+    plan,
+    *,
+    source_config,
+    endpoint,
+    prompt_for_length,
+    server_log_path,
+    profiler_directory,
 ):
     """Execute and finalize a run while the caller owns server lifetime."""
     root = Path(plan.result_directory)
@@ -94,10 +100,7 @@ def execute_master_decode(
             batch_executor,
             run_root=root,
             log_path=server_log_path,
-            trace_directory=(
-                resolved["engine"]["args"].get("torch_cuda_profiler_dir")
-                or resolved["engine"]["env"].get("TORCH_CUDA_PROFILER_DIR")
-            ),
+            trace_directory=Path(profiler_directory),
         )
         case_executor = DecodeCaseExecutor(
             batch_executor, topology=topology, profiler=profiler

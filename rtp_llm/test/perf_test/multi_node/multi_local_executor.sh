@@ -6,9 +6,9 @@ enter_work_dir() {
   export SUB_DIR=${FT_SUB_DIR:-"."}
   export WORK_DIR=${FT_WORK_DIR:-${HIPPO_APP_WORKDIR:-$HOME}}/$SUB_DIR
   if [ ! -d "$WORK_DIR" ]; then
-    mkdir -p $WORK_DIR
+    mkdir -p "$WORK_DIR"
   fi
-  cd $WORK_DIR
+  cd "$WORK_DIR"
 }
 
 kill_processes() {
@@ -145,6 +145,14 @@ run_server() {
 }
 
 find_test_output_path() {
+  if [ -n "$PERF_TEST_RUN_ID" ]; then
+    TEST_OUTPUT_PATH=$(readlink -f -- "TEST_OUTPUT_${PERF_TEST_RUN_ID}_${WORLD_RANK:-0}") || return 1
+    if [ ! -d "$TEST_OUTPUT_PATH" ]; then
+      echo "No output directory for attempt ${PERF_TEST_RUN_ID}, rank ${WORLD_RANK:-0}" >&2
+      return 1
+    fi
+    return 0
+  fi
   # Get prefix of result directory
   TEST_OUTPUT_PATH_PREFIX="TEST_OUTPUT_"
   # Search for directories matching the prefix

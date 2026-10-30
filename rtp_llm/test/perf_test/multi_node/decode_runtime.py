@@ -67,7 +67,7 @@ def execute_master_decode(
 ):
     """Execute and finalize a run while the caller owns server lifetime."""
     root = Path(plan.result_directory)
-    run_id = root.name
+    run_id = os.environ.get("PERF_TEST_RUN_ID", root.name)
     initialize_run_directory(
         root,
         source_config=source_config,

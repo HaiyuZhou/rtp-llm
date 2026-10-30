@@ -24,7 +24,10 @@ if has_internal_source():
     configure_optional_env()
 
 from rtp_llm.config.py_config_modules import PyEnvConfigs
-from rtp_llm.config.server_config_setup import setup_and_configure_server
+from rtp_llm.config.server_config_setup import (
+    set_parallelism_config,
+    setup_and_configure_server,
+)
 from rtp_llm.distribute.distributed_server import members_from_test_env
 from rtp_llm.server.server_args.server_args import setup_args
 from rtp_llm.test.perf_test.multi_node.decode_runtime import (
@@ -130,14 +133,14 @@ if __name__ == "__main__":
     os.environ["FAKE_BALANCE_EXPERT"] = "1"
 
     py_env_configs: PyEnvConfigs = setup_args()
-    setup_and_configure_server(py_env_configs)
+    set_parallelism_config(
+        py_env_configs.parallelism_config,
+        py_prefill_cp_config=py_env_configs.prefill_cp_config,
+    )
     port = py_env_configs.server_config.start_port
     world_rank = py_env_configs.parallelism_config.world_rank
-    log_dir_name = (
-        f"test_output_{py_env_configs.model_args.model_type}_{py_env_configs.parallelism_config.dp_size}"
-        f"_{py_env_configs.parallelism_config.tp_size}_{py_env_configs.parallelism_config.world_rank}"
-        f"_{time.strftime('%Y%m%d_%H%M%S')}"
-    ).upper()
+    run_id = os.environ.setdefault("PERF_TEST_RUN_ID", f"decode-{time.time_ns()}")
+    log_dir_name = f"TEST_OUTPUT_{run_id}_{world_rank}"
     log_dir_path = os.path.abspath(log_dir_name)
     parallelism = py_env_configs.parallelism_config
     plan, source = build_external_decode_plan(
@@ -150,6 +153,7 @@ if __name__ == "__main__":
             "ep": parallelism.ep_size,
         },
     )
+    setup_and_configure_server(py_env_configs)
     input_len_list = sorted(
         {length for case in plan.cases for length in case.identity["input_lengths"]}
     )
@@ -202,7 +206,16 @@ if __name__ == "__main__":
         )
         if result is not None:
             print(
-                "PERF_TEST_DECODE_RESULT " + json.dumps({"state": result.state.value})
+                "PERF_TEST_DECODE_RESULT "
+                + json.dumps(
+                    {
+                        "state": result.state.value,
+                        "run_id": run_id,
+                        "world_rank": world_rank,
+                        "config_fingerprint": plan.config_fingerprint,
+                        "workload_fingerprint": plan.workload_fingerprint,
+                    }
+                )
             )
     finally:
         server.stop_server()

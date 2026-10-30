@@ -1,3 +1,4 @@
+import ast
 import copy
 import itertools
 import json
@@ -8,7 +9,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import yaml
@@ -16,7 +19,11 @@ import yaml
 from rtp_llm.test.perf_test.cli import CliRequest
 from rtp_llm.test.perf_test.decode.transport import DecodeHttpTransport
 from rtp_llm.test.perf_test.entry import build_request_plan
-from rtp_llm.test.perf_test.errors import ConfigurationError, PlanningError
+from rtp_llm.test.perf_test.errors import (
+    ConfigurationError,
+    PartialRunError,
+    PlanningError,
+)
 from rtp_llm.test.perf_test.multi_node import multi_benchmark
 from rtp_llm.test.perf_test.multi_node.decode_runtime import (
     build_external_decode_plan,
@@ -69,7 +76,291 @@ def _write_decode_config(root, *, dp=2):
 TOPOLOGY = {"tp": 1, "dp": 2, "pp": 1, "ep": 1}
 
 
+def _marker(plan, run_id, state):
+    return {
+        "state": state,
+        "run_id": run_id,
+        "world_rank": 0,
+        "config_fingerprint": plan.config_fingerprint,
+        "workload_fingerprint": plan.workload_fingerprint,
+    }
+
+
+def _persist_run(plan, source, root, state, run_id):
+    class Transport:
+        def configure_scheduler(self, _allocations):
+            pass
+
+        def run_round(self, *, input_lengths, output_length, **_kwargs):
+            return tuple(
+                {
+                    "request_index": index,
+                    "success": state == "completed",
+                    "input_length": length,
+                    "output_length": output_length,
+                    "error": "request failed",
+                    "latency_ms": {
+                        "wait": 1.0,
+                        "prefill": 2.0,
+                        "decode": 15.0,
+                        "tpot": 1.0,
+                        "total": 17.0,
+                    },
+                }
+                for index, length in enumerate(input_lengths)
+            )
+
+    plan = replace(plan, result_directory=str(root))
+    with patch.dict(os.environ, {"PERF_TEST_RUN_ID": run_id}):
+        with patch(
+            "rtp_llm.test.perf_test.multi_node.decode_runtime.DecodeHttpTransport",
+            return_value=Transport(),
+        ):
+            execute_master_decode(
+                plan,
+                source_config=source,
+                endpoint="http://test",
+                prompt_for_length=str,
+                server_log_path=None,
+            )
+
+
 class DecodeMultiNodeTest(unittest.TestCase):
+    def test_collection_selects_current_attempt_instead_of_newest_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "work with spaces/RTP-LLM/github-opensource"
+            current = repository / "TEST_OUTPUT_current_0"
+            stale = repository / "TEST_OUTPUT_stale_0"
+            current.mkdir(parents=True)
+            stale.mkdir()
+            os.utime(current, (1, 1))
+            os.utime(stale, (2, 2))
+            env = {
+                "PATH": os.environ["PATH"],
+                "FT_WORK_DIR": str(root),
+                "FT_SUB_DIR": "work with spaces",
+                "SUB_CMD": "copy",
+                "PERF_TEST_RUN_ID": "current",
+                "WORLD_RANK": "0",
+            }
+            script = Path(__file__).parent / "multi_node/multi_local_executor.sh"
+            completed = subprocess.run(
+                ["bash", str(script)], env=env, capture_output=True, text=True
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(str(current), completed.stdout.strip())
+            completed = subprocess.run(
+                ["bash", str(script)],
+                env={**env, "PERF_TEST_RUN_ID": "missing"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(0, completed.returncode)
+
+    def test_partial_benchmark_propagates_nonzero_launcher_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = {
+                "test_config": {"build_from_scratch": 0},
+                "build_config": {"ft_sub_dir": "perf"},
+                "benchmarks": [{"benchmark_name": "partial", "fixed_config": {}}],
+            }
+            with patch.multiple(
+                multi_benchmark,
+                get_args=lambda: SimpleNamespace(config="unused"),
+                load_config=lambda _path: config,
+                check_machine_and_build_config=lambda *_args: None,
+                ensure_test_output_dir=lambda: None,
+                ensure_experiment_output_dir=lambda _name: None,
+                setup_logging=lambda: "host.log",
+                multi_kill_script=lambda *_args, **_kwargs: None,
+                multi_clean_script=lambda *_args, **_kwargs: None,
+                experiment_output_dir=directory,
+                logger=logging.getLogger("decode-launcher-test"),
+            ):
+                with patch.object(multi_benchmark.time, "sleep"):
+                    with patch.object(
+                        multi_benchmark,
+                        "multi_test_script",
+                        side_effect=PartialRunError("target_tpot_not_met"),
+                    ):
+                        self.assertEqual(5, multi_benchmark.main())
+
+    def test_matching_marker_without_persisted_artifacts_fails_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = _write_decode_config(root)
+            plan, _source = build_external_decode_plan(path, "unused", TOPOLOGY)
+            task = {
+                "perf_test_config": str(path),
+                "tp_size": 1,
+                "dp_size": 2,
+                "ep_size": 1,
+                "ip_lists": "node0",
+                "run_user": "test",
+                "ssh_port": 2222,
+                "ft_sub_dir": "perf",
+                "sub_cmd": "test",
+            }
+            actions = []
+
+            def run(args, *, env, stdout, **_kwargs):
+                actions.append(env["SUB_CMD"])
+                if env["SUB_CMD"] == "test":
+                    stdout.write(
+                        "PERF_TEST_DECODE_RESULT "
+                        + json.dumps(
+                            _marker(plan, env["PERF_TEST_RUN_ID"], "completed")
+                        )
+                        + "\n"
+                    )
+                return subprocess.CompletedProcess(
+                    args, 7 if env["SUB_CMD"] == "test" else 0
+                )
+
+            with patch.object(
+                multi_benchmark, "logger", logging.getLogger("decode-launcher-test")
+            ):
+                with patch.object(multi_benchmark.subprocess, "run", side_effect=run):
+                    with self.assertRaisesRegex(RuntimeError, "persisted"):
+                        multi_benchmark.execute_task(task, str(root), {}, False, 0)
+            self.assertEqual(["test", "kill", "copy"], actions)
+
+    def test_completion_requires_current_master_and_persisted_matching_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, source = build_external_decode_plan(
+                _write_decode_config(root), str(root / "run"), TOPOLOGY
+            )
+            log = root / "log"
+            run_id = "current-attempt"
+            marker = _marker(plan, run_id, "completed")
+            for field, value in (
+                ("run_id", "stale"),
+                ("world_rank", 1),
+                ("config_fingerprint", "other"),
+                ("workload_fingerprint", "other"),
+            ):
+                log.write_text(
+                    "PERF_TEST_DECODE_RESULT "
+                    + json.dumps({**marker, field: value})
+                    + "\n"
+                )
+                self.assertIsNone(
+                    multi_benchmark.extract_decode_state(
+                        str(log), plan=plan, run_id=run_id
+                    )
+                )
+            log.write_text("PERF_TEST_DECODE_RESULT " + json.dumps(marker) + "\n")
+            self.assertEqual(
+                "completed",
+                multi_benchmark.extract_decode_state(
+                    str(log), plan=plan, run_id=run_id
+                ),
+            )
+            with self.assertRaisesRegex(RuntimeError, "persisted"):
+                multi_benchmark.verify_collected_decode_run(
+                    root / "run", plan=plan, run_id=run_id, state="completed"
+                )
+            _persist_run(plan, source, root / "run", "completed", run_id)
+            multi_benchmark.verify_collected_decode_run(
+                root / "run", plan=plan, run_id=run_id, state="completed"
+            )
+            for artifact, field, value in (
+                ("manifest.json", "run_id", "stale"),
+                ("results/result.json", "run_id", "stale"),
+                ("results/result.json", "config_fingerprint", "other"),
+                ("results/result.json", "status", "partial"),
+                ("manifest.json", None, []),
+            ):
+                path = root / "run" / artifact
+                original = path.read_text()
+                changed = json.loads(original)
+                if field is None:
+                    changed = value
+                else:
+                    changed[field] = value
+                path.write_text(json.dumps(changed))
+                with self.subTest(artifact=artifact, field=field):
+                    with self.assertRaisesRegex(RuntimeError, "persisted"):
+                        multi_benchmark.verify_collected_decode_run(
+                            root / "run", plan=plan, run_id=run_id, state="completed"
+                        )
+                path.write_text(original)
+
+    def test_runtime_topology_mismatch_precedes_model_setup_or_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = _write_decode_config(root)
+            parallelism = SimpleNamespace(
+                tp_size=1, dp_size=1, pp_size=1, ep_size=1, world_rank=0
+            )
+            configs = SimpleNamespace(
+                parallelism_config=parallelism,
+                prefill_cp_config=None,
+                server_config=SimpleNamespace(start_port=12333),
+                model_args=SimpleNamespace(model_type="registered"),
+            )
+            effects = []
+
+            def configure(_configs):
+                effects.append("model-download")
+                raise RuntimeError("model setup reached")
+
+            script = Path(__file__).parent / "multi_node/local_server_runner.py"
+            entry = ast.parse(script.read_text()).body[-1]
+            compiled = compile(
+                ast.Module(body=entry.body, type_ignores=[]), str(script), "exec"
+            )
+            namespace = dict(
+                os=os,
+                pathlib=__import__("pathlib"),
+                time=__import__("time"),
+                PyEnvConfigs=object,
+                setup_args=lambda: configs,
+                setup_and_configure_server=configure,
+                set_parallelism_config=lambda *_args, **_kwargs: effects.append(
+                    "topology"
+                ),
+                build_external_decode_plan=build_external_decode_plan,
+            )
+            with patch.dict(os.environ, {"PERF_TEST_CONFIG_PATH": str(path)}):
+                with self.assertRaisesRegex(PlanningError, "runtime topology"):
+                    exec(compiled, namespace)
+            self.assertEqual(["topology"], effects)
+            self.assertFalse(list(root.glob("TEST_OUTPUT*")))
+
+    def test_environment_newline_cannot_spoof_a_persisted_completed_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {
+                "perf_test_config": str(_write_decode_config(root)),
+                "tp_size": 1,
+                "dp_size": 2,
+                "ep_size": 1,
+                "ip_lists": "node0",
+                "run_user": "test",
+                "ssh_port": 2222,
+                "ft_sub_dir": "perf",
+                "sub_cmd": "test",
+                "injected": '\nPERF_TEST_DECODE_RESULT {"state":"completed"}\n',
+            }
+
+            def run(args, *, env, stdout, **_kwargs):
+                if env["SUB_CMD"] == "test":
+                    stdout.write(env["INJECTED"])
+                return subprocess.CompletedProcess(
+                    args, 7 if env["SUB_CMD"] == "test" else 0
+                )
+
+            with patch.object(
+                multi_benchmark, "logger", logging.getLogger("decode-launcher-test")
+            ):
+                with patch.object(multi_benchmark.subprocess, "run", side_effect=run):
+                    with self.assertRaisesRegex(RuntimeError, "did not finalize"):
+                        multi_benchmark.execute_task(task, str(root), {}, True, 0)
+            self.assertFalse((root / "Task_/run").exists())
+
     def test_launcher_does_not_accept_nonzero_without_persisted_run_marker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -150,22 +441,28 @@ class DecodeMultiNodeTest(unittest.TestCase):
                         # Rank delivery must read the frozen launch snapshot,
                         # even if the original user config changes meanwhile.
                         path.write_text("{}")
-                        delivered_plan, _ = build_external_decode_plan(
+                        delivered_plan, delivered_source = build_external_decode_plan(
                             env["PERF_TEST_CONFIG_PATH"], "unused", TOPOLOGY
                         )
-                        delivered.append(delivered_plan)
+                        delivered.append(
+                            (delivered_plan, delivered_source, env["PERF_TEST_RUN_ID"])
+                        )
                         stdout.write(
                             "PERF_TEST_DECODE_RESULT "
-                            + json.dumps({"state": state})
+                            + json.dumps(
+                                _marker(delivered_plan, env["PERF_TEST_RUN_ID"], state)
+                            )
                             + "\n"
                         )
                         code = 137
                     if action == "copy":
-                        result = (
-                            Path(env["TASK_OUTPUT_DIR"]) / "run/results/result.json"
+                        _persist_run(
+                            delivered[0][0],
+                            delivered[0][1],
+                            Path(env["TASK_OUTPUT_DIR"]) / "run",
+                            state,
+                            delivered[0][2],
                         )
-                        result.parent.mkdir(parents=True)
-                        result.write_text(json.dumps({"status": state}))
                     if check and code:
                         raise subprocess.CalledProcessError(code, args)
                     return subprocess.CompletedProcess(args, code)
@@ -176,14 +473,20 @@ class DecodeMultiNodeTest(unittest.TestCase):
                     with patch.object(
                         multi_benchmark.subprocess, "run", side_effect=run
                     ):
-                        multi_benchmark.execute_task(task, str(root), {}, True, 0)
+                        if state == "partial":
+                            with self.assertRaises(PartialRunError):
+                                multi_benchmark.execute_task(
+                                    task, str(root), {}, True, 0
+                                )
+                        else:
+                            multi_benchmark.execute_task(task, str(root), {}, True, 0)
                 self.assertEqual(["test", "kill", "copy", "clean"], actions)
                 self.assertEqual(
-                    expected.workload_fingerprint, delivered[0].workload_fingerprint
+                    expected.workload_fingerprint, delivered[0][0].workload_fingerprint
                 )
                 self.assertEqual(
                     [case.case_id for case in expected.cases],
-                    [case.case_id for case in delivered[0].cases],
+                    [case.case_id for case in delivered[0][0].cases],
                 )
                 self.assertEqual(
                     state,
@@ -321,17 +624,29 @@ class DecodeMultiNodeTest(unittest.TestCase):
 
     def test_launcher_reads_unified_completion_instead_of_legacy_table(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "test.log"
-            path.write_text(
-                'worker waiting\nPERF_TEST_DECODE_RESULT {"state":"completed"}\n'
+            root = Path(directory)
+            plan, _ = build_external_decode_plan(
+                _write_decode_config(root), "unused", TOPOLOGY
             )
-            self.assertEqual(
-                "completed", multi_benchmark.extract_decode_state(str(path))
-            )
-            path.write_text('PERF_TEST_DECODE_RESULT {"state":"partial"}\n')
-            self.assertEqual("partial", multi_benchmark.extract_decode_state(str(path)))
+            path = root / "test.log"
+            for state in ("completed", "partial"):
+                path.write_text(
+                    "worker waiting\nPERF_TEST_DECODE_RESULT "
+                    + json.dumps(_marker(plan, "attempt", state))
+                    + "\n"
+                )
+                self.assertEqual(
+                    state,
+                    multi_benchmark.extract_decode_state(
+                        str(path), plan=plan, run_id="attempt"
+                    ),
+                )
             path.write_text("PERF_TEST_DECODE_RESULT malformed\n")
-            self.assertIsNone(multi_benchmark.extract_decode_state(str(path)))
+            self.assertIsNone(
+                multi_benchmark.extract_decode_state(
+                    str(path), plan=plan, run_id="attempt"
+                )
+            )
 
     def test_test_launcher_rejects_missing_config_before_remote_commands(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -407,8 +722,8 @@ class DecodeMultiNodeTest(unittest.TestCase):
     def test_runner_collects_recursive_run_artifacts_and_separate_logs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            remote = root / "remote"
-            output = root / "output"
+            remote = root / "remote path"
+            output = root / "output path"
             for relative in (
                 "run/results/cases/a.json",
                 "run/reports/decode_report.json",
@@ -429,17 +744,27 @@ class DecodeMultiNodeTest(unittest.TestCase):
             bin_dir = root / "bin"
             bin_dir.mkdir()
             (bin_dir / "ssh").write_text(
-                f"#!{sys.executable}\nimport os\nprint(os.environ['FAKE_REMOTE_ROOT'])\n"
+                f"#!{sys.executable}\nimport os, pathlib, shlex, sys\n"
+                "command = shlex.split(sys.argv[-1])\n"
+                "if 'bash' in command:\n"
+                " if command[0] != 'env' or ('TASK_OUTPUT_DIR=' + os.environ['TASK_OUTPUT_DIR']) not in command: sys.exit(9)\n"
+                " if ('FT_SUB_DIR=' + os.environ['FT_SUB_DIR']) not in command: sys.exit(9)\n"
+                " print(os.environ['FAKE_REMOTE_ROOT'])\n"
+                "elif command[0] == 'find':\n"
+                " if os.environ.get('FAKE_FAIL_LIST') == '1': sys.exit(8)\n"
+                " if list(pathlib.Path(os.environ['FAKE_REMOTE_ROOT']).glob('normal_*')): print('x')\n"
+                "else: sys.exit(10)\n"
             )
             (bin_dir / "scp").write_text(
                 f"#!{sys.executable}\n"
-                "import glob, pathlib, shutil, sys\n"
+                "import glob, os, pathlib, shutil, sys\n"
                 "args = sys.argv[1:]\n"
                 "if '-P' in args:\n i = args.index('-P'); del args[i:i+2]\n"
                 "recursive = '-r' in args\n"
                 "args = [arg for arg in args if arg != '-r']\n"
                 "destination = pathlib.Path(args[-1])\n"
                 "for source in args[:-1]:\n"
+                " if os.environ.get('FAKE_FAIL_HOST', '') and source.startswith('test@' + os.environ['FAKE_FAIL_HOST'] + ':') and os.environ['FAKE_FAIL_ARTIFACT'] in source: sys.exit(7)\n"
                 " source = source.split(':', 1)[-1]\n"
                 " matches = glob.glob(source)\n"
                 " if not matches: sys.exit(1)\n"
@@ -460,6 +785,7 @@ class DecodeMultiNodeTest(unittest.TestCase):
                 SSH_PORT="2222",
                 TASK_OUTPUT_DIR=str(output),
                 FAKE_REMOTE_ROOT=str(remote),
+                FT_SUB_DIR="work with spaces",
             )
             script = Path(__file__).parent / "multi_node/multi_runner.sh"
             completed = subprocess.run(
@@ -479,6 +805,35 @@ class DecodeMultiNodeTest(unittest.TestCase):
             ):
                 self.assertTrue((output / relative).is_file(), relative)
             self.assertTrue(list((output / "process_logs").glob("process_*.log")))
+            for host, artifact in itertools.product(
+                ("node0", "node1"), ("process.log", "normal_*")
+            ):
+                with self.subTest(host=host, artifact=artifact):
+                    failed = subprocess.run(
+                        ["bash", str(script)],
+                        env={
+                            **env,
+                            "FAKE_FAIL_HOST": host,
+                            "FAKE_FAIL_ARTIFACT": artifact,
+                        },
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(0, failed.returncode)
+            failed = subprocess.run(
+                ["bash", str(script)],
+                env={**env, "FAKE_FAIL_LIST": "1"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(0, failed.returncode)
+            (remote / "normal_trace.json").unlink()
+            (remote / "normal_trace_dir/trace.json").unlink()
+            (remote / "normal_trace_dir").rmdir()
+            optional_absent = subprocess.run(
+                ["bash", str(script)], env=env, capture_output=True, text=True
+            )
+            self.assertEqual(0, optional_absent.returncode, optional_absent.stderr)
             (remote / "run/manifest.json").unlink()
             completed = subprocess.run(
                 ["bash", str(script)], env=env, capture_output=True, text=True

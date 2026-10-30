@@ -5,6 +5,8 @@ py_test(
     srcs = ["decode_multi_node_test.py"],
     data = [
         "multi_node/multi_benchmark_config.yaml",
+        "multi_node/local_server_runner.py",
+        "multi_node/multi_local_executor.sh",
         "multi_node/multi_runner.sh",
     ],
     deps = [":perf_test_runtime_lib"],

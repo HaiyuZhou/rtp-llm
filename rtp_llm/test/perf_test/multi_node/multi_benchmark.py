@@ -19,9 +19,14 @@ import yaml
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from rtp_llm.test.perf_test.errors import ConfigurationError
+from rtp_llm.test.perf_test.errors import (
+    ConfigurationError,
+    PartialRunError,
+    PerfTestError,
+)
 from rtp_llm.test.perf_test.multi_node.decode_runtime import build_external_decode_plan
 from rtp_llm.test.perf_test.plan import thaw
+from rtp_llm.test.perf_test.results import parse_result_envelope
 
 # Global variables
 logger = None
@@ -179,8 +184,8 @@ def log_stage(message: str, stage: str = ""):
         logger.info(f"{stage_marker} {message}")
 
 
-def extract_decode_state(log_file_path: str):
-    """Read the master's final state after standard artifacts were persisted."""
+def extract_decode_state(log_file_path: str, *, plan, run_id):
+    """Find this master's terminal marker; collected artifacts remain authoritative."""
     if not os.path.exists(log_file_path):
         return None
     state = None
@@ -192,12 +197,71 @@ def extract_decode_state(log_file_path: str):
                 value = json.loads(line.split(" ", 1)[1])
             except json.JSONDecodeError:
                 continue
-            if isinstance(value, dict) and value.get("state") in (
-                "completed",
-                "partial",
+            expected = {
+                "run_id": run_id,
+                "world_rank": 0,
+                "config_fingerprint": plan.config_fingerprint,
+                "workload_fingerprint": plan.workload_fingerprint,
+            }
+            if (
+                isinstance(value, dict)
+                and type(value.get("world_rank")) is int
+                and value.get("state") in ("completed", "partial")
+                and all(value.get(key) == item for key, item in expected.items())
             ):
                 state = value["state"]
     return state
+
+
+def verify_collected_decode_run(root, *, plan, run_id, state):
+    """Accept only terminal artifacts copied from this attempt's master path."""
+    root = Path(root)
+    try:
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        envelope = json.loads(
+            (root / "results/result.json").read_text(encoding="utf-8")
+        )
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest must contain an object")
+        parse_result_envelope(envelope)
+        expected = {
+            "run_id": run_id,
+            "mode": "decode",
+            "backend": "local",
+            "config_fingerprint": plan.config_fingerprint,
+            "workload_fingerprint": plan.workload_fingerprint,
+        }
+        if any(
+            manifest.get(key) != value or envelope.get(key) != value
+            for key, value in expected.items()
+        ):
+            raise ValueError("run identity or fingerprints differ")
+        if manifest.get("state") != state or envelope.get("status") != state:
+            raise ValueError("terminal states differ")
+        identities = {case.case_id: thaw(case.identity) for case in plan.cases}
+        cases = envelope["cases"]
+        if (
+            manifest.get("case_ids") != [case.case_id for case in plan.cases]
+            or len(cases) != len(identities)
+            or {case["case_id"]: case["identity"] for case in cases} != identities
+        ):
+            raise ValueError("persisted cases differ from the plan")
+        actual_state = (
+            "completed" if all(case["status"] == "ok" for case in cases) else "partial"
+        )
+        if actual_state != state:
+            raise ValueError("case statuses differ from terminal state")
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        KeyError,
+        PerfTestError,
+    ) as error:
+        raise RuntimeError(
+            f"persisted decode run verification failed: {error}"
+        ) from error
 
 
 def execute_task(
@@ -235,7 +299,6 @@ def execute_task(
     log_stage(f"Task Variable Dict: {variable_dict}", stage="TASK")
     # Convert task config to environment variables
     multi_runner_env = convert_to_env(task_config)
-    multi_runner_env["PERF_TEST_RUN_ID"] = uuid.uuid4().hex
     config_dir = Path(task_output_dir) / "config"
     config_dir.mkdir()
     if source["workload"]["kind"] == "distribution":
@@ -257,8 +320,9 @@ def execute_task(
         "./multi_runner.sh",
     ]
     # Retry test
-    test_success_flag = False
+    terminal_state = None
     for i in range(num_retry_times + 1):
+        multi_runner_env["PERF_TEST_RUN_ID"] = uuid.uuid4().hex
         # Run subprocess and redirect both stdout and stderr to file
         with open(task_test_output_path, "a", encoding="utf-8") as f:
             f.write(f"=== OUTPUT {i} ===\n")
@@ -270,7 +334,7 @@ def execute_task(
                 stderr=subprocess.STDOUT,
                 text=True,
                 # The existing server shutdown SIGKILLs its process group.
-                # Only the master's post-persistence marker proves completion.
+                # A bound marker triggers collection; persisted artifacts prove completion.
                 check=False,
             )
             f.write(f"\n\n=== Return Code: {result.returncode} ===\n")
@@ -285,10 +349,33 @@ def execute_task(
             kill_log_path=task_kill_output_path,
         )
         # A partial run still has diagnostic artifacts that must be collected.
-        state = extract_decode_state(task_test_output_path)
+        state = extract_decode_state(
+            task_test_output_path,
+            plan=plan,
+            run_id=multi_runner_env["PERF_TEST_RUN_ID"],
+        )
         if state:
+            multi_copy_script(
+                {
+                    "ip_lists": task_config["ip_lists"],
+                    "run_user": task_config["run_user"],
+                    "ssh_port": task_config["ssh_port"],
+                    "ft_sub_dir": task_config["ft_sub_dir"],
+                    "task_output_dir": task_output_dir,
+                    "perf_test_run_id": multi_runner_env["PERF_TEST_RUN_ID"],
+                    "local_world_size": task_config.get("local_world_size", 8),
+                    "collect_diagnostics": copy_test_result or state == "partial",
+                },
+                copy_log_path=task_copy_output_path,
+            )
+            verify_collected_decode_run(
+                Path(task_output_dir) / "run",
+                plan=plan,
+                run_id=multi_runner_env["PERF_TEST_RUN_ID"],
+                state=state,
+            )
             log_stage(f"Decode run finalized: {state}", stage="TASK")
-            test_success_flag = True
+            terminal_state = state
             break
         else:
             # clean task result files
@@ -311,21 +398,10 @@ def execute_task(
                     "Decode run did not finalize; check log file\n\n",
                     stage="ERROR",
                 )
-    if not test_success_flag:
+    if terminal_state is None:
         raise RuntimeError("Decode run did not finalize; see task test.log")
     # Copy test result and clean task result files
-    if copy_test_result and test_success_flag:
-        # copy test result to local
-        multi_copy_script(
-            {
-                "ip_lists": task_config["ip_lists"],
-                "run_user": task_config["run_user"],
-                "ssh_port": task_config["ssh_port"],
-                "ft_sub_dir": task_config["ft_sub_dir"],
-                "task_output_dir": task_output_dir,
-            },
-            copy_log_path=task_copy_output_path,
-        )
+    if copy_test_result or terminal_state == "partial":
         # clean task result files
         multi_clean_script(
             {
@@ -335,6 +411,10 @@ def execute_task(
                 "ft_sub_dir": task_config["ft_sub_dir"],
             },
             clean_log_path=task_clean_output_path,
+        )
+    if terminal_state == "partial":
+        raise PartialRunError(
+            "Decode run is partial; diagnostic artifacts were collected"
         )
 
 
@@ -768,6 +848,7 @@ def main():
     copy_clean_config["ft_sub_dir"] = build_config["ft_sub_dir"]
     multi_clean_script(copy_clean_config, clean_log_path=clean_log_path)
     # Run all benchmarks
+    exit_code = 0
     for benchmark_config in benchmarks:
         # Get benchmark name, fixed config, iterative search config and recursive search config
         benchmark_name = benchmark_config.get("benchmark_name", "unknown_benchmark")
@@ -798,8 +879,10 @@ def main():
             )
         except Exception as e:
             log_stage(f"Benchmark {benchmark_name} failed: {e}", stage="ERROR")
+            exit_code = max(exit_code, getattr(e, "exit_code", 1))
             continue
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

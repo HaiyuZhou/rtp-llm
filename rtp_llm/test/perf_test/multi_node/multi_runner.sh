@@ -85,13 +85,18 @@ multi_copy_script() {
     do
       (
         # Concat all environment variables
-        ENV_STR=$(printenv | paste -sd " ");
-        echo "Environment variables: $ENV_STR";
-        TEST_OUTPUT_PATH=$(ssh ${RUN_USER}@${IP} -p ${SSH_PORT} "$ENV_STR bash /tmp/multi_local_executor.sh");
+        ENV_STR=$(remote_environment)
+        TEST_OUTPUT_PATH=$(ssh "${RUN_USER}@${IP}" -p "${SSH_PORT}" "env $ENV_STR bash /tmp/multi_local_executor.sh") || exit 1
         echo "TEST_OUTPUT_PATH=${TEST_OUTPUT_PATH}";
         TEST_OUTPUT_NAME=$(basename "$TEST_OUTPUT_PATH")
-        scp -P "${SSH_PORT}" "${RUN_USER}@${IP}:${TEST_OUTPUT_PATH}/main_logs/process.log" "${TASK_OUTPUT_DIR}/process_logs/process_${TEST_OUTPUT_NAME}.log"
-        scp -r -P "${SSH_PORT}" "${RUN_USER}@${IP}:${TEST_OUTPUT_PATH}/normal_*" "${TASK_OUTPUT_DIR}/trace_files/"
+        if [ "${COLLECT_DIAGNOSTICS:-1}" -eq 1 ]; then
+          scp -P "${SSH_PORT}" "${RUN_USER}@${IP}:${TEST_OUTPUT_PATH}/main_logs/process.log" "${TASK_OUTPUT_DIR}/process_logs/process_${TEST_OUTPUT_NAME}.log" || exit 1
+          printf -v quoted_output '%q' "$TEST_OUTPUT_PATH"
+          traces_present=$(ssh "${RUN_USER}@${IP}" -p "${SSH_PORT}" "find $quoted_output -maxdepth 1 -name 'normal_*' -printf x -quit") || exit 1
+          if [ -n "$traces_present" ]; then
+            scp -r -P "${SSH_PORT}" "${RUN_USER}@${IP}:${TEST_OUTPUT_PATH}/normal_*" "${TASK_OUTPUT_DIR}/trace_files/" || exit 1
+          fi
+        fi
         if [ $WORLD_RANK -eq 0 ]; then
           mkdir -p "${TASK_OUTPUT_DIR}/run"
           for artifact in results reports profiles manifest.json execution_plan.json resolved_config.json source_config.json; do
@@ -100,7 +105,7 @@ multi_copy_script() {
         fi
       ) &
       pids+=("$!")
-      export WORLD_RANK=$((WORLD_RANK + 8));
+      export WORLD_RANK=$((WORLD_RANK + ${LOCAL_WORLD_SIZE:-8}));
     done;
     status=0
     for pid in "${pids[@]}"; do

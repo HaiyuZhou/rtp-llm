@@ -61,6 +61,7 @@ def _measurement(batch, tpot=1.0):
         measurements=tuple(
             {
                 "run": run,
+                "worker_allocations": [],
                 "throughput_tokens_per_second": 100.0,
                 "requests": [
                     {
@@ -85,6 +86,84 @@ def _measurement(batch, tpot=1.0):
 
 
 class DecodeProfilingTest(unittest.TestCase):
+    def test_log_marker_waits_for_complete_trace_and_retains_it_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "server.log"
+            log.write_text("")
+            trace = root / "export.json"
+            payload = {"traceEvents": [{"name": "kernel"}]}
+
+            def export(_case, _batch, *, trace_name, **_kwargs):
+                trace.write_text('{"traceEvents": [')
+                log.write_text(
+                    f"profiler trace saved: {trace.parent / (trace_name + '.json')}\n"
+                )
+                trace.rename(trace.parent / (trace_name + ".json"))
+
+            executor = Mock()
+            executor.profile.side_effect = export
+
+            def finish_export(_seconds):
+                next(root.glob("decode_*.json")).write_text(json.dumps(payload))
+
+            profiler = DecodeProfiler(
+                executor,
+                run_root=root / "run",
+                log_path=str(log),
+                trace_directory=root,
+                monotonic=Mock(side_effect=[0.0, 0.0, 0.2, 2.0]),
+                sleep=finish_export,
+            )
+            manifest = profiler.profile(_exact_case(batch=1, profile=True), 1)
+            retained = root / "run/traces" / (manifest["trace_name"] + ".json")
+            self.assertEqual("completed", manifest["status"])
+            self.assertEqual([str(retained.resolve())], manifest["artifacts"])
+            self.assertEqual(payload, json.loads(retained.read_text()))
+            self.assertEqual([retained], list(retained.parent.iterdir()))
+            next(root.glob("decode_*.json")).unlink()
+            self.assertEqual(payload, json.loads(retained.read_text()))
+
+    def test_log_marker_rejects_stale_partial_missing_and_invalid_traces(self):
+        for content in (
+            '{"traceEvents": []}',
+            '{"traceEvents": [',
+            "{}",
+            '{"traceEvents": {}}',
+            None,
+        ):
+            with self.subTest(
+                content=content
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                case = _exact_case(batch=1, profile=True)
+                name = f"decode_in128_out16_bs1_{case_id('decode', case.to_identity()).rsplit('-', 1)[-1]}"
+                trace = root / f"{name}_wr0_1.json"
+                stale = content == '{"traceEvents": []}'
+                if stale:
+                    trace.write_text(content)
+                log = root / "server.log"
+                log.write_text("")
+                executor = Mock()
+
+                def export(*_args, **_kwargs):
+                    if not stale and content is not None:
+                        trace.write_text(content)
+                    log.write_text(f"profiler trace saved: {trace}\n")
+
+                executor.profile.side_effect = export
+                manifest = DecodeProfiler(
+                    executor,
+                    run_root=root / "run",
+                    log_path=str(log),
+                    trace_directory=root,
+                    monotonic=Mock(side_effect=[0.0, 0.0, 100.0]),
+                    sleep=lambda _seconds: None,
+                ).profile(case, 1)
+                self.assertEqual("failed", manifest["status"])
+                self.assertEqual([], manifest["artifacts"])
+                self.assertFalse((root / "run/traces").exists())
+
     def test_profile_discovers_fresh_complete_trace_without_stdout_save_marker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -155,7 +234,6 @@ class DecodeProfilingTest(unittest.TestCase):
     def test_tpot_profiles_only_selected_batch_after_search(self):
         with tempfile.TemporaryDirectory() as directory:
             trace = Path(directory) / "trace.json"
-            trace.write_text("{}", encoding="utf-8")
             batch_executor = Mock()
             events = []
 
@@ -164,9 +242,12 @@ class DecodeProfilingTest(unittest.TestCase):
                 return _measurement(batch, 8.0 if batch <= 8 else 12.0)
 
             batch_executor.measure.side_effect = measure
-            batch_executor.profile.side_effect = (
-                lambda _case, batch, **_kw: events.append(("profile", batch))
-            )
+
+            def profile(_case, batch, **_kwargs):
+                events.append(("profile", batch))
+                trace.write_text(json.dumps({"traceEvents": []}))
+
+            batch_executor.profile.side_effect = profile
             profiler = DecodeProfiler(
                 batch_executor,
                 run_root=Path(directory),
@@ -183,7 +264,9 @@ class DecodeProfilingTest(unittest.TestCase):
             self.assertEqual("completed", manifest["status"])
             self.assertEqual([128] * 8, manifest["input_lengths"])
             self.assertEqual(8, manifest["batch_size"])
-            self.assertEqual([str(trace)], manifest["artifacts"])
+            self.assertEqual(
+                [str(Path(directory) / "traces/trace.json")], manifest["artifacts"]
+            )
             self.assertIn("decode_in128_out16_bs8_", manifest["trace_name"])
             self.assertEqual(
                 manifest,
@@ -352,10 +435,17 @@ class DecodeProfilingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "server.log"
             log.write_text("existing log\n", encoding="utf-8")
-            discover = Mock(side_effect=[(), ("trace.json",)])
+            trace = Path(directory) / "trace.json"
+            batch_executor = Mock()
+            batch_executor.profile.side_effect = (
+                lambda *_args, **_kwargs: trace.write_text(
+                    json.dumps({"traceEvents": []})
+                )
+            )
+            discover = Mock(side_effect=[(), (str(trace),)])
             sleep = Mock()
             profiler = DecodeProfiler(
-                Mock(),
+                batch_executor,
                 run_root=Path(directory),
                 log_path=str(log),
                 monotonic=Mock(side_effect=[0.0, 0.0, 0.2]),
@@ -372,11 +462,18 @@ class DecodeProfilingTest(unittest.TestCase):
 
     def test_manifest_is_atomically_replaced(self):
         with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / "trace.json"
+            batch_executor = Mock()
+            batch_executor.profile.side_effect = (
+                lambda *_args, **_kwargs: trace.write_text(
+                    json.dumps({"traceEvents": []})
+                )
+            )
             profiler = DecodeProfiler(
-                Mock(),
+                batch_executor,
                 run_root=Path(directory),
                 log_path=None,
-                artifact_discoverer=lambda *_args: ("trace.json",),
+                artifact_discoverer=lambda *_args: (str(trace),),
             )
             case = _exact_case(batch=1, profile=True)
             manifest = profiler.profile(case, 1)

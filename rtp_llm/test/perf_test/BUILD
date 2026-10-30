@@ -4,6 +4,8 @@ py_test(
     name = "decode_multi_node_analyzer_test",
     srcs = [
         "decode_multi_node_analyzer_test.py",
+        "decode/metrics.py",
+        "decode/model.py",
         "errors.py",
         "multi_node/analyzer/batch_analyze.py",
         "multi_node/analyzer/merge_decode_results.py",
@@ -16,13 +18,17 @@ py_test(
 
 py_test(
     name = "decode_multi_node_test",
-    srcs = ["decode_multi_node_test.py"],
+    srcs = [
+        "decode_multi_node_test.py",
+        "multi_node/analyzer/batch_analyze.py",
+        "multi_node/analyzer/trace_analyze.py",
+    ],
     data = [
         "multi_node/multi_benchmark_config.yaml",
         "multi_node/local_server_runner.py",
         "multi_node/multi_local_executor.sh",
         "multi_node/multi_runner.sh",
-    ],
+    ] + glob(["multi_node/analyzer/configs/*.py"]),
     deps = [":perf_test_runtime_lib"],
 )
 

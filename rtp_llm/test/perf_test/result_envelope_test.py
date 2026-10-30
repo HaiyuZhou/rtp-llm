@@ -97,7 +97,29 @@ def _decode_result():
                     "total": 11.0,
                 },
                 "throughput_tokens_per_second": 8000.0,
-                "measurements": [{"run": 0, "successful_requests": 4}],
+                "measurements": [
+                    {
+                        "run": 0,
+                        "throughput_tokens_per_second": 8000.0,
+                        "worker_allocations": [],
+                        "requests": [
+                            {
+                                "request_index": index,
+                                "success": True,
+                                "input_length": 128,
+                                "output_length": 16,
+                                "latency_ms": {
+                                    "wait": 1.0,
+                                    "prefill": 2.0,
+                                    "decode": 8.0,
+                                    "tpot": 0.5,
+                                    "total": 11.0,
+                                },
+                            }
+                            for index in range(4)
+                        ],
+                    }
+                ],
                 "search": None,
                 "distribution": None,
                 "profiling": {
@@ -197,6 +219,10 @@ class ResultEnvelopeTest(unittest.TestCase):
                 "error": "trace flush timeout",
             },
         )
+        requests = case["metrics"]["measurements"][0]["requests"]
+        requests.extend(copy.deepcopy(requests))
+        for index, request in enumerate(requests):
+            request["request_index"] = index
         value["cases"].append(case)
         value["summary"].update(
             planned_cases=2, successful_cases=2, profiling_failed_cases=1
@@ -217,7 +243,9 @@ class ResultEnvelopeTest(unittest.TestCase):
         value = _decode_result()
         case = value["cases"][0]
         case["runs"] = case["identity"]["measure_runs"] = 2
-        case["metrics"]["measurements"].append({"run": 1})
+        second = copy.deepcopy(case["metrics"]["measurements"][0])
+        second["run"] = 1
+        case["metrics"]["measurements"].append(second)
         case["metrics"]["successful_requests"] = 8
         self.assertEqual(value, parse_result_envelope(value).to_dict())
         case["runs"] = 1
@@ -421,7 +449,7 @@ class ResultEnvelopeTest(unittest.TestCase):
                         else "throughput_tokens_per_second"
                     )
                     metrics["search"]["observations"][0][name] = bad
-                with self.assertRaisesRegex(ResultSchemaError, "selected"):
+                with self.assertRaises(ResultSchemaError):
                     parse_result_envelope(invalid)
 
     def test_prefill_envelope_round_trips_as_golden_schema(self):

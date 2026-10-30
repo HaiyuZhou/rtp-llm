@@ -6,10 +6,9 @@ import copy
 import math
 import statistics
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from rtp_llm.test.perf_test.decode.model import DecodeBatchMeasurement
-from rtp_llm.test.perf_test.plan import freeze, thaw
 
 _LATENCIES = ("wait", "prefill", "decode", "tpot", "total")
 
@@ -32,6 +31,8 @@ def _number(path: str, value: Any) -> float:
 
 
 def _identity(case: Mapping[str, Any]) -> Dict[str, Any]:
+    from rtp_llm.test.perf_test.plan import freeze, thaw
+
     return thaw(
         freeze(
             {
@@ -102,7 +103,17 @@ def validate_decode_measurement(
             raise _MeasurementError(
                 "invalid_shape", f"measurements[{run_index}] must be an object"
             )
-        if measurement.get("run") != run_index:
+        if set(measurement) != {
+            "run",
+            "requests",
+            "throughput_tokens_per_second",
+            "worker_allocations",
+        }:
+            raise _MeasurementError(
+                "invalid_shape",
+                "measurement requires exactly run, requests, throughput_tokens_per_second and worker_allocations",
+            )
+        if type(measurement["run"]) is not int or measurement["run"] != run_index:
             raise _MeasurementError(
                 "invalid_shape", "measurement run indices must be contiguous"
             )
@@ -131,7 +142,9 @@ def validate_decode_measurement(
                 )
             seen_indices.add(request_index)
             if (
-                request.get("input_length") != expected_lengths[request_index]
+                type(request.get("input_length")) is not int
+                or type(request.get("output_length")) is not int
+                or request.get("input_length") != expected_lengths[request_index]
                 or request.get("output_length") != output_length
             ):
                 raise _MeasurementError(
@@ -142,7 +155,7 @@ def validate_decode_measurement(
                     "invalid_shape", "request success must be boolean"
                 )
             normalized_request = copy.deepcopy(dict(request))
-            if request["success"]:
+            if request["success"] or "latency_ms" in request:
                 latency = request.get("latency_ms")
                 if not isinstance(latency, Mapping) or set(latency) != set(_LATENCIES):
                     raise _MeasurementError(
@@ -159,6 +172,13 @@ def validate_decode_measurement(
                 "invalid_shape", "measurement does not cover every request"
             )
         normalized_measurement = copy.deepcopy(dict(measurement))
+        allocations = measurement["worker_allocations"]
+        if not isinstance(allocations, list) or any(
+            not isinstance(worker, Mapping) for worker in allocations
+        ):
+            raise _MeasurementError(
+                "invalid_shape", "worker allocations must be an array of objects"
+            )
         normalized_measurement["requests"] = normalized_requests
         normalized_measurement["throughput_tokens_per_second"] = _number(
             "throughput_tokens_per_second",
@@ -166,6 +186,29 @@ def validate_decode_measurement(
         )
         normalized_measurements.append(normalized_measurement)
     return normalized_measurements
+
+
+def summarize_decode_measurements(
+    measurements: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Aggregate validated rounds identically for producers and persisted readers."""
+    requests = [request for run in measurements for request in run["requests"]]
+    successful = [request for request in requests if request["success"]]
+    return {
+        "successful_requests": len(successful),
+        "failed_requests": len(requests) - len(successful),
+        "latency_ms": {
+            name: (
+                statistics.fmean(request["latency_ms"][name] for request in successful)
+                if successful
+                else 0.0
+            )
+            for name in _LATENCIES
+        },
+        "throughput_tokens_per_second": statistics.fmean(
+            run["throughput_tokens_per_second"] for run in measurements
+        ),
+    }
 
 
 def build_decode_case_result(
@@ -193,16 +236,7 @@ def build_decode_case_result(
     requests = [
         request for run in normalized_measurements for request in run["requests"]
     ]
-    successful = [request for request in requests if request["success"]]
     failed = [request for request in requests if not request["success"]]
-    aggregate_latency = {
-        name: (
-            statistics.fmean(request["latency_ms"][name] for request in successful)
-            if successful
-            else 0.0
-        )
-        for name in _LATENCIES
-    }
     distribution_details = None
     if case["workload_kind"] == "distribution":
         distribution_details = copy.deepcopy(dict(case.get("distribution") or {}))
@@ -213,12 +247,7 @@ def build_decode_case_result(
         "output_length": int(case["output_length"]),
         "global_batch_size": selected.batch_size,
         "topology": parsed_topology,
-        "successful_requests": len(successful),
-        "failed_requests": len(failed),
-        "latency_ms": aggregate_latency,
-        "throughput_tokens_per_second": statistics.fmean(
-            run["throughput_tokens_per_second"] for run in normalized_measurements
-        ),
+        **summarize_decode_measurements(normalized_measurements),
         "measurements": normalized_measurements,
         "search": None if search is None else copy.deepcopy(dict(search)),
         "distribution": distribution_details,

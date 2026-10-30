@@ -8,6 +8,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
+from rtp_llm.test.perf_test.decode.metrics import (
+    summarize_decode_measurements,
+    validate_decode_measurement,
+)
+from rtp_llm.test.perf_test.decode.model import DecodeBatchMeasurement
 from rtp_llm.test.perf_test.state import CaseState, RunState
 
 RESULT_SCHEMA_VERSION = 2
@@ -476,6 +481,36 @@ def _parse_decode_metrics(path: str, value: Any) -> DecodeMetrics:
         name: _number(f"{path}.latency_ms.{name}", latency[name])
         for name in sorted(latency_fields)
     }
+    output_length = _positive_int(f"{path}.output_length", raw["output_length"])
+    throughput = _number(
+        f"{path}.throughput_tokens_per_second", raw["throughput_tokens_per_second"]
+    )
+    try:
+        normalized_measurements = validate_decode_measurement(
+            {
+                "input_lengths": list(parsed_inputs),
+                "output_length": output_length,
+                "measure_runs": len(measurements),
+            },
+            DecodeBatchMeasurement(global_batch, parsed_inputs, (), measurements),
+        )
+        summary = summarize_decode_measurements(normalized_measurements)
+    except ValueError as error:
+        raise ResultSchemaError(f"{path}.measurements: {error}") from error
+    if (
+        successful != summary["successful_requests"]
+        or failed != summary["failed_requests"]
+    ):
+        raise ResultSchemaError(f"{path}: request totals must match raw measurements")
+    for name, latency_value in parsed_latency.items():
+        if not math.isclose(latency_value, summary["latency_ms"][name]):
+            raise ResultSchemaError(
+                f"{path}.latency_ms.{name}: must match raw measurements"
+            )
+    if not math.isclose(throughput, summary["throughput_tokens_per_second"]):
+        raise ResultSchemaError(
+            f"{path}.throughput_tokens_per_second: must match raw measurements"
+        )
     optional_records = {}
     for name in ("search", "distribution"):
         item = raw[name]
@@ -485,17 +520,14 @@ def _parse_decode_metrics(path: str, value: Any) -> DecodeMetrics:
     return DecodeMetrics(
         workload_kind=kind,
         input_lengths=parsed_inputs,
-        output_length=_positive_int(f"{path}.output_length", raw["output_length"]),
+        output_length=output_length,
         global_batch_size=global_batch,
         topology=parsed_topology,
         successful_requests=successful,
         failed_requests=failed,
         latency_ms=parsed_latency,
-        throughput_tokens_per_second=_number(
-            f"{path}.throughput_tokens_per_second",
-            raw["throughput_tokens_per_second"],
-        ),
-        measurements=measurements,
+        throughput_tokens_per_second=throughput,
+        measurements=tuple(normalized_measurements),
         search=(
             None
             if raw["search"] is None
@@ -583,6 +615,10 @@ def parse_case_result(index: int, mode: str, value: Any) -> CaseResult:
                     f"{path}: search must match identity.batch_policy"
                 )
         if metrics is not None:
+            if status == CaseState.OK and metrics.failed_requests:
+                raise ResultSchemaError(
+                    f"{path}.status: ok requires zero failed requests"
+                )
             batch = metrics.global_batch_size
             if (
                 metrics.workload_kind != identity["workload_kind"]

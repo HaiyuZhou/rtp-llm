@@ -41,6 +41,7 @@ def _measurement(batch, tpot, *, failed=False):
         measurements=tuple(
             {
                 "run": run,
+                "worker_allocations": [],
                 "throughput_tokens_per_second": 100.0 + run,
                 "requests": [
                     {

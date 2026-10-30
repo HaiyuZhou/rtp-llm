@@ -164,8 +164,11 @@ def scan_trace_files(benchmark_dir: str) -> list:
                     trace = None
                     for artifact in manifest["artifacts"]:
                         artifact = Path(artifact)
-                        # Collection preserves the listed basename under trace_files.
-                        candidates = [task / "trace_files" / artifact.name]
+                        # Remote absolute paths relocate with the retained run traces.
+                        candidates = [
+                            run / "traces" / artifact.name,
+                            task / "trace_files" / artifact.name,
+                        ]
                         candidates.append(
                             artifact if artifact.is_absolute() else run / artifact
                         )

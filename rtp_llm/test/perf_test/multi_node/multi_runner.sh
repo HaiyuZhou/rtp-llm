@@ -1,5 +1,6 @@
 #!/bin/bash
 set -x;
+SCRIPT_DIRECTORY=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 remote_environment() {
   while IFS= read -r -d '' assignment; do
@@ -28,7 +29,7 @@ multi_build_script() {
     for IP in "${IP_ARRAY[@]}"
     do
       (
-        scp -P ${SSH_PORT} multi_local_executor.sh ${RUN_USER}@${IP}:/tmp/multi_local_executor.sh;
+        scp -P ${SSH_PORT} "${SCRIPT_DIRECTORY}/multi_local_executor.sh" ${RUN_USER}@${IP}:/tmp/multi_local_executor.sh;
         # Concat all environment variables
         ENV_STR=$(printenv | paste -sd " ");
         echo "Environment variables: $ENV_STR";
@@ -53,7 +54,7 @@ multi_kill_script() {
     for IP in "${IP_ARRAY[@]}"
     do
       (
-        scp -P ${SSH_PORT} multi_local_executor.sh ${RUN_USER}@${IP}:/tmp/multi_local_executor.sh;
+        scp -P ${SSH_PORT} "${SCRIPT_DIRECTORY}/multi_local_executor.sh" ${RUN_USER}@${IP}:/tmp/multi_local_executor.sh;
         # Concat all environment variables
         ENV_STR=$(printenv | paste -sd " ");
         echo "Environment variables: $ENV_STR";
@@ -102,6 +103,11 @@ multi_copy_script() {
           for artifact in results reports profiles manifest.json execution_plan.json resolved_config.json source_config.json; do
             scp -r -P "${SSH_PORT}" "${RUN_USER}@${IP}:${TEST_OUTPUT_PATH}/run/${artifact}" "${TASK_OUTPUT_DIR}/run/" || exit 1
           done
+          printf -v quoted_run '%q' "${TEST_OUTPUT_PATH}/run"
+          retained_traces=$(ssh "${RUN_USER}@${IP}" -p "${SSH_PORT}" "find $quoted_run -maxdepth 1 -type d -name traces -printf x -quit") || exit 1
+          if [ -n "$retained_traces" ]; then
+            scp -r -P "${SSH_PORT}" "${RUN_USER}@${IP}:${TEST_OUTPUT_PATH}/run/traces" "${TASK_OUTPUT_DIR}/run/" || exit 1
+          fi
         fi
       ) &
       pids+=("$!")
@@ -129,7 +135,7 @@ multi_clean_script() {
     for IP in "${IP_ARRAY[@]}"
     do
       (
-        scp -P ${SSH_PORT} multi_local_executor.sh ${RUN_USER}@${IP}:/tmp/multi_local_executor.sh;
+        scp -P ${SSH_PORT} "${SCRIPT_DIRECTORY}/multi_local_executor.sh" ${RUN_USER}@${IP}:/tmp/multi_local_executor.sh;
         # Concat all environment variables
         ENV_STR=$(printenv | paste -sd " ");
         echo "Environment variables: $ENV_STR";
@@ -214,7 +220,7 @@ multi_test_script() {
           scp -P "${SSH_PORT}" "$PERF_TEST_DISTRIBUTION_PATH" "${RUN_USER}@${IP}:${remote_config_dir}/distribution.json" || exit 1
         fi
         export PERF_TEST_CONFIG_PATH="${remote_config_dir}/config.json"
-        scp -P "${SSH_PORT}" multi_local_executor.sh "${RUN_USER}@${IP}:/tmp/multi_local_executor.sh" || exit 1
+        scp -P "${SSH_PORT}" "${SCRIPT_DIRECTORY}/multi_local_executor.sh" "${RUN_USER}@${IP}:/tmp/multi_local_executor.sh" || exit 1
         # Concat all environment variables
         ENV_STR=$(remote_environment);
         echo "Environment variables: $ENV_STR";

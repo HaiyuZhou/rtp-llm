@@ -18,6 +18,9 @@ workers and the result records both the global batch and worker-local allocation
 Uneven batches are supported. The report contains one input-by-output matrix per
 exact batch size, retaining status, TPOT, throughput, total latency, and success
 rate for every cell. Failed or incomplete cases produce a diagnostic report.
+Persisted rounds include their index, worker allocations, throughput, and one
+outcome per request. Readers validate request shapes and timings and reconcile
+the aggregate metrics with those rounds before including a case in formal reports.
 
 ```bash
 ./tools/perf_test \
@@ -90,6 +93,10 @@ Profile requests and timing stay separate from formal measurements. Each attempt
 writes `profiles/<case_id>/profile_manifest.json` with the shape, settings, trace
 identity, discovered artifacts, and outcome. A profile failure preserves valid
 performance metrics and increments the summary's `profiling_failed_cases` count.
+Both log-marker discovery and filesystem discovery accept complete JSON exports
+with a `traceEvents` array and retain them atomically under `traces/` in the run.
+Multi-node collection copies those retained files with the run, and trace analysis
+resolves remote manifest paths to the collected `Task_*/run/traces/` files.
 
 Decode `resume`, `profile`, and `report` are unsupported. AOne decode is also
 unsupported. These combinations return configuration exit code 2 before a run

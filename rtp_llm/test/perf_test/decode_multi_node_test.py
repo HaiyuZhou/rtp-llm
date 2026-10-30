@@ -17,6 +17,12 @@ from unittest.mock import patch
 import yaml
 
 from rtp_llm.test.perf_test.cli import CliRequest
+from rtp_llm.test.perf_test.decode.model import (
+    DecodeCaseSpec,
+    DecodeProfilingConfig,
+    ExactBatchPolicy,
+)
+from rtp_llm.test.perf_test.decode.profiling import DecodeProfiler
 from rtp_llm.test.perf_test.decode.transport import DecodeHttpTransport
 from rtp_llm.test.perf_test.entry import build_request_plan
 from rtp_llm.test.perf_test.errors import (
@@ -25,6 +31,7 @@ from rtp_llm.test.perf_test.errors import (
     PlanningError,
 )
 from rtp_llm.test.perf_test.multi_node import multi_benchmark
+from rtp_llm.test.perf_test.multi_node.analyzer import batch_analyze
 from rtp_llm.test.perf_test.multi_node.decode_runtime import (
     build_external_decode_plan,
     execute_master_decode,
@@ -127,6 +134,63 @@ def _persist_run(plan, source, root, state, run_id):
 
 
 class DecodeMultiNodeTest(unittest.TestCase):
+    def test_launcher_resolves_runner_and_executor_from_unrelated_cwd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "ssh").write_text("#!/bin/bash\nexit 0\n")
+            (bin_dir / "scp").write_text(
+                '#!/bin/bash\nfor source in "$@"; do\n'
+                ' case "$source" in *:*) ;; *multi_local_executor.sh) test -f "$source" || exit 19;; esac\ndone\n'
+            )
+            for tool in bin_dir.iterdir():
+                tool.chmod(0o755)
+            config = {
+                "ip_lists": ["node0"],
+                "run_user": "test",
+                "ssh_port": 22,
+                "path": f"{bin_dir}:{os.environ['PATH']}",
+            }
+            with patch.object(multi_benchmark, "logger", logging.getLogger("test")):
+                previous = Path.cwd()
+                try:
+                    os.chdir(root)
+                    try:
+                        multi_benchmark.multi_kill_script(
+                            config, str(root / "kill.log")
+                        )
+                    except subprocess.CalledProcessError:
+                        self.fail((root / "kill.log").read_text())
+                finally:
+                    os.chdir(previous)
+            self.assertIn("Return Code: 0", (root / "kill.log").read_text())
+            script = Path(multi_benchmark.__file__).with_name("multi_runner.sh")
+            completed = subprocess.run(
+                ["bash", str(script)],
+                cwd=root,
+                env={
+                    key.upper(): str(value)
+                    for key, value in {
+                        **config,
+                        "ip_lists": "node0",
+                        "sub_cmd": "test",
+                        "perf_test_config_path": str(_write_decode_config(root)),
+                        "tp_size": 1,
+                        "dp_size": 1,
+                        "open_source_ref": "main",
+                        "model_type": "test",
+                        "tokenizer_path": "/m",
+                        "checkpoint_path": "/m",
+                    }.items()
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                0, completed.returncode, completed.stdout + completed.stderr
+            )
+
     def test_collection_rejects_missing_or_inconsistent_plan_and_config(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -776,7 +840,7 @@ class DecodeMultiNodeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             remote = root / "remote path"
-            output = root / "output path"
+            output = root / "Task_dp_size-2"
             for relative in (
                 "run/results/cases/a.json",
                 "run/reports/decode_report.json",
@@ -792,12 +856,50 @@ class DecodeMultiNodeTest(unittest.TestCase):
                 target = remote / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(relative)
+            case = DecodeCaseSpec(
+                "grid",
+                (128,),
+                16,
+                ExactBatchPolicy("fixed", 1),
+                1,
+                0,
+                profiling=DecodeProfilingConfig(enabled=True),
+            )
+
+            class Exporter:
+                def profile(self, _case, _batch, *, trace_name, **_kwargs):
+                    (remote / f"{trace_name}_wr0_1.json").write_text(
+                        json.dumps(
+                            {
+                                "traceEvents": [
+                                    {
+                                        "cat": "kernel",
+                                        "name": "test_kernel",
+                                        "ph": "X",
+                                        "ts": 0,
+                                        "dur": 10,
+                                        "pid": 1,
+                                        "tid": 1,
+                                    },
+                                ]
+                            }
+                        )
+                    )
+
+            manifest = DecodeProfiler(
+                Exporter(),
+                run_root=remote / "run",
+                log_path=None,
+                trace_directory=remote,
+            ).profile(case, 1)
+            self.assertEqual("completed", manifest["status"])
+            trace_name = Path(manifest["artifacts"][0]).name
             (output / "process_logs").mkdir(parents=True)
             (output / "trace_files").mkdir()
             bin_dir = root / "bin"
             bin_dir.mkdir()
             (bin_dir / "ssh").write_text(
-                f"#!{sys.executable}\nimport os, pathlib, shlex, sys\n"
+                f"#!{sys.executable}\nimport os, pathlib, shlex, subprocess, sys\n"
                 "command = shlex.split(sys.argv[-1])\n"
                 "if 'bash' in command:\n"
                 " if command[0] != 'env' or ('TASK_OUTPUT_DIR=' + os.environ['TASK_OUTPUT_DIR']) not in command: sys.exit(9)\n"
@@ -805,7 +907,7 @@ class DecodeMultiNodeTest(unittest.TestCase):
                 " print(os.environ['FAKE_REMOTE_ROOT'])\n"
                 "elif command[0] == 'find':\n"
                 " if os.environ.get('FAKE_FAIL_LIST') == '1': sys.exit(8)\n"
-                " if list(pathlib.Path(os.environ['FAKE_REMOTE_ROOT']).glob('normal_*')): print('x')\n"
+                " sys.exit(subprocess.run(command).returncode)\n"
                 "else: sys.exit(10)\n"
             )
             (bin_dir / "scp").write_text(
@@ -845,6 +947,41 @@ class DecodeMultiNodeTest(unittest.TestCase):
                 ["bash", str(script)], env=env, capture_output=True, text=True
             )
             self.assertEqual(0, completed.returncode, completed.stderr)
+            collected_trace = output / "run/traces" / trace_name
+            self.assertTrue(collected_trace.is_file())
+            # Remove the authoritative remote artifact as cleanup would; analysis must
+            # resolve its absolute manifest reference inside the collected run.
+            Path(manifest["artifacts"][0]).unlink()
+            configs = batch_analyze.scan_trace_files(str(root))
+            self.assertEqual(
+                [(2, 128, 16, 1, str(collected_trace.resolve()))],
+                [
+                    (
+                        item.dp_size,
+                        item.input_length,
+                        item.output_length,
+                        item.batch_size,
+                        item.trace_file,
+                    )
+                    for item in configs
+                ],
+            )
+            analysis = batch_analyze.analyze_single_trace(
+                configs[0].trace_file, min_occurrences=1
+            )
+            self.assertEqual(1, analysis["total_kernels"])
+            Path(manifest["artifacts"][0]).write_text(collected_trace.read_text())
+            collected_trace.unlink()
+            without_diagnostics = subprocess.run(
+                ["bash", str(script)],
+                env={**env, "COLLECT_DIAGNOSTICS": "0"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                0, without_diagnostics.returncode, without_diagnostics.stderr
+            )
+            self.assertTrue(collected_trace.is_file())
             for relative in (
                 "run/results/cases/a.json",
                 "run/reports/decode_report.json",
@@ -858,9 +995,10 @@ class DecodeMultiNodeTest(unittest.TestCase):
             ):
                 self.assertTrue((output / relative).is_file(), relative)
             self.assertTrue(list((output / "process_logs").glob("process_*.log")))
-            for host, artifact in itertools.product(
-                ("node0", "node1"), ("process.log", "normal_*")
-            ):
+            for host, artifact in [
+                *itertools.product(("node0", "node1"), ("process.log", "normal_*")),
+                ("node0", "/run/traces"),
+            ]:
                 with self.subTest(host=host, artifact=artifact):
                     failed = subprocess.run(
                         ["bash", str(script)],
@@ -917,7 +1055,7 @@ class DecodeMultiNodeTest(unittest.TestCase):
                 requests.append((url, copy.deepcopy(json)))
                 if url.endswith("/start_profile"):
                     trace = root / (json["trace_name"] + ".json")
-                    trace.write_text("{}")
+                    trace.write_text('{"traceEvents": []}')
                     with log.open("a") as stream:
                         stream.write(f"profiler trace saved: {trace}\n")
                     return Response({"status": "ok"})

@@ -12,6 +12,7 @@ from rtp_llm.test.perf_test.decode.model import (
 )
 from rtp_llm.test.perf_test.decode.report import generate_decode_report
 from rtp_llm.test.perf_test.plan import case_id
+from rtp_llm.test.perf_test.results import ResultSchemaError, parse_case_result
 
 TOPOLOGY = {"tp": 1, "dp": 1, "pp": 1, "ep": 1}
 DISABLED = {"status": "disabled", "manifest_path": None, "error": None}
@@ -111,6 +112,61 @@ def _tpot_cases(inputs, outputs):
 
 
 class DecodeReportTest(unittest.TestCase):
+    def test_persisted_raw_measurements_must_reconcile_before_formal_reporting(self):
+        mutations = (
+            (("measurements",), [{}]),
+            (("measurements", 0, "run"), True),
+            (("measurements", 0, "run"), 1),
+            (("measurements", 0, "extra"), 1),
+            (("measurements", 0, "requests"), []),
+            (("measurements", 0, "requests", 1, "request_index"), 0),
+            (("measurements", 0, "requests", 0, "input_length"), 64),
+            (("measurements", 0, "requests", 0, "output_length"), 8),
+            (("measurements", 0, "requests", 0, "success"), 1),
+            (("measurements", 0, "requests", 0, "latency_ms"), {}),
+            (("measurements", 0, "requests", 0, "latency_ms", "tpot"), float("inf")),
+            (("measurements", 0, "requests", 0, "latency_ms", "tpot"), 20.0),
+            (("measurements", 0, "throughput_tokens_per_second"), 200.0),
+            (("measurements", 0, "throughput_tokens_per_second"), None),
+            (("successful_requests",), 1),
+            (("latency_ms", "tpot"), 99.0),
+            (("throughput_tokens_per_second",), 999.0),
+        )
+        for keys, value in mutations:
+            with self.subTest(keys=keys, value=value):
+                case = _result(_exact_case(2), 2)
+                parent = case["metrics"]
+                for key in keys[:-1]:
+                    parent = parent[key]
+                parent[keys[-1]] = value
+                original = copy.deepcopy(case)
+                with self.assertRaises(ResultSchemaError):
+                    parse_case_result(0, "decode", case)
+                report = generate_decode_report([case])
+                self.assertEqual("diagnostic", report["report_kind"])
+                self.assertEqual("invalid_result", report["observations"][0]["status"])
+                self.assertIsNone(report["observations"][0]["tpot_ms"])
+                self.assertEqual(original, case)
+
+    def test_ok_case_rejects_failed_raw_requests_even_with_matching_aggregates(self):
+        case = _result(_exact_case(2), 2)
+        metrics = case["metrics"]
+        metrics.update(successful_requests=1, failed_requests=1)
+        metrics["measurements"][0]["requests"][0] = {
+            "request_index": 0,
+            "success": False,
+            "input_length": 128,
+            "output_length": 16,
+            "error": "HTTP 503",
+        }
+        original = copy.deepcopy(case)
+        with self.assertRaises(ResultSchemaError):
+            parse_case_result(0, "decode", case)
+        report = generate_decode_report([case])
+        self.assertEqual("diagnostic", report["report_kind"])
+        self.assertIsNone(report["observations"][0]["success_rate"])
+        self.assertEqual(original, case)
+
     def test_unhashable_search_outcomes_remain_diagnostic_on_both_paths(self):
         for location in ("metrics", "details"):
             for outcome_field in ("search", "observation"):

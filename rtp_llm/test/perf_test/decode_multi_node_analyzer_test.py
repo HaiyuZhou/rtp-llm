@@ -51,7 +51,29 @@ def _decode_case_v2(*, case_id, policy, batch, profile, search):
                 "total": 11.0,
             },
             "throughput_tokens_per_second": 1000.0,
-            "measurements": [{"run": 0, "worker_allocations": [], "requests": []}],
+            "measurements": [
+                {
+                    "run": 0,
+                    "worker_allocations": [],
+                    "throughput_tokens_per_second": 1000.0,
+                    "requests": [
+                        {
+                            "request_index": index,
+                            "success": True,
+                            "input_length": 128,
+                            "output_length": 16,
+                            "latency_ms": {
+                                "wait": 1.0,
+                                "prefill": 2.0,
+                                "decode": 8.0,
+                                "tpot": 1.0,
+                                "total": 11.0,
+                            },
+                        }
+                        for index in range(batch)
+                    ],
+                }
+            ],
             "search": search,
             "distribution": None,
             "profiling": profile,
@@ -142,6 +164,17 @@ def _write_collected_run(
         successful_requests=batch_size,
     )
     case["metrics"]["search"]["best_batch_size"] = batch_size
+    requests = case["metrics"]["measurements"][0]["requests"]
+    template = copy.deepcopy(requests[0])
+    requests[:] = [
+        {
+            **copy.deepcopy(template),
+            "request_index": index,
+            "input_length": input_length,
+            "output_length": output_length,
+        }
+        for index in range(batch_size)
+    ]
     result_path.write_text(json.dumps(envelope), encoding="utf-8")
     return result_path
 
@@ -178,6 +211,22 @@ def _write_profile_manifest(
 
 
 class DecodeMultiNodeAnalyzerTest(unittest.TestCase):
+    def test_trace_manifest_relocates_remote_path_to_collected_run_traces(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = _write_profile_manifest(root, nested=True)
+            manifest = json.loads(manifest_path.read_text())
+            original = Path(manifest["artifacts"][0])
+            retained = root / "Task_dp_size-2/run/traces" / original.name
+            retained.parent.mkdir(parents=True)
+            retained.write_text('{"traceEvents": []}')
+            manifest["artifacts"] = ["/removed/remote/run/traces/" + retained.name]
+            manifest_path.write_text(json.dumps(manifest))
+            configs = batch_analyze.scan_trace_files(directory)
+            self.assertEqual(
+                [str(retained.resolve())], [item.trace_file for item in configs]
+            )
+
     def test_merger_isolates_malformed_envelopes_from_valid_files(self):
         for malformed in (
             [],
@@ -414,6 +463,9 @@ class DecodeMultiNodeAnalyzerTest(unittest.TestCase):
             value["cases"][0]["status"] = "request_failed"
             value["cases"][0]["metrics"].update(
                 successful_requests=3, failed_requests=1
+            )
+            value["cases"][0]["metrics"]["measurements"][0]["requests"][0].update(
+                success=False, error="HTTP 503"
             )
             value["status"] = "partial"
             value["summary"].update(successful_cases=1, failed_cases=1)

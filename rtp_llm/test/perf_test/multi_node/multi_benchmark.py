@@ -36,6 +36,7 @@ experiment_output_dir = None
 
 benchmark_separator = "=" * 120
 task_separator = "-" * 120
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 
 
 def get_args():
@@ -43,7 +44,7 @@ def get_args():
     parser.add_argument(
         "-c",
         "--config",
-        default="./multi_benchmark_config.yaml",
+        default=str(SCRIPT_DIRECTORY / "multi_benchmark_config.yaml"),
         type=str,
         help="Path to the configuration file",
     )
@@ -337,7 +338,7 @@ def execute_task(
     log_stage(f"Task Config: {multi_runner_env}", stage="TASK")
     multi_runner_args = [
         "bash",
-        "./multi_runner.sh",
+        str(SCRIPT_DIRECTORY / "multi_runner.sh"),
     ]
     # Retry test
     terminal_state = None
@@ -349,6 +350,7 @@ def execute_task(
             f.flush()
             result = subprocess.run(
                 multi_runner_args,
+                cwd=SCRIPT_DIRECTORY,
                 env=multi_runner_env,
                 stdout=f,
                 stderr=subprocess.STDOUT,
@@ -571,7 +573,7 @@ def multi_build_script(
     copy_build_config["ip_lists"] = ",".join(copy_build_config["ip_lists"])
     # Convert build config to environment variables
     multi_runner_env = convert_to_env(copy_build_config)
-    multi_runner_args = ["bash", "./multi_runner.sh"]
+    multi_runner_args = ["bash", str(SCRIPT_DIRECTORY / "multi_runner.sh")]
     # Log build information
     log_stage(f"Build environment | Log: {build_log_path}", stage="BUILD")
     # Run build command and redirect both stdout and stderr to build log file
@@ -581,6 +583,7 @@ def multi_build_script(
             f.flush()
             result = subprocess.run(
                 multi_runner_args,
+                cwd=SCRIPT_DIRECTORY,
                 env=multi_runner_env,
                 stdout=f,
                 stderr=subprocess.STDOUT,
@@ -614,7 +617,7 @@ def multi_kill_script(copy_kill_config: Dict[str, Any], kill_log_path: str) -> N
         copy_kill_config["ip_lists"] = ",".join(copy_kill_config["ip_lists"])
     # Convert kill config to environment variables
     multi_runner_env = convert_to_env(copy_kill_config)
-    multi_runner_args = ["bash", "./multi_runner.sh"]
+    multi_runner_args = ["bash", str(SCRIPT_DIRECTORY / "multi_runner.sh")]
     # Log kill information
     log_stage(f"Kill processes | Log: {kill_log_path}", stage="KILL")
     # Run kill command and redirect both stdout and stderr to file
@@ -623,6 +626,7 @@ def multi_kill_script(copy_kill_config: Dict[str, Any], kill_log_path: str) -> N
         f.flush()
         result = subprocess.run(
             multi_runner_args,
+            cwd=SCRIPT_DIRECTORY,
             env=multi_runner_env,
             stdout=f,
             stderr=subprocess.STDOUT,
@@ -641,7 +645,7 @@ def multi_copy_script(copy_copy_config: Dict[str, Any], copy_log_path: str) -> N
         copy_copy_config["ip_lists"] = ",".join(copy_copy_config["ip_lists"])
     # Convert clean config to environment variables
     multi_runner_env = convert_to_env(copy_copy_config)
-    multi_runner_args = ["bash", "./multi_runner.sh"]
+    multi_runner_args = ["bash", str(SCRIPT_DIRECTORY / "multi_runner.sh")]
     # Log copy test results information
     log_stage(f"Copy test results | Log: {copy_log_path}", stage="COPY")
     # Run copy test results command and redirect both stdout and stderr to file
@@ -650,6 +654,7 @@ def multi_copy_script(copy_copy_config: Dict[str, Any], copy_log_path: str) -> N
         f.flush()
         result = subprocess.run(
             multi_runner_args,
+            cwd=SCRIPT_DIRECTORY,
             env=multi_runner_env,
             stdout=f,
             stderr=subprocess.STDOUT,
@@ -668,7 +673,7 @@ def multi_clean_script(copy_clean_config: Dict[str, Any], clean_log_path: str) -
         copy_clean_config["ip_lists"] = ",".join(copy_clean_config["ip_lists"])
     # Convert clean config to environment variables
     multi_runner_env = convert_to_env(copy_clean_config)
-    multi_runner_args = ["bash", "./multi_runner.sh"]
+    multi_runner_args = ["bash", str(SCRIPT_DIRECTORY / "multi_runner.sh")]
     # Log clean information
     log_stage(f"Clean log files | Log: {clean_log_path}", stage="CLEAN")
     # Run clean command and redirect both stdout and stderr to file
@@ -677,6 +682,7 @@ def multi_clean_script(copy_clean_config: Dict[str, Any], clean_log_path: str) -
         f.flush()
         result = subprocess.run(
             multi_runner_args,
+            cwd=SCRIPT_DIRECTORY,
             env=multi_runner_env,
             stdout=f,
             stderr=subprocess.STDOUT,

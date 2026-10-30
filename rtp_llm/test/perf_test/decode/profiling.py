@@ -73,21 +73,35 @@ class DecodeProfiler:
 
     def _trace_files(self, trace_name: str) -> Dict[Path, Tuple[int, int]]:
         files = {}
-        for path in self._trace_directory.glob(f"{trace_name}_wr[0-9]*_[0-9]*.json"):
+        directories = {self._trace_directory}
+        if self._log_path:
+            directories.add(Path(self._log_path).parent)
+        paths = (
+            path
+            for directory in directories
+            for path in directory.glob(f"{trace_name}*.json")
+        )
+        for path in paths:
             try:
                 stat = path.stat()
-                files[path] = (stat.st_mtime_ns, stat.st_size)
+                files[path.resolve()] = (stat.st_mtime_ns, stat.st_size)
             except OSError:
                 continue
         return files
 
-    def _complete_new_traces(self, trace_name: str, before) -> Tuple[str, ...]:
+    def _retain_complete_traces(self, candidates, before) -> Tuple[str, ...]:
         artifacts = []
-        for path, signature in self._trace_files(trace_name).items():
-            if signature == before.get(path):
-                continue
+        for candidate in sorted(set(candidates)):
+            path = Path(candidate).resolve()
             try:
+                stat = path.stat()
+                signature = (stat.st_mtime_ns, stat.st_size)
+                if signature == before.get(path):
+                    continue
                 trace = json.loads(path.read_text(encoding="utf-8"))
+                after = path.stat()
+                if signature != (after.st_mtime_ns, after.st_size):
+                    continue
             except (OSError, UnicodeError, ValueError):
                 continue
             if isinstance(trace, dict) and isinstance(trace.get("traceEvents"), list):
@@ -111,6 +125,10 @@ class DecodeProfiler:
         artifacts: Tuple[str, ...] = ()
         try:
             before_traces = self._trace_files(trace_name)
+            for candidate in discover_profile_artifacts(self._log_path, 0, trace_name):
+                path = Path(candidate).resolve()
+                stat = path.stat()
+                before_traces[path] = (stat.st_mtime_ns, stat.st_size)
             log_offset = (
                 Path(self._log_path).stat().st_size
                 if self._log_path and Path(self._log_path).is_file()
@@ -125,11 +143,13 @@ class DecodeProfiler:
             )
             deadline = self._monotonic() + case.profiling.flush_timeout_seconds
             while self._monotonic() < deadline:
-                artifacts = self._artifact_discoverer(
+                candidates = self._artifact_discoverer(
                     self._log_path, log_offset, trace_name
                 )
-                if not artifacts:
-                    artifacts = self._complete_new_traces(trace_name, before_traces)
+                candidates = tuple(candidates) + tuple(
+                    str(path) for path in self._trace_files(trace_name)
+                )
+                artifacts = self._retain_complete_traces(candidates, before_traces)
                 if artifacts:
                     break
                 self._sleep(0.2)

@@ -241,6 +241,7 @@ class DecodeCaseExecutorTest(unittest.TestCase):
             measurements=tuple(
                 {
                     "run": run,
+                    "worker_allocations": [],
                     "throughput_tokens_per_second": 100.0,
                     "requests": list(_request_round(inputs, spec.output_length)),
                 }

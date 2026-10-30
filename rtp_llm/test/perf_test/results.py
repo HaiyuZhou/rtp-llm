@@ -318,6 +318,7 @@ def _parse_search(path: str, value: Any) -> Dict[str, Any]:
     target = _number(f"{path}.target_tpot_ms", raw["target_tpot_ms"], positive=True)
     maximum = _positive_int(f"{path}.max_size", raw["max_size"])
     step = _positive_int(f"{path}.candidate_step", raw["candidate_step"])
+    _string(f"{path}.outcome", raw["outcome"])
     if raw["outcome"] not in {"found", "no_satisfying_candidate"}:
         raise ResultSchemaError(f"{path}.outcome: unknown search outcome")
     observations = _record_list(f"{path}.observations", raw["observations"])
@@ -348,7 +349,7 @@ def _parse_search(path: str, value: Any) -> Dict[str, Any]:
                 f"{observation_path}.batch_size: invalid or duplicate candidate"
             )
         seen.add(batch)
-        outcome = observation["outcome"]
+        outcome = _string(f"{observation_path}.outcome", observation["outcome"])
         if outcome not in {
             "satisfied",
             "target_exceeded",

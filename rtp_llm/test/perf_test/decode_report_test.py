@@ -111,6 +111,49 @@ def _tpot_cases(inputs, outputs):
 
 
 class DecodeReportTest(unittest.TestCase):
+    def test_unhashable_search_outcomes_remain_diagnostic_on_both_paths(self):
+        for location in ("metrics", "details"):
+            for outcome_field in ("search", "observation"):
+                for malformed in ([], {}):
+                    with self.subTest(
+                        location=location, field=outcome_field, malformed=malformed
+                    ):
+                        cases = _tpot_cases((128,), (16, 64))[:1]
+                        case = cases[0]
+                        search = case["metrics"]["search"]
+                        if location == "details":
+                            search.update(
+                                outcome="no_satisfying_candidate",
+                                best_batch_size=None,
+                                observations=[
+                                    {"batch_size": 8, "outcome": "target_exceeded"}
+                                ],
+                            )
+                            case.update(
+                                status="target_tpot_not_met",
+                                metrics=None,
+                                errors=[
+                                    {
+                                        "code": "target_tpot_not_met",
+                                        "message": "bad search",
+                                        "details": {"search": search},
+                                    }
+                                ],
+                            )
+                        record = (
+                            search
+                            if outcome_field == "search"
+                            else search["observations"][0]
+                        )
+                        record["outcome"] = malformed
+                        report = generate_decode_report(cases)
+                        self.assertEqual("diagnostic", report["report_kind"])
+                        self.assertEqual(1, len(report["matrices"][0]["cells"]))
+                        cell = report["matrices"][0]["cells"][0]
+                        self.assertEqual(case["case_id"], cell["case_id"])
+                        self.assertIsNone(cell["tpot_ms"])
+                        self.assertEqual("invalid_result", cell["errors"][-1]["code"])
+
     def test_exact_report_groups_input_output_matrix_by_batch(self):
         cases = _exact_cases((128, 512), (16, 64), (1, 4))
         before = copy.deepcopy(cases)

@@ -112,6 +112,61 @@ def _decode_result():
 
 
 class ResultEnvelopeTest(unittest.TestCase):
+    def test_search_outcomes_require_strings_on_formal_and_failed_paths(self):
+        for location in ("metrics", "details"):
+            for outcome_field in ("search", "observation"):
+                for malformed in ([], {}, 1, None):
+                    with self.subTest(
+                        location=location, field=outcome_field, malformed=malformed
+                    ):
+                        value = _decode_result()
+                        case = value["cases"][0]
+                        case["identity"]["batch_policy"] = {
+                            "strategy": "target_tpot",
+                            "max_size": 4,
+                            "candidate_step": 2,
+                            "target_tpot_ms": 10.0,
+                        }
+                        search = {
+                            "target_tpot_ms": 10.0,
+                            "max_size": 4,
+                            "candidate_step": 2,
+                            "outcome": "found",
+                            "best_batch_size": 4,
+                            "observations": [{"batch_size": 4, "outcome": "satisfied"}],
+                        }
+                        if location == "metrics":
+                            case["metrics"]["search"] = search
+                        else:
+                            search.update(
+                                outcome="no_satisfying_candidate",
+                                best_batch_size=None,
+                                observations=[
+                                    {"batch_size": 4, "outcome": "target_exceeded"}
+                                ],
+                            )
+                            case.update(
+                                status="target_tpot_not_met",
+                                metrics=None,
+                                errors=[
+                                    {
+                                        "code": "target_tpot_not_met",
+                                        "message": "no candidate",
+                                        "details": {"search": search},
+                                    }
+                                ],
+                            )
+                            value["status"] = "partial"
+                            value["summary"].update(successful_cases=0, failed_cases=1)
+                        record = (
+                            search
+                            if outcome_field == "search"
+                            else search["observations"][0]
+                        )
+                        record["outcome"] = malformed
+                        with self.assertRaisesRegex(ResultSchemaError, "outcome"):
+                            parse_result_envelope(value)
+
     def test_decode_v2_selected_batch_search_and_profiling(self):
         value = _decode_result()
         case = copy.deepcopy(value["cases"][0])

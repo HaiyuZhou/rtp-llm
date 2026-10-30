@@ -19,6 +19,7 @@ import yaml
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
+from rtp_llm.test.perf_test.config_resolver import canonical_json
 from rtp_llm.test.perf_test.errors import (
     ConfigurationError,
     PartialRunError,
@@ -223,6 +224,25 @@ def verify_collected_decode_run(root, *, plan, run_id, state):
         )
         if not isinstance(manifest, dict):
             raise ValueError("manifest must contain an object")
+        resolved = json.loads(
+            (root / "resolved_config.json").read_text(encoding="utf-8")
+        )
+        persisted_plan = json.loads(
+            (root / "execution_plan.json").read_text(encoding="utf-8")
+        )
+        if canonical_json(resolved) != canonical_json(thaw(plan.resolved_config)):
+            raise ValueError("persisted normalized config differs from the plan")
+        if (
+            not isinstance(persisted_plan, dict)
+            or not isinstance(persisted_plan.get("result_directory"), str)
+            or not persisted_plan["result_directory"].strip()
+        ):
+            raise ValueError("persisted execution plan requires a result directory")
+        expected_plan = plan.to_dict()
+        # The master's run root differs from both preflight and collected roots.
+        expected_plan["result_directory"] = persisted_plan["result_directory"]
+        if canonical_json(persisted_plan) != canonical_json(expected_plan):
+            raise ValueError("persisted execution plan differs from the plan")
         parse_result_envelope(envelope)
         expected = {
             "run_id": run_id,

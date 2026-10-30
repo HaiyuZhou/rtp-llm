@@ -126,6 +126,58 @@ def _persist_run(plan, source, root, state, run_id):
 
 
 class DecodeMultiNodeTest(unittest.TestCase):
+    def test_collection_rejects_missing_or_inconsistent_plan_and_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, source = build_external_decode_plan(
+                _write_decode_config(root), "preflight", TOPOLOGY
+            )
+            run = root / "collected-run"
+            _persist_run(plan, source, run, "completed", "attempt")
+            verify = lambda: multi_benchmark.verify_collected_decode_run(
+                run, plan=plan, run_id="attempt", state="completed"
+            )
+            verify()
+            changes = (
+                ("resolved_config.json", None, None),
+                ("resolved_config.json", (), []),
+                ("resolved_config.json", ("engine", "concurrency_limit"), 9),
+                ("resolved_config.json", ("model", "topology", "ep"), True),
+                ("execution_plan.json", None, None),
+                ("execution_plan.json", (), []),
+                ("execution_plan.json", ("action",), "profile"),
+                ("execution_plan.json", ("config_fingerprint",), "stale"),
+                ("execution_plan.json", ("cases", 0, "identity", "output_length"), 999),
+                ("execution_plan.json", ("resource_plan", "devices"), [2, 3]),
+                (
+                    "execution_plan.json",
+                    ("resolved_config", "engine", "max_seq_len"),
+                    999,
+                ),
+                ("execution_plan.json", ("result_directory",), ""),
+            )
+            for artifact, keys, value in changes:
+                path = run / artifact
+                original = path.read_text()
+                with self.subTest(artifact=artifact, keys=keys):
+                    if keys is None:
+                        path.unlink()
+                    else:
+                        changed = json.loads(original)
+                        if not keys:
+                            changed = value
+                        else:
+                            parent = changed
+                            for key in keys[:-1]:
+                                parent = parent[key]
+                            parent[keys[-1]] = value
+                        path.write_text(json.dumps(changed))
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, "persisted"):
+                            verify()
+                    finally:
+                        path.write_text(original)
+
     def test_collection_selects_current_attempt_instead_of_newest_run(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

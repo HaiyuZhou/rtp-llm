@@ -1,5 +1,15 @@
 package(default_visibility = ["//visibility:public"])
 
+py_test(
+    name = "decode_multi_node_test",
+    srcs = ["decode_multi_node_test.py"],
+    data = [
+        "multi_node/multi_benchmark_config.yaml",
+        "multi_node/multi_runner.sh",
+    ],
+    deps = [":perf_test_runtime_lib"],
+)
+
 py_library(
     name = "perf_test_entry_lib",
     srcs = [
@@ -53,6 +63,8 @@ py_library(
         "modes/base.py",
         "modes/decode.py",
         "modes/prefill.py",
+        "multi_node/decode_runtime.py",
+        "multi_node/multi_benchmark.py",
         "prefill/checkpoint.py",
         "prefill/finalize.py",
         "prefill/profile.py",

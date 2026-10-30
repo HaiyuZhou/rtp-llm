@@ -136,7 +136,7 @@ configure_env() {
 run_server() {
   if [ "${BUILD_FROM_SCRATCH:-2}" -eq 0 ]; then
     SERVER_CMD="$PYTHON_BIN ./rtp_llm/test/perf_test/multi_node/local_server_runner.py";
-    if [ $CUDA_ASAN -eq 1 ]; then
+    if [ "${CUDA_ASAN:-0}" -eq 1 ]; then
         /usr/local/cuda/compute-sanitizer/compute-sanitizer --print-limit 10000 --target-processes all $SERVER_CMD || exit 1;
     else
       $SERVER_CMD || exit 1;
@@ -213,6 +213,10 @@ local_clean_script() {
 }
 
 local_test_script() {
+  if [ -z "$PERF_TEST_CONFIG_PATH" ] || [ ! -r "$PERF_TEST_CONFIG_PATH" ]; then
+    echo "PERF_TEST_CONFIG_PATH must name the delivered decode config"
+    exit 1
+  fi
   # Kill all running processes related to rtp_llm and conda310
   kill_processes || exit 1;
   # Enter work dir

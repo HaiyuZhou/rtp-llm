@@ -10,7 +10,7 @@ import signal
 import socket
 import sys
 import time
-from typing import Dict, List
+from typing import Dict
 
 current_file_path = pathlib.Path(__file__).parent.absolute()
 sys.path.append(str(current_file_path.parent.parent.parent.absolute()))
@@ -27,7 +27,11 @@ from rtp_llm.config.py_config_modules import PyEnvConfigs
 from rtp_llm.config.server_config_setup import setup_and_configure_server
 from rtp_llm.distribute.distributed_server import members_from_test_env
 from rtp_llm.server.server_args.server_args import setup_args
-from rtp_llm.test.perf_test.decode.grid_runner import run_single
+from rtp_llm.test.perf_test.multi_node.decode_runtime import (
+    build_external_decode_plan,
+    execute_master_decode,
+    run_external_rank,
+)
 from rtp_llm.test.perf_test.test_util import create_query
 from rtp_llm.test.utils.maga_server_manager import MagaServerManager
 from rtp_llm.utils.fuser import fetch_remote_file_to_local
@@ -96,28 +100,6 @@ def script_exit(pgrp_set: bool = False):
         os._exit(0)
 
 
-def test_main(
-    port: int,
-    py_env_configs: PyEnvConfigs,
-    batch_size_list: List[int],
-    input_len_list: List[int],
-    input_query_dict: Dict[int, str],
-    is_decode: bool,
-    log_dir_path: str,
-    decode_test_length: int,
-):
-    run_single(
-        port,
-        py_env_configs.parallelism_config.dp_size,
-        batch_size_list,
-        input_len_list,
-        input_query_dict,
-        is_decode,
-        log_dir_path,
-        decode_test_length,
-    )
-
-
 def try_upload_log(log_dir_path: str, upload_path: str):
     import shutil
 
@@ -140,15 +122,12 @@ def try_upload_log(log_dir_path: str, upload_path: str):
 
 
 if __name__ == "__main__":
-    batch_size_list = json.loads(os.environ.get("BATCH_SIZE_LIST", "[1,4,8]"))
-    input_len_list = json.loads(os.environ.get("INPUT_LEN_LIST", "[2048, 4096, 8192]"))
-    is_decode = os.environ.get("IS_DECODE", "1") == "1"
-    decode_test_length = int(os.environ.get("DECODE_TEST_LENGTH", 10))
-    max_seq_len = max(input_len_list) + decode_test_length
+    config_path = os.environ.get("PERF_TEST_CONFIG_PATH")
+    if not config_path:
+        raise RuntimeError("PERF_TEST_CONFIG_PATH is required for multi-node decode")
 
     os.environ["USE_BATCH_DECODE_SCHEDULER"] = "1"
     os.environ["FAKE_BALANCE_EXPERT"] = "1"
-    os.environ["MAX_SEQ_LEN"] = str(max_seq_len + 20)
 
     py_env_configs: PyEnvConfigs = setup_args()
     setup_and_configure_server(py_env_configs)
@@ -160,6 +139,24 @@ if __name__ == "__main__":
         f"_{time.strftime('%Y%m%d_%H%M%S')}"
     ).upper()
     log_dir_path = os.path.abspath(log_dir_name)
+    parallelism = py_env_configs.parallelism_config
+    plan, source = build_external_decode_plan(
+        config_path,
+        result_directory=str(pathlib.Path(log_dir_path) / "run"),
+        actual_topology={
+            "tp": parallelism.tp_size,
+            "dp": parallelism.dp_size,
+            "pp": parallelism.pp_size,
+            "ep": parallelism.ep_size,
+        },
+    )
+    input_len_list = sorted(
+        {length for case in plan.cases for length in case.identity["input_lengths"]}
+    )
+    engine = plan.resolved_config["engine"]
+    os.environ["MAX_SEQ_LEN"] = str(engine["max_seq_len"])
+    os.environ["MAX_BATCH_TOKENS_SIZE"] = str(engine["max_batch_tokens"])
+    os.environ["CONCURRENCY_LIMIT"] = str(engine["concurrency_limit"])
     os.makedirs(log_dir_path, exist_ok=True)
     os.environ["TORCH_CUDA_PROFILER_DIR"] = log_dir_path
     # for maga server files
@@ -173,38 +170,39 @@ if __name__ == "__main__":
     except Exception as e:
         logging.info(f"setpgrp error: {e}")
 
-    raw_tok = py_env_configs.model_args.tokenizer_path
-    if not raw_tok:
-        raise RuntimeError(
-            f"tokenizer_path is missing; set model_args.tokenizer_path or ckpt_path"
+    input_query_dict = {}
+    if world_rank == 0:
+        raw_tok = py_env_configs.model_args.tokenizer_path
+        if not raw_tok:
+            raise RuntimeError(
+                "tokenizer_path is missing; set model_args.tokenizer_path or ckpt_path"
+            )
+        tokenizer_path = fetch_remote_file_to_local(
+            os.path.expanduser(str(raw_tok).strip())
         )
-    tokenizer_path = fetch_remote_file_to_local(
-        os.path.expanduser(str(raw_tok).strip())
-    )
-
-    input_query_dict = create_query(
-        tokenizer_path=tokenizer_path,
-        input_len_list=input_len_list,
-    )
+        input_query_dict = create_query(
+            tokenizer_path=tokenizer_path, input_len_list=input_len_list
+        )
 
     server = MagaServerManager(port=str(port))
     try:
         if not server.start_server():
             server.print_process_log()
             raise Exception("server start failed")
-        if world_rank:
-            logging.info(f"world rank non-zero: {world_rank}, wait for main.")
-            wait_master_done(world_rank=world_rank)
-        else:
-            test_main(
-                port,
-                py_env_configs,
-                batch_size_list,
-                input_len_list,
-                input_query_dict,
-                is_decode,
-                log_dir_path,
-                decode_test_length,
+        result = run_external_rank(
+            world_rank=world_rank,
+            wait_for_master=lambda: wait_master_done(world_rank=world_rank),
+            execute_master=lambda: execute_master_decode(
+                plan,
+                source_config=source,
+                endpoint=f"http://127.0.0.1:{port}",
+                prompt_for_length=lambda length: input_query_dict[length],
+                server_log_path=server.log_file_path,
+            ),
+        )
+        if result is not None:
+            print(
+                "PERF_TEST_DECODE_RESULT " + json.dumps({"state": result.state.value})
             )
     finally:
         server.stop_server()

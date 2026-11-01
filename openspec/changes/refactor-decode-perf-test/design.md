@@ -65,7 +65,7 @@ Planning behavior is deterministic:
 - Exact distribution materializes the real length list for each configured batch.
 - Target-TPOT distribution requires one sequence-length list of at least `max_size`; candidates use prefixes. Explicit per-batch maps are rejected for search.
 
-Case identifiers derive from normalized shape and policy identity, not loop position. Config order determines plan/report order, while equivalent normalized cases retain equivalent identifiers.
+Case identifiers derive from normalized shape and policy identity, not loop position. Plan and report ordering is the deterministic `case_id` order and is independent of configuration order, while equivalent normalized cases retain equivalent identifiers.
 
 Known-invalid values and configured engine bounds are rejected during planning, including non-positive dimensions, input plus output beyond maximum sequence length, and a configured upper batch that cannot satisfy declared concurrency or token bounds. Runtime capacity failures such as allocation failure remain search observations.
 

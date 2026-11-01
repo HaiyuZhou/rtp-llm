@@ -452,6 +452,33 @@ class ResultEnvelopeTest(unittest.TestCase):
                 with self.assertRaises(ResultSchemaError):
                     parse_result_envelope(invalid)
 
+    def test_search_found_without_selected_observation_is_isolated(self):
+        # A found search whose observations never include the selected batch
+        # must be rejected as a schema error (isolated per case), never crash
+        # the envelope parser: _parse_search requires best_batch_size to equal
+        # the largest satisfied observation, so the selected-observation lookup
+        # in parse_case_result is always satisfiable.
+        value = _decode_result()
+        case = value["cases"][0]
+        case["identity"]["batch_policy"] = {
+            "strategy": "target_tpot",
+            "max_size": 4,
+            "candidate_step": 2,
+            "target_tpot_ms": 10.0,
+        }
+        case["metrics"]["search"] = {
+            "target_tpot_ms": 10.0,
+            "max_size": 4,
+            "candidate_step": 2,
+            "outcome": "found",
+            "best_batch_size": 4,
+            "observations": [{"batch_size": 2, "outcome": "satisfied"}],
+        }
+        with self.assertRaisesRegex(
+            ResultSchemaError, "must select largest satisfied candidate"
+        ):
+            parse_result_envelope(value)
+
     def test_prefill_envelope_round_trips_as_golden_schema(self):
         source = _prefill_result()
 

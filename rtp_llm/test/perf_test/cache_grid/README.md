@@ -150,13 +150,13 @@ python3 -m rtp_llm.test.perf_test.cache_grid.runner.generate_random_batch_grid \
 ./tools/cache_perf run --profile /path/local.jsonc --grid /path/grid.json \
   --result-dir /path/test-only --runs 3
 
-# 连续压力：4 个长 seed family，scheduler 每批 4 请求，最多 12 个请求在途。
+# 连续压力：4 个长 seed family，FIFO 动态组批，最多 12 个请求在途。
 ./tools/cache_perf run --profile /path/local.jsonc --grid /path/grid.json \
   --result-dir /path/continuous --runs 20 --pressure-mode continuous \
-  --pressure-seed-count 4 --pressure-batch-size 4 \
+  --pressure-seed-count 4 \
   --pressure-client-concurrency 12 --pressure-request-rate 0
 
-# FIFO 连续压力：不固定服务端 batch，按到达流量动态组批。
+# 限速的 FIFO 连续压力：按到达流量动态组批。
 ./tools/cache_perf run --profile /path/local.jsonc --grid /path/grid.json \
   --result-dir /path/continuous-fifo --runs 20 --pressure-mode continuous \
   --pressure-scheduler fifo --pressure-seed-count 4 \
@@ -189,10 +189,10 @@ fixed workspace、materialized cases、profiling 或 `cache_shared_seed` 混用�
 它先并发 seed 若干条 `max(cache_len)+commit_tail` 长前缀，再将各 case/run 打乱，
 从不同 seed 截断到目标 cache_len 后持续提交。`--pressure-request-rate=0` 表示 burst；
 正数配合 `constant` 或 `poisson` 到达模型。要制造服务端排队，应让
-`pressure-client-concurrency > pressure-batch-size`，同时保证 `engine.concurrency_limit`
-不小于 client concurrency 和 seed count。详细执行与结果字段见参考文档。
-默认 `--pressure-scheduler batch_decode` 使用固定批；`--pressure-scheduler fifo` 使用线上动态
-组批语义，不接受 `--pressure-batch-size`，也不会为了凑批增加 padding。FIFO 下实际 batch 由
+client concurrency 或 request rate 足以形成积压，同时保证 `engine.concurrency_limit`
+不小于 client concurrency。详细执行与结果字段见参考文档。
+continuous 模式只使用 FIFO 线上动态组批语义；`--pressure-scheduler batch_decode` 会被拒绝，
+`--pressure-batch-size` 必须保持兼容默认值 1，也不会为了凑批增加 padding。实际 batch 由
 到达速率、客户端并发、token budget 和 KV 资源共同决定；未指定客户端并发时使用
 `engine.concurrency_limit`。
 `--skip-test` 不接受 profile/grid/runs/env 等启动覆盖项。

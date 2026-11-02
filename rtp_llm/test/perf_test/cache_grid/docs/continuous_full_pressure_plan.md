@@ -55,7 +55,7 @@ Task15 运行修复提交依次为 `94f336727a`、`f1f01fc2a8`、`f62615cbf1`、
 | 入口与环境 | cache_perf profile/grid 配置、启动、结果目录和快照 | 新阶段及 profile 配置纳入冻结配置 |
 | 请求构造 | seed family、目标前缀、独立 suffix、cold 输入 | 与正式 seed 独立的容量灌注请求 |
 | 压力发送 | 客户端并发上限、burst/constant/poisson | 连续阶段切换、可选时间窗口和有界持续供给 |
-| 调度 | batch_decode 固定 batch；FIFO 动态组批 | 复用现有调度，不另建模拟 scheduler |
+| 调度 | continuous 固定使用 FIFO 动态组批 | 复用现有调度，不另建模拟 scheduler |
 | 初始 seed | 长度为 max(cache_len)+commit_tail；验证请求结果 | 读取实际容量压力，达标后才正式测量 |
 | 观测 | 请求时延、reuse、吞吐、schedule lag、engine wait | 分层 cache 压力、成功降级、step 时间和 CPU/等待归因 |
 | Profiling | 单 case replay；continuous 显式禁止 profile | 连续流上的 Kineto 或 Nsight 窗口 |
@@ -73,7 +73,7 @@ Task15 运行修复提交依次为 `94f336727a`、`f1f01fc2a8`、`f62615cbf1`、
 
 初版沿用 DP=1、独占服务、未分组 batch_size=1 grid、dashsc_input_ids、已知 block size、完整 commit tail，以及不与 fixed workspace、物化输入和 cache_shared_seed 混用的限制。这里 grid 的 batch_size=1 描述单请求几何，不限制服务端 batch 大小。
 
-当前 preload 默认且只允许 FIFO；旧 batch_decode preload 对照已废弃，仅普通有限 batch 模式保留。client backlog 与 active batch 分别验证，不自动修改引擎容量以使测试通过。
+当前所有 continuous 路径默认且只允许 FIFO；旧 batch_decode continuous 对照已废弃，固定批只在普通 case 模式保留。client backlog 与 active batch 分别验证，不自动修改引擎容量以使测试通过。
 
 所谓“满载”包括两个分别检查的条件：
 

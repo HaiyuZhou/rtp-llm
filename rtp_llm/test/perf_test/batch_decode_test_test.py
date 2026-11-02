@@ -576,9 +576,18 @@ class BatchDecodeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "FIFO-only"):
             parse_args(flags + ["--cache_pressure_scheduler=batch_decode"])
         ordinary, _ = parse_args(["--cache_pressure_mode=continuous"])
-        self.assertEqual(ordinary.cache_pressure_scheduler, "batch_decode")
+        self.assertEqual(ordinary.cache_pressure_scheduler, "fifo")
         self.assertEqual(ordinary.cache_pressure_seed_count, 4)
-        self.assertEqual(ordinary.cache_pressure_client_concurrency, 0)
+        self.assertEqual(
+            ordinary.cache_pressure_client_concurrency, ordinary.concurrency_limit
+        )
+        with self.assertRaisesRegex(ValueError, "FIFO-only"):
+            parse_args(
+                [
+                    "--cache_pressure_mode=continuous",
+                    "--cache_pressure_scheduler=batch_decode",
+                ]
+            )
         self.assertEqual(args._pressure_config.measure_s, 60)
         self.assertEqual(args._pressure_config.fill_max_requests, 50)
         self.assertEqual(args._pressure_config.control_timeout_s, 7.5)
@@ -2361,6 +2370,28 @@ class CacheGridRunnerResumeGuardTest(unittest.TestCase):
                     run_config={"model": {"checkpoint_path": "/weights/new"}},
                 )
 
+    def test_continuous_resume_rejects_legacy_non_fifo_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_existing_results(
+                tmp,
+                {
+                    "metrics": [],
+                    "seed_mode": "continuous_shared_prefix_v1",
+                    "pressure_scheduler": "batch_decode",
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "FIFO-only.*new result directory"):
+                validate_cache_grid_resume(
+                    tmp,
+                    grid_sha256=None,
+                    profile_sha256=None,
+                    measure_runs=3,
+                    cache_commit_tail_tokens=4096,
+                    expected_block_size=0,
+                    request_transport="http_prompt",
+                    pressure_mode="continuous",
+                )
+
     @patch("rtp_llm.test.perf_test.cache_grid.runner.cache_grid_runner._post_prefill")
     def test_resume_skips_ok_case_and_starts_at_next_input_cache(self, post):
         cases = [
@@ -2862,7 +2893,7 @@ class ContinuousPressureTest(unittest.TestCase):
         options = {
             "request_transport": "dashsc_input_ids",
             "pressure_mode": "continuous",
-            "pressure_batch_size": 4,
+            "pressure_batch_size": 1,
             "pressure_client_concurrency": 4,
             "pressure_seed_count": 2,
             "pressure_random_seed": 7,
@@ -2883,7 +2914,7 @@ class ContinuousPressureTest(unittest.TestCase):
             **options,
         )
 
-    def test_interleaves_cases_reuses_seed_families_and_pads_tail(self):
+    def test_interleaves_cases_reuses_seed_families_without_padding(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = self.runner(directory)
             self.addCleanup(runner._close_resources)
@@ -2934,17 +2965,15 @@ class ContinuousPressureTest(unittest.TestCase):
                 metrics = runner.run()
 
             self.assertTrue(all(metric["status"] == "ok" for metric in metrics))
-            self.assertEqual(
-                [call.args[0] for call in scheduler.call_args_list], [2, 4, 1]
-            )
+            scheduler.assert_not_called()
             self.assertEqual(max_active, 4)
-            self.assertEqual(len(measured), 8)
+            self.assertEqual(len(measured), 6)
             saved = json.loads(
                 (Path(directory) / "cache_grid_results.json").read_text()
             )
             self.assertEqual(saved["seed_mode"], "continuous_shared_prefix_v1")
             self.assertEqual(saved["continuous_pressure"]["measured_requests"], 6)
-            self.assertEqual(saved["continuous_pressure"]["padding_requests"], 2)
+            self.assertEqual(saved["continuous_pressure"]["padding_requests"], 0)
             self.assertGreater(saved["continuous_pressure"]["queued_requests"], 0)
             sequence = [
                 run["pressure_sequence"] for metric in metrics for run in metric["runs"]
@@ -2958,7 +2987,7 @@ class ContinuousPressureTest(unittest.TestCase):
                 )
             )
 
-    def test_requires_input_ids_and_enough_client_concurrency(self):
+    def test_requires_input_ids_and_rejects_fixed_batch_controls(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "dashsc_input_ids"):
                 CacheGridRunner(
@@ -2970,8 +2999,10 @@ class ContinuousPressureTest(unittest.TestCase):
                     expected_block_size=8,
                     cache_commit_tail_tokens=8,
                 )
-            with self.assertRaisesRegex(ValueError, "at least batch size"):
-                self.runner(directory, pressure_client_concurrency=2)
+            with self.assertRaisesRegex(ValueError, "FIFO-only"):
+                self.runner(directory, pressure_scheduler="batch_decode")
+            with self.assertRaisesRegex(ValueError, "does not use"):
+                self.runner(directory, pressure_batch_size=2)
 
     def test_fifo_uses_dynamic_batching_without_padding_or_scheduler_control(self):
         with tempfile.TemporaryDirectory() as directory:

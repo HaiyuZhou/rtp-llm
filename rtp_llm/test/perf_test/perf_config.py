@@ -123,8 +123,8 @@ def parse_args(
         choices=("batch_decode", "fifo"),
         default=None,
         help=(
-            "Scheduler used by continuous pressure: fixed-size BatchDecodeScheduler "
-            "or production-style dynamic FIFO batching"
+            "Scheduler used by cache-grid execution. Continuous pressure is FIFO-only; "
+            "batch_decode remains available for ordinary case mode"
         ),
     )
     perf.add_argument(
@@ -132,8 +132,8 @@ def parse_args(
         type=int,
         default=1,
         help=(
-            "BatchDecodeScheduler prefill batch size in continuous mode; "
-            "must remain 1 and is ignored with FIFO"
+            "Compatibility value for continuous pressure; must remain 1 because "
+            "continuous execution is FIFO-only"
         ),
     )
     perf.add_argument(
@@ -393,15 +393,25 @@ def parse_args(
     args._profile = profile
     args._profile_sha256 = profile_sha256
     args.cache_pressure_scheduler = args.cache_pressure_scheduler or (
-        "fifo" if args.cache_pressure_preload else "batch_decode"
+        "fifo" if args.cache_pressure_mode == "continuous" else "batch_decode"
     )
+    if (
+        args.cache_pressure_mode == "continuous"
+        and args.cache_pressure_scheduler != "fifo"
+    ):
+        raise ValueError(
+            "continuous pressure is FIFO-only; use case mode for fixed batching"
+        )
     if args.cache_pressure_preload:
-        if args.cache_pressure_scheduler != "fifo":
-            raise ValueError("full-pressure preload is FIFO-only")
         args.cache_pressure_client_concurrency = (
             args.cache_pressure_client_concurrency or MIN_FORMAL_CLIENT_INFLIGHT
         )
-    elif args.cache_pressure_seed_count is None:
+    elif (
+        args.cache_pressure_mode == "continuous"
+        and args.cache_pressure_client_concurrency == 0
+    ):
+        args.cache_pressure_client_concurrency = args.concurrency_limit
+    if not args.cache_pressure_preload and args.cache_pressure_seed_count is None:
         args.cache_pressure_seed_count = 4
     args._pressure_config = None
     if args.cache_pressure_preload:

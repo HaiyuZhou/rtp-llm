@@ -809,15 +809,12 @@ class LifecycleTest(unittest.TestCase):
         valid=True,
         cfg=None,
         controller=None,
-        scheduler="fifo",
         poll_transform=None,
         payload_hook=None,
         seed_count=0,
         rate=3,
-        control=None,
         diagnostics_control=None,
         concurrency=4,
-        batch_size=1,
         request_observer=None,
         executor_factory=InlineExecutor,
     ):
@@ -877,8 +874,6 @@ class LifecycleTest(unittest.TestCase):
             session_id="session",
             limits=cp.ExecutionLimits(128, 8, 256, 64, 16),
             concurrency=concurrency,
-            scheduler=scheduler,
-            batch_size=batch_size,
             max_input_tokens=16,
             seed_plan=seed_plan(seed_count, client_inflight=concurrency),
             startup_targets=select_targets((sample(0),), (0,)),
@@ -886,7 +881,6 @@ class LifecycleTest(unittest.TestCase):
             request=request,
             poll=poll,
             sink=events.append,
-            set_batch=control or (lambda count, **kwargs: batches.append(count)),
             controller=controller,
             diagnostics_control=diagnostics_control,
             clock=clock,
@@ -1370,15 +1364,6 @@ class LifecycleTest(unittest.TestCase):
         self.assertTrue(any(e.get("phase") == "support" for e in events))
         self.assertIn("support_pressure", result)
         self.assertAlmostEqual(controller.stops[0][1], controller.started + 3, places=2)
-
-    def test_preload_rejects_fixed_batch_schedulers_before_any_request(self):
-        with self.assertRaisesRegex(ValueError, "FIFO-only"):
-            self.run_session(scheduler="batch_decode")
-        for batch_size in (2, True, 1.0):
-            with self.subTest(batch_size=batch_size), self.assertRaisesRegex(
-                ValueError, "no fixed batch"
-            ):
-                self.run_session(batch_size=batch_size)
 
     def test_fill_time_and_no_progress_budgets(self):
         for settings in (dict(fill_timeout_s=1), dict(fill_no_progress_s=1)):
@@ -1897,12 +1882,6 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(result["failure"], "supervisor_failed")
         self.assertFalse(any(e["event"] == "dispatch" for e in events))
 
-    def test_fifo_never_invokes_fixed_batch_control(self):
-        result, _, _, _ = self.run_session(
-            control=lambda *args, **kwargs: self.fail("FIFO scheduler control")
-        )
-        self.assertIsNone(result["failure"])
-
     def test_blocked_rpc_is_cancelled_at_drain_without_boundary_drain(self):
         self.run_blocked_rpc(seed_count=0)
 
@@ -1968,8 +1947,6 @@ class LifecycleTest(unittest.TestCase):
             session_id="blocked",
             limits=cp.ExecutionLimits(128, 2, 128, 64, 16),
             concurrency=2,
-            scheduler="fifo",
-            batch_size=1,
             max_input_tokens=16,
             seed_plan=seed_plan(seed_count, client_inflight=2),
             startup_targets=startup_targets,
@@ -1977,7 +1954,6 @@ class LifecycleTest(unittest.TestCase):
             request=request,
             poll=poll,
             sink=events.append,
-            set_batch=lambda count: self.fail("FIFO control"),
         )
         began = time.monotonic()
         result = session.run()
@@ -2262,8 +2238,6 @@ class WarmupCutoffTest(unittest.TestCase):
             session_id="partial",
             limits=cp.ExecutionLimits(128, 2, 128, 64, 16),
             concurrency=2,
-            scheduler="fifo",
-            batch_size=1,
             max_input_tokens=16,
             seed_plan=seed_plan(client_inflight=2),
             startup_targets=startup_targets,
@@ -2271,7 +2245,6 @@ class WarmupCutoffTest(unittest.TestCase):
             request=request,
             poll=poll,
             sink=events.append,
-            set_batch=lambda count, **kwargs: batches.append(count),
             clock=clock,
             sleep=sleep,
         )
@@ -2539,8 +2512,6 @@ class TransportRegistrationTest(unittest.TestCase):
                     session_id="queued",
                     limits=cp.ExecutionLimits(128, 8, 256, 64, 16),
                     concurrency=4,
-                    scheduler="fifo",
-                    batch_size=1,
                     max_input_tokens=16,
                     seed_plan=seed_plan(),
                     startup_targets=(),
@@ -2548,7 +2519,6 @@ class TransportRegistrationTest(unittest.TestCase):
                     request=request,
                     poll=lambda timeout: None,
                     sink=lambda event: None,
-                    set_batch=lambda *args, **kwargs: None,
                     clock=clock,
                 )
                 session.executor = QueuedExecutor()
@@ -3408,6 +3378,8 @@ class RunnerIntegrationTest(unittest.TestCase):
         for changes in (
             dict(pressure_scheduler="batch_decode"),
             dict(pressure_batch_size=2),
+            dict(pressure_batch_size=True),
+            dict(pressure_batch_size=1.0),
             dict(pressure_seed_count=0),
             dict(pressure_seed_count=True),
             dict(pressure_seed_count=1.5),

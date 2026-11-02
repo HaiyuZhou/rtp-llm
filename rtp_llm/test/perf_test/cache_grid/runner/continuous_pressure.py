@@ -443,8 +443,6 @@ class PressureSession:
         session_id,
         limits,
         concurrency,
-        scheduler,
-        batch_size,
         max_input_tokens,
         seed_plan: SeedPlan,
         startup_targets: tuple[PressureTarget, ...],
@@ -452,7 +450,6 @@ class PressureSession:
         request,
         poll,
         sink,
-        set_batch,
         controller=None,
         diagnostics_control=None,
         rate=0,
@@ -468,10 +465,6 @@ class PressureSession:
         seed_count = seed_plan.seed_count
         seed_input_tokens = seed_plan.seed_input_tokens
         self.arrivals = ArrivalClock(rate, poisson, random_seed)
-        if scheduler != "fifo":
-            raise ValueError("continuous full-pressure preload is FIFO-only")
-        if batch_size != 1 or type(batch_size) is not int:
-            raise ValueError("FIFO full-pressure preload has no fixed batch")
         if type(concurrency) is not int or concurrency < 1:
             raise ValueError("positive concurrency required")
         limits.require_request(max_input_tokens)
@@ -481,11 +474,7 @@ class PressureSession:
         )
         if type(seed_count) is not int or seed_count < 0:
             raise ValueError("invalid seed count")
-        self.session_id, self.scheduler, self.batch_size = (
-            session_id,
-            scheduler,
-            batch_size,
-        )
+        self.session_id = session_id
         self.seed_count = seed_count
         self.adaptive = None
         if config.rate_control == "adaptive_backlog":

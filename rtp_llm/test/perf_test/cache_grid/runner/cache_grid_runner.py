@@ -250,6 +250,15 @@ def validate_cache_grid_resume(
     with result_path.open(encoding="utf-8") as stream:
         payload = json.load(stream)
 
+    if pressure_mode == "continuous" and payload.get("pressure_scheduler") not in (
+        None,
+        "fifo",
+    ):
+        raise ValueError(
+            "continuous pressure is FIFO-only; start a new result directory "
+            "instead of resuming a non-FIFO checkpoint"
+        )
+
     current_metrics(payload, str(result_path))
     required = {
         "seed_mode",
@@ -1050,7 +1059,7 @@ class CacheGridRunner:
         request_timeout: int = 7200,
         shared_seed: bool = False,
         pressure_mode: str = "case",
-        pressure_scheduler: str = "batch_decode",
+        pressure_scheduler: str | None = None,
         pressure_batch_size: int = 1,
         pressure_client_concurrency: int = 2,
         pressure_seed_count: int | None = None,
@@ -1086,6 +1095,9 @@ class CacheGridRunner:
         nsys_tail_seconds: float = 0.1,
     ):
         self.port = port
+        pressure_scheduler = pressure_scheduler or (
+            "fifo" if pressure_mode == "continuous" else "batch_decode"
+        )
         if pressure_config is None and pressure_seed_count is None:
             pressure_seed_count = 4
         self.pressure_config = pressure_config
@@ -1213,10 +1225,12 @@ class CacheGridRunner:
         if pressure_mode != "continuous" and pressure_scheduler != "batch_decode":
             raise ValueError("FIFO cache pressure requires continuous mode")
         if pressure_mode == "continuous":
-            if pressure_batch_size <= 0 or pressure_client_concurrency <= 0:
+            if pressure_scheduler != "fifo":
                 raise ValueError(
-                    "continuous pressure batch size and concurrency must be positive"
+                    "continuous pressure is FIFO-only; use case mode for fixed batching"
                 )
+            if pressure_client_concurrency <= 0:
+                raise ValueError("continuous pressure concurrency must be positive")
             if pressure_seed_count is None:
                 if pressure_config is None:
                     raise ValueError(
@@ -1232,14 +1246,7 @@ class CacheGridRunner:
                 raise ValueError(
                     "continuous pressure arrival must be constant or poisson"
                 )
-            if (
-                pressure_scheduler == "batch_decode"
-                and pressure_client_concurrency < pressure_batch_size
-            ):
-                raise ValueError(
-                    "continuous pressure client concurrency must be at least batch size"
-                )
-            if pressure_scheduler == "fifo" and pressure_batch_size != 1:
+            if type(pressure_batch_size) is not int or pressure_batch_size != 1:
                 raise ValueError(
                     "continuous FIFO pressure does not use pressure_batch_size; "
                     "leave it at 1"
@@ -1278,8 +1285,7 @@ class CacheGridRunner:
                 )
             run_config = dict(run_config or {})
             run_config["cache_seed_mode"] = "continuous_shared_prefix_v1"
-            if pressure_scheduler == "fifo":
-                run_config["cache_pressure_scheduler"] = "fifo"
+            run_config["cache_pressure_scheduler"] = "fifo"
         if shared_seed:
             if request_transport != "dashsc_input_ids":
                 raise ValueError("shared seed requires dashsc_input_ids transport")
@@ -1846,15 +1852,11 @@ class CacheGridRunner:
                 seed_len, f"continuous_seed_{family}_{seed_id}_"
             )
             seeds.append((family, seed_id, ids))
-        if self.pressure_scheduler == "batch_decode":
-            self._set_prefill_batch_size(len(seeds))
-        barrier = threading.Barrier(len(seeds))
 
         def send(item):
             family, seed_id, ids = item
             started = time.perf_counter()
             try:
-                barrier.wait(timeout=self.request_timeout)
                 result = self._post_request(
                     "", ids, f"continuous_seed:{family}:{seed_id}"
                 )
@@ -1871,7 +1873,8 @@ class CacheGridRunner:
             }
 
         with ThreadPoolExecutor(
-            max_workers=len(seeds), thread_name_prefix="continuous-seed"
+            max_workers=min(len(seeds), self.pressure_client_concurrency),
+            thread_name_prefix="continuous-seed",
         ) as pool:
             futures = [pool.submit(send, seed) for seed in seeds]
             records = [future.result() for future in futures]
@@ -2388,8 +2391,6 @@ class CacheGridRunner:
             session_id=session_id,
             limits=limits,
             concurrency=self.pressure_client_concurrency,
-            scheduler=self.pressure_scheduler,
-            batch_size=self.pressure_batch_size,
             max_input_tokens=max(int(c["input_len"]) for c in cases),
             seed_plan=seed_plan,
             startup_targets=startup_targets,
@@ -2397,7 +2398,6 @@ class CacheGridRunner:
             request=request,
             poll=poll,
             sink=evidence,
-            set_batch=self._set_prefill_batch_size,
             controller=controller,
             diagnostics_control=diagnostics_control,
             rate=self.pressure_request_rate,
@@ -2466,12 +2466,8 @@ class CacheGridRunner:
             "seed": {},
             "seed_mode": "continuous_shared_prefix_v1",
             "execution_mode": "continuous_pressure_v1",
-            "pressure_scheduler": self.pressure_scheduler,
-            "pressure_batch_size": (
-                self.pressure_batch_size
-                if self.pressure_scheduler == "batch_decode"
-                else None
-            ),
+            "pressure_scheduler": "fifo",
+            "pressure_batch_size": None,
             "pressure_client_concurrency": self.pressure_client_concurrency,
             "runs": runs,
             "reuse_exact": reuse_exact,
@@ -2492,150 +2488,114 @@ class CacheGridRunner:
 
     def _run_continuous(self, pending) -> List[Dict[str, Any]]:
         rng = random.Random(self.pressure_random_seed)
-        try:
-            self._initialize_continuous_seeds(pending)
-            jobs = []
-            for case in pending:
-                for run_index in range(self.measure_runs):
-                    jobs.append(
-                        {
-                            "case": case,
-                            "run_index": run_index,
-                            "padding": False,
-                        }
-                    )
-            rng.shuffle(jobs)
-            padding_count = (
-                (-len(jobs)) % self.pressure_batch_size
-                if self.pressure_scheduler == "batch_decode"
-                else 0
-            )
-            for index in range(padding_count):
-                padding = dict(jobs[index % len(jobs)])
-                padding["padding"] = True
-                jobs.append(padding)
-            for sequence, job in enumerate(jobs):
-                job["sequence"] = sequence
-                job["nonce"] = uuid.uuid4().hex
-                if int(job["case"]["cache_len"]):
-                    job["family"] = sequence % len(self._continuous_seed_ids)
+        self._initialize_continuous_seeds(pending)
+        jobs = [
+            {"case": case, "run_index": run_index}
+            for case in pending
+            for run_index in range(self.measure_runs)
+        ]
+        rng.shuffle(jobs)
+        for sequence, job in enumerate(jobs):
+            job["sequence"] = sequence
+            job["nonce"] = uuid.uuid4().hex
+            if int(job["case"]["cache_len"]):
+                job["family"] = sequence % len(self._continuous_seed_ids)
+            else:
+                job["family"] = None
+
+        offsets = []
+        offset = 0.0
+        for index in range(len(jobs)):
+            if index and self.pressure_request_rate:
+                if self.pressure_arrival == "poisson":
+                    offset += rng.expovariate(self.pressure_request_rate)
                 else:
-                    job["family"] = None
+                    offset += 1.0 / self.pressure_request_rate
+            offsets.append(offset)
 
-            offsets = []
-            offset = 0.0
-            for index in range(len(jobs)):
-                if index and self.pressure_request_rate:
-                    if self.pressure_arrival == "poisson":
-                        offset += rng.expovariate(self.pressure_request_rate)
-                    else:
-                        offset += 1.0 / self.pressure_request_rate
-                offsets.append(offset)
+        pressure_started_wall = time.time()
+        pressure_started = time.perf_counter()
 
-            if self.pressure_scheduler == "batch_decode":
-                self._set_prefill_batch_size(self.pressure_batch_size)
-            pressure_started_wall = time.time()
-            pressure_started = time.perf_counter()
+        def send(job, scheduled_offset):
+            case = job["case"]
+            key = self.case_key(case)
+            request_id = (
+                f"{key}:run{job['run_index']}:pressure{job['sequence']}:"
+                f"family{job['family']}"
+            )
+            try:
+                ids = self._continuous_request_ids(case, job["family"], job["nonce"])
+                due = pressure_started + scheduled_offset
+                remaining = due - time.perf_counter()
+                if remaining > 0:
+                    time.sleep(remaining)
+                dispatched = time.perf_counter()
+                result = self._post_request("", ids, request_id)
+            except Exception as exc:
+                dispatched = time.perf_counter()
+                result = {
+                    "success": False,
+                    "error": repr(exc),
+                    "request_id": request_id,
+                }
+            completed = time.perf_counter()
+            result = dict(result)
+            result.update(
+                {
+                    "run_index": job["run_index"],
+                    "seed_family": job["family"],
+                    "pressure_sequence": job["sequence"],
+                    "pressure_padding": False,
+                    "pressure_scheduled_offset_ms": scheduled_offset * 1000.0,
+                    "pressure_dispatch_offset_ms": (dispatched - pressure_started)
+                    * 1000.0,
+                    "pressure_schedule_lag_ms": max(
+                        0.0,
+                        (dispatched - pressure_started - scheduled_offset) * 1000.0,
+                    ),
+                    "pressure_completed_offset_ms": (completed - pressure_started)
+                    * 1000.0,
+                }
+            )
+            return result
 
-            def send(job, scheduled_offset):
-                case = job["case"]
-                key = self.case_key(case)
-                request_id = (
-                    f"{key}:run{job['run_index']}:pressure{job['sequence']}:"
-                    f"family{job['family']}"
-                )
-                try:
-                    ids = self._continuous_request_ids(
-                        case, job["family"], job["nonce"]
-                    )
-                    due = pressure_started + scheduled_offset
-                    remaining = due - time.perf_counter()
-                    if remaining > 0:
-                        time.sleep(remaining)
-                    dispatched = time.perf_counter()
-                    result = self._post_request("", ids, request_id)
-                except Exception as exc:
-                    dispatched = time.perf_counter()
-                    result = {
-                        "success": False,
-                        "error": repr(exc),
-                        "request_id": request_id,
-                    }
-                completed = time.perf_counter()
-                result = dict(result)
-                result.update(
-                    {
-                        "run_index": job["run_index"],
-                        "seed_family": job["family"],
-                        "pressure_sequence": job["sequence"],
-                        "pressure_padding": job["padding"],
-                        "pressure_scheduled_offset_ms": scheduled_offset * 1000.0,
-                        "pressure_dispatch_offset_ms": (dispatched - pressure_started)
-                        * 1000.0,
-                        "pressure_schedule_lag_ms": max(
-                            0.0,
-                            (dispatched - pressure_started - scheduled_offset) * 1000.0,
-                        ),
-                        "pressure_completed_offset_ms": (completed - pressure_started)
-                        * 1000.0,
-                    }
-                )
-                return result
-
-            with ThreadPoolExecutor(
-                max_workers=self.pressure_client_concurrency,
-                thread_name_prefix="continuous-pressure",
-            ) as pool:
-                futures = [
-                    pool.submit(send, job, offsets[index])
-                    for index, job in enumerate(jobs)
-                ]
-                results = [future.result() for future in futures]
-        finally:
-            if self.pressure_scheduler == "batch_decode":
-                self._set_prefill_batch_size(1)
+        with ThreadPoolExecutor(
+            max_workers=self.pressure_client_concurrency,
+            thread_name_prefix="continuous-pressure",
+        ) as pool:
+            futures = [
+                pool.submit(send, job, offsets[index]) for index, job in enumerate(jobs)
+            ]
+            results = [future.result() for future in futures]
 
         by_key = {self.case_key(case): [] for case in pending}
         for job, result in zip(jobs, results):
-            if not job["padding"]:
-                by_key[self.case_key(job["case"])].append(result)
+            by_key[self.case_key(job["case"])].append(result)
         elapsed = time.perf_counter() - pressure_started
         schedule_lags = [
-            float(result["pressure_schedule_lag_ms"])
-            for job, result in zip(jobs, results)
-            if not job["padding"]
+            float(result["pressure_schedule_lag_ms"]) for result in results
         ]
         server_waits = [
             float(result["wait_time_ms"])
-            for job, result in zip(jobs, results)
-            if not job["padding"]
-            and result.get("success")
+            for result in results
+            if result.get("success")
             and isinstance(result.get("wait_time_ms"), (int, float))
         ]
-        padding_failures = sum(
-            not result.get("success")
-            for job, result in zip(jobs, results)
-            if job["padding"]
-        )
         self._continuous_summary = {
             "schema_version": 1,
             "started_at_epoch_s": pressure_started_wall,
             "execution_mode": "continuous_pressure_v1",
-            "scheduler": self.pressure_scheduler,
+            "scheduler": "fifo",
             "arrival": self.pressure_arrival,
             "request_rate": self.pressure_request_rate,
             "random_seed": self.pressure_random_seed,
-            "scheduler_batch_size": (
-                self.pressure_batch_size
-                if self.pressure_scheduler == "batch_decode"
-                else None
-            ),
+            "scheduler_batch_size": None,
             "client_concurrency": self.pressure_client_concurrency,
             "configured_seed_count": self.pressure_seed_count,
             "effective_seed_count": len(self._continuous_seed_ids),
-            "measured_requests": len(jobs) - padding_count,
-            "padding_requests": padding_count,
-            "padding_failures": padding_failures,
+            "measured_requests": len(jobs),
+            "padding_requests": 0,
+            "padding_failures": 0,
             "elapsed_s": elapsed,
             "achieved_request_rate": (len(jobs) / elapsed if elapsed else None),
             "median_schedule_lag_ms": (
@@ -2663,10 +2623,6 @@ class CacheGridRunner:
         )
         self._save(complete=complete)
         failures = [metric for metric in metrics if metric["status"] != "ok"]
-        if padding_failures:
-            raise RuntimeError(
-                f"continuous cache pressure had {padding_failures} failed padding requests"
-            )
         if failures and self.fail_fast:
             raise RuntimeError(
                 "continuous cache pressure completed with invalid cases: "

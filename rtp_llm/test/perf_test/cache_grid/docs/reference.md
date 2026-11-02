@@ -102,27 +102,25 @@ FULL-pressure preload 的 `rate_control=adaptive_backlog` 提供独立定时发�
 `formal_sequence`、`outstanding_before`、`effective_rate` 和 schedule lag；finished result 的
 `supply` 保存实际最大在途、速率范围/均值、backlog 区间计数和 saturation 状态。
 
-`cache_pressure_scheduler=batch_decode` 是默认模式。BatchDecodeScheduler 只在攒满
-`cache_pressure_batch_size` 后执行，因此正式请求数不是整批时，runner 自动增加不计入 metric 的
-padding 请求，防止尾批永久等待。padding 失败会使本次测试失败。
-
-`cache_pressure_scheduler=fifo` 以 `USE_BATCH_DECODE_SCHEDULER=0` 启动服务，不调用运行时
-scheduler 控制接口。FIFO 不等待固定 batch，也不增加 padding；空闲时首个请求可立即运行，执行中
+continuous 模式固定使用 `cache_pressure_scheduler=fifo`，并以
+`USE_BATCH_DECODE_SCHEDULER=0` 启动服务，不调用运行时 scheduler 控制接口。
+传入 `cache_pressure_scheduler=batch_decode` 会在启动前失败；固定批只保留给普通 `case` 模式。
+FIFO 不等待固定 batch，也不增加 padding；空闲时首个请求可立即运行，执行中
 到达的请求在下一个 prefill 边界按并发、token budget 和 KV 资源动态组批。
 `cache_pressure_batch_size` 在 FIFO 下不适用，必须保持默认值 1。未显式配置 client concurrency 时，
 FIFO 使用 `engine.concurrency_limit`。结果的 `pressure_scheduler` 和
-`continuous_pressure.scheduler` 区分两种口径；FIFO 的 `scheduler_batch_size` 为 null。
+`continuous_pressure.scheduler` 固定为 `fifo`；`scheduler_batch_size` 为 null，兼容字段
+`padding_requests` 和 `padding_failures` 固定为 0。
 
-固定批模式若要观察服务端排队，配置 `client_concurrency > batch_size`；两者相等只保证连续组批，
-不保证 scheduler 内存在等待请求。FIFO 模式通过提高 client concurrency 或 request rate 制造积压。
-上述普通有限模式要求 `engine.concurrency_limit` 覆盖 client concurrency 和 seed count。
+FIFO 模式通过提高 client concurrency 或 request rate 制造积压。上述普通有限模式要求
+`engine.concurrency_limit` 覆盖 client concurrency；seed 按该并发上限有界初始化。
 FULL-pressure preload 则分别验证单请求可执行性及排队 admission，客户端 backlog 不以
 active execution capacity 封顶，seed 总数也不要求同时执行。普通有限模式目前要求
 DP=1、未分组 batch=1、`dashsc_input_ids`、明确 block size 和
 完整 commit tail；不支持 fixed workspace、物化输入、profiling 或额外的 `cache_shared_seed`。
 
 结果使用 `seed_mode=continuous_shared_prefix_v1`。每个 run 记录 seed family、全局发送序号、
-计划/实际发送 offset、客户端 schedule lag；顶层 `continuous_pressure` 记录实际吞吐、padding、
+计划/实际发送 offset、客户端 schedule lag；顶层 `continuous_pressure` 记录实际吞吐、兼容的零值 padding 字段、
 schedule lag 以及来自服务端 `engine_wait_time` 的排队请求数和 wait time 聚合。
 
 `--skip-reuse-validation` 允许测试保留实测 reuse 不匹配的结果，仍记录期望值及校验状态；

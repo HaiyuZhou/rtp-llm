@@ -185,16 +185,8 @@ def _build_cache_resume_config(
             **(
                 {
                     "cache_pressure_mode": args.cache_pressure_mode,
-                    **(
-                        {"cache_pressure_scheduler": "fifo"}
-                        if args.cache_pressure_scheduler == "fifo"
-                        else {}
-                    ),
-                    **(
-                        {"cache_pressure_batch_size": (args.cache_pressure_batch_size)}
-                        if args.cache_pressure_scheduler == "batch_decode"
-                        else {}
-                    ),
+                    "cache_pressure_scheduler": "fifo",
+                    "cache_pressure_batch_size": 1,
                     "cache_pressure_client_concurrency": (
                         args.cache_pressure_client_concurrency
                     ),
@@ -1029,12 +1021,7 @@ def main() -> str:
         if args.cache_checkpoint_every <= 0:
             raise ValueError("--cache_checkpoint_every must be positive")
         if (
-            args.cache_pressure_scheduler == "batch_decode"
-            and args.cache_pressure_batch_size <= 0
-        ):
-            raise ValueError("--cache_pressure_batch_size must be positive")
-        if (
-            args.cache_pressure_scheduler == "fifo"
+            args.cache_pressure_mode == "continuous"
             and args.cache_pressure_batch_size != 1
         ):
             raise ValueError(
@@ -1053,13 +1040,7 @@ def main() -> str:
             args.cache_pressure_mode == "continuous"
             and args.cache_pressure_client_concurrency == 0
         ):
-            if args.cache_pressure_scheduler == "fifo":
-                args.cache_pressure_client_concurrency = args.concurrency_limit
-            else:
-                args.cache_pressure_client_concurrency = min(
-                    args.concurrency_limit,
-                    max(2, 2 * args.cache_pressure_batch_size),
-                )
+            args.cache_pressure_client_concurrency = args.concurrency_limit
         if args.materialize_cache_cases and args.cache_case_files:
             raise ValueError(
                 "--materialize_cache_cases and --cache_case_files are mutually "
@@ -1174,24 +1155,8 @@ def main() -> str:
                     "continuous cache pressure requires a known block size and "
                     "full commit tail"
                 )
-            if (
-                args.cache_pressure_scheduler == "batch_decode"
-                and args.cache_pressure_client_concurrency
-                < args.cache_pressure_batch_size
-            ):
-                raise ValueError(
-                    "continuous pressure client concurrency must be at least "
-                    "the scheduler batch size"
-                )
             if not full_pressure:
-                required_admission = max(
-                    args.cache_pressure_client_concurrency,
-                    (
-                        args.cache_pressure_seed_count
-                        if any(int(case["cache_len"]) for case in cases)
-                        else 0
-                    ),
-                )
+                required_admission = args.cache_pressure_client_concurrency
                 if args.concurrency_limit < required_admission:
                     raise ValueError(
                         f"--concurrency_limit={args.concurrency_limit} cannot admit "
@@ -1228,7 +1193,6 @@ def main() -> str:
             )
             resume_config["workload"].update(
                 cache_pressure_scheduler=args.cache_pressure_scheduler,
-                cache_pressure_batch_size=args.cache_pressure_batch_size,
             )
             resume_config["cache_pressure_scheduler"] = args.cache_pressure_scheduler
         if args.cache_shared_seed:

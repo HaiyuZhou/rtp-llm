@@ -178,7 +178,7 @@ def build_plan(args, inherited=None):
     if args.pressure_preload and args.pressure_mode != "continuous":
         raise ValueError("pressure preload requires continuous mode")
     scheduler = args.pressure_scheduler or (
-        "fifo" if args.pressure_preload else "batch_decode"
+        "fifo" if args.pressure_mode == "continuous" else "batch_decode"
     )
     client_inflight = args.pressure_client_concurrency or (
         MIN_FORMAL_CLIENT_INFLIGHT if args.pressure_preload else 0
@@ -186,8 +186,10 @@ def build_plan(args, inherited=None):
     seed_count = args.pressure_seed_count
     if seed_count is None and not args.pressure_preload:
         seed_count = 4
-    if args.pressure_preload and scheduler != "fifo":
-        raise ValueError("full-pressure preload is FIFO-only")
+    if args.pressure_mode == "continuous" and scheduler != "fifo":
+        raise ValueError(
+            "continuous pressure is FIFO-only; use case mode for fixed batching"
+        )
     if (
         args.pressure_preload
         and args.runs is not None
@@ -695,8 +697,19 @@ def parser():
     p.add_argument("--pressure-preload", action="store_true")
     for option, _, value_type in PRESSURE_OPTIONS:
         p.add_argument("--pressure-" + option, type=value_type)
-    p.add_argument("--pressure-scheduler", choices=("batch_decode", "fifo"))
-    p.add_argument("--pressure-batch-size", type=int)
+    p.add_argument(
+        "--pressure-scheduler",
+        choices=("batch_decode", "fifo"),
+        help=(
+            "continuous pressure is FIFO-only; batch_decode remains available "
+            "for ordinary case mode"
+        ),
+    )
+    p.add_argument(
+        "--pressure-batch-size",
+        type=int,
+        help="continuous compatibility value; must remain 1",
+    )
     p.add_argument("--pressure-client-concurrency", type=int)
     p.add_argument("--pressure-seed-count", type=int)
     p.add_argument("--pressure-request-rate", type=float)

@@ -67,6 +67,7 @@ py_library(
 py_library(
     name = "perf_test_runtime_lib",
     srcs = [
+        "aone/broker.py",
         "aone/collector.py",
         "aone/gang_package.py",
         "aone/package.py",
@@ -79,6 +80,7 @@ py_library(
         "execution/defaults.py",
         "execution/aone.py",
         "execution/aone_bazel.py",
+        "execution/aone_gang.py",
         "execution/engine_session.py",
         "execution/local.py",
         "execution/runtime.py",
@@ -145,6 +147,7 @@ py_library(
         "execution/engine_session.py",
         "execution/aone.py",
         "execution/aone_bazel.py",
+        "execution/aone_gang.py",
         "execution/defaults.py",
         "execution/local.py",
         "execution/runtime.py",
@@ -555,6 +558,14 @@ py_test(
 py_test(
     name = "aone_gang_worker_test",
     srcs = ["aone_gang_worker_test.py"],
+    deps = [
+        ":perf_test_lib",
+    ],
+)
+
+py_test(
+    name = "aone_gang_executor_test",
+    srcs = ["aone_gang_executor_test.py"],
     deps = [
         ":perf_test_lib",
     ],

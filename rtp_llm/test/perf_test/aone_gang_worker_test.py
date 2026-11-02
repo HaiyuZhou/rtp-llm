@@ -21,7 +21,9 @@ from rtp_llm.test.perf_test.aone.gang_worker import (
     BrokerRejectedError,
     GangBrokerFailure,
     GangWorkerContext,
+    WorkerConfigError,
     main as worker_main,
+    merged_config_mode,
     run_gang_worker,
 )
 
@@ -804,6 +806,142 @@ class WorkerMainTest(_WorkerTestCase):
         self.assertEqual({"kind": "grid"}, merged["workload"])
         self.assertEqual("m", merged["model"]["label"])
         self.assertTrue((self.outputs / "gang_worker.json").exists())
+
+
+class MergedConfigModeTest(unittest.TestCase):
+    def _mode_for(self, workload):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "merged.json"
+            path.write_text(json.dumps({"workload": workload}), encoding="utf-8")
+            return merged_config_mode(path)
+
+    def test_workload_kind_maps_to_the_master_execution_mode(self):
+        self.assertEqual("prefill", self._mode_for({"kind": "cache_grid"}))
+        self.assertEqual("decode", self._mode_for({"kind": "grid"}))
+        self.assertEqual("decode", self._mode_for({"kind": "distribution"}))
+
+    def test_unknown_or_missing_kind_is_a_config_error(self):
+        for workload in ({"kind": "turbo"}, {}, None):
+            with self.subTest(workload=workload):
+                with self.assertRaises(WorkerConfigError):
+                    self._mode_for(workload)
+
+
+class MasterPathSelectionTest(_WorkerTestCase):
+    """main() picks the master executor from the resolved config's mode."""
+
+    def _main_selecting(self, workload_kind):
+        self._write_plan()
+        workload = self.root / "resolved_workload.json"
+        workload.write_text(json.dumps({"kind": workload_kind}), encoding="utf-8")
+        self.resolved_config.write_text(
+            json.dumps({"model": {"label": "m"}}), encoding="utf-8"
+        )
+        runner, _handle = self._server_runner()
+        broker = FakeBroker(self.gang_plan_machine_count, members=_members(2))
+        self._seed_completed(broker, [1])
+        calls = {"decode": 0, "prefill": 0}
+
+        def decode_executor(_handle, **_kwargs):
+            calls["decode"] += 1
+            return 0
+
+        def prefill_executor(_handle, **_kwargs):
+            calls["prefill"] += 1
+            return 0
+
+        environment = {
+            BROKER_URL_ENV: "http://broker.example",
+            BROKER_TOKEN_ENV: "secret-token",
+            BROKER_RUN_ID_ENV: "run-1",
+            "TEST_UNDECLARED_OUTPUTS_DIR": str(self.outputs),
+            "TEST_SHARD_INDEX": "0",
+            "TEST_TOTAL_SHARDS": "2",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with patch("rtp_llm.test.perf_test.aone.gang_worker._sleep"):
+                with patch(
+                    "rtp_llm.test.perf_test.aone.gang_worker._default_master_executor",
+                    decode_executor,
+                ), patch(
+                    "rtp_llm.test.perf_test.aone.gang_worker."
+                    "_default_prefill_master_executor",
+                    prefill_executor,
+                ):
+                    code = worker_main(
+                        [
+                            "--resolved-config", str(self.resolved_config),
+                            "--resolved-workload", str(workload),
+                            "--gang-plan", str(self.gang_plan_path),
+                        ],
+                        broker_factory=lambda _url, _token, _run_id: broker,
+                        server_runner=runner,
+                    )
+        return code, calls
+
+    def setUp(self):
+        super().setUp()
+        self.gang_plan_machine_count = 2
+
+    def test_cache_grid_workload_selects_the_prefill_master_path(self):
+        code, calls = self._main_selecting("cache_grid")
+
+        self.assertEqual(0, code)
+        self.assertEqual({"decode": 0, "prefill": 1}, calls)
+
+    def test_grid_workload_selects_the_decode_master_path(self):
+        code, calls = self._main_selecting("grid")
+
+        self.assertEqual(0, code)
+        self.assertEqual({"decode": 1, "prefill": 0}, calls)
+
+    def test_explicit_master_executor_wins_over_mode_selection(self):
+        self._write_plan()
+        workload = self.root / "resolved_workload.json"
+        workload.write_text(json.dumps({"kind": "cache_grid"}), encoding="utf-8")
+        self.resolved_config.write_text(
+            json.dumps({"model": {"label": "m"}}), encoding="utf-8"
+        )
+        runner, _handle = self._server_runner()
+        broker = FakeBroker(2, members=_members(2))
+        self._seed_completed(broker, [1])
+        provided = []
+
+        def executor(_handle, **_kwargs):
+            provided.append(True)
+            return 0
+
+        environment = {
+            BROKER_URL_ENV: "http://broker.example",
+            BROKER_TOKEN_ENV: "secret-token",
+            BROKER_RUN_ID_ENV: "run-1",
+            "TEST_UNDECLARED_OUTPUTS_DIR": str(self.outputs),
+            "TEST_SHARD_INDEX": "0",
+            "TEST_TOTAL_SHARDS": "2",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with patch("rtp_llm.test.perf_test.aone.gang_worker._sleep"):
+                with patch(
+                    "rtp_llm.test.perf_test.aone.gang_worker._default_master_executor"
+                ) as decode_default, patch(
+                    "rtp_llm.test.perf_test.aone.gang_worker."
+                    "_default_prefill_master_executor"
+                ) as prefill_default:
+                    code = worker_main(
+                        [
+                            "--resolved-config", str(self.resolved_config),
+                            "--resolved-workload", str(workload),
+                            "--gang-plan", str(self.gang_plan_path),
+                        ],
+                        broker_factory=lambda _url, _token, _run_id: broker,
+                        server_runner=runner,
+                        master_executor=executor,
+                    )
+
+        self.assertEqual(0, code)
+        self.assertEqual([True], provided)
+        decode_default.assert_not_called()
+        prefill_default.assert_not_called()
 
 
 if __name__ == "__main__":

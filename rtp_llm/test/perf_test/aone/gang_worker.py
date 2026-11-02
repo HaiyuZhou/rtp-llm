@@ -773,6 +773,96 @@ def _default_master_executor(
     return EXIT_SUCCESS if getattr(state, "value", None) == "completed" else 1
 
 
+def _default_prefill_master_executor(
+    handle: Any, *, context: GangWorkerContext, config_path: str, result_directory: str
+) -> int:
+    """Execute and finalize the unified prefill plan on the master shard.
+
+    The prefill runner drives the gang's own distributed server through the
+    external session: the session owns no lifecycle, the worker does.
+    """
+    from rtp_llm.test.perf_test.modes.base import ModeExecutionContext
+    from rtp_llm.test.perf_test.modes.prefill import PrefillAdapter
+    from rtp_llm.test.perf_test.multi_node import prefill_runtime
+    from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
+    from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
+    from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
+    from rtp_llm.test.perf_test.run_directory import initialize_run_directory
+    from rtp_llm.test.perf_test.storage import RunStore
+    from rtp_llm.test.perf_test.test_util import _load_tokenizer
+
+    topology = context.gang_plan["topology"]
+    merged = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    plan, source = prefill_runtime.build_external_prefill_plan(
+        config_path, result_directory=result_directory, actual_topology=topology
+    )
+    root = Path(result_directory)
+    run_id = os.environ.get("PERF_TEST_RUN_ID", root.name)
+    initialize_run_directory(
+        root,
+        source_config=source,
+        plan=plan,
+        run_id=run_id,
+        code_version=os.environ.get("BUILD_SCM_REVISION", "unknown"),
+    )
+    store = RunStore(root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest["state"] = "running"
+    store.write_manifest(manifest)
+    tokenizer = _load_tokenizer(
+        _resolve_model_paths(config_path, context.gang_plan),
+        checkpoint_path=str(merged["model"].get("checkpoint", "")),
+        model_type=str(merged["model"].get("type", "")),
+    )
+    commit_tail = int(merged["workload"]["commit_tail_tokens"])
+    endpoint = f"http://127.0.0.1:{int(context.gang_plan['port_range']['start'])}"
+    session = prefill_runtime.ExternalPrefillSession(endpoint, topology=topology)
+    try:
+        adapter = PrefillAdapter(
+            lambda executor_context: PrefillRunner(
+                executor_context.session.client,
+                tokenizer,
+                commit_tail_tokens=commit_tail,
+            )
+        )
+        result = adapter(
+            ModeExecutionContext(plan=plan, session=session, store=store)
+        )
+        finalize_prefill_run(
+            root,
+            plan=plan,
+            run_id=run_id,
+            case_results=result.case_results,
+            terminal_state=result.state,
+        )
+    except Exception:
+        manifest["state"] = "failed"
+        store.write_manifest(manifest)
+        raise
+    finally:
+        session.close()
+    generate_prefill_report(root, acquire_lock=False)
+    manifest["state"] = result.state.value
+    store.write_manifest(manifest)
+    return EXIT_SUCCESS if result.state.value == "completed" else 1
+
+
+def merged_config_mode(config_path: Path) -> str:
+    """Derive the master execution mode from the merged resolved config."""
+    try:
+        config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        kind = config["workload"]["kind"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise WorkerConfigError(
+            f"cannot derive the gang mode from the merged config: {error}"
+        ) from error
+    if kind == "cache_grid":
+        return "prefill"
+    if kind in ("grid", "distribution"):
+        return "decode"
+    raise WorkerConfigError(f"unsupported gang workload kind: {kind!r}")
+
+
 def _merge_workload(resolved_config: str, resolved_workload: str, outputs: Path) -> Path:
     """Combine the package's config and workload runfiles for plan building.
 
@@ -819,11 +909,21 @@ def main(
     os.environ[CONFIG_PATH_ENV] = str(merged_config)
     factory = BrokerClient if broker_factory is None else broker_factory
     broker = factory(coordinates.url, coordinates.token, coordinates.run_id)
+    # The master path follows the resolved config's mode: decode keeps the
+    # existing decode master wiring, cache_grid runs the external prefill
+    # session against the gang's own server. An explicit executor wins.
+    executor = master_executor
+    if executor is None:
+        executor = (
+            _default_master_executor
+            if merged_config_mode(merged_config) == "decode"
+            else _default_prefill_master_executor
+        )
     return run_gang_worker(
         merged_config,
         Path(args.gang_plan),
         broker=broker,
         server_runner=_default_server_runner if server_runner is None else server_runner,
         test_outputs_dir=outputs,
-        master_executor=master_executor,
+        master_executor=executor,
     )

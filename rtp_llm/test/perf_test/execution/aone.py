@@ -30,6 +30,12 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def is_gang_plan(plan: ExecutionPlan) -> bool:
+    """True when an AOne plan's resource layout spans multiple machines."""
+    resource = plan.resource_plan
+    return isinstance(resource, AOneResourcePlan) and resource.machine_count > 1
+
+
 @dataclass(frozen=True)
 class AOneExecutionOutcome:
     state: RunState

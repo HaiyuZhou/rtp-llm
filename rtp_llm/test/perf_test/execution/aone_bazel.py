@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Union
 
 from rtp_llm.test.perf_test.aone.package import GeneratedAOnePackage
-from rtp_llm.test.perf_test.execution.aone import AOneExecutor
+from rtp_llm.test.perf_test.execution.aone import AOneExecutor, is_gang_plan
 from rtp_llm.test.perf_test.plan import (
     AONE_GPU_PLATFORMS,
     AONE_RESOURCES,
@@ -28,6 +28,9 @@ _MAX_RESULT_BYTES = 64 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 4096
 _MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 _MAX_COMPRESSION_RATIO = 1000.0
+# Shared wiring for every remote AOne test invocation (single-machine and
+# gang): the timeout covers build, scheduling, and the perf run itself.
+AONE_TEST_TIMEOUT_S = 7000
 
 
 @dataclass(frozen=True)
@@ -193,7 +196,7 @@ class BazelAOneIntegration:
             f"--config={self._resource}_aone_bazel_remote",
             "--strategy=TestRunner=remote",
             f"--jobs={self._max_parallel}",
-            "--test_timeout=7000",
+            f"--test_timeout={AONE_TEST_TIMEOUT_S}",
             "--test_output=errors",
             "--keep_going",
             "--remote_download_outputs=all",
@@ -357,6 +360,12 @@ def create_default_aone_executor(plan: ExecutionPlan):
         from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
 
         return generate_prefill_report(plan.result_directory)
+    if is_gang_plan(plan):
+        from rtp_llm.test.perf_test.execution.aone_gang import (
+            create_default_gang_executor,
+        )
+
+        return create_default_gang_executor(plan)
     workspace_root = _workspace_root()
     integration: Optional[BazelAOneIntegration] = None
 

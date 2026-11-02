@@ -6,24 +6,29 @@ for key, value in os.environ.items():
 import json
 import logging
 import pathlib
-import re
 import signal
 import socket
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional
 
 current_file_path = pathlib.Path(__file__).parent.absolute()
 sys.path.append(str(current_file_path.parent.parent.parent.absolute()))
 from rtp_llm.utils.import_util import has_internal_source
 
 if has_internal_source():
-    from internal_source.rtp_llm.test.util.set_internal_env import (
-        configure_optional_env,
-    )
+    try:
+        from internal_source.rtp_llm.test.util.set_internal_env import (
+            configure_optional_env,
+        )
+    except ModuleNotFoundError:
+        # Bazel runfiles may expose the internal-source tree marker without
+        # the internal test utilities; the optional env tuning is skippable.
+        configure_optional_env = None
 
-    configure_optional_env()
+    if configure_optional_env is not None:
+        configure_optional_env()
 
 from rtp_llm.config.py_config_modules import PyEnvConfigs
 from rtp_llm.config.server_config_setup import (
@@ -31,13 +36,13 @@ from rtp_llm.config.server_config_setup import (
     setup_and_configure_server,
 )
 from rtp_llm.distribute.distributed_server import members_from_test_env
-from rtp_llm.distribute.worker_info import WorkerInfo
 from rtp_llm.server.server_args.server_args import setup_args
 from rtp_llm.test.perf_test.multi_node.decode_runtime import (
     build_external_decode_plan,
     execute_master_decode,
     run_external_rank,
 )
+from rtp_llm.test.perf_test.multi_node.gang_config import build_gang_config_string
 from rtp_llm.test.perf_test.plan import ExecutionPlan
 from rtp_llm.test.perf_test.test_util import create_query
 from rtp_llm.test.utils.maga_server_manager import MagaServerManager
@@ -126,51 +131,6 @@ def try_upload_log(log_dir_path: str, upload_path: str):
 
     # shutil.rmtree(log_dir_path)
     os.remove(zip_path)
-
-
-def _shard_index_key(member: WorkerInfo):
-    """Sort key: the shard index encoded in the legacy ``...partN`` name."""
-    match = re.search(r"part(\d+)$", member.name)
-    if match:
-        return (0, int(match.group(1)), member.name)
-    return (1, 0, member.name)
-
-
-def build_gang_config_string(
-    members: Sequence[WorkerInfo], local_world_size: int
-) -> str:
-    """Build the ``GANG_CONFIG_STRING`` value for one multi-host gang.
-
-    ``members`` are the legacy member records the server side already
-    parses (the ``WorkerInfo`` records ``members_from_test_env`` returns).
-    The master (the member whose name ends with ``part0``) is placed first
-    and the remaining members follow their shard index, matching the
-    encoding the legacy SSH launcher emits::
-
-        name:test_part0,ip:host0,port:12333;name:test_part1,ip:host1,port:12333
-
-    ``local_world_size`` is the per-host rank-group width; the caller owns
-    the rank layout (world rank = shard index * local world size).
-    """
-    member_list = list(members)
-    if not member_list:
-        raise RuntimeError("no gang members, unexpected!")
-    if not isinstance(local_world_size, int) or local_world_size < 1:
-        raise RuntimeError(
-            f"local_world_size must be a positive integer, got {local_world_size!r}"
-        )
-    masters = [member for member in member_list if member.name.endswith("part0")]
-    if len(masters) != 1:
-        raise RuntimeError(f"gang master should contains 1 but got {len(masters)}")
-    ordered = sorted(member_list, key=_shard_index_key)
-    if masters[0].name != ordered[0].name:
-        raise RuntimeError(
-            f"gang master should be the first one but got {ordered[0].name}"
-        )
-    return ";".join(
-        f"name:{member.name},ip:{member.ip},port:{member.server_port}"
-        for member in ordered
-    )
 
 
 @dataclass

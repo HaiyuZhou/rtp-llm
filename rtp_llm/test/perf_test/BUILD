@@ -25,6 +25,7 @@ py_test(
     ],
     data = [
         "multi_node/multi_benchmark_config.yaml",
+        "multi_node/gang_config.py",
         "multi_node/local_server_runner.py",
         "multi_node/multi_local_executor.sh",
         "multi_node/multi_runner.sh",
@@ -113,9 +114,14 @@ py_library(
         "aone/broker.py",
         "aone/gang_package.py",
         "aone/gang.py",
+        "aone/gang_worker.py",
         "aone/sharding.py",
         "aone/worker.py",
         "aone_worker.py",
+        "aone_gang_worker.py",
+        "multi_node/decode_runtime.py",
+        "multi_node/gang_config.py",
+        "multi_node/local_server_runner.py",
         "capabilities.py",
         "cli.py",
         "config_resolver.py",
@@ -532,6 +538,14 @@ py_test(
     name = "aone_gang_package_test",
     srcs = ["aone_gang_package_test.py"],
     data = ["defs.bzl"],
+    deps = [
+        ":perf_test_lib",
+    ],
+)
+
+py_test(
+    name = "aone_gang_worker_test",
+    srcs = ["aone_gang_worker_test.py"],
     deps = [
         ":perf_test_lib",
     ],

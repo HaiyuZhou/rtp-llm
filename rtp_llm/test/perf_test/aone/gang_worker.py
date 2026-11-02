@@ -1,0 +1,829 @@
+"""Gang worker for multi-machine AOne execution.
+
+One worker process runs per machine inside a Bazel gang shard
+(``perf_test_gang_shard``). The worker registers with the rendezvous
+broker, keeps a heartbeat flowing while it waits, derives its rank layout
+from the gang plan, starts the host's local rank group, and then either
+executes the unified plan (the master shard) or waits for the master to
+finish (every other shard). Every exit path casts exactly one terminal
+vote to the broker and returns a process exit code; a broker-reported
+gang failure is always a nonzero exit, never an endless retry.
+
+The broker coordinates arrive through ``PERF_TEST_BROKER_URL``,
+``PERF_TEST_BROKER_TOKEN``, and ``PERF_TEST_BROKER_RUN_ID``. The token is
+only ever sent in the authorization header; it never reaches worker logs
+or persisted artifacts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+import json
+import logging
+import os
+import socket
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
+
+import requests
+
+from rtp_llm.test.perf_test.aone.broker import (
+    STATE_COMPLETED,
+    STATE_READY,
+    BrokerMember,
+)
+from rtp_llm.test.perf_test.aone.gang_package import GANG_PLAN_SCHEMA_VERSION
+from rtp_llm.test.perf_test.multi_node.gang_config import build_gang_config_string
+from rtp_llm.test.perf_test.storage import atomic_write_json
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, heavy at runtime
+    from rtp_llm.test.perf_test.multi_node.local_server_runner import ServerHandle
+
+BROKER_URL_ENV = "PERF_TEST_BROKER_URL"
+BROKER_TOKEN_ENV = "PERF_TEST_BROKER_TOKEN"
+BROKER_RUN_ID_ENV = "PERF_TEST_BROKER_RUN_ID"
+
+SHARD_INDEX_ENV = "TEST_SHARD_INDEX"
+TOTAL_SHARDS_ENV = "TEST_TOTAL_SHARDS"
+CONFIG_PATH_ENV = "PERF_TEST_CONFIG_PATH"
+
+# Client-side request bounds. The broker serves ``members`` as a blocking
+# call until the gang completes or the register deadline (3600 s default)
+# passes, so the client uses a short timeout and re-polls while heartbeats
+# keep flowing between calls.
+REGISTER_TIMEOUT_S = 30.0
+HEARTBEAT_TIMEOUT_S = 30.0
+REPORT_TIMEOUT_S = 30.0
+MEMBERS_POLL_TIMEOUT_S = 30.0
+FORMATION_RETRY_DELAY_S = 1.0
+WAITER_POLL_INTERVAL_S = 5.0
+# The broker expires members after HEARTBEAT_EXPIRY_S (120 s); the worker
+# interval keeps several beats of margin even under transient delays.
+HEARTBEAT_INTERVAL_S = 30.0
+HEARTBEAT_JOIN_TIMEOUT_S = 5.0
+
+EXIT_SUCCESS = 0
+EXIT_CONFIG_ERROR = 3
+EXIT_RENDEZVOUS_ERROR = 4
+EXIT_EXECUTION_ERROR = 5
+
+_LOG = logging.getLogger(__name__)
+_LOG.addHandler(logging.NullHandler())
+
+_sleep = time.sleep
+
+
+class GangWorkerError(RuntimeError):
+    """Worker failure carrying the process exit code."""
+
+    exit_code = EXIT_RENDEZVOUS_ERROR
+
+
+class WorkerConfigError(GangWorkerError):
+    """Invalid environment, gang plan, or runfile inputs."""
+
+    exit_code = EXIT_CONFIG_ERROR
+
+
+class GangRendezvousError(GangWorkerError):
+    """The rendezvous could not be completed."""
+
+
+class GangBrokerFailure(GangRendezvousError):
+    """The broker reported that the gang run failed."""
+
+
+class BrokerRejectedError(GangRendezvousError):
+    """The broker rejected a request with an unrecoverable status."""
+
+
+class BrokerUnavailableError(GangRendezvousError):
+    """The broker could not be reached (transient transport error)."""
+
+
+class GangExecutionError(GangWorkerError):
+    """The local rank group or the master plan failed."""
+
+    exit_code = EXIT_EXECUTION_ERROR
+
+
+@dataclass(frozen=True)
+class BrokerCoordinates:
+    """Broker location and credentials derived from the environment."""
+
+    url: str
+    token: str
+    run_id: str
+
+
+def broker_coordinates(environ: Optional[Mapping[str, str]] = None) -> BrokerCoordinates:
+    """Read the broker coordinates; every variable is mandatory."""
+    environ = os.environ if environ is None else environ
+    missing = [
+        name
+        for name in (BROKER_URL_ENV, BROKER_TOKEN_ENV, BROKER_RUN_ID_ENV)
+        if not str(environ.get(name, "")).strip()
+    ]
+    if missing:
+        raise WorkerConfigError(
+            "gang worker requires the environment variable(s): "
+            + ", ".join(missing)
+        )
+    return BrokerCoordinates(
+        url=environ[BROKER_URL_ENV].strip(),
+        token=environ[BROKER_TOKEN_ENV].strip(),
+        run_id=environ[BROKER_RUN_ID_ENV].strip(),
+    )
+
+
+class BrokerClient:
+    """Minimal authenticated HTTP client for the gang rendezvous broker.
+
+    ``gang_state`` exposes the state observed by the latest ``members`` or
+    ``register`` call; the broker serves both ready and completed gangs as
+    HTTP 200, so the state is the only way to tell them apart.
+    """
+
+    _FAILURE_CODES = frozenset(
+        {"gang_failed", "run_closed", "broker_stopped", "register_deadline_exceeded"}
+    )
+
+    def __init__(self, url: str, token: str, run_id: str, *, request=requests.request):
+        self._base = url.rstrip("/")
+        self._token = token
+        self._run_id = run_id
+        self._request = request
+        self._gang_state: Optional[str] = None
+
+    @property
+    def gang_state(self) -> Optional[str]:
+        return self._gang_state
+
+    def register(self, shard_index: int, hostname: str, port: int) -> List[BrokerMember]:
+        """Register this shard; returns the members when this call completes the gang."""
+        body = self._call(
+            "POST",
+            "register",
+            {"shard_index": shard_index, "hostname": hostname, "port": port},
+            timeout_s=REGISTER_TIMEOUT_S,
+        )
+        self._gang_state = body.get("gang_state")
+        if self._gang_state == STATE_READY:
+            return self.members(REGISTER_TIMEOUT_S)
+        return []
+
+    def members(self, timeout_s: float) -> List[BrokerMember]:
+        """Poll the member list; a client timeout is transient and re-polled."""
+        try:
+            body = self._call("GET", "members", None, timeout_s=timeout_s)
+        except BrokerUnavailableError as error:
+            _LOG.debug("members poll was transient: %s", error)
+            return []
+        self._gang_state = body.get("gang_state")
+        return [BrokerMember(**item) for item in body.get("members", [])]
+
+    def heartbeat(self, shard_index: int) -> None:
+        self._call(
+            "POST", "heartbeat", {"shard_index": shard_index}, timeout_s=HEARTBEAT_TIMEOUT_S
+        )
+
+    def report(self, shard_index: int, state: str, detail: Optional[str] = None) -> None:
+        self._call(
+            "POST",
+            "result",
+            {"shard_index": shard_index, "state": state, "detail": detail},
+            timeout_s=REPORT_TIMEOUT_S,
+        )
+
+    def cleanup(self) -> None:
+        """Close the rendezvous run. Only the submit side calls this."""
+        self._call("POST", "cleanup", None, timeout_s=REPORT_TIMEOUT_S)
+
+    def _call(self, method: str, op: str, payload: Optional[Dict[str, Any]], *, timeout_s: float) -> Dict[str, Any]:
+        url = f"{self._base}/v1/runs/{self._run_id}/{op}"
+        try:
+            response = self._request(
+                method,
+                url,
+                json=payload,
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=timeout_s,
+            )
+        except requests.RequestException as error:
+            raise BrokerUnavailableError(
+                f"broker request {op} failed: {error}"
+            ) from error
+        status = response.status_code
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if status == 200:
+            return body if isinstance(body, dict) else {}
+        code = body.get("error", f"http_{status}") if isinstance(body, dict) else f"http_{status}"
+        if status == 504 or code in self._FAILURE_CODES:
+            raise GangBrokerFailure(f"broker reported gang failure during {op}: {code}")
+        raise BrokerRejectedError(f"broker rejected {op}: HTTP {status} {code}")
+
+
+class _HeartbeatLoop:
+    """Background heartbeat thread; the broker expires silent members.
+
+    The loop beats from registration onward (it starts before the first
+    ``members`` poll), survives transient broker errors, and records a
+    broker-reported gang failure in ``failed`` so waiting workers can stop
+    early. ``stop`` joins the thread, so no heartbeat outlives the worker.
+    """
+
+    def __init__(self, broker: BrokerClient, shard_index: int):
+        self._broker = broker
+        self._shard_index = shard_index
+        self._stop = threading.Event()
+        self.failed = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._loop,
+            name=f"gang-worker-heartbeat-{self._shard_index}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._broker.heartbeat(self._shard_index)
+            except GangBrokerFailure as error:
+                _LOG.warning("heartbeat rejected; gang failed: %s", error)
+                self.failed.set()
+                return
+            except GangWorkerError as error:
+                # Transient transport errors and unexpected rejections are
+                # retried on the next beat; the main flow surfaces real
+                # failures through its own broker calls.
+                _LOG.warning("heartbeat attempt failed, will retry: %s", error)
+            if self._stop.wait(HEARTBEAT_INTERVAL_S):
+                return
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=HEARTBEAT_JOIN_TIMEOUT_S)
+
+
+@dataclass(frozen=True)
+class GangWorkerContext:
+    """Everything a host needs from the rendezvous, frozen at formation."""
+
+    gang_plan: Dict[str, Any]
+    members: Tuple[BrokerMember, ...]
+    shard_index: int
+    world_rank: int
+    local_world_size: int
+    gang_config_string: str
+    cuda_visible_devices: str
+
+
+@dataclass(frozen=True)
+class _LegacyMember:
+    """Adapter to the legacy ``name/ip/port`` member records."""
+
+    name: str
+    ip: str
+    server_port: int
+
+
+def load_gang_plan(path: Path) -> Dict[str, Any]:
+    """Read and validate one ``gang_plan.json`` runfile."""
+    try:
+        plan = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WorkerConfigError(f"cannot read gang plan {path}: {error}") from error
+    if not isinstance(plan, dict):
+        raise WorkerConfigError(f"gang plan {path} must contain an object")
+    if plan.get("schema_version") != GANG_PLAN_SCHEMA_VERSION:
+        raise WorkerConfigError(
+            f"unsupported gang plan schema_version: {plan.get('schema_version')!r}"
+        )
+    for field in ("run_id", "machine_count", "local_world_size", "master_shard_index",
+                  "port_range", "topology"):
+        if field not in plan:
+            raise WorkerConfigError(f"gang plan is missing required field {field!r}")
+    if not isinstance(plan["run_id"], str) or not plan["run_id"]:
+        raise WorkerConfigError("gang plan run_id must be a non-empty string")
+    machine_count = plan["machine_count"]
+    local_world_size = plan["local_world_size"]
+    if type(machine_count) is not int or machine_count < 1:
+        raise WorkerConfigError("gang plan machine_count must be a positive integer")
+    if type(local_world_size) is not int or local_world_size < 1:
+        raise WorkerConfigError("gang plan local_world_size must be a positive integer")
+    master_shard_index = plan["master_shard_index"]
+    if type(master_shard_index) is not int or not 0 <= master_shard_index < machine_count:
+        raise WorkerConfigError(
+            f"gang plan master_shard_index {master_shard_index!r} is outside the gang"
+        )
+    port_range = plan["port_range"]
+    if (
+        not isinstance(port_range, dict)
+        or type(port_range.get("start")) is not int
+        or not 0 < port_range["start"] < 65536
+        or port_range.get("count") != local_world_size
+    ):
+        raise WorkerConfigError(
+            "gang plan port_range must be {start: valid port, count: local_world_size}"
+        )
+    topology = plan["topology"]
+    if not isinstance(topology, dict) or any(
+        type(topology.get(name)) is not int or topology.get(name) < 1
+        for name in ("tp", "dp", "pp", "ep")
+    ):
+        raise WorkerConfigError("gang plan topology must supply positive tp/dp/pp/ep")
+    return plan
+
+
+def shard_index_from_env(gang_plan: Dict[str, Any], environ: Optional[Mapping[str, str]] = None) -> int:
+    """Derive this worker's shard index from the Bazel sharding env."""
+    environ = os.environ if environ is None else environ
+    raw_index = environ.get(SHARD_INDEX_ENV)
+    raw_total = environ.get(TOTAL_SHARDS_ENV)
+    if raw_index is None or raw_total is None:
+        raise WorkerConfigError(
+            f"gang worker requires the Bazel sharding env {SHARD_INDEX_ENV}/{TOTAL_SHARDS_ENV}"
+        )
+    try:
+        shard_index = int(raw_index)
+        total_shards = int(raw_total)
+    except ValueError as error:
+        raise WorkerConfigError(
+            f"invalid Bazel sharding env {raw_index!r}/{raw_total!r}"
+        ) from error
+    machine_count = gang_plan["machine_count"]
+    if total_shards != machine_count or not 0 <= shard_index < machine_count:
+        raise WorkerConfigError(
+            f"test shard {shard_index}/{total_shards} does not match the gang's "
+            f"machine_count {machine_count}"
+        )
+    return shard_index
+
+
+def build_worker_context(
+    gang_plan: Dict[str, Any], members: Tuple[BrokerMember, ...], shard_index: int
+) -> GangWorkerContext:
+    """Freeze the rank layout: world rank, gang config, and GPU visibility."""
+    local_world_size = int(gang_plan["local_world_size"])
+    legacy_members = tuple(
+        _LegacyMember(
+            name=f"gang_part{member.shard_index}",
+            ip=member.hostname,
+            server_port=int(member.port),
+        )
+        for member in sorted(members, key=lambda member: member.shard_index)
+    )
+    gang_config_string = build_gang_config_string(legacy_members, local_world_size)
+    return GangWorkerContext(
+        gang_plan=gang_plan,
+        members=tuple(members),
+        shard_index=shard_index,
+        world_rank=shard_index * local_world_size,
+        local_world_size=local_world_size,
+        gang_config_string=gang_config_string,
+        cuda_visible_devices=",".join(str(index) for index in range(local_world_size)),
+    )
+
+
+def _apply_environment(context: GangWorkerContext) -> None:
+    """Export the rendezvous-derived environment for the local rank group."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = context.cuda_visible_devices
+    os.environ["GANG_CONFIG_STRING"] = context.gang_config_string
+
+
+def _canonical_local_hostname() -> str:
+    """Best-effort canonical hostname matching the broker's resolver.
+
+    The broker reverse-resolves each registration's source address and
+    cross-checks the claimed hostname, so claiming the canonical name for
+    our own address maximizes the match; any resolution failure falls back
+    to the plain hostname.
+    """
+    name = socket.gethostname()
+    try:
+        address = socket.gethostbyname(name)
+        return socket.gethostbyaddr(address)[0]
+    except OSError:
+        return name
+
+
+def _await_formation(
+    broker: BrokerClient, gang_plan: Dict[str, Any], *, clock: Callable[[], float]
+) -> Tuple[BrokerMember, ...]:
+    """Poll until the broker reports the complete member list."""
+    machine_count = int(gang_plan["machine_count"])
+    started = clock()
+    while True:
+        members = broker.members(MEMBERS_POLL_TIMEOUT_S)
+        if (
+            broker.gang_state in (STATE_READY, STATE_COMPLETED)
+            and len(members) == machine_count
+        ):
+            _LOG.info(
+                "gang formed after %.1f s with %d members",
+                clock() - started,
+                machine_count,
+            )
+            return tuple(members)
+        _sleep(FORMATION_RETRY_DELAY_S)
+
+
+def _run_master(
+    broker: BrokerClient,
+    shard_index: int,
+    context: GangWorkerContext,
+    handle: Any,
+    *,
+    resolved_config_path: Path,
+    outputs: Path,
+    master_executor: Optional[Callable[..., int]],
+) -> int:
+    """Execute the unified plan on the master shard and cast its vote."""
+    executor = _default_master_executor if master_executor is None else master_executor
+    try:
+        exit_code = int(
+            executor(
+                handle,
+                context=context,
+                config_path=str(resolved_config_path),
+                result_directory=str(outputs / "run"),
+            )
+        )
+    except Exception as error:
+        _report_failure_vote(
+            broker, shard_index, f"master executor failed: {type(error).__name__}: {error}"
+        )
+        raise GangExecutionError(
+            f"master executor failed: {type(error).__name__}: {error}"
+        ) from error
+    if exit_code != 0:
+        _report_failure_vote(
+            broker, shard_index, f"master executor exited with code {exit_code}"
+        )
+        return exit_code
+    # A success vote that the broker rejects (the gang already failed while
+    # the master was executing) is a nonzero exit, not a silent success.
+    broker.report(shard_index, "completed", "master plan completed")
+    return EXIT_SUCCESS
+
+
+def _run_waiter(
+    broker: BrokerClient,
+    shard_index: int,
+    heartbeats: _HeartbeatLoop,
+) -> int:
+    """Wait for the master's outcome and mirror it in this shard's exit code.
+
+    A non-master shard's own duty ends once its rank group is up, so it
+    casts its success vote now — the gang can only complete after the
+    master reports, because the master always reports last. The exit code
+    then follows the gang outcome: completed is success, any broker-
+    reported failure is an immediate nonzero exit.
+    """
+    broker.report(
+        shard_index, "completed", "rank group up; awaiting master completion"
+    )
+    while True:
+        if heartbeats.failed.is_set():
+            raise GangBrokerFailure("heartbeat rejected by the broker; gang failed")
+        broker.members(MEMBERS_POLL_TIMEOUT_S)
+        if broker.gang_state == STATE_COMPLETED:
+            return EXIT_SUCCESS
+        _sleep(WAITER_POLL_INTERVAL_S)
+
+
+def _report_failure_vote(broker: BrokerClient, shard_index: int, detail: str) -> None:
+    """Cast the failure vote; a broker that already failed the gang wins."""
+    try:
+        broker.report(shard_index, "failed", detail)
+    except GangWorkerError as report_error:
+        _LOG.warning("failure vote was rejected (gang already terminal): %s", report_error)
+
+
+def _run_worker(
+    resolved_config_path: Path,
+    gang_plan: Dict[str, Any],
+    shard_index: int,
+    *,
+    broker: BrokerClient,
+    server_runner: Callable[[GangWorkerContext], Any],
+    outputs: Path,
+    master_executor: Optional[Callable[..., int]],
+    clock: Callable[[], float],
+    record: Dict[str, Any],
+) -> int:
+    """Full worker lifecycle: register, form, start, execute, report."""
+    hostname = _canonical_local_hostname()
+    port = int(gang_plan["port_range"]["start"])
+    broker.register(shard_index, hostname, port)
+    heartbeats = _HeartbeatLoop(broker, shard_index)
+    heartbeats.start()  # beats from registration onward, before any members poll
+    handle: Any = None
+    try:
+        try:
+            members = _await_formation(broker, gang_plan, clock=clock)
+            context = build_worker_context(gang_plan, members, shard_index)
+            record["context"] = context
+            _apply_environment(context)
+            handle = server_runner(context)
+            if not handle.start_server():
+                handle.print_process_log()
+                raise GangExecutionError("local rank-group server failed to start")
+        except GangWorkerError as error:
+            # Failures before dispatch have not voted yet; every dispatched
+            # path owns exactly one vote of its own.
+            _report_failure_vote(broker, shard_index, f"{type(error).__name__}: {error}")
+            raise
+        if shard_index == int(gang_plan["master_shard_index"]):
+            return _run_master(
+                broker,
+                shard_index,
+                context,
+                handle,
+                resolved_config_path=resolved_config_path,
+                outputs=outputs,
+                master_executor=master_executor,
+            )
+        return _run_waiter(broker, shard_index, heartbeats)
+    finally:
+        if handle is not None:
+            handle.stop_server()
+        heartbeats.stop()
+
+
+def run_gang_worker(
+    resolved_config_path: Path,
+    gang_plan_path: Path,
+    *,
+    broker: BrokerClient,
+    server_runner: Callable[[GangWorkerContext], Any],
+    test_outputs_dir: Path,
+    master_executor: Optional[Callable[..., int]] = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> int:
+    """Run one gang worker to its terminal state and return the exit code.
+
+    ``server_runner`` starts (but does not launch) the host's local rank
+    group and returns the owning server handle; ``master_executor`` runs
+    the unified plan on the master shard and defaults to the external
+    decode executor. Partial ``run/`` artifacts always remain on disk.
+    """
+    outputs = Path(test_outputs_dir)
+    outcome: Dict[str, Any] = {"state": "completed", "exit_code": EXIT_SUCCESS, "detail": None}
+    gang_plan: Optional[Dict[str, Any]] = None
+    record: Dict[str, Any] = {}
+    try:
+        outputs.mkdir(parents=True, exist_ok=True)
+        gang_plan = load_gang_plan(gang_plan_path)
+        resolved = Path(resolved_config_path)
+        if not resolved.is_file():
+            raise WorkerConfigError(f"resolved config {resolved} does not exist")
+        shard_index = shard_index_from_env(gang_plan)
+        exit_code = _run_worker(
+            resolved,
+            gang_plan,
+            shard_index,
+            broker=broker,
+            server_runner=server_runner,
+            outputs=outputs,
+            master_executor=master_executor,
+            clock=clock,
+            record=record,
+        )
+        outcome.update(
+            state="completed" if exit_code == EXIT_SUCCESS else "failed",
+            exit_code=exit_code,
+        )
+        return exit_code
+    except GangWorkerError as error:
+        outcome.update(state="failed", exit_code=error.exit_code, detail=str(error))
+        return error.exit_code
+    except Exception as error:  # defensive: unexpected failures still exit nonzero
+        outcome.update(
+            state="failed",
+            exit_code=EXIT_EXECUTION_ERROR,
+            detail=f"{type(error).__name__}: {error}",
+        )
+        return EXIT_EXECUTION_ERROR
+    finally:
+        _write_worker_summary(outputs, gang_plan, record.get("context"), outcome)
+
+
+def _write_worker_summary(
+    outputs: Path,
+    gang_plan: Optional[Dict[str, Any]],
+    context: Optional[GangWorkerContext],
+    outcome: Mapping[str, Any],
+) -> None:
+    """Persist a token-free worker summary under the undeclared outputs."""
+    summary = {
+        "schema_version": 1,
+        "run_id": gang_plan.get("run_id") if gang_plan else None,
+        "machine_count": gang_plan.get("machine_count") if gang_plan else None,
+        "shard_index": context.shard_index if context else None,
+        "world_rank": context.world_rank if context else None,
+        "local_world_size": context.local_world_size if context else None,
+        "gang_config_string": context.gang_config_string if context else None,
+        "members": [member.to_dict() for member in context.members] if context else [],
+        "state": outcome["state"],
+        "exit_code": outcome["exit_code"],
+        "detail": outcome["detail"],
+    }
+    try:
+        atomic_write_json(outputs / "gang_worker.json", summary)
+    except OSError as error:
+        _LOG.warning("cannot write worker summary: %s", error)
+
+
+def _load_local_server_runner():
+    """Import the legacy rank-group module without leaking the environment.
+
+    ``multi_node.local_server_runner`` prints the whole process environment
+    at import time (a legacy debugging aid). Gang workers import it lazily
+    with stdout redirected and the broker token masked so neither worker
+    logs nor test output can capture the token.
+    """
+    token = os.environ.pop(BROKER_TOKEN_ENV, None)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            from rtp_llm.test.perf_test.multi_node import local_server_runner
+
+            return local_server_runner
+    finally:
+        if token is not None:
+            os.environ[BROKER_TOKEN_ENV] = token
+
+
+def _default_server_runner(context: GangWorkerContext):
+    """Start this host's rank group through the extracted legacy startup."""
+    from rtp_llm.config.server_config_setup import set_parallelism_config
+    from rtp_llm.server.server_args.server_args import setup_args
+
+    runner = _load_local_server_runner()
+    config_path = os.environ.get(CONFIG_PATH_ENV)
+    if not config_path:
+        raise WorkerConfigError(
+            f"gang server runner requires {CONFIG_PATH_ENV} (set by the worker main)"
+        )
+    plan = context.gang_plan
+    topology = plan["topology"]
+    engine_environment = {
+        "GANG_CONFIG_STRING": context.gang_config_string,
+        "CUDA_VISIBLE_DEVICES": context.cuda_visible_devices,
+        "WORLD_SIZE": str(plan["world_size"]),
+        "WORLD_RANK": str(context.world_rank),
+        "LOCAL_WORLD_SIZE": str(context.local_world_size),
+        "TP_SIZE": str(topology["tp"]),
+        "DP_SIZE": str(topology["dp"]),
+        "EP_SIZE": str(topology["ep"]),
+        "PP_SIZE": str(topology["pp"]),
+        # Match the legacy decode runner's engine switches.
+        "USE_BATCH_DECODE_SCHEDULER": "1",
+        "FAKE_BALANCE_EXPERT": "1",
+        "PERF_TEST_RUN_ID": str(plan["run_id"]),
+    }
+    for key, value in engine_environment.items():
+        os.environ[key] = value
+
+    outputs = Path(os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR", os.getcwd()))
+    log_dir = outputs / f"TEST_OUTPUT_{plan['run_id']}_{context.world_rank}"
+    configs = setup_args()
+    set_parallelism_config(
+        configs.parallelism_config, py_prefill_cp_config=configs.prefill_cp_config
+    )
+    execution_plan, _source = runner.decode_runtime.build_external_decode_plan(
+        config_path,
+        result_directory=str(outputs / "run"),
+        actual_topology=topology,
+    )
+    rank_context = runner.LocalRankGroupContext(
+        port=int(plan["port_range"]["start"]),
+        world_rank=context.world_rank,
+        log_dir_path=str(log_dir),
+        profiler_directory=log_dir,
+        plan=execution_plan,
+    )
+    model_paths = _resolve_model_paths(config_path, plan)
+    return runner.start_local_rank_group(rank_context, configs, model_paths)
+
+
+def _resolve_model_paths(config_path: str, plan: Mapping[str, Any]) -> str:
+    """Resolve the tokenizer location through the shared remote resolver."""
+    from rtp_llm.test.perf_test.aone.worker import (
+        RemoteInputs,
+        resolve_remote_runtime_inputs,
+    )
+
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    resolved = resolve_remote_runtime_inputs(
+        RemoteInputs(
+            run_id=str(plan["run_id"]),
+            shard_id=f"gang_part{plan['master_shard_index']}",
+            config_fingerprint=str(plan.get("config_fingerprint", "")),
+            workload_fingerprint=str(plan.get("workload_fingerprint", "")),
+            config=config,
+            owned_case_ids=(),
+            owned_cases=(),
+        )
+    )
+    return resolved.config["model"]["tokenizer"]
+
+
+def _default_master_executor(
+    handle: Any, *, context: GangWorkerContext, config_path: str, result_directory: str
+) -> int:
+    """Execute and finalize the unified decode plan on the master shard."""
+    from rtp_llm.test.perf_test.multi_node import decode_runtime
+    from rtp_llm.test.perf_test.test_util import create_query
+
+    plan, source = decode_runtime.build_external_decode_plan(
+        config_path,
+        result_directory=result_directory,
+        actual_topology=context.gang_plan["topology"],
+    )
+    input_lengths = sorted(
+        {length for case in plan.cases for length in case.identity["input_lengths"]}
+    )
+    queries = create_query(
+        tokenizer_path=handle.tokenizer_path, input_len_list=input_lengths
+    )
+    result = decode_runtime.execute_master_decode(
+        plan,
+        source_config=source,
+        endpoint=f"http://127.0.0.1:{int(context.gang_plan['port_range']['start'])}",
+        prompt_for_length=lambda length: queries[length],
+        server_log_path=handle.log_file_path,
+        profiler_directory=Path(result_directory),
+    )
+    state = getattr(result, "state", None)
+    return EXIT_SUCCESS if getattr(state, "value", None) == "completed" else 1
+
+
+def _merge_workload(resolved_config: str, resolved_workload: str, outputs: Path) -> Path:
+    """Combine the package's config and workload runfiles for plan building.
+
+    Gang packages freeze the workload in its own runfile; the plan builders
+    expect a single config document with ``workload`` embedded.
+    """
+    try:
+        config = json.loads(Path(resolved_config).read_text(encoding="utf-8"))
+        workload = json.loads(Path(resolved_workload).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WorkerConfigError(f"cannot read gang runfiles: {error}") from error
+    if not isinstance(config, dict) or not isinstance(workload, dict):
+        raise WorkerConfigError("gang resolved config and workload must be objects")
+    config["workload"] = workload
+    merged = outputs / "resolved_config_with_workload.json"
+    atomic_write_json(merged, config)
+    return merged
+
+
+def main(
+    argv: Optional[List[str]] = None,
+    *,
+    broker_factory: Optional[Callable[..., BrokerClient]] = None,
+    server_runner: Optional[Callable[[GangWorkerContext], Any]] = None,
+    master_executor: Optional[Callable[..., int]] = None,
+) -> int:
+    """Bazel entry point: parse runfile args and drive one gang worker."""
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    parser = argparse.ArgumentParser(description="Run one multi-machine gang worker shard.")
+    parser.add_argument("--resolved-config", required=True)
+    parser.add_argument("--resolved-workload", required=True)
+    parser.add_argument("--gang-plan", required=True)
+    args = parser.parse_args(argv)
+
+    outputs = Path(os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR", "."))
+    try:
+        outputs.mkdir(parents=True, exist_ok=True)
+        coordinates = broker_coordinates()
+        merged_config = _merge_workload(args.resolved_config, args.resolved_workload, outputs)
+    except GangWorkerError as error:
+        print(f"gang worker setup failed: {error}", file=sys.stderr)
+        return error.exit_code
+    # The legacy startup and the plan builders read the config from here.
+    os.environ[CONFIG_PATH_ENV] = str(merged_config)
+    factory = BrokerClient if broker_factory is None else broker_factory
+    broker = factory(coordinates.url, coordinates.token, coordinates.run_id)
+    return run_gang_worker(
+        merged_config,
+        Path(args.gang_plan),
+        broker=broker,
+        server_runner=_default_server_runner if server_runner is None else server_runner,
+        test_outputs_dir=outputs,
+        master_executor=master_executor,
+    )

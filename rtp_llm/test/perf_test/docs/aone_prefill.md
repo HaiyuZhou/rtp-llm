@@ -49,3 +49,7 @@ adapter selects the platform config from `execution.gpu_type` and expands
 `PERF_TEST_BAZEL_ARGS` supplies additional Bazel command arguments; and
 `PERF_TEST_BAZEL_TESTLOGS` overrides the default workspace `bazel-testlogs`
 collection root.
+
+When the derived machine count exceeds one, the run becomes one multi-machine
+gang instead of case shards; `multi_node_aone.md` covers the gang config,
+broker, and collection contract.

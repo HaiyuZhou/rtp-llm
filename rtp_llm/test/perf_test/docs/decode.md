@@ -98,6 +98,8 @@ with a `traceEvents` array and retain them atomically under `traces/` in the run
 Multi-node collection copies those retained files with the run, and trace analysis
 resolves remote manifest paths to the collected `Task_*/run/traces/` files.
 
-Decode `resume`, `profile`, and `report` are unsupported. AOne decode is also
-unsupported. These combinations return configuration exit code 2 before a run
-directory, model process, build, or remote submission is created.
+Decode `resume`, `profile`, and `report` are unsupported and return
+configuration exit code 2. Single-machine AOne `run` is rejected during
+planning, before a run directory, model process, build, or remote submission
+is created. A derived multi-machine gang runs decode against AOne;
+`multi_node_aone.md` covers the gang contract.

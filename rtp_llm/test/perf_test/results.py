@@ -702,7 +702,9 @@ def parse_result_envelope(value: Any) -> ResultEnvelope:
     if mode not in {"prefill", "decode"}:
         raise ResultSchemaError("mode: expected prefill or decode")
     backend = raw["backend"]
-    if backend not in {"local", "aone"} or mode == "decode" and backend != "local":
+    # Both modes accept the aone backend: a gang run reports through the same
+    # envelope as a local run (single-machine decode+aone never reaches one).
+    if backend not in {"local", "aone"}:
         raise ResultSchemaError("backend: unsupported for result mode")
     try:
         status = RunState(raw["status"])

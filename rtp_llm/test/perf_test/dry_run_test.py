@@ -1,10 +1,10 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.config_resolver import resolve_config
-from rtp_llm.test.perf_test.dry_run import dispatch_plan
+from rtp_llm.test.perf_test.dry_run import create_preview, dispatch_plan
 from rtp_llm.test.perf_test.plan import build_execution_plan
 
 
@@ -39,6 +39,45 @@ def _config(backend):
             "batch_sizes": [1],
         },
         "execution": execution,
+        "output": {},
+        "regression": {},
+        "publish": {},
+    }
+
+
+def _gang_execution():
+    return {
+        "backend": "aone",
+        "resource": "daily",
+        "gpu_type": "H20",
+        "max_parallel": 2,
+        "gpus_per_machine": 1,
+    }
+
+
+def _gang_config():
+    return {
+        "schema_version": 1,
+        "model": {
+            "label": "test-model",
+            "type": "registered_model",
+            "checkpoint": "/models/test",
+            "topology": {"tp": 2, "dp": 1, "pp": 1, "ep": 1},
+        },
+        "engine": {
+            "max_seq_len": 4096,
+            "max_batch_tokens": 8192,
+            "concurrency_limit": 8,
+        },
+        "workload": {
+            "kind": "cache_grid",
+            "max_input_len": 2048,
+            "cache_alignment": 64,
+            "commit_tail_tokens": 64,
+            "compute_steps": [128],
+            "batch_sizes": [1],
+        },
+        "execution": _gang_execution(),
         "output": {},
         "regression": {},
         "publish": {},
@@ -134,6 +173,99 @@ class DryRunTest(unittest.TestCase):
 
         self.assertEqual({"status": "executed"}, result)
         execute.assert_called_once_with(plan)
+
+    def test_gang_dry_run_is_complete_and_side_effect_free(self):
+        create_run_directory = Mock()
+        start_broker = Mock()
+        generate_package = Mock()
+        submit_job = Mock()
+
+        def execute(_plan):
+            create_run_directory()
+            start_broker()
+            generate_package()
+            submit_job()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_directory = Path(temp_dir) / "gang-run"
+            plan = build_execution_plan(
+                mode="prefill",
+                action="run",
+                resolved=resolve_config(_gang_config()),
+                cases=_cases(),
+                result_directory=str(result_directory),
+            )
+
+            with patch("subprocess.run", create_run_directory) as run_subprocess, patch(
+                "subprocess.Popen", submit_job
+            ) as popen_subprocess, patch(
+                "rtp_llm.test.perf_test.aone.broker.run_gang_broker", start_broker
+            ), patch(
+                "rtp_llm.test.perf_test.aone.gang_package.generate_gang_package",
+                generate_package,
+            ), patch(
+                "rtp_llm.test.perf_test.run_directory.initialize_run_directory",
+                create_run_directory,
+            ):
+                preview = dispatch_plan(plan, dry_run=True, execute=execute)
+
+            self.assertFalse(result_directory.exists())
+
+        create_run_directory.assert_not_called()
+        submit_job.assert_not_called()
+        run_subprocess.assert_not_called()
+        popen_subprocess.assert_not_called()
+        start_broker.assert_not_called()
+        generate_package.assert_not_called()
+
+        self.assertTrue(preview["dry_run"])
+        self.assertEqual("aone", preview["backend"])
+        self.assertEqual(
+            plan.to_dict()["resolved_config"], preview["normalized_config"]
+        )
+        self.assertEqual(plan.resource_plan.to_dict(), preview["resource_summary"])
+        self.assertEqual(2, preview["cases"]["count"])
+        self.assertNotIn("shards", preview)
+        self.assertEqual("//generated/perf_test:gang", preview["gang"]["target"])
+
+    def test_gang_dry_run_prints_topology_members_and_gang_commands(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = build_execution_plan(
+                mode="prefill",
+                action="run",
+                resolved=resolve_config(_gang_config()),
+                cases=_cases(),
+                result_directory=str(Path(temp_dir) / "gang-run"),
+            )
+
+            preview = create_preview(plan)
+
+        gang = preview["gang"]
+        self.assertEqual(2, gang["machine_count"])
+        self.assertEqual(1, gang["gpus_per_machine"])
+        self.assertEqual(1, gang["local_world_size"])
+        self.assertEqual(2, gang["world_size"])
+        self.assertEqual(0, gang["master_shard_index"])
+        self.assertEqual(
+            [
+                {"shard_index": 0, "world_ranks": [0], "is_master": True},
+                {"shard_index": 1, "world_ranks": [1], "is_master": False},
+            ],
+            gang["members"],
+        )
+        self.assertEqual(
+            ["build", "remote-test"],
+            [command["stage"] for command in preview["commands"]],
+        )
+        for command in preview["commands"]:
+            self.assertIn("//generated/perf_test:gang", command["argv"])
+            self.assertIn("--config=cuda13", command["argv"])
+        self.assertIn("--config=daily_aone_bazel_cache", preview["commands"][0]["argv"])
+        self.assertIn(
+            "--config=daily_aone_bazel_remote", preview["commands"][1]["argv"]
+        )
+        self.assertIn("--strategy=TestRunner=remote", preview["commands"][1]["argv"])
+        self.assertIn("--jobs=2", preview["commands"][1]["argv"])
 
 
 if __name__ == "__main__":

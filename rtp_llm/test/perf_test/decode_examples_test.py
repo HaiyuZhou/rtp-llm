@@ -74,11 +74,15 @@ class DecodeExamplesTest(unittest.TestCase):
             for effect in side_effects:
                 effect()
 
+        # decode aone run is a supported gang capability; only its follow-up
+        # actions must fail before any side effect.
         for action, backend in (
             ("resume", "local"),
             ("profile", "local"),
             ("report", "local"),
-            ("run", "aone"),
+            ("resume", "aone"),
+            ("profile", "aone"),
+            ("report", "aone"),
         ):
             with self.subTest(action=action, backend=backend):
                 with self.assertRaises(CapabilityError) as context:

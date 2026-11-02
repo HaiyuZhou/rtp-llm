@@ -624,6 +624,18 @@ py_test(
 )
 
 py_test(
+    name = "gang_examples_test",
+    srcs = ["gang_examples_test.py"],
+    data = [
+        "examples/decode_aone_gang.json",
+        "examples/prefill_aone_gang.json",
+    ],
+    deps = [
+        ":perf_test_lib",
+    ],
+)
+
+py_test(
     name = "decode_planner_test",
     srcs = ["decode_planner_test.py"],
     deps = [":perf_test_lib"],

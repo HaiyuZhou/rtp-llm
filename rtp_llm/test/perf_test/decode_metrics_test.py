@@ -13,7 +13,16 @@ from rtp_llm.test.perf_test.decode.model import (
     DecodeCaseSpec,
     ExactBatchPolicy,
 )
-from rtp_llm.test.perf_test.plan import build_execution_plan
+from rtp_llm.test.perf_test.errors import PlanningError
+from rtp_llm.test.perf_test.plan import (
+    PLAN_SCHEMA_VERSION,
+    AOneResourcePlan,
+    ExecutionPlan,
+    PlannedCase,
+    build_execution_plan,
+    case_id,
+    freeze,
+)
 from rtp_llm.test.perf_test.results import ResultSchemaError, parse_result_envelope
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 
@@ -394,6 +403,111 @@ class DecodeMetricsTest(unittest.TestCase):
                 self.assertEqual(search, details.get("search"))
                 details["search"]["observations"][0]["outcome"] = "changed"
                 self.assertEqual("satisfied", search["observations"][0]["outcome"])
+
+
+    def test_gang_decode_finalizes_into_parseable_aone_envelope(self):
+        source = _source()
+        source["execution"] = {
+            "backend": "aone",
+            "resource": "daily",
+            "gpu_type": "H20",
+            "max_parallel": 2,
+            "gpus_per_machine": 2,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+            case = _case()
+            plan = build_execution_plan(
+                mode="decode",
+                action="run",
+                resolved=resolve_config(source),
+                cases=[{key: value for key, value in case.items() if key != "case_id"}],
+                result_directory=str(root),
+            )
+            case["case_id"] = plan.cases[0].case_id
+            result = build_decode_case_result(
+                case,
+                selected=_selected(),
+                topology=TOPOLOGY,
+                profiling={
+                    "status": "disabled",
+                    "manifest_path": None,
+                    "error": None,
+                },
+            )
+            initialize_run_directory(
+                root,
+                source_config=source,
+                plan=plan,
+                run_id="decode-gang",
+                code_version="rev",
+            )
+
+            envelope = finalize_decode_run(
+                root, plan=plan, run_id="decode-gang", case_results=[result]
+            )
+
+            parsed = parse_result_envelope(envelope)
+            self.assertEqual(2, plan.resource_plan.machine_count)
+            self.assertEqual("decode", parsed.mode)
+            self.assertEqual("aone", parsed.backend)
+            self.assertEqual("completed", parsed.status)
+            summary = json.loads((root / "results" / "summary.json").read_text())
+            self.assertEqual("aone", summary["backend"])
+            self.assertTrue((root / "reports" / "decode_report.json").is_file())
+
+    def test_single_machine_decode_aone_never_reaches_finalize(self):
+        source = _source()
+        source["execution"] = {
+            "backend": "aone",
+            "resource": "daily",
+            "gpu_type": "H20",
+            "max_parallel": 1,
+            "shard_count": 1,
+        }
+        identity = {key: value for key, value in _case().items() if key != "case_id"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+
+            # Plan validation keeps single-machine decode+aone unreachable...
+            with self.assertRaisesRegex(PlanningError, "machine_count"):
+                build_execution_plan(
+                    mode="decode",
+                    action="run",
+                    resolved=resolve_config(source),
+                    cases=[identity],
+                    result_directory=str(root),
+                )
+
+            # ...and finalization independently rejects such a plan: only a
+            # gang (machine_count > 1) may finalize with backend=aone.
+            plan = ExecutionPlan(
+                schema_version=PLAN_SCHEMA_VERSION,
+                mode="decode",
+                action="run",
+                backend="aone",
+                resolved_config=freeze(resolve_config(source).resolved_config),
+                config_fingerprint="a" * 64,
+                workload_fingerprint="b" * 64,
+                cases=(PlannedCase(case_id("decode", identity), freeze(identity)),),
+                resource_plan=AOneResourcePlan(
+                    backend="aone",
+                    resource="daily",
+                    gpu_type="H20",
+                    gpus_per_shard=4,
+                    shard_count=1,
+                    max_parallel=1,
+                    gpus_per_machine=4,
+                    machine_count=1,
+                    local_world_size=4,
+                ),
+                result_directory=str(root),
+            )
+            with self.assertRaisesRegex(PlanningError, "machine_count"):
+                finalize_decode_run(
+                    root, plan=plan, run_id="decode-run", case_results=[]
+                )
+            self.assertFalse(root.exists())
 
 
 if __name__ == "__main__":

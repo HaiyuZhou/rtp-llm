@@ -12,14 +12,43 @@ from rtp_llm.test.perf_test.plan import (
     ExecutionPlan,
 )
 
+# Symbolic location of the single gang target a generated gang package
+# exposes (Bazel expands it into one shard per machine at submission time).
+GANG_TARGET = "//generated/perf_test:gang"
+
+
+def _is_gang_resource(resource: AOneResourcePlan) -> bool:
+    return resource.machine_count > 1
+
+
+def _gang_member_layout(resource: AOneResourcePlan) -> List[Dict[str, Any]]:
+    return [
+        {
+            "shard_index": shard_index,
+            "world_ranks": [
+                shard_index * resource.local_world_size + offset
+                for offset in range(resource.local_world_size)
+            ],
+            "is_master": shard_index == 0,
+        }
+        for shard_index in range(resource.machine_count)
+    ]
+
 
 def _command_preview(plan: ExecutionPlan) -> List[Dict[str, Any]]:
-    if isinstance(plan.resource_plan, AOneResourcePlan):
-        resource = plan.resource_plan
-        targets = [
-            f"//generated/perf_test:shard_{shard:04d}"
-            for shard in range(resource.shard_count)
-        ]
+    resource = plan.resource_plan
+    if isinstance(resource, AOneResourcePlan):
+        if _is_gang_resource(resource):
+            targets = [GANG_TARGET]
+            # The whole gang must be placed as one wave, exactly like the
+            # gang executor's submission stage.
+            jobs = max(resource.max_parallel, resource.machine_count)
+        else:
+            targets = [
+                f"//generated/perf_test:shard_{shard:04d}"
+                for shard in range(resource.shard_count)
+            ]
+            jobs = resource.max_parallel
         common = [f"--config={AONE_GPU_PLATFORMS[resource.gpu_type]}", "--config=cicd"]
         return [
             {
@@ -41,7 +70,7 @@ def _command_preview(plan: ExecutionPlan) -> List[Dict[str, Any]]:
                     *common,
                     f"--config={resource.resource}_aone_bazel_remote",
                     "--strategy=TestRunner=remote",
-                    f"--jobs={resource.max_parallel}",
+                    f"--jobs={jobs}",
                 ],
             },
         ]
@@ -75,7 +104,20 @@ def create_preview(plan: ExecutionPlan) -> Dict[str, Any]:
         "resource_summary": plan.resource_plan.to_dict(),
         "commands": _command_preview(plan),
     }
-    if isinstance(plan.resource_plan, AOneResourcePlan):
+    resource = plan.resource_plan
+    if isinstance(resource, AOneResourcePlan) and _is_gang_resource(resource):
+        # A gang plan has no case shards: every machine hosts the full plan's
+        # rank group, so the preview prints the gang topology instead.
+        preview["gang"] = {
+            "machine_count": resource.machine_count,
+            "gpus_per_machine": resource.gpus_per_machine,
+            "local_world_size": resource.local_world_size,
+            "world_size": resource.machine_count * resource.local_world_size,
+            "master_shard_index": 0,
+            "target": GANG_TARGET,
+            "members": _gang_member_layout(resource),
+        }
+    elif isinstance(resource, AOneResourcePlan):
         shard_plan = plan_shards(plan)
         preview["shards"] = {
             "count": len(shard_plan.shards),

@@ -562,6 +562,25 @@ class ResultEnvelopeTest(unittest.TestCase):
                 with self.assertRaisesRegex(ResultSchemaError, diagnostic):
                     parse_result_envelope(value)
 
+    def test_decode_gang_aone_backend_is_accepted_like_prefill_aone(self):
+        gang = _decode_result()
+        gang["backend"] = "aone"
+
+        parsed = parse_result_envelope(gang)
+
+        self.assertEqual("aone", parsed.backend)
+        self.assertEqual(gang, parsed.to_dict())
+
+        prefill = _prefill_result()
+        prefill["backend"] = "aone"
+        self.assertEqual("aone", parse_result_envelope(prefill).backend)
+
+        for value in (_decode_result(), _prefill_result()):
+            with self.subTest(mode=value["mode"]):
+                value["backend"] = "remote"
+                with self.assertRaisesRegex(ResultSchemaError, "backend"):
+                    parse_result_envelope(value)
+
     def test_legacy_cache_grid_result_is_not_accepted_as_envelope(self):
         legacy = {
             "schema_version": 2,

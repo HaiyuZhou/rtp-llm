@@ -6,11 +6,13 @@ for key, value in os.environ.items():
 import json
 import logging
 import pathlib
+import re
 import signal
 import socket
 import sys
 import time
-from typing import Dict
+from dataclasses import dataclass
+from typing import Dict, Optional, Sequence
 
 current_file_path = pathlib.Path(__file__).parent.absolute()
 sys.path.append(str(current_file_path.parent.parent.parent.absolute()))
@@ -29,12 +31,14 @@ from rtp_llm.config.server_config_setup import (
     setup_and_configure_server,
 )
 from rtp_llm.distribute.distributed_server import members_from_test_env
+from rtp_llm.distribute.worker_info import WorkerInfo
 from rtp_llm.server.server_args.server_args import setup_args
 from rtp_llm.test.perf_test.multi_node.decode_runtime import (
     build_external_decode_plan,
     execute_master_decode,
     run_external_rank,
 )
+from rtp_llm.test.perf_test.plan import ExecutionPlan
 from rtp_llm.test.perf_test.test_util import create_query
 from rtp_llm.test.utils.maga_server_manager import MagaServerManager
 from rtp_llm.utils.fuser import fetch_remote_file_to_local
@@ -124,6 +128,145 @@ def try_upload_log(log_dir_path: str, upload_path: str):
     os.remove(zip_path)
 
 
+def _shard_index_key(member: WorkerInfo):
+    """Sort key: the shard index encoded in the legacy ``...partN`` name."""
+    match = re.search(r"part(\d+)$", member.name)
+    if match:
+        return (0, int(match.group(1)), member.name)
+    return (1, 0, member.name)
+
+
+def build_gang_config_string(
+    members: Sequence[WorkerInfo], local_world_size: int
+) -> str:
+    """Build the ``GANG_CONFIG_STRING`` value for one multi-host gang.
+
+    ``members`` are the legacy member records the server side already
+    parses (the ``WorkerInfo`` records ``members_from_test_env`` returns).
+    The master (the member whose name ends with ``part0``) is placed first
+    and the remaining members follow their shard index, matching the
+    encoding the legacy SSH launcher emits::
+
+        name:test_part0,ip:host0,port:12333;name:test_part1,ip:host1,port:12333
+
+    ``local_world_size`` is the per-host rank-group width; the caller owns
+    the rank layout (world rank = shard index * local world size).
+    """
+    member_list = list(members)
+    if not member_list:
+        raise RuntimeError("no gang members, unexpected!")
+    if not isinstance(local_world_size, int) or local_world_size < 1:
+        raise RuntimeError(
+            f"local_world_size must be a positive integer, got {local_world_size!r}"
+        )
+    masters = [member for member in member_list if member.name.endswith("part0")]
+    if len(masters) != 1:
+        raise RuntimeError(f"gang master should contains 1 but got {len(masters)}")
+    ordered = sorted(member_list, key=_shard_index_key)
+    if masters[0].name != ordered[0].name:
+        raise RuntimeError(
+            f"gang master should be the first one but got {ordered[0].name}"
+        )
+    return ";".join(
+        f"name:{member.name},ip:{member.ip},port:{member.server_port}"
+        for member in ordered
+    )
+
+
+@dataclass
+class LocalRankGroupContext:
+    """Per-host context needed to start one local rank group."""
+
+    port: int
+    world_rank: int
+    log_dir_path: str
+    profiler_directory: pathlib.Path
+    plan: ExecutionPlan
+
+
+@dataclass
+class ServerHandle:
+    """Owning handle for one host's local rank-group server.
+
+    Wraps the MagaServerManager together with the startup byproducts the
+    caller needs: the locally resolved tokenizer path (rank zero only) and
+    whether this process became its own process group leader during
+    startup. The caller launches and stops the server through the handle so
+    the legacy cleanup, upload, and exit semantics stay at the call site.
+    """
+
+    manager: MagaServerManager
+    tokenizer_path: Optional[str]
+    pgrp_set: bool
+
+    @property
+    def log_file_path(self) -> Optional[str]:
+        return self.manager.log_file_path
+
+    def start_server(self) -> bool:
+        return self.manager.start_server()
+
+    def print_process_log(self) -> None:
+        self.manager.print_process_log()
+
+    def stop_server(self) -> None:
+        self.manager.stop_server()
+
+
+def start_local_rank_group(
+    context: LocalRankGroupContext,
+    config: PyEnvConfigs,
+    model_paths: Optional[str],
+) -> ServerHandle:
+    """Start this host's local rank group.
+
+    Performs the legacy per-host startup in the legacy order: model setup
+    and download, engine environment, output directories, process-group
+    isolation, rank-zero tokenizer resolution, then construction of the
+    maga server manager that owns every local rank. ``config`` is the
+    parsed ``PyEnvConfigs`` and ``model_paths`` is the tokenizer location
+    exactly as the legacy script reads it from
+    ``model_args.tokenizer_path`` (gang workers pass their locally
+    resolved path; resolution is idempotent for local paths). The server
+    subprocess itself is launched by the caller through the returned
+    handle so legacy failure, upload, and exit semantics are unchanged.
+    """
+    setup_and_configure_server(config)
+    engine = context.plan.resolved_config["engine"]
+    os.environ["MAX_SEQ_LEN"] = str(engine["max_seq_len"])
+    os.environ["MAX_BATCH_TOKENS_SIZE"] = str(engine["max_batch_tokens"])
+    os.environ["CONCURRENCY_LIMIT"] = str(engine["concurrency_limit"])
+    os.makedirs(context.log_dir_path, exist_ok=True)
+    os.environ["TORCH_CUDA_PROFILER_DIR"] = str(context.profiler_directory)
+    # for maga server files
+    os.environ["TEST_UNDECLARED_OUTPUTS_DIR"] = context.log_dir_path
+    os.environ["MAGA_SERVER_WORK_DIR"] = os.getcwd()
+
+    pgrp_set = False
+    try:
+        os.setpgrp()
+        pgrp_set = True
+    except Exception as e:
+        logging.info(f"setpgrp error: {e}")
+
+    tokenizer_path = None
+    if context.world_rank == 0:
+        if not model_paths:
+            raise RuntimeError(
+                "tokenizer_path is missing; set model_args.tokenizer_path or ckpt_path"
+            )
+        tokenizer_path = fetch_remote_file_to_local(
+            os.path.expanduser(str(model_paths).strip())
+        )
+
+    server = MagaServerManager(port=str(context.port))
+    return ServerHandle(
+        manager=server,
+        tokenizer_path=tokenizer_path,
+        pgrp_set=pgrp_set,
+    )
+
+
 if __name__ == "__main__":
     config_path = os.environ.get("PERF_TEST_CONFIG_PATH")
     if not config_path:
@@ -154,45 +297,36 @@ if __name__ == "__main__":
             "ep": parallelism.ep_size,
         },
     )
-    setup_and_configure_server(py_env_configs)
+    # Normalize the inherited gang config through the shared builder so the
+    # legacy flow and gang workers construct identical GANG_CONFIG_STRINGs.
+    gang_config_string = py_env_configs.distribute_config.gang_config_string
+    if gang_config_string:
+        os.environ["GANG_CONFIG_STRING"] = build_gang_config_string(
+            members_from_test_env(gang_config_string),
+            parallelism.local_world_size,
+        )
     input_len_list = sorted(
         {length for case in plan.cases for length in case.identity["input_lengths"]}
     )
-    engine = plan.resolved_config["engine"]
-    os.environ["MAX_SEQ_LEN"] = str(engine["max_seq_len"])
-    os.environ["MAX_BATCH_TOKENS_SIZE"] = str(engine["max_batch_tokens"])
-    os.environ["CONCURRENCY_LIMIT"] = str(engine["concurrency_limit"])
-    os.makedirs(log_dir_path, exist_ok=True)
-    os.environ["TORCH_CUDA_PROFILER_DIR"] = str(runtime_profiler_directory)
-    # for maga server files
-    os.environ["TEST_UNDECLARED_OUTPUTS_DIR"] = log_dir_path
-    os.environ["MAGA_SERVER_WORK_DIR"] = os.getcwd()
-
-    pgrp_set = False
-    try:
-        os.setpgrp()
-        pgrp_set = True
-    except Exception as e:
-        logging.info(f"setpgrp error: {e}")
-
+    context = LocalRankGroupContext(
+        port=port,
+        world_rank=world_rank,
+        log_dir_path=log_dir_path,
+        profiler_directory=runtime_profiler_directory,
+        plan=plan,
+    )
+    server_handle = start_local_rank_group(
+        context, py_env_configs, py_env_configs.model_args.tokenizer_path
+    )
     input_query_dict = {}
     if world_rank == 0:
-        raw_tok = py_env_configs.model_args.tokenizer_path
-        if not raw_tok:
-            raise RuntimeError(
-                "tokenizer_path is missing; set model_args.tokenizer_path or ckpt_path"
-            )
-        tokenizer_path = fetch_remote_file_to_local(
-            os.path.expanduser(str(raw_tok).strip())
-        )
         input_query_dict = create_query(
-            tokenizer_path=tokenizer_path, input_len_list=input_len_list
+            tokenizer_path=server_handle.tokenizer_path,
+            input_len_list=input_len_list,
         )
-
-    server = MagaServerManager(port=str(port))
     try:
-        if not server.start_server():
-            server.print_process_log()
+        if not server_handle.start_server():
+            server_handle.print_process_log()
             raise Exception("server start failed")
         result = run_external_rank(
             world_rank=world_rank,
@@ -202,7 +336,7 @@ if __name__ == "__main__":
                 source_config=source,
                 endpoint=f"http://127.0.0.1:{port}",
                 prompt_for_length=lambda length: input_query_dict[length],
-                server_log_path=server.log_file_path,
+                server_log_path=server_handle.log_file_path,
                 profiler_directory=runtime_profiler_directory,
             ),
         )
@@ -220,9 +354,9 @@ if __name__ == "__main__":
                 )
             )
     finally:
-        server.stop_server()
+        server_handle.stop_server()
         upload_path = os.environ.get("UPLOAD_OSS_PATH", "")
         if upload_path != "":
             logging.info(f"upload log to {upload_path}")
             try_upload_log(log_dir_path, upload_path)
-        script_exit(pgrp_set)
+        script_exit(server_handle.pgrp_set)

@@ -132,6 +132,18 @@ AONE_GPU_PLATFORMS = {
     "SM100_ARM_CU13": "cuda13_arm",
     "SM103_CU13": "cuda13",
 }
+# Full per-host GPU counts for gang execution. A gang shard always requests
+# every GPU of the machine it lands on, so every GPU type that can run as a
+# gang member must be registered here with the number of GPUs one host
+# provides.
+AONE_GPU_HOSTS = {
+    "H20": 8,
+    "H20_CU13": 8,
+    "L20D_DEV": 8,
+    "L20_CU13": 8,
+    "SM100_ARM_CU13": 8,
+    "SM103_CU13": 8,
+}
 AONE_RESOURCES = ("daily", "online")
 
 
@@ -246,12 +258,6 @@ def _aone_resource_plan(
             f"unsupported AOne resource {execution['resource']!r}; "
             f"supported resources: {supported}"
         )
-    if execution["gpu_type"] not in AONE_GPU_PLATFORMS:
-        supported = ", ".join(sorted(AONE_GPU_PLATFORMS))
-        raise ResourceError(
-            f"unsupported GPU type {execution['gpu_type']!r}; "
-            f"supported GPU types: {supported}"
-        )
     max_parallel = execution["max_parallel"]
     shard_count = execution.get("shard_count")
     gpus_per_machine = execution.get("gpus_per_machine")
@@ -259,6 +265,16 @@ def _aone_resource_plan(
         world_size, world_size if gpus_per_machine is None else gpus_per_machine
     )
     if gang.machine_count > 1:
+        # A gang shard always requests the full host, so the GPU type must
+        # have a registered per-host GPU count before planning continues.
+        if execution["gpu_type"] not in AONE_GPU_HOSTS:
+            supported = ", ".join(sorted(AONE_GPU_HOSTS))
+            raise ResourceError(
+                f"unsupported GPU type {execution['gpu_type']!r} for gang "
+                "execution: gang shards request full hosts, so the GPU type "
+                "must have a per-host GPU count in AONE_GPU_HOSTS; "
+                f"supported GPU types: {supported}"
+            )
         if shard_count is not None:
             raise PlanningError(
                 "execution.shard_count cannot be combined with "
@@ -271,6 +287,12 @@ def _aone_resource_plan(
                 f"machine_count {gang.machine_count} machines"
             )
     else:
+        if execution["gpu_type"] not in AONE_GPU_PLATFORMS:
+            supported = ", ".join(sorted(AONE_GPU_PLATFORMS))
+            raise ResourceError(
+                f"unsupported GPU type {execution['gpu_type']!r}; "
+                f"supported GPU types: {supported}"
+            )
         if shard_count is None:
             raise PlanningError(
                 "execution.shard_count is required when "

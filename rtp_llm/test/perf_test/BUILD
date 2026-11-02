@@ -67,6 +67,7 @@ py_library(
     name = "perf_test_runtime_lib",
     srcs = [
         "aone/collector.py",
+        "aone/gang_package.py",
         "aone/package.py",
         "decode/executor.py",
         "decode/finalize.py",
@@ -110,6 +111,7 @@ py_library(
         "aone/collector.py",
         "aone/executor.py",
         "aone/broker.py",
+        "aone/gang_package.py",
         "aone/gang.py",
         "aone/sharding.py",
         "aone/worker.py",
@@ -520,6 +522,15 @@ py_test(
 py_test(
     name = "aone_package_test",
     srcs = ["aone_package_test.py"],
+    data = ["defs.bzl"],
+    deps = [
+        ":perf_test_lib",
+    ],
+)
+
+py_test(
+    name = "aone_gang_package_test",
+    srcs = ["aone_gang_package_test.py"],
     data = ["defs.bzl"],
     deps = [
         ":perf_test_lib",

@@ -15,6 +15,17 @@ from rtp_llm.test.perf_test.storage import atomic_write_json
 
 PACKAGE_SCHEMA_VERSION = 1
 
+_PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*")
+
+
+def _validated_package_name(package_name: object) -> str:
+    """Reject names that cannot become a generated Bazel package label."""
+    if not isinstance(package_name, str) or not _PACKAGE_NAME_PATTERN.fullmatch(
+        package_name
+    ):
+        raise PlanningError(f"invalid generated Bazel package: {package_name!r}")
+    return package_name
+
 
 @dataclass(frozen=True)
 class GeneratedAOnePackage:
@@ -146,11 +157,7 @@ def generate_aone_package(
     }
 
     output = Path(root)
-    package_name = output.name if package is None else package
-    if not isinstance(package_name, str) or not re.fullmatch(
-        r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", package_name
-    ):
-        raise PlanningError(f"invalid generated Bazel package: {package_name!r}")
+    package_name = _validated_package_name(output.name if package is None else package)
     try:
         output.mkdir(parents=True, exist_ok=False)
     except FileExistsError as error:

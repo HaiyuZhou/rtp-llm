@@ -193,6 +193,18 @@ class GangConfigTest(unittest.TestCase):
 
         self.assertEqual(2, plan.resource_plan.machine_count)
 
+    def test_gang_gpu_type_requires_per_host_count(self):
+        topology = {"tp": 8, "dp": 2, "pp": 1, "ep": 1}
+
+        # Gang shards request full hosts, so the GPU type must be registered
+        # in AONE_GPU_HOSTS with a per-host GPU count.
+        with self.assertRaisesRegex(ResourceError, "per-host GPU count"):
+            _build(_execution(gpu_type="H900", gpus_per_machine=8), topology)
+
+        # Single-machine execution keeps the platform-registry rejection.
+        with self.assertRaisesRegex(ResourceError, "unsupported GPU type"):
+            _build(_execution(gpu_type="H900", shard_count=2))
+
     def test_prefill_aone_passes_in_both_modes(self):
         single_machine = _build(_execution(shard_count=2))
         gang = _build(

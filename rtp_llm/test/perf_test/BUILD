@@ -558,6 +558,10 @@ py_test(
 py_test(
     name = "aone_gang_worker_test",
     srcs = ["aone_gang_worker_test.py"],
+    data = [
+        "examples/decode_aone_gang.json",
+        "examples/prefill_aone_gang.json",
+    ],
     deps = [
         ":perf_test_lib",
     ],

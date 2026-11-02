@@ -149,15 +149,18 @@ class ServerHandle:
     """Owning handle for one host's local rank-group server.
 
     Wraps the MagaServerManager together with the startup byproducts the
-    caller needs: the locally resolved tokenizer path (rank zero only) and
+    caller needs: the locally resolved tokenizer path (rank zero only),
     whether this process became its own process group leader during
-    startup. The caller launches and stops the server through the handle so
-    the legacy cleanup, upload, and exit semantics stay at the call site.
+    startup, and the member's log dir (where the engine drops raw chrome
+    traces through TORCH_CUDA_PROFILER_DIR). The caller launches and stops
+    the server through the handle so the legacy cleanup, upload, and exit
+    semantics stay at the call site.
     """
 
     manager: MagaServerManager
     tokenizer_path: Optional[str]
     pgrp_set: bool
+    log_dir: str
 
     @property
     def log_file_path(self) -> Optional[str]:
@@ -224,6 +227,7 @@ def start_local_rank_group(
         manager=server,
         tokenizer_path=tokenizer_path,
         pgrp_set=pgrp_set,
+        log_dir=str(context.log_dir_path),
     )
 
 

@@ -9,6 +9,7 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from rtp_llm.test.perf_test.aone.broker import BrokerMember
@@ -24,10 +25,21 @@ from rtp_llm.test.perf_test.aone.gang_worker import (
     GangBrokerFailure,
     GangWorkerContext,
     WorkerConfigError,
+    _default_master_executor,
+    _default_prefill_master_executor,
+    _default_server_runner,
+    build_worker_context,
+    load_gang_plan,
     main as worker_main,
     merged_config_mode,
     run_gang_worker,
 )
+
+ROOT = Path(__file__).resolve().parent
+EXAMPLES = {
+    "prefill": ROOT / "examples" / "prefill_aone_gang.json",
+    "decode": ROOT / "examples" / "decode_aone_gang.json",
+}
 
 
 @dataclass
@@ -489,6 +501,22 @@ class WorkerPreludeTest(_WorkerTestCase):
         self.assertFalse(handle.started)
         self.assertEqual([], broker.reports())
 
+    def test_unexpected_startup_error_still_casts_the_failure_vote(self):
+        plan = self._write_plan()
+        broker = FakeBroker(plan["machine_count"], members=_members(2))
+
+        def runner(context):
+            self.contexts.append(context)
+            raise ImportError("torch wheels are missing on this host")
+
+        code = self._run(broker, runner, shard_index=0, machine_count=2)
+
+        # The exit code was already nonzero without the vote; the vote is
+        # what fails the gang immediately instead of waiting for the
+        # heartbeat expiry.
+        self.assertEqual(EXIT_EXECUTION_ERROR, code)
+        self.assertEqual([("report", 0, "failed")], broker.reports())
+
 
 class MasterExecutionTest(_WorkerTestCase):
     def test_master_runs_executor_with_handle_and_reports_completed(self):
@@ -827,6 +855,308 @@ class MergedConfigModeTest(unittest.TestCase):
             with self.subTest(workload=workload):
                 with self.assertRaises(WorkerConfigError):
                     self._mode_for(workload)
+
+
+class LoadGangPlanTest(unittest.TestCase):
+    def test_nonzero_master_shard_index_is_rejected(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "gang_plan.json"
+            path.write_text(
+                json.dumps(_gang_plan(master_shard_index=1)), encoding="utf-8"
+            )
+            with self.assertRaises(WorkerConfigError) as caught:
+                load_gang_plan(path)
+        message = str(caught.exception)
+        self.assertIn("master_shard_index", message)
+        self.assertIn("0", message)
+
+
+class _RecordingRunnerModule:
+    """Fake ``local_server_runner`` module: records the rank-group startup."""
+
+    def __init__(self):
+        self.rank_contexts = []
+        self.starts = []
+
+    def LocalRankGroupContext(self, **kwargs):
+        context = SimpleNamespace(**kwargs)
+        self.rank_contexts.append(context)
+        return context
+
+    def start_local_rank_group(self, rank_context, configs, model_paths):
+        self.starts.append((rank_context, configs, model_paths))
+        return "handle-sentinel"
+
+
+class DefaultServerRunnerPlanTest(_WorkerTestCase):
+    """The default server runner picks the plan builder by gang mode.
+
+    Both gang modes start their server through ``_default_server_runner``;
+    only the plan builder differs. The merged configs mirror the shipped
+    gang examples (TP2 across two single-GPU machines), and everything past
+    plan building — rank-group startup, server launch — is faked.
+    """
+
+    TOPOLOGY = {"tp": 2, "dp": 1, "pp": 1, "ep": 1}
+
+    def _example_gang_plan(self):
+        return {
+            "schema_version": 1,
+            "run_id": "example-gang",
+            "config_fingerprint": "config-fp",
+            "workload_fingerprint": "workload-fp",
+            "world_size": 2,
+            "machine_count": 2,
+            "local_world_size": 1,
+            "gpus_per_machine": 1,
+            "gpus_per_host": 8,
+            "gpu_type": "H20_CU13",
+            "topology": dict(self.TOPOLOGY),
+            "master_shard_index": 0,
+            "port_range": {"start": 12333, "count": 1},
+        }
+
+    def _run_default_server_runner(self, gang_plan, config_path):
+        context = build_worker_context(
+            gang_plan, tuple(_members(gang_plan["machine_count"])), 0
+        )
+        runner = _RecordingRunnerModule()
+        decode_calls = []
+        prefill_calls = []
+
+        def fake_decode_plan(path, **kwargs):
+            decode_calls.append((path, kwargs))
+            return ("decode-plan", "decode-source")
+
+        def fake_prefill_plan(path, **kwargs):
+            prefill_calls.append((path, kwargs))
+            return ("prefill-plan", "prefill-source")
+
+        with patch.dict(
+            os.environ,
+            {
+                "PERF_TEST_CONFIG_PATH": str(config_path),
+                "TEST_UNDECLARED_OUTPUTS_DIR": str(self.outputs),
+            },
+        ):
+            with patch(
+                "rtp_llm.test.perf_test.aone.gang_worker._load_local_server_runner",
+                return_value=runner,
+            ), patch(
+                "rtp_llm.test.perf_test.aone.gang_worker._resolve_model_paths",
+                return_value="/resolved/tokenizer",
+            ), patch(
+                "rtp_llm.config.server_config_setup.set_parallelism_config"
+            ), patch(
+                "rtp_llm.server.server_args.server_args.setup_args",
+                return_value=SimpleNamespace(
+                    parallelism_config=object(), prefill_cp_config=object()
+                ),
+            ), patch(
+                "rtp_llm.test.perf_test.multi_node.decode_runtime"
+                ".build_external_decode_plan",
+                side_effect=fake_decode_plan,
+            ), patch(
+                "rtp_llm.test.perf_test.multi_node.prefill_runtime"
+                ".build_external_prefill_plan",
+                side_effect=fake_prefill_plan,
+            ):
+                handle = _default_server_runner(context)
+        return handle, runner, decode_calls, prefill_calls
+
+    def _merged_example(self, mode):
+        merged = json.loads(EXAMPLES[mode].read_text(encoding="utf-8"))
+        merged_path = self.root / f"merged_{mode}.json"
+        merged_path.write_text(json.dumps(merged), encoding="utf-8")
+        return merged_path
+
+    def test_cache_grid_workload_builds_the_prefill_rank_group_plan(self):
+        plan = self._example_gang_plan()
+        merged_path = self._merged_example("prefill")
+
+        handle, runner, decode_calls, prefill_calls = (
+            self._run_default_server_runner(plan, merged_path)
+        )
+
+        self.assertEqual("handle-sentinel", handle)
+        # The prefill gang must build the prefill plan: the decode planner
+        # rejects cache_grid workloads outright.
+        self.assertEqual([], decode_calls)
+        self.assertEqual(1, len(prefill_calls))
+        path, kwargs = prefill_calls[0]
+        self.assertEqual(str(merged_path), str(path))
+        self.assertEqual(str(self.outputs / "run"), kwargs["result_directory"])
+        self.assertEqual(self.TOPOLOGY, kwargs["actual_topology"])
+        # The prefill plan is what the local rank group starts from.
+        self.assertEqual(1, len(runner.rank_contexts))
+        self.assertEqual("prefill-plan", runner.rank_contexts[0].plan)
+        self.assertEqual(1, len(runner.starts))
+        rank_context, _configs, model_paths = runner.starts[0]
+        self.assertIs(runner.rank_contexts[0], rank_context)
+        self.assertEqual("/resolved/tokenizer", model_paths)
+
+    def test_grid_workload_keeps_the_decode_rank_group_plan(self):
+        plan = self._example_gang_plan()
+        merged_path = self._merged_example("decode")
+
+        handle, runner, decode_calls, prefill_calls = (
+            self._run_default_server_runner(plan, merged_path)
+        )
+
+        self.assertEqual("handle-sentinel", handle)
+        self.assertEqual([], prefill_calls)
+        self.assertEqual(1, len(decode_calls))
+        path, kwargs = decode_calls[0]
+        self.assertEqual(str(merged_path), str(path))
+        self.assertEqual(str(self.outputs / "run"), kwargs["result_directory"])
+        self.assertEqual(self.TOPOLOGY, kwargs["actual_topology"])
+        self.assertEqual(1, len(runner.rank_contexts))
+        self.assertEqual("decode-plan", runner.rank_contexts[0].plan)
+
+
+class DefaultMasterExecutorTest(_WorkerTestCase):
+    """The default decode master executor wires the gang's profiler seam."""
+
+    def test_profiler_directory_comes_from_the_handle_log_dir(self):
+        plan = self._write_plan()
+        context = build_worker_context(plan, tuple(_members(2)), 0)
+        handle = SimpleNamespace(
+            tokenizer_path="/tokenizer",
+            log_file_path="/logs/rank0/server.log",
+            log_dir="/outputs/TEST_OUTPUT_run-123_0",
+        )
+        execute_calls = []
+
+        def fake_execute(_plan, **kwargs):
+            execute_calls.append(kwargs)
+            return SimpleNamespace(state=SimpleNamespace(value="completed"))
+
+        with patch(
+            "rtp_llm.test.perf_test.multi_node.decode_runtime"
+            ".build_external_decode_plan",
+            return_value=(SimpleNamespace(cases=()), "source"),
+        ), patch(
+            "rtp_llm.test.perf_test.multi_node.decode_runtime.execute_master_decode",
+            side_effect=fake_execute,
+        ), patch(
+            "rtp_llm.test.perf_test.test_util.create_query", return_value={}
+        ):
+            code = _default_master_executor(
+                handle,
+                context=context,
+                config_path=str(self.resolved_config),
+                result_directory=str(self.outputs / "run"),
+            )
+
+        self.assertEqual(0, code)
+        self.assertEqual(1, len(execute_calls))
+        # The engine writes raw chrome traces to TORCH_CUDA_PROFILER_DIR,
+        # which start_local_rank_group points at the member's log dir; the
+        # profiler must scan there, not the run root.
+        self.assertEqual(
+            Path("/outputs/TEST_OUTPUT_run-123_0"),
+            execute_calls[0]["profiler_directory"],
+        )
+        self.assertNotEqual(
+            Path(self.outputs / "run"), execute_calls[0]["profiler_directory"]
+        )
+
+
+class DefaultPrefillMasterExecutorTest(_WorkerTestCase):
+    """The default prefill master executor fails the manifest on errors."""
+
+    def _run_prefill_executor(self, report_error=None):
+        plan = self._write_plan(_gang_plan(machine_count=2, local_world_size=1))
+        merged = {
+            "model": {"checkpoint": "/model", "type": "qwen_2"},
+            "workload": {"kind": "cache_grid", "commit_tail_tokens": 64},
+        }
+        merged_path = self.root / "merged_prefill.json"
+        merged_path.write_text(json.dumps(merged), encoding="utf-8")
+        context = build_worker_context(plan, tuple(_members(2)), 0)
+        handle = SimpleNamespace(tokenizer_path="/tokenizer", log_dir=str(self.outputs))
+        run_root = self.outputs / "run"
+        report_calls = []
+
+        def fake_initialize(root, **_kwargs):
+            Path(root).mkdir(parents=True, exist_ok=True)
+            (Path(root) / "manifest.json").write_text(
+                json.dumps({"run_id": "run-1", "state": "planned"}),
+                encoding="utf-8",
+            )
+
+        def fake_report(root, **kwargs):
+            report_calls.append((root, kwargs))
+            if report_error is not None:
+                raise report_error
+            return {"report_kind": "formal"}
+
+        def fake_adapter(_factory):
+            return lambda _context: SimpleNamespace(
+                case_results=(),
+                state=SimpleNamespace(value="completed"),
+            )
+
+        code, raised = None, None
+        with patch(
+            "rtp_llm.test.perf_test.multi_node.prefill_runtime"
+            ".build_external_prefill_plan",
+            return_value=(SimpleNamespace(cases=()), {"model": {}}),
+        ), patch(
+            "rtp_llm.test.perf_test.run_directory.initialize_run_directory",
+            side_effect=fake_initialize,
+        ), patch(
+            "rtp_llm.test.perf_test.aone.gang_worker._resolve_model_paths",
+            return_value="/tokenizer",
+        ), patch(
+            "rtp_llm.test.perf_test.test_util._load_tokenizer",
+            return_value=object(),
+        ), patch(
+            "rtp_llm.test.perf_test.modes.prefill.PrefillAdapter",
+            side_effect=fake_adapter,
+        ), patch(
+            "rtp_llm.test.perf_test.prefill.finalize.finalize_prefill_run",
+        ), patch(
+            "rtp_llm.test.perf_test.prefill.report.generate_prefill_report",
+            side_effect=fake_report,
+        ):
+            try:
+                code = _default_prefill_master_executor(
+                    handle,
+                    context=context,
+                    config_path=str(merged_path),
+                    result_directory=str(run_root),
+                )
+            except Exception as error:  # the executor re-raises past failures
+                raised = error
+        return {
+            "code": code,
+            "raised": raised,
+            "run_root": run_root,
+            "report_calls": report_calls,
+        }
+
+    def _manifest_state(self, run_root):
+        return json.loads(
+            (run_root / "manifest.json").read_text(encoding="utf-8")
+        )["state"]
+
+    def test_report_success_completes_the_manifest(self):
+        outcome = self._run_prefill_executor()
+
+        self.assertIsNone(outcome["raised"])
+        self.assertEqual(0, outcome["code"])
+        self.assertEqual(1, len(outcome["report_calls"]))
+        self.assertEqual("completed", self._manifest_state(outcome["run_root"]))
+
+    def test_report_failure_marks_the_manifest_failed_and_propagates(self):
+        outcome = self._run_prefill_executor(
+            report_error=RuntimeError("chart failed")
+        )
+
+        self.assertIsInstance(outcome["raised"], RuntimeError)
+        self.assertEqual(1, len(outcome["report_calls"]))
+        self.assertEqual("failed", self._manifest_state(outcome["run_root"]))
 
 
 class MasterPathSelectionTest(_WorkerTestCase):

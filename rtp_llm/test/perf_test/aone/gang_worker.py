@@ -330,6 +330,11 @@ def load_gang_plan(path: Path) -> Dict[str, Any]:
         raise WorkerConfigError(
             f"gang plan master_shard_index {master_shard_index!r} is outside the gang"
         )
+    if master_shard_index != 0:
+        raise WorkerConfigError(
+            "gang plan master_shard_index must be 0 (the gang generator pins "
+            f"shard 0 as the master); got {master_shard_index!r}"
+        )
     port_range = plan["port_range"]
     if (
         not isinstance(port_range, dict)
@@ -543,10 +548,15 @@ def _run_worker(
             if not handle.start_server():
                 handle.print_process_log()
                 raise GangExecutionError("local rank-group server failed to start")
-        except GangWorkerError as error:
+        except Exception as error:
             # Failures before dispatch have not voted yet; every dispatched
-            # path owns exactly one vote of its own.
-            _report_failure_vote(broker, shard_index, f"{type(error).__name__}: {error}")
+            # path owns exactly one vote of its own. Non-GangWorkerError
+            # startup failures (import, planning, key errors) vote too: the
+            # broker rejects a second result with 409 and the vote helper
+            # swallows that, so this cannot double-vote.
+            _report_failure_vote(
+                broker, shard_index, f"{type(error).__name__}: {error}"
+            )
             raise
         if shard_index == int(gang_plan["master_shard_index"]):
             return _run_master(
@@ -580,7 +590,8 @@ def run_gang_worker(
     ``server_runner`` starts (but does not launch) the host's local rank
     group and returns the owning server handle; ``master_executor`` runs
     the unified plan on the master shard and defaults to the external
-    decode executor. Partial ``run/`` artifacts always remain on disk.
+    decode or prefill executor chosen by the merged config's workload
+    kind. Partial ``run/`` artifacts always remain on disk.
     """
     outputs = Path(test_outputs_dir)
     outcome: Dict[str, Any] = {"state": "completed", "exit_code": EXIT_SUCCESS, "detail": None}
@@ -668,6 +679,30 @@ def _load_local_server_runner():
             os.environ[BROKER_TOKEN_ENV] = token
 
 
+def _build_rank_group_plan(
+    config_path: str, context: GangWorkerContext, outputs: Path
+) -> Tuple[Any, Mapping[str, Any]]:
+    """Build the plan the local rank group starts from, by gang mode.
+
+    ``LocalRankGroupContext`` only consumes ``plan.resolved_config["engine"]``,
+    which both external plan builders provide, but the builders are
+    workload-specific: the decode planner rejects cache_grid workloads
+    outright, so a prefill gang must build the external prefill plan or its
+    server can never start.
+    """
+    from rtp_llm.test.perf_test.multi_node import decode_runtime, prefill_runtime
+
+    result_directory = str(outputs / "run")
+    topology = context.gang_plan["topology"]
+    if merged_config_mode(config_path) == "prefill":
+        return prefill_runtime.build_external_prefill_plan(
+            config_path, result_directory=result_directory, actual_topology=topology
+        )
+    return decode_runtime.build_external_decode_plan(
+        config_path, result_directory=result_directory, actual_topology=topology
+    )
+
+
 def _default_server_runner(context: GangWorkerContext):
     """Start this host's rank group through the extracted legacy startup."""
     from rtp_llm.config.server_config_setup import set_parallelism_config
@@ -705,11 +740,9 @@ def _default_server_runner(context: GangWorkerContext):
     set_parallelism_config(
         configs.parallelism_config, py_prefill_cp_config=configs.prefill_cp_config
     )
-    execution_plan, _source = runner.decode_runtime.build_external_decode_plan(
-        config_path,
-        result_directory=str(outputs / "run"),
-        actual_topology=topology,
-    )
+    # The plan builder follows the gang mode: decode gangs keep the decode
+    # plan, cache_grid (prefill) gangs build the prefill plan.
+    execution_plan, _source = _build_rank_group_plan(config_path, context, outputs)
     rank_context = runner.LocalRankGroupContext(
         port=int(plan["port_range"]["start"]),
         world_rank=context.world_rank,
@@ -767,7 +800,10 @@ def _default_master_executor(
         endpoint=f"http://127.0.0.1:{int(context.gang_plan['port_range']['start'])}",
         prompt_for_length=lambda length: queries[length],
         server_log_path=handle.log_file_path,
-        profiler_directory=Path(result_directory),
+        # The engine writes raw chrome traces to TORCH_CUDA_PROFILER_DIR,
+        # which the rank-group startup points at the member's log dir, so
+        # the profiler must scan there — not the run root.
+        profiler_directory=Path(handle.log_dir),
     )
     state = getattr(result, "state", None)
     return EXIT_SUCCESS if getattr(state, "value", None) == "completed" else 1
@@ -841,7 +877,14 @@ def _default_prefill_master_executor(
         raise
     finally:
         session.close()
-    generate_prefill_report(root, acquire_lock=False)
+    try:
+        generate_prefill_report(root, acquire_lock=False)
+    except Exception:
+        # A report failure must not leave the manifest claiming running
+        # while the exception propagates to the failure vote.
+        manifest["state"] = "failed"
+        store.write_manifest(manifest)
+        raise
     manifest["state"] = result.state.value
     store.write_manifest(manifest)
     return EXIT_SUCCESS if result.state.value == "completed" else 1

@@ -12,8 +12,10 @@ state directory — and never persists the bearer token.
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -25,6 +27,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import urlsplit
 
 from rtp_llm.test.perf_test.storage import atomic_write_json
+
+_LOG = logging.getLogger(__name__)
+_LOG.addHandler(logging.NullHandler())
 
 REGISTER_DEADLINE_S = 3600.0
 RUN_DEADLINE_S = 43200.0
@@ -505,6 +510,22 @@ class _BrokerHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args: Any) -> None:
         """Keep test and service output pristine."""
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        """Collapse client-disconnect tracebacks to a single log line.
+
+        ``ThreadingHTTPServer`` funnels per-connection exceptions here and
+        prints a full traceback by default; a worker dropping its HTTP
+        connection mid-poll (timeout, shutdown race) is routine, so those
+        get one quiet line while every other error stays fully visible.
+        """
+        exception = sys.exc_info()[1]
+        if isinstance(exception, (BrokenPipeError, ConnectionResetError)):
+            _LOG.debug(
+                "broker client %s disconnected: %r", client_address, exception
+            )
+            return
+        super().handle_error(request, client_address)
 
     def version_string(self) -> str:
         return self.server_version

@@ -23,6 +23,9 @@ from rtp_llm.test.perf_test.execution.aone import is_gang_plan
 from rtp_llm.test.perf_test.execution.aone_bazel import create_default_aone_executor
 from rtp_llm.test.perf_test.execution.aone_gang import (
     BROKER_HOST_ENV,
+    BROKER_RUN_ID_ENV,
+    BROKER_TOKEN_ENV,
+    BROKER_URL_ENV,
     GangAOneExecutor,
     resolve_broker_host,
 )
@@ -198,7 +201,7 @@ class FakeBazelRun:
             if self.test_error is not None:
                 raise self.test_error(list(command))
             if self.on_test_command is not None:
-                self.on_test_command(list(command))
+                self.on_test_command(list(command), dict(entry.get("env") or {}))
         code = self._returncodes.pop(0) if self._returncodes else 0
         return SimpleNamespace(returncode=code)
 
@@ -210,6 +213,13 @@ class FakeBazelRun:
     def test_command(self):
         return self._command_with("test")
 
+    @property
+    def test_entry(self):
+        for entry in self.calls:
+            if "test" in entry["command"]:
+                return entry
+        raise AssertionError("bazel test was never invoked")
+
     def _command_with(self, verb):
         for entry in self.calls:
             if verb in entry["command"]:
@@ -217,38 +227,40 @@ class FakeBazelRun:
         raise AssertionError(f"bazel {verb} was never invoked")
 
 
-def _broker_env_from_command(command):
-    values = {}
-    for arg in command:
-        if arg.startswith("--test_env=PERF_TEST_BROKER_"):
-            _prefix, name, value = arg.split("=", 2)
-            values[name] = value
-    return values
+_BROKER_ENV_NAMES = (BROKER_URL_ENV, BROKER_TOKEN_ENV, BROKER_RUN_ID_ENV)
 
 
-def _token_from_command(command):
-    token = _broker_env_from_command(command).get("PERF_TEST_BROKER_TOKEN")
+def _broker_env_from_env(env):
+    return {name: env[name] for name in _BROKER_ENV_NAMES if name in env}
+
+
+def _broker_env_from_entry(entry):
+    return _broker_env_from_env(entry.get("env") or {})
+
+
+def _token_from_entry(entry):
+    token = _broker_env_from_entry(entry).get(BROKER_TOKEN_ENV)
     assert token
     return token
 
 
-def _register_members_from_command(command, count):
-    """Register gang members against the live broker exporting this command.
+def _register_members(env, count):
+    """Register gang members against the live broker exporting this env.
 
     The broker rejects two registrations from the same source address (its
     distinct-host backstop), so a loopback test can only register one real
     member; the recorded host then comes from a genuine rendezvous.
     """
-    values = _broker_env_from_command(command)
+    values = _broker_env_from_env(env)
     claim = socket.gethostbyaddr(LOOPBACK)[0]
     for index in range(count):
         request = urllib.request.Request(
-            f"{values['PERF_TEST_BROKER_URL']}/v1/runs/"
-            f"{values['PERF_TEST_BROKER_RUN_ID']}/register",
+            f"{values[BROKER_URL_ENV]}/v1/runs/"
+            f"{values[BROKER_RUN_ID_ENV]}/register",
             data=json.dumps(
                 {"shard_index": index, "hostname": claim, "port": 12333 + index}
             ).encode("utf-8"),
-            headers={"Authorization": f"Bearer {values['PERF_TEST_BROKER_TOKEN']}"},
+            headers={"Authorization": f"Bearer {values[BROKER_TOKEN_ENV]}"},
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=30) as response:
@@ -345,11 +357,7 @@ class GangStageLifecycleTest(_GangExecutorTestCase):
     def test_completed_gang_persists_stages_in_order_and_exports_broker_env(self):
         plan = self._setup_run()
         _write_testlogs_tree(self._shard_base(), plan)
-        runner = FakeBazelRun(
-            on_test_command=lambda command: _register_members_from_command(
-                command, 1
-            )
-        )
+        runner = FakeBazelRun(on_test_command=lambda command, env: _register_members(env, 1))
 
         outcome = self._executor(runner).execute(plan)
 
@@ -370,7 +378,8 @@ class GangStageLifecycleTest(_GangExecutorTestCase):
                 for name, stage in manifest["stages"].items()
             },
         )
-        test_command = runner.test_command
+        test_entry = runner.test_entry
+        test_command = test_entry["command"]
         self.assertIn("--strategy=TestRunner=remote", test_command)
         self.assertIn("--test_timeout=7000", test_command)
         jobs = int(
@@ -379,28 +388,32 @@ class GangStageLifecycleTest(_GangExecutorTestCase):
             )[1]
         )
         self.assertGreaterEqual(jobs, MACHINE_COUNT)
+        # The broker coordinates travel through env_inherit declared on the
+        # generated rule: they ride the submit environment, never the
+        # command line (where the token would be visible to ps and logs).
+        self.assertEqual(
+            [], [arg for arg in test_command if arg.startswith("--test_env=PERF_TEST_BROKER_")]
+        )
         rendezvous = manifest["stages"]["rendezvous"]
-        self.assertIn(
-            f"--test_env=PERF_TEST_BROKER_URL={rendezvous['broker_url']}", test_command
+        submit_env = test_entry["env"]
+        self.assertEqual(rendezvous["broker_url"], submit_env[BROKER_URL_ENV])
+        self.assertEqual(
+            rendezvous["broker_run_id"], submit_env[BROKER_RUN_ID_ENV]
         )
-        self.assertIn(
-            f"--test_env=PERF_TEST_BROKER_RUN_ID={rendezvous['broker_run_id']}",
-            test_command,
+        self.assertEqual(
+            list(_BROKER_ENV_NAMES),
+            manifest["stages"]["submit"]["env_inherit"],
         )
-        broker_env = _broker_env_from_command(test_command)
+        broker_env = _broker_env_from_entry(test_entry)
         self.assertEqual(3, len(broker_env))
         # Only the env var names are recorded; the secret value itself must
         # not survive anywhere under the run directory.
-        self._assert_token_persisted_nowhere(broker_env["PERF_TEST_BROKER_TOKEN"])
+        self._assert_token_persisted_nowhere(broker_env[BROKER_TOKEN_ENV])
 
     def test_manifest_records_gang_metadata_with_sanitized_hosts(self):
         plan = self._setup_run()
         _write_testlogs_tree(self._shard_base(), plan)
-        runner = FakeBazelRun(
-            on_test_command=lambda command: _register_members_from_command(
-                command, 1
-            )
-        )
+        runner = FakeBazelRun(on_test_command=lambda command, env: _register_members(env, 1))
 
         self._executor(runner).execute(plan)
 
@@ -512,13 +525,9 @@ class GangSubmitFailureTest(_GangExecutorTestCase):
 
     def test_runner_error_is_redacted_before_persistence(self):
         self._setup_run()
-        raised = {}
-
-        def fail(command):
-            raised["command"] = list(command)
-            return RuntimeError(f"cannot launch: {command}")
-
-        runner = FakeBazelRun(test_error=fail)
+        runner = FakeBazelRun(
+            test_error=lambda command: RuntimeError(f"cannot launch: {command}")
+        )
 
         outcome = self._executor(runner).execute(self.plan)
 
@@ -527,8 +536,66 @@ class GangSubmitFailureTest(_GangExecutorTestCase):
         manifest = self._manifest()
         error = manifest["stages"]["submit"]["error"]
         self.assertIn("cannot launch", error)
-        self.assertNotIn(_token_from_command(raised["command"]), error)
-        self._assert_token_persisted_nowhere(_token_from_command(raised["command"]))
+        token = _token_from_entry(runner.test_entry)
+        self.assertNotIn(token, error)
+        self._assert_token_persisted_nowhere(token)
+
+
+class GangSubmitTransportTest(_GangExecutorTestCase):
+    """Broker coordinates reach the shards through env, not argv."""
+
+    def test_broker_coordinates_travel_through_env_inherit_not_argv(self):
+        plan = self._setup_run()
+        _write_testlogs_tree(self._shard_base(), plan)
+        seen = {}
+
+        def on_test(command, env):
+            seen["command"] = command
+            seen["env"] = dict(env)
+
+        runner = FakeBazelRun(on_test_command=on_test)
+        for name in _BROKER_ENV_NAMES:
+            os.environ.pop(name, None)
+
+        outcome = self._executor(runner).execute(plan)
+
+        self.assertEqual(RunState.COMPLETED, outcome.state)
+        # Present in the submit environment during the bazel test run...
+        for name in _BROKER_ENV_NAMES:
+            with self.subTest(variable=name):
+                self.assertIn(name, seen["env"])
+        self.assertTrue(seen["env"][BROKER_URL_ENV].startswith("http://"))
+        # ...absent from the recorded argv, and cleaned up afterwards so no
+        # later stage of the submit process can observe them.
+        self.assertEqual(
+            [],
+            [
+                arg
+                for arg in seen["command"]
+                if arg.startswith("--test_env=PERF_TEST_BROKER_")
+            ],
+        )
+        for name in _BROKER_ENV_NAMES:
+            with self.subTest(cleanup=name):
+                self.assertNotIn(name, os.environ)
+
+    def test_exported_coordinates_are_restored_after_the_invocation(self):
+        plan = self._setup_run()
+        _write_testlogs_tree(self._shard_base(), plan)
+        runner = FakeBazelRun()
+
+        with patch.dict(
+            os.environ, {BROKER_URL_ENV: "http://preexisting.example"}
+        ):
+            outcome = self._executor(runner).execute(plan)
+            # Read inside the patch: patch.dict removes the exported value
+            # again when the context exits.
+            restored_url = os.environ.get(BROKER_URL_ENV)
+
+        self.assertEqual(RunState.COMPLETED, outcome.state)
+        self.assertEqual("http://preexisting.example", restored_url)
+        self.assertNotIn(BROKER_TOKEN_ENV, os.environ)
+        self.assertNotIn(BROKER_RUN_ID_ENV, os.environ)
 
 
 class GangCollectionParityTest(_GangExecutorTestCase):

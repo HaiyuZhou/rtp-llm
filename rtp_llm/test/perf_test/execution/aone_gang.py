@@ -2,16 +2,18 @@
 
 The gang executor owns the submit side of a multi-machine AOne run. It
 starts the rendezvous broker on a routable host, generates the gang Bazel
-package, drives the remote build/test invocations (exporting the broker
-coordinates to the test actions through ``--test_env``), collects the
+package, drives the remote build/test invocations (the broker coordinates
+reach the remote shards through the generated rule's ``env_inherit``,
+exported into the environment of the bazel test invocation), collects the
 master shard's full ``run/`` tree plus non-master logs from the testlogs
 tree, and produces the standard envelope report.
 
 Stage order is rendezvous -> build -> submit -> collect -> report, every
 transition persists to the manifest, partial collection always runs, and
 the original test failure exit code wins over collect/report errors. The
-broker token is only ever handed to the bazel test invocation; it is never
-persisted to the manifest, the run directory, or any log line.
+broker token is only ever present in the bazel test invocation's
+environment; it never reaches a command line (where ps and command logs
+could capture it), nor the manifest, the run directory, or any log line.
 """
 
 from __future__ import annotations
@@ -360,8 +362,12 @@ class GangAOneExecutor(AOneExecutor):
             "targets": list(package.targets),
             # The whole gang must be placed as one wave.
             "jobs": max(self._max_parallel, resource.machine_count),
-            "test_env": [BROKER_URL_ENV, BROKER_TOKEN_ENV, BROKER_RUN_ID_ENV],
+            # The generated gang rule declares env_inherit for these names,
+            # so exporting them into the submit environment is what carries
+            # them to every remote shard.
+            "env_inherit": [BROKER_URL_ENV, BROKER_TOKEN_ENV, BROKER_RUN_ID_ENV],
         }
+        submit_env, saved_env = self._export_broker_env(broker)
         try:
             command = self._bazel_command(
                 "test",
@@ -374,18 +380,17 @@ class GangAOneExecutor(AOneExecutor):
                 "--keep_going",
                 "--remote_download_outputs=all",
                 "--nocache_test_results",
-                f"--test_env={BROKER_URL_ENV}={broker.url}",
-                f"--test_env={BROKER_TOKEN_ENV}={broker.token}",
-                f"--test_env={BROKER_RUN_ID_ENV}={broker.run_id}",
             )
             completed = self._run_command(
-                command, cwd=self._workspace_root, env=self._process_env, check=False
+                command, cwd=self._workspace_root, env=submit_env, check=False
             )
             test_exit = int(completed.returncode)
         except Exception as error:
             test_failure = PostExecutionError(
                 f"Bazel gang test invocation failed: {error}"
             )
+        finally:
+            self._restore_broker_env(saved_env)
         if test_failure is None and test_exit:
             test_failure = PostExecutionError(f"Bazel gang test exited {test_exit}")
         if test_exit is not None:
@@ -400,6 +405,37 @@ class GangAOneExecutor(AOneExecutor):
             details=details,
         )
         return test_failure
+
+    def _export_broker_env(
+        self, broker: GangBroker
+    ) -> Tuple[Dict[str, str], Dict[str, Optional[str]]]:
+        """Export the broker coordinates into the submit environment.
+
+        The generated gang rule declares ``env_inherit`` for these names, so
+        they must be present in the bazel invocation's environment to reach
+        the remote shards. They are never placed on the command line, where
+        the token would be visible to process listings and command logs.
+        """
+        saved: Dict[str, Optional[str]] = {}
+        submit_env = dict(self._process_env)
+        for name, value in (
+            (BROKER_URL_ENV, broker.url),
+            (BROKER_TOKEN_ENV, broker.token),
+            (BROKER_RUN_ID_ENV, broker.run_id),
+        ):
+            saved[name] = os.environ.get(name)
+            os.environ[name] = value
+            submit_env[name] = value
+        return submit_env, saved
+
+    @staticmethod
+    def _restore_broker_env(saved: Mapping[str, Optional[str]]) -> None:
+        """Drop the exported coordinates so later stages never see them."""
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
     def _run_collect_stage(
         self,

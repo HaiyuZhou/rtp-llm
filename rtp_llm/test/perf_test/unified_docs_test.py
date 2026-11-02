@@ -18,7 +18,9 @@ class UnifiedDocsTest(unittest.TestCase):
             "Exit codes",
             "results/cases/<case_id>.json",
             "unified_prefill_ci_test",
-            "Decode is not supported by the AOne backend",
+            "the AOne backend runs",
+            "decode only as a multi-machine gang",
+            "gang only",
         ):
             self.assertIn(text, reference)
 

@@ -36,6 +36,7 @@ py_library(
     name = "perf_test_entry_lib",
     srcs = [
         "aone/__init__.py",
+        "aone/gang.py",
         "aone/sharding.py",
         "capabilities.py",
         "cli.py",
@@ -107,6 +108,7 @@ py_library(
         "aone/package.py",
         "aone/collector.py",
         "aone/executor.py",
+        "aone/gang.py",
         "aone/sharding.py",
         "aone/worker.py",
         "aone_worker.py",
@@ -295,6 +297,14 @@ py_test(
 py_test(
     name = "plan_test",
     srcs = ["plan_test.py"],
+    deps = [
+        ":perf_test_lib",
+    ],
+)
+
+py_test(
+    name = "gang_config_test",
+    srcs = ["gang_config_test.py"],
     deps = [
         ":perf_test_lib",
     ],

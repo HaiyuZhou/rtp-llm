@@ -237,7 +237,8 @@ class AOneExecutionConfig:
     resource: str
     gpu_type: str
     max_parallel: int
-    shard_count: int
+    shard_count: Optional[int]
+    gpus_per_machine: Optional[int] = None
 
 
 ExecutionConfig = Union[LocalExecutionConfig, AOneExecutionConfig]
@@ -564,8 +565,30 @@ def _parse_execution(value: Any) -> ExecutionConfig:
         _reject_unknown(
             "execution",
             raw,
-            {"backend", "resource", "gpu_type", "max_parallel", "shard_count"},
+            {
+                "backend",
+                "resource",
+                "gpu_type",
+                "max_parallel",
+                "shard_count",
+                "gpus_per_machine",
+            },
         )
+        gpus_per_machine = (
+            None
+            if "gpus_per_machine" not in raw
+            else _positive_int("execution.gpus_per_machine", raw["gpus_per_machine"])
+        )
+        if gpus_per_machine is None:
+            shard_count = _positive_int(
+                "execution.shard_count", _required("execution", raw, "shard_count")
+            )
+        else:
+            shard_count = (
+                None
+                if "shard_count" not in raw
+                else _positive_int("execution.shard_count", raw["shard_count"])
+            )
         return AOneExecutionConfig(
             backend=backend,
             resource=_non_empty_string(
@@ -578,9 +601,8 @@ def _parse_execution(value: Any) -> ExecutionConfig:
                 "execution.max_parallel",
                 _required("execution", raw, "max_parallel"),
             ),
-            shard_count=_positive_int(
-                "execution.shard_count", _required("execution", raw, "shard_count")
-            ),
+            shard_count=shard_count,
+            gpus_per_machine=gpus_per_machine,
         )
     raise ConfigError("execution.backend: expected one of: aone, local")
 

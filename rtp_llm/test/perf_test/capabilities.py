@@ -20,6 +20,7 @@ _SUPPORTED: FrozenSet[Tuple[str, str, str]] = frozenset(
         ("prefill", "aone", "run"),
         ("prefill", "aone", "report"),
         ("decode", "local", "run"),
+        ("decode", "aone", "run"),
     }
 )
 

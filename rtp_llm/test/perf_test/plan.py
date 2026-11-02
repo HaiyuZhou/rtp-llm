@@ -7,6 +7,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
+from rtp_llm.test.perf_test.aone.gang import derive_gang_topology
 from rtp_llm.test.perf_test.capabilities import validate_capability
 from rtp_llm.test.perf_test.config_resolver import ResolvedConfig, canonical_json
 from rtp_llm.test.perf_test.errors import PlanningError, ResourceError
@@ -98,8 +99,14 @@ class AOneResourcePlan:
     resource: str
     gpu_type: str
     gpus_per_shard: int
-    shard_count: int
+    shard_count: Optional[int]
     max_parallel: int
+    # Gang layout fields; the defaults keep pre-gang construction sites valid.
+    # The plan builders always set them to the derived gang topology, and
+    # persisted plans without them reconstruct with the single-machine layout.
+    gpus_per_machine: int = 0
+    machine_count: int = 1
+    local_world_size: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -109,6 +116,9 @@ class AOneResourcePlan:
             "gpus_per_shard": self.gpus_per_shard,
             "shard_count": self.shard_count,
             "max_parallel": self.max_parallel,
+            "gpus_per_machine": self.gpus_per_machine,
+            "machine_count": self.machine_count,
+            "local_world_size": self.local_world_size,
         }
 
 
@@ -242,16 +252,38 @@ def _aone_resource_plan(
             f"unsupported GPU type {execution['gpu_type']!r}; "
             f"supported GPU types: {supported}"
         )
-    shard_count = execution["shard_count"]
     max_parallel = execution["max_parallel"]
-    if shard_count > case_count:
-        raise ResourceError(
-            f"execution.shard_count {shard_count} exceeds case count {case_count}"
-        )
-    if max_parallel > shard_count:
-        raise ResourceError(
-            "execution.max_parallel cannot exceed execution.shard_count"
-        )
+    shard_count = execution.get("shard_count")
+    gpus_per_machine = execution.get("gpus_per_machine")
+    gang = derive_gang_topology(
+        world_size, world_size if gpus_per_machine is None else gpus_per_machine
+    )
+    if gang.machine_count > 1:
+        if shard_count is not None:
+            raise PlanningError(
+                "execution.shard_count cannot be combined with "
+                "execution.gpus_per_machine: case-shard and gang semantics "
+                "are mutually exclusive"
+            )
+        if max_parallel < gang.machine_count:
+            raise ResourceError(
+                f"execution.max_parallel {max_parallel} cannot run a gang of "
+                f"machine_count {gang.machine_count} machines"
+            )
+    else:
+        if shard_count is None:
+            raise PlanningError(
+                "execution.shard_count is required when "
+                "execution.gpus_per_machine derives machine_count == 1"
+            )
+        if shard_count > case_count:
+            raise ResourceError(
+                f"execution.shard_count {shard_count} exceeds case count {case_count}"
+            )
+        if max_parallel > shard_count:
+            raise ResourceError(
+                "execution.max_parallel cannot exceed execution.shard_count"
+            )
     return AOneResourcePlan(
         backend="aone",
         resource=execution["resource"],
@@ -259,6 +291,9 @@ def _aone_resource_plan(
         gpus_per_shard=world_size,
         shard_count=shard_count,
         max_parallel=max_parallel,
+        gpus_per_machine=gang.gpus_per_machine,
+        machine_count=gang.machine_count,
+        local_world_size=gang.local_world_size,
     )
 
 
@@ -274,13 +309,17 @@ def _resource_from_dict(value: Any) -> ResourcePlan:
                 world_size=value["world_size"],
             )
         if backend == "aone":
+            gpus_per_shard = value["gpus_per_shard"]
             return AOneResourcePlan(
                 backend="aone",
                 resource=value["resource"],
                 gpu_type=value["gpu_type"],
-                gpus_per_shard=value["gpus_per_shard"],
+                gpus_per_shard=gpus_per_shard,
                 shard_count=value["shard_count"],
                 max_parallel=value["max_parallel"],
+                gpus_per_machine=value.get("gpus_per_machine", gpus_per_shard),
+                machine_count=value.get("machine_count", 1),
+                local_world_size=value.get("local_world_size", gpus_per_shard),
             )
     except KeyError as error:
         raise PlanningError(f"invalid resource plan: missing {error}") from error
@@ -356,6 +395,13 @@ def build_execution_plan(
         resource_plan = _aone_resource_plan(
             resolved.resolved_config, world_size, len(planned_cases)
         )
+        if mode == "decode" and resource_plan.machine_count == 1:
+            raise PlanningError(
+                "decode AOne execution requires a gang: execution."
+                "gpus_per_machine must be smaller than the model topology "
+                f"world_size {world_size} so the derived machine_count "
+                "exceeds one"
+            )
     return ExecutionPlan(
         schema_version=PLAN_SCHEMA_VERSION,
         mode=mode,

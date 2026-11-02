@@ -24,6 +24,7 @@ class CapabilitiesTest(unittest.TestCase):
             ("prefill", "aone", "run"),
             ("prefill", "aone", "report"),
             ("decode", "local", "run"),
+            ("decode", "aone", "run"),
         }
         for mode in ("prefill", "decode"):
             for backend in ("local", "aone"):
@@ -70,7 +71,9 @@ class CapabilitiesTest(unittest.TestCase):
             ("resume", "local"),
             ("profile", "local"),
             ("report", "local"),
-            ("run", "aone"),
+            ("resume", "aone"),
+            ("profile", "aone"),
+            ("report", "aone"),
         ):
             with self.subTest(action=action, backend=backend):
                 with self.assertRaises(CapabilityError):
@@ -80,6 +83,16 @@ class CapabilitiesTest(unittest.TestCase):
         build_target.assert_not_called()
         start_engine.assert_not_called()
         submit_job.assert_not_called()
+
+    def test_decode_aone_run_is_supported_without_offline_restriction(self):
+        capability = validate_capability("decode", "run", "aone")
+
+        self.assertEqual(("decode", "aone", "run"), capability.key)
+        self.assertFalse(capability.offline_only)
+        for action in ("resume", "profile", "report"):
+            with self.subTest(action=action):
+                with self.assertRaises(CapabilityError):
+                    validate_capability("decode", action, "aone")
 
     def test_failure_types_have_stable_exit_code_classes(self):
         expected = {

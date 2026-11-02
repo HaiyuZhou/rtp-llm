@@ -126,7 +126,9 @@ class RuntimeAdapterTest(unittest.TestCase):
             }
         }
         post = Mock(return_value=response)
-        client = HttpPrefillClient(18000, post=post, timeout_seconds=30)
+        client = HttpPrefillClient(
+            "http://127.0.0.1:18000", post=post, timeout_seconds=30
+        )
 
         result = client.request(
             phase="measure",
@@ -138,6 +140,7 @@ class RuntimeAdapterTest(unittest.TestCase):
             output_length=1,
         )
 
+        self.assertEqual("http://127.0.0.1:18000", post.call_args.args[0])
         self.assertEqual(
             {
                 "success": True,

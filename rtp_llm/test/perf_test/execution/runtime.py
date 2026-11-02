@@ -6,6 +6,7 @@ import json
 import shlex
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from urllib.parse import urlsplit
 
 import requests
 
@@ -92,14 +93,19 @@ class HttpPrefillClient:
 
     def __init__(
         self,
-        port: int,
+        endpoint: str,
         *,
         post: Callable[..., Any] = requests.post,
         timeout_seconds: float = 300,
     ):
-        self.port = int(port)
+        self.endpoint = endpoint.rstrip("/")
         self._post = post
         self._timeout_seconds = timeout_seconds
+
+    @property
+    def port(self) -> Optional[int]:
+        """Endpoint port for callers that compose loopback service URLs."""
+        return urlsplit(self.endpoint).port
 
     def request(
         self,
@@ -124,7 +130,7 @@ class HttpPrefillClient:
         }
         try:
             response = self._post(
-                f"http://127.0.0.1:{self.port}",
+                self.endpoint,
                 json=body,
                 headers={"X-DashScope-LoggingConsent": "none"},
                 timeout=self._timeout_seconds,
@@ -168,7 +174,7 @@ class MagaEngineHandle:
         self._model_type = model_type
         self._tokenizer = tokenizer
         self._stopped = False
-        self.client = HttpPrefillClient(manager.port)
+        self.client = HttpPrefillClient(f"http://127.0.0.1:{manager.port}")
 
     @property
     def log_path(self) -> Optional[str]:

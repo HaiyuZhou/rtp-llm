@@ -122,6 +122,7 @@ py_library(
         "multi_node/decode_runtime.py",
         "multi_node/gang_config.py",
         "multi_node/local_server_runner.py",
+        "multi_node/prefill_runtime.py",
         "capabilities.py",
         "cli.py",
         "config_resolver.py",
@@ -476,6 +477,14 @@ py_test(
 py_test(
     name = "prefill_runner_test",
     srcs = ["prefill_runner_test.py"],
+    deps = [
+        ":perf_test_lib",
+    ],
+)
+
+py_test(
+    name = "prefill_external_test",
+    srcs = ["prefill_external_test.py"],
     deps = [
         ":perf_test_lib",
     ],

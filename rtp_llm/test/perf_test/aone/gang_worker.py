@@ -902,6 +902,9 @@ def main(
         outputs.mkdir(parents=True, exist_ok=True)
         coordinates = broker_coordinates()
         merged_config = _merge_workload(args.resolved_config, args.resolved_workload, outputs)
+        # Resolve the mode here so a bad workload kind fails setup with the
+        # intended message and exit code instead of escaping as a traceback.
+        mode = None if master_executor is not None else merged_config_mode(merged_config)
     except GangWorkerError as error:
         print(f"gang worker setup failed: {error}", file=sys.stderr)
         return error.exit_code
@@ -916,7 +919,7 @@ def main(
     if executor is None:
         executor = (
             _default_master_executor
-            if merged_config_mode(merged_config) == "decode"
+            if mode == "decode"
             else _default_prefill_master_executor
         )
     return run_gang_worker(

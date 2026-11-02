@@ -1,5 +1,7 @@
 """Unit tests for the gang worker orchestration (no network, no GPUs)."""
 
+import contextlib
+import io
 import json
 import os
 import threading
@@ -882,6 +884,52 @@ class MasterPathSelectionTest(_WorkerTestCase):
     def setUp(self):
         super().setUp()
         self.gang_plan_machine_count = 2
+
+    def test_unsupported_workload_kind_is_a_handled_config_error(self):
+        cases = (
+            ({"kind": "turbo"}, "unsupported gang workload kind: 'turbo'"),
+            ({}, "cannot derive the gang mode from the merged config"),
+        )
+        for workload, detail in cases:
+            with self.subTest(workload=workload):
+                self._write_plan()
+                workload_path = self.root / "resolved_workload.json"
+                workload_path.write_text(json.dumps(workload), encoding="utf-8")
+                self.resolved_config.write_text(
+                    json.dumps({"model": {"label": "m"}}), encoding="utf-8"
+                )
+                runner, _handle = self._server_runner()
+                factory_calls = []
+
+                def factory(_url, _token, _run_id):
+                    factory_calls.append(True)
+                    raise AssertionError("broker must not be built on setup failure")
+
+                environment = {
+                    BROKER_URL_ENV: "http://broker.example",
+                    BROKER_TOKEN_ENV: "secret-token",
+                    BROKER_RUN_ID_ENV: "run-1",
+                    "TEST_UNDECLARED_OUTPUTS_DIR": str(self.outputs),
+                    "TEST_SHARD_INDEX": "0",
+                    "TEST_TOTAL_SHARDS": "2",
+                }
+                stderr = io.StringIO()
+                with patch.dict(os.environ, environment, clear=True):
+                    with contextlib.redirect_stderr(stderr):
+                        code = worker_main(
+                            [
+                                "--resolved-config", str(self.resolved_config),
+                                "--resolved-workload", str(workload_path),
+                                "--gang-plan", str(self.gang_plan_path),
+                            ],
+                            broker_factory=factory,
+                            server_runner=runner,
+                        )
+
+                self.assertEqual(EXIT_CONFIG_ERROR, code)
+                self.assertIn("gang worker setup failed:", stderr.getvalue())
+                self.assertIn(detail, stderr.getvalue())
+                self.assertEqual([], factory_calls)
 
     def test_cache_grid_workload_selects_the_prefill_master_path(self):
         code, calls = self._main_selecting("cache_grid")

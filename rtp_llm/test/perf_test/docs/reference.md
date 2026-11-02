@@ -90,5 +90,6 @@ decode only as a multi-machine gang.
 
 - `docs/prefill.md`: local run, resume, profile, and report.
 - `docs/aone_prefill.md`: AOne packaging, sharding, and collection.
+- `docs/multi_node_aone.md`: multi-machine gangs, rendezvous broker, and collection.
 - `docs/decode.md`: fixed, distribution, DP scheduling, and target TPOT.
 - `docs/regression_publish.md`: baselines, goldens, OSS, ODPS, and failure policy.

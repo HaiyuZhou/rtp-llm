@@ -73,10 +73,12 @@ host's fully qualified domain name by default so remote workers can reach it;
 other through a small authenticated HTTP API under
 `/v1/runs/<run_id>/<operation>` with the operations `register`, `members`,
 `heartbeat`, `result`, and `cleanup`. Every request carries a bearer token in
-the authorization header; the token is handed to the remote test through
-`PERF_TEST_BROKER_URL`, `PERF_TEST_BROKER_TOKEN`, and `PERF_TEST_BROKER_RUN_ID`
-— exported into the remote test environment — and is never persisted to the
-manifest, the run directory, or any log.
+the authorization header; the token reaches the remote workers through
+`PERF_TEST_BROKER_URL`, `PERF_TEST_BROKER_TOKEN`, and
+`PERF_TEST_BROKER_RUN_ID` — exported into the submit environment of the
+bazel test invocation and carried to every remote shard by the generated
+rule's `env_inherit`, never on a command line — and is never persisted to
+the manifest, the run directory, or any log.
 
 The broker records each registration's HTTP source address and cross-checks
 the claimed hostname by reverse resolution. It rejects duplicate shard

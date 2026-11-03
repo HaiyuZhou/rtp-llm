@@ -30,10 +30,9 @@ from rtp_llm.test.perf_test.aone.gang_worker import (
     _default_server_runner,
     build_worker_context,
     load_gang_plan,
-    main as worker_main,
-    merged_config_mode,
-    run_gang_worker,
 )
+from rtp_llm.test.perf_test.aone.gang_worker import main as worker_main
+from rtp_llm.test.perf_test.aone.gang_worker import merged_config_mode, run_gang_worker
 
 ROOT = Path(__file__).resolve().parent
 EXAMPLES = {
@@ -213,7 +212,9 @@ class _WorkerTestCase(unittest.TestCase):
         return plan
 
     def _server_runner(self, handle=None, start_returns=True):
-        handle = FakeServerHandle(start_returns=start_returns) if handle is None else handle
+        handle = (
+            FakeServerHandle(start_returns=start_returns) if handle is None else handle
+        )
         self.handles.append(handle)
 
         def runner(context):
@@ -228,8 +229,16 @@ class _WorkerTestCase(unittest.TestCase):
         for index in shard_indices:
             broker._results[index] = "completed"
 
-    def _run(self, broker, server_runner, *, shard_index=1, machine_count=2,
-             master_executor=None, clock=lambda: 0.0):
+    def _run(
+        self,
+        broker,
+        server_runner,
+        *,
+        shard_index=1,
+        machine_count=2,
+        master_executor=None,
+        clock=lambda: 0.0,
+    ):
         with patch.dict(
             os.environ,
             {
@@ -265,11 +274,13 @@ class BrokerClientTest(unittest.TestCase):
 
         def fake_request(method, url, **kwargs):
             captured.append(
-                {"method": method, "url": url, "proxies": kwargs.get("proxies", "missing")}
+                {
+                    "method": method,
+                    "url": url,
+                    "proxies": kwargs.get("proxies", "missing"),
+                }
             )
-            return _FakeResponse(
-                200, {"status": "registered", "gang_state": "ready"}
-            )
+            return _FakeResponse(200, {"status": "registered", "gang_state": "ready"})
 
         client = BrokerClient("http://broker.example/", "secret-token", "run-1")
         original = gang_worker_module.requests.request
@@ -374,14 +385,18 @@ class BrokerClientTest(unittest.TestCase):
         self.assertEqual(1, len(members))
         self.assertEqual("host-0", members[0].hostname)
         register_call = transport.calls[0]
-        self.assertEqual("http://broker.example/v1/runs/run-1/register", register_call["url"])
+        self.assertEqual(
+            "http://broker.example/v1/runs/run-1/register", register_call["url"]
+        )
         self.assertEqual(
             {"shard_index": 0, "hostname": "host-0", "port": 12333},
             register_call["json"],
         )
 
     def test_error_messages_never_contain_the_token(self):
-        transport = _FakeRequest(responses=[_FakeResponse(401, {"error": "unauthorized"})])
+        transport = _FakeRequest(
+            responses=[_FakeResponse(401, {"error": "unauthorized"})]
+        )
         client = self._client(transport)
 
         with self.assertRaises(BrokerRejectedError) as caught:
@@ -411,9 +426,12 @@ class WorkerEnvTest(_WorkerTestCase):
                     ) as factory:
                         code = worker_main(
                             [
-                                "--resolved-config", str(config),
-                                "--resolved-workload", str(workload),
-                                "--gang-plan", str(self.gang_plan_path),
+                                "--resolved-config",
+                                str(config),
+                                "--resolved-workload",
+                                str(workload),
+                                "--gang-plan",
+                                str(self.gang_plan_path),
                             ]
                         )
                 self.assertEqual(EXIT_CONFIG_ERROR, code)
@@ -447,8 +465,13 @@ class WorkerPreludeTest(_WorkerTestCase):
         self._seed_completed(broker, [0])
         runner, handle = self._server_runner()
 
-        code = self._run(broker, runner, shard_index=1, machine_count=2,
-                         master_executor=lambda *a, **k: 0)
+        code = self._run(
+            broker,
+            runner,
+            shard_index=1,
+            machine_count=2,
+            master_executor=lambda *a, **k: 0,
+        )
 
         self.assertEqual(0, code)
         self.assertEqual(1, len(self.contexts))
@@ -481,8 +504,13 @@ class WorkerPreludeTest(_WorkerTestCase):
         self._seed_completed(broker, [0, 1])
         runner, _ = self._server_runner()
 
-        code = self._run(broker, runner, shard_index=2, machine_count=3,
-                         master_executor=lambda *a, **k: 0)
+        code = self._run(
+            broker,
+            runner,
+            shard_index=2,
+            machine_count=3,
+            master_executor=lambda *a, **k: 0,
+        )
 
         self.assertEqual(0, code)
         self.assertEqual("0", self.contexts[0].cuda_visible_devices)
@@ -510,8 +538,13 @@ class WorkerPreludeTest(_WorkerTestCase):
 
         broker.on_members = on_members
 
-        code = self._run(broker, runner, shard_index=1, machine_count=2,
-                         master_executor=lambda *a, **k: 0)
+        code = self._run(
+            broker,
+            runner,
+            shard_index=1,
+            machine_count=2,
+            master_executor=lambda *a, **k: 0,
+        )
 
         self.assertEqual(0, code)
         members_polls = [event for event in broker.events if event[0] == "members"]
@@ -559,8 +592,9 @@ class MasterExecutionTest(_WorkerTestCase):
             executor_calls.append((server_handle, kwargs))
             return 0
 
-        code = self._run(broker, runner, shard_index=0, machine_count=2,
-                         master_executor=executor)
+        code = self._run(
+            broker, runner, shard_index=0, machine_count=2, master_executor=executor
+        )
 
         self.assertEqual(0, code)
         self.assertEqual(1, len(executor_calls))
@@ -584,8 +618,9 @@ class MasterExecutionTest(_WorkerTestCase):
             partial.write_text("{}", encoding="utf-8")
             return 7
 
-        code = self._run(broker, runner, shard_index=0, machine_count=2,
-                         master_executor=executor)
+        code = self._run(
+            broker, runner, shard_index=0, machine_count=2, master_executor=executor
+        )
 
         self.assertEqual(7, code)
         self.assertEqual([("report", 0, "failed")], broker.reports())
@@ -603,8 +638,9 @@ class MasterExecutionTest(_WorkerTestCase):
         def executor(_server_handle, **_kwargs):
             raise RuntimeError("decode blew up")
 
-        code = self._run(broker, runner, shard_index=0, machine_count=2,
-                         master_executor=executor)
+        code = self._run(
+            broker, runner, shard_index=0, machine_count=2, master_executor=executor
+        )
 
         self.assertEqual(EXIT_EXECUTION_ERROR, code)
         self.assertEqual([("report", 0, "failed")], broker.reports())
@@ -622,8 +658,13 @@ class MasterExecutionTest(_WorkerTestCase):
             broker._gang_state = "failed"
             return handle
 
-        code = self._run(broker, runner, shard_index=0, machine_count=2,
-                         master_executor=lambda *a, **k: 0)
+        code = self._run(
+            broker,
+            runner,
+            shard_index=0,
+            machine_count=2,
+            master_executor=lambda *a, **k: 0,
+        )
 
         self.assertEqual(EXIT_RENDEZVOUS_ERROR, code)
         self.assertTrue(handle.stopped)
@@ -634,8 +675,13 @@ class MasterExecutionTest(_WorkerTestCase):
         broker = FakeBroker(plan["machine_count"], members=_members(2))
         runner, handle = self._server_runner(start_returns=False)
 
-        code = self._run(broker, runner, shard_index=0, machine_count=2,
-                         master_executor=lambda *a, **k: 0)
+        code = self._run(
+            broker,
+            runner,
+            shard_index=0,
+            machine_count=2,
+            master_executor=lambda *a, **k: 0,
+        )
 
         self.assertEqual(EXIT_EXECUTION_ERROR, code)
         self.assertEqual([("report", 0, "failed")], broker.reports())
@@ -774,8 +820,13 @@ class HeartbeatAndArtifactsTest(_WorkerTestCase):
         self._seed_completed(broker, [0])
         runner, _ = self._server_runner()
 
-        code = self._run(broker, runner, shard_index=1, machine_count=2,
-                         master_executor=lambda *a, **k: 0)
+        code = self._run(
+            broker,
+            runner,
+            shard_index=1,
+            machine_count=2,
+            master_executor=lambda *a, **k: 0,
+        )
 
         self.assertEqual(0, code)
         summary_path = self.outputs / "gang_worker.json"
@@ -793,8 +844,13 @@ class HeartbeatAndArtifactsTest(_WorkerTestCase):
         broker = FakeBroker(plan["machine_count"], members=_members(2))
         runner, _ = self._server_runner()
 
-        code = self._run(broker, runner, shard_index=0, machine_count=2,
-                         master_executor=lambda *a, **k: 3)
+        code = self._run(
+            broker,
+            runner,
+            shard_index=0,
+            machine_count=2,
+            master_executor=lambda *a, **k: 3,
+        )
 
         self.assertEqual(3, code)
         summary = json.loads(
@@ -809,8 +865,13 @@ class HeartbeatAndArtifactsTest(_WorkerTestCase):
         self._seed_completed(broker, [0])
         runner, _ = self._server_runner()
 
-        self._run(broker, runner, shard_index=1, machine_count=2,
-                  master_executor=lambda *a, **k: 0)
+        self._run(
+            broker,
+            runner,
+            shard_index=1,
+            machine_count=2,
+            master_executor=lambda *a, **k: 0,
+        )
 
         self.assertEqual([("report", 1, "completed")], broker.reports())
 
@@ -851,9 +912,12 @@ class WorkerMainTest(_WorkerTestCase):
             with patch("rtp_llm.test.perf_test.aone.gang_worker._sleep"):
                 code = worker_main(
                     [
-                        "--resolved-config", str(self.resolved_config),
-                        "--resolved-workload", str(workload),
-                        "--gang-plan", str(self.gang_plan_path),
+                        "--resolved-config",
+                        str(self.resolved_config),
+                        "--resolved-workload",
+                        str(workload),
+                        "--gang-plan",
+                        str(self.gang_plan_path),
                     ],
                     broker_factory=factory,
                     server_runner=runner,
@@ -1086,8 +1150,8 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
         plan = self._example_gang_plan()
         merged_path = self._merged_example("prefill")
 
-        handle, runner, _decode_calls, _prefill_calls = (
-            self._run_default_server_runner(plan, merged_path)
+        handle, runner, _decode_calls, _prefill_calls = self._run_default_server_runner(
+            plan, merged_path
         )
 
         self.assertEqual(1, len(runner.start_kwargs))
@@ -1135,8 +1199,8 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
         plan = self._example_gang_plan()
         merged_path = self._merged_example("prefill")
 
-        handle, runner, decode_calls, prefill_calls = (
-            self._run_default_server_runner(plan, merged_path)
+        handle, runner, decode_calls, prefill_calls = self._run_default_server_runner(
+            plan, merged_path
         )
 
         self.assertEqual("handle-sentinel", handle)
@@ -1160,8 +1224,8 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
         plan = self._example_gang_plan()
         merged_path = self._merged_example("decode")
 
-        handle, runner, decode_calls, prefill_calls = (
-            self._run_default_server_runner(plan, merged_path)
+        handle, runner, decode_calls, prefill_calls = self._run_default_server_runner(
+            plan, merged_path
         )
 
         self.assertEqual("handle-sentinel", handle)
@@ -1252,7 +1316,7 @@ class DefaultPrefillMasterExecutorTest(_WorkerTestCase):
                 raise report_error
             return {"report_kind": "formal"}
 
-        def fake_adapter(_factory):
+        def fake_adapter(_factory, *, probe=None):
             return lambda _context: SimpleNamespace(
                 case_results=(),
                 state=SimpleNamespace(value="completed"),
@@ -1302,9 +1366,9 @@ class DefaultPrefillMasterExecutorTest(_WorkerTestCase):
         }
 
     def _manifest_state(self, run_root):
-        return json.loads(
-            (run_root / "manifest.json").read_text(encoding="utf-8")
-        )["state"]
+        return json.loads((run_root / "manifest.json").read_text(encoding="utf-8"))[
+            "state"
+        ]
 
     def test_report_success_completes_the_manifest(self):
         outcome = self._run_prefill_executor()
@@ -1315,9 +1379,7 @@ class DefaultPrefillMasterExecutorTest(_WorkerTestCase):
         self.assertEqual("completed", self._manifest_state(outcome["run_root"]))
 
     def test_report_failure_marks_the_manifest_failed_and_propagates(self):
-        outcome = self._run_prefill_executor(
-            report_error=RuntimeError("chart failed")
-        )
+        outcome = self._run_prefill_executor(report_error=RuntimeError("chart failed"))
 
         self.assertIsInstance(outcome["raised"], RuntimeError)
         self.assertEqual(1, len(outcome["report_calls"]))
@@ -1367,9 +1429,12 @@ class MasterPathSelectionTest(_WorkerTestCase):
                 ):
                     code = worker_main(
                         [
-                            "--resolved-config", str(self.resolved_config),
-                            "--resolved-workload", str(workload),
-                            "--gang-plan", str(self.gang_plan_path),
+                            "--resolved-config",
+                            str(self.resolved_config),
+                            "--resolved-workload",
+                            str(workload),
+                            "--gang-plan",
+                            str(self.gang_plan_path),
                         ],
                         broker_factory=lambda _url, _token, _run_id: broker,
                         server_runner=runner,
@@ -1413,9 +1478,12 @@ class MasterPathSelectionTest(_WorkerTestCase):
                     with contextlib.redirect_stderr(stderr):
                         code = worker_main(
                             [
-                                "--resolved-config", str(self.resolved_config),
-                                "--resolved-workload", str(workload_path),
-                                "--gang-plan", str(self.gang_plan_path),
+                                "--resolved-config",
+                                str(self.resolved_config),
+                                "--resolved-workload",
+                                str(workload_path),
+                                "--gang-plan",
+                                str(self.gang_plan_path),
                             ],
                             broker_factory=factory,
                             server_runner=runner,
@@ -1472,9 +1540,12 @@ class MasterPathSelectionTest(_WorkerTestCase):
                 ) as prefill_default:
                     code = worker_main(
                         [
-                            "--resolved-config", str(self.resolved_config),
-                            "--resolved-workload", str(workload),
-                            "--gang-plan", str(self.gang_plan_path),
+                            "--resolved-config",
+                            str(self.resolved_config),
+                            "--resolved-workload",
+                            str(workload),
+                            "--gang-plan",
+                            str(self.gang_plan_path),
                         ],
                         broker_factory=lambda _url, _token, _run_id: broker,
                         server_runner=runner,

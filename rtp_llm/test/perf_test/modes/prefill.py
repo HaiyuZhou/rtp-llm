@@ -12,8 +12,11 @@ from rtp_llm.test.perf_test.state import RunState
 
 
 class PrefillAdapter:
-    def __init__(self, runner_factory: Callable[[ModeExecutionContext], Any]):
+    def __init__(
+        self, runner_factory: Callable[[ModeExecutionContext], Any], *, probe=None
+    ):
         self._runner_factory = runner_factory
+        self._probe = probe
 
     @staticmethod
     def _request_failure(case: Dict[str, Any], error: Exception) -> Dict[str, Any]:
@@ -46,6 +49,16 @@ class PrefillAdapter:
             if selected_case_ids is None
             else set(selected_case_ids)
         )
+        if selected and self._probe is not None:
+            try:
+                probe_result = self._probe(context)
+            except Exception as error:
+                context.store.write_checkpoint(
+                    "prefill_cache_probe",
+                    {"schema_version": 1, "status": "failed", "error": str(error)},
+                )
+                raise
+            context.store.write_checkpoint("prefill_cache_probe", probe_result)
         for planned_case in context.plan.cases:
             if planned_case.case_id not in selected:
                 continue

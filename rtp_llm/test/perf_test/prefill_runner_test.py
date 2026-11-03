@@ -65,6 +65,97 @@ def _case(cache_len=8, batch_size=1, measure_runs=2):
     }
 
 
+def _grouped_case():
+    return dict(
+        _case(batch_size=3, measure_runs=1),
+        input_len=24,
+        cache_len=8,
+        compute_len=16,
+        prefix_policy="independent",
+        measurement_contract="concurrent_grouped_batch_v1",
+        request_groups=[
+            {"count": 1, "input_len": 16, "cache_len": 8},
+            {"count": 2, "input_len": 24, "cache_len": 0},
+        ],
+    )
+
+
+class GroupedRunnerTest(unittest.TestCase):
+    def run_group(self, bad_reuse=False):
+        barrier = threading.Barrier(3, timeout=2)
+
+        class Client(_Client):
+            def request(self, **request):
+                self.requests.append(request)
+                if request["phase"] == "measure":
+                    barrier.wait()
+                    return _response(
+                        len(request["input_ids"]),
+                        8 if bad_reuse or request["request_index"] == 0 else 0,
+                        latency=10 * (request["request_index"] + 1),
+                    )
+                return _response(len(request["input_ids"]), 0)
+
+        client = Client([])
+        times = iter([0, 0.2])
+        result = PrefillRunner(
+            client, _Tokenizer(), commit_tail_tokens=4, monotonic=lambda: next(times)
+        ).run_case(_grouped_case())
+        return client, result
+
+    def test_grouped_members_use_own_geometry_and_round_wall_time(self):
+        client, result = self.run_group()
+        self.assertEqual("ok", result["status"])
+        self.assertEqual([1, 3], client.scheduler_calls)
+        self.assertEqual(
+            [12], [len(r["input_ids"]) for r in client.requests if r["phase"] == "seed"]
+        )
+        metrics = result["metrics"]
+        self.assertEqual(
+            (64, 8, 56),
+            (
+                metrics["input_length"],
+                metrics["expected_reuse_length"],
+                metrics["compute_length"],
+            ),
+        )
+        self.assertEqual(280, metrics["throughput_tokens_per_second"])
+        self.assertEqual(30, metrics["latency_ms"])
+        self.assertEqual(
+            [16, 24, 24], [m["input_length"] for m in metrics["measurements"]]
+        )
+        self.assertEqual(
+            [8, 0, 0], [m["expected_reuse_length"] for m in metrics["measurements"]]
+        )
+        self.assertTrue(
+            all(m["round_elapsed_ms"] == 200 for m in metrics["measurements"])
+        )
+
+    def test_grouped_reuse_is_validated_per_member(self):
+        _, result = self.run_group(bad_reuse=True)
+        self.assertEqual("invalid_reuse", result["status"])
+
+    def test_grouped_result_round_trip_and_tamper_rejection(self):
+        import copy
+
+        from rtp_llm.test.perf_test.results import ResultSchemaError, parse_case_result
+
+        _, result = self.run_group()
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(result, parse_case_result(0, "prefill", result).to_dict())
+        for field, value in (
+            ("input_length", 25),
+            ("expected_reuse_length", 8),
+            ("observed_reuse_length", 8),
+            ("compute_length", 25),
+            ("round_elapsed_ms", 201),
+        ):
+            broken = copy.deepcopy(result)
+            broken["metrics"]["measurements"][1][field] = value
+            with self.subTest(field=field), self.assertRaises(ResultSchemaError):
+                parse_case_result(0, "prefill", broken)
+
+
 class PrefillRunnerTest(unittest.TestCase):
     def test_batch_four_measure_requests_overlap(self):
         barrier = threading.Barrier(4, timeout=2)

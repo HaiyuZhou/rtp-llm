@@ -11,7 +11,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Tuple
 
 from rtp_llm.test.perf_test.prefill.measurement import PREFILL_MEASUREMENT_CONTRACT
-from rtp_llm.test.perf_test.prefill.prompts import PrefixPromptFactory
+from rtp_llm.test.perf_test.prefill.prompts import (
+    PrefixPromptFactory,
+    build_grouped_prompts,
+)
 
 
 class PrefillRunner:
@@ -73,24 +76,42 @@ class PrefillRunner:
         measure_runs = int(case["measure_runs"])
         input_len = int(case["input_len"])
         cache_len = int(case["cache_len"])
-        members = [
-            self.factory.build_case_prompts(
-                f"{case['case_id']}_r{member}", input_len, cache_len, measure_runs
-            )
-            for member in range(batch_size)
-        ]
-
-        if cache_len:
+        grouped = "request_groups" in case
+        contract = (
+            "concurrent_grouped_batch_v1" if grouped else PREFILL_MEASUREMENT_CONTRACT
+        )
+        members = (
+            build_grouped_prompts(self.factory, case, measure_runs)
+            if grouped
+            else [
+                {
+                    "input_len": input_len,
+                    "cache_len": cache_len,
+                    "prefix_id": f"{case['case_id']}_r{member}",
+                    "prompts": self.factory.build_case_prompts(
+                        f"{case['case_id']}_r{member}",
+                        input_len,
+                        cache_len,
+                        measure_runs,
+                    ),
+                }
+                for member in range(batch_size)
+            ]
+        )
+        if any(item["cache_len"] for item in members):
             try:
                 self.client.configure_scheduler(1, mode="prefill")
             except Exception as error:
                 return self._failure(case, "request_failed", str(error))
-            seed_len = cache_len + self.commit_tail_tokens
-            for member, prompts in enumerate(members):
+            for member, item in enumerate(members):
+                if not item["cache_len"]:
+                    continue
+                prompts = item["prompts"]
+                seed_len = item["cache_len"] + self.commit_tail_tokens
                 seed_text, seed_ids = self.factory.make_seed_and_ids(
-                    f"{case['case_id']}_r{member}",
+                    item["prefix_id"],
                     prompts.seed_text,
-                    cache_len,
+                    item["cache_len"],
                     self.commit_tail_tokens,
                 )
                 try:
@@ -116,7 +137,11 @@ class PrefillRunner:
 
         measurements: List[Dict[str, Any]] = []
         round_rates: List[float] = []
-        compute_length = int(case["compute_len"])
+        compute_length = (
+            sum(item["input_len"] - item["cache_len"] for item in members)
+            if grouped
+            else int(case["compute_len"])
+        )
         with ThreadPoolExecutor(max_workers=batch_size) as executor:
             for run_index in range(measure_runs):
                 release = threading.Event()
@@ -126,7 +151,7 @@ class PrefillRunner:
                     release.wait()
                     if aborted:
                         raise RuntimeError("round setup aborted")
-                    prompts = members[member]
+                    prompts = members[member]["prompts"]
                     return self.client.request(
                         phase="measure",
                         case_id=case["case_id"],
@@ -172,7 +197,9 @@ class PrefillRunner:
                     )
                 for member, response in enumerate(responses):
                     invalid = self._validate(
-                        response, input_len=input_len, expected_reuse=cache_len
+                        response,
+                        input_len=members[member]["input_len"],
+                        expected_reuse=members[member]["cache_len"],
                     )
                     if invalid is not None:
                         return self._failure(case, *invalid)
@@ -183,13 +210,41 @@ class PrefillRunner:
                             "latency_ms": response["latency_ms"],
                             "observed_reuse_length": response["reuse_len"],
                             "round_elapsed_ms": elapsed_ms,
-                            "measurement_contract": PREFILL_MEASUREMENT_CONTRACT,
+                            "measurement_contract": contract,
+                            **(
+                                {
+                                    "input_length": members[member]["input_len"],
+                                    "expected_reuse_length": members[member][
+                                        "cache_len"
+                                    ],
+                                    "compute_length": members[member]["input_len"]
+                                    - members[member]["cache_len"],
+                                    "group_index": members[member]["group_index"],
+                                }
+                                if grouped
+                                else {}
+                            ),
                         }
                     )
-                round_rates.append(compute_length * batch_size * 1000.0 / elapsed_ms)
+                round_rates.append(
+                    compute_length
+                    * (1 if grouped else batch_size)
+                    * 1000.0
+                    / elapsed_ms
+                )
 
         latencies = [float(item["latency_ms"]) for item in measurements]
-        median_latency = statistics.median(latencies)
+        median_latency = statistics.median(
+            [
+                max(item["latency_ms"] for item in measurements if item["run"] == run)
+                for run in range(measure_runs)
+            ]
+            if grouped
+            else latencies
+        )
+        if grouped:
+            input_len = sum(item["input_len"] for item in members)
+            cache_len = sum(item["cache_len"] for item in members)
         throughput = statistics.mean(round_rates)
         return {
             "case_id": case["case_id"],

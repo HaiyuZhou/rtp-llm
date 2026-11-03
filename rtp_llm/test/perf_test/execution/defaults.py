@@ -23,6 +23,10 @@ from rtp_llm.test.perf_test.modes.prefill import PrefillAdapter
 from rtp_llm.test.perf_test.plan import ExecutionPlan, thaw
 from rtp_llm.test.perf_test.prefill.checkpoint import PrefillResume
 from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
+from rtp_llm.test.perf_test.prefill.probe import (
+    probe_cache_block,
+    resolve_probe_block_size,
+)
 from rtp_llm.test.perf_test.prefill.profile import PrefillProfiler
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
 from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
@@ -99,7 +103,13 @@ class UnifiedLocalExecutor:
                 context.session.client,
                 tokenizer,
                 commit_tail_tokens=commit_tail,
-            )
+            ),
+            probe=lambda context: probe_cache_block(
+                context.session.client,
+                tokenizer,
+                resolve_probe_block_size(thaw(plan.resolved_config)),
+                commit_tail,
+            ),
         )
 
     def _decode_adapter(self, plan: ExecutionPlan) -> DecodeAdapter:

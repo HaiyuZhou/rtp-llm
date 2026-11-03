@@ -33,9 +33,14 @@ class _Client:
     def request(self, **_request):
         return {
             "success": True,
-            "input_len": 16,
+            "input_len": len(_request["input_ids"]),
             "output_len": 1,
-            "reuse_len": 0,
+            "reuse_len": (
+                4
+                if _request["case_id"].startswith("cache_probe_")
+                and _request["phase"] == "measure"
+                else 0
+            ),
             "latency_ms": 10.0,
         }
 
@@ -306,6 +311,9 @@ class DefaultExecutorTest(unittest.TestCase):
             self.assertEqual(RunState.COMPLETED, outcome.state)
             self.assertEqual(1, session.entered)
             self.assertEqual(1, session.exited)
+            self.assertTrue(
+                (root / "checkpoints" / "prefill_cache_probe.json").is_file()
+            )
             self.assertTrue((root / "results" / "result.json").is_file())
             self.assertTrue((root / "results" / "summary.json").is_file())
             self.assertTrue((root / "reports" / "prefill_report.json").is_file())
@@ -407,17 +415,27 @@ class PrefillBackendIntegrationTest(unittest.TestCase):
                     with lock:
                         events.append((url, json))
                     if url.endswith("/update_scheduler_info"):
-                        self.assertEqual({"batch_size": 4, "mode": "prefill"}, json)
+                        self.assertIn(
+                            json,
+                            (
+                                {"batch_size": 4, "mode": "prefill"},
+                                {"batch_size": 1, "mode": "prefill"},
+                            ),
+                        )
                         return Mock(status_code=200, json=lambda: {"status": "ok"})
                     self.assertEqual(endpoint, url)
-                    barrier.wait()  # Sequential submission cannot complete this round.
+                    is_probe = "cache_probe_" in json["prompt"]
+                    if not is_probe:
+                        barrier.wait()  # Sequential submission cannot complete this round.
                     return Mock(
                         status_code=200,
                         json=lambda: {
                             "aux_info": {
                                 "input_len": len(json["prompt"].split()),
                                 "output_len": 1,
-                                "reuse_len": 0,
+                                "reuse_len": (
+                                    4 if is_probe and "__run_" in json["prompt"] else 0
+                                ),
                                 "first_token_cost_time": 10.0,
                             }
                         },
@@ -511,7 +529,12 @@ class PrefillBackendIntegrationTest(unittest.TestCase):
                     [result["case_id"] for result in results],
                 )
                 self.assertGreater(len(results), 1)
-                self.assertEqual(len(plan.cases) * 5, len(events))
+                self.assertEqual(len(plan.cases) * 5 + 3, len(events))
+                self.assertEqual({"batch_size": 1, "mode": "prefill"}, events[0][1])
+                self.assertTrue(
+                    (run_root / "checkpoints" / "prefill_cache_probe.json").is_file()
+                )
+                events = events[3:]
                 for offset in range(0, len(events), 5):
                     self.assertEqual(
                         endpoint + "/update_scheduler_info", events[offset][0]

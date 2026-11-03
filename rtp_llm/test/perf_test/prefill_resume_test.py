@@ -130,6 +130,67 @@ def _initialized(root):
 
 
 class PrefillResumeTest(unittest.TestCase):
+    def test_grouped_resume_preserves_success_and_retries_failed_identity(self):
+        from rtp_llm.test.perf_test.prefill_runner_test import GroupedRunnerTest
+        from rtp_llm.test.perf_test.results import parse_case_result
+
+        _, good = GroupedRunnerTest().run_group()
+        cases = [good["identity"], dict(good["identity"], seed=8)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            plans = [
+                build_execution_plan(
+                    mode="prefill",
+                    action=action,
+                    resolved=resolve_config(_config()),
+                    cases=cases,
+                    result_directory=str(root),
+                )
+                for action in ("run", "resume")
+            ]
+            initialize_run_directory(
+                root,
+                source_config=_config(),
+                plan=plans[0],
+                run_id="grouped",
+                code_version="test",
+            )
+            store = RunStore(root)
+            good["case_id"] = plans[0].cases[0].case_id
+            store.write_case(good["case_id"], good)
+            store.write_checkpoint(
+                "prefill_progress",
+                {"schema_version": 1, **resume_fingerprints(plans[0])},
+            )
+            preserved = (
+                root / "results" / "cases" / f"{good['case_id']}.json"
+            ).read_bytes()
+            seen = []
+
+            class Runner:
+                def run_case(self, case):
+                    seen.append(case)
+                    return dict(
+                        good,
+                        case_id=case["case_id"],
+                        identity={k: v for k, v in case.items() if k != "case_id"},
+                    )
+
+            result = PrefillResume(PrefillAdapter(lambda context: Runner()))(
+                ModeExecutionContext(plan=plans[1], session=object(), store=store)
+            )
+            self.assertEqual(RunState.COMPLETED, result.state)
+            self.assertEqual(
+                [plans[1].cases[1].case_id], [case["case_id"] for case in seen]
+            )
+            self.assertEqual(cases[1]["request_groups"], seen[0]["request_groups"])
+            self.assertEqual(
+                preserved,
+                (root / "results" / "cases" / f"{good['case_id']}.json").read_bytes(),
+            )
+            for item in result.case_results:
+                self.assertEqual(item, parse_case_result(0, "prefill", item).to_dict())
+
     def test_legacy_plan_resume_and_profile_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "run"

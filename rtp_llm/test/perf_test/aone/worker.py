@@ -150,6 +150,10 @@ def _default_executor(inputs: RemoteInputs):
     from rtp_llm.test.perf_test.aone.executor import RemoteShardExecutor
     from rtp_llm.test.perf_test.execution.defaults import _default_session_factory
     from rtp_llm.test.perf_test.modes.prefill import PrefillAdapter
+    from rtp_llm.test.perf_test.prefill.probe import (
+        probe_cache_block,
+        resolve_probe_block_size,
+    )
     from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
     from rtp_llm.test.perf_test.test_util import _load_tokenizer
 
@@ -166,7 +170,13 @@ def _default_executor(inputs: RemoteInputs):
             context.session.client,
             tokenizer,
             commit_tail_tokens=commit_tail,
-        )
+        ),
+        probe=lambda context: probe_cache_block(
+            context.session.client,
+            tokenizer,
+            resolve_probe_block_size(inputs.config),
+            commit_tail,
+        ),
     )
     executor = RemoteShardExecutor(
         session_factory=_default_session_factory, adapter=adapter

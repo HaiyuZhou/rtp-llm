@@ -928,6 +928,10 @@ def _default_prefill_master_executor(
     from rtp_llm.test.perf_test.modes.prefill import PrefillAdapter
     from rtp_llm.test.perf_test.multi_node import prefill_runtime
     from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
+    from rtp_llm.test.perf_test.prefill.probe import (
+        probe_cache_block,
+        resolve_probe_block_size,
+    )
     from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
     from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
     from rtp_llm.test.perf_test.run_directory import initialize_run_directory
@@ -967,7 +971,13 @@ def _default_prefill_master_executor(
                 executor_context.session.client,
                 tokenizer,
                 commit_tail_tokens=commit_tail,
-            )
+            ),
+            probe=lambda executor_context: probe_cache_block(
+                executor_context.session.client,
+                tokenizer,
+                resolve_probe_block_size(merged),
+                commit_tail,
+            ),
         )
         result = adapter(ModeExecutionContext(plan=plan, session=session, store=store))
         finalize_prefill_run(

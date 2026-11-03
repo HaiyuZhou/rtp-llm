@@ -610,6 +610,23 @@ class GangAOneExecutor(AOneExecutor):
         for path in sorted(outputs.iterdir()):
             if path.is_file():
                 shutil.copy2(path, logs_home / path.name)
+        # Engine server logs live under the worker's TEST_OUTPUT_* run dirs;
+        # cap each file so a verbose engine cannot balloon the run directory.
+        _MAX_ENGINE_LOG_BYTES = 2 * 1024 * 1024
+        for engine_dir in sorted(outputs.glob("TEST_OUTPUT_*")):
+            destination = logs_home / engine_dir.name
+            for source in sorted(engine_dir.rglob("*.log")):
+                if not source.is_file():
+                    continue
+                relative = source.relative_to(engine_dir)
+                target = destination / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if source.stat().st_size > _MAX_ENGINE_LOG_BYTES:
+                    with source.open("rb") as handle:
+                        tail = handle.read()[-_MAX_ENGINE_LOG_BYTES:]
+                    target.write_bytes(tail)
+                else:
+                    shutil.copy2(source, target)
 
     def _collect_master_tree(
         self, root: Path, outputs: Path

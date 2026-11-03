@@ -58,6 +58,23 @@ Preview either example before running it:
 ./tools/perf_test --mode=prefill --action=run --config=rtp_llm/test/perf_test/examples/prefill_multi_grid_local.json --dry-run
 ```
 
+## Cache probe admission
+
+Every engine session probes cache reuse before formal measurements. Planning
+checks the seed and two-block continuation, each with one output token, against
+`engine.max_seq_len`, `engine.max_batch_tokens`, and block-padded
+`workload.workspace_tokens` when specified. These checks apply to generated
+flat grids, named grids, and explicit groups.
+
+The shared planner/runtime block expectation is `workload.probe_block_size`,
+then `engine.args.seq_size_per_block`, then `workload.cache_alignment`.
+Enabling `engine.args.prefill_cp_kv_cache_sharded` or
+`engine.env.PREFILL_CP_KV_CACHE_SHARDED` requires an explicit
+`workload.probe_block_size` before engine launch. Arguments override environment
+settings. Choose the model's effective cache-key block size; multiplying the
+base size by CP size is not universally valid. Group alignment and padded
+workspace use this same value, and the live probe verifies actual reuse.
+
 ## Run
 
 `run` is the only action that accepts `--config`. The preview validates and

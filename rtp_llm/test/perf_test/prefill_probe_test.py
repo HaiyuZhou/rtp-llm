@@ -110,6 +110,22 @@ class ProbeTest(unittest.TestCase):
             )
             self.assertEqual("failed", artifact["status"])
 
+    def test_cp_sharding_runtime_override_and_argument_precedence(self):
+        from rtp_llm.test.perf_test.errors import PlanningError
+        from rtp_llm.test.perf_test.prefill.probe import resolve_probe_block_size
+
+        config = {
+            "workload": {"cache_alignment": 8},
+            "engine": {"args": {}, "env": {"PREFILL_CP_KV_CACHE_SHARDED": "1"}},
+        }
+        with self.assertRaisesRegex(PlanningError, "CP.*probe_block_size"):
+            resolve_probe_block_size(config)
+        config["engine"]["args"]["prefill_cp_kv_cache_sharded"] = "off"
+        self.assertEqual(8, resolve_probe_block_size(config))
+        config["engine"]["args"]["prefill_cp_kv_cache_sharded"] = "on"
+        config["workload"]["probe_block_size"] = 32
+        self.assertEqual(32, resolve_probe_block_size(config))
+
     def test_block_size_precedence(self):
         from rtp_llm.test.perf_test.prefill.probe import resolve_probe_block_size
 

@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple
 
 from rtp_llm.test.perf_test.config_schema import EngineConfig, PrefillWorkloadConfig
 from rtp_llm.test.perf_test.errors import PlanningError
+from rtp_llm.test.perf_test.prefill.block_size import resolve_cache_block_size
 from rtp_llm.test.perf_test.prefill.measurement import PREFILL_MEASUREMENT_CONTRACT
 
 
@@ -161,14 +162,9 @@ def expected_probe_block_size(
     workload: PrefillWorkloadConfig, engine: EngineConfig
 ) -> int:
     """Return the configured physical block expectation used by preflight."""
-    value = workload.probe_block_size or engine.args.get(
-        "seq_size_per_block", workload.cache_alignment
+    return resolve_cache_block_size(
+        workload.probe_block_size, workload.cache_alignment, engine.args, engine.env
     )
-    if type(value) is not int or value <= 0:
-        raise PlanningError(
-            "probe_block_size/seq_size_per_block must be a positive integer"
-        )
-    return value
 
 
 def _plan_grouped_cases(
@@ -259,23 +255,22 @@ def plan_prefill_cases(
     workload: PrefillWorkloadConfig, engine: EngineConfig, *, dp_size: int = 1
 ) -> Tuple[Dict[str, object], ...]:
     """Plan flat workloads unchanged, or named grids in declaration order."""
-    if workload.probe_block_size is not None or workload.request_batches:
-        block_size = expected_probe_block_size(workload, engine)
-        for probe_input in (block_size + workload.commit_tail_tokens, 2 * block_size):
-            if probe_input + 1 > engine.max_seq_len:
-                raise PlanningError(
-                    "cache probe plus output reserve exceeds engine.max_seq_len"
-                )
-            if probe_input + 1 > engine.max_batch_tokens:
-                raise PlanningError(
-                    "cache probe plus output reserve exceeds engine.max_batch_tokens"
-                )
-            if (
-                workload.workspace_tokens is not None
-                and (probe_input + 1 + block_size - 1) // block_size * block_size
-                > workload.workspace_tokens
-            ):
-                raise PlanningError("cache probe exceeds workload.workspace_tokens")
+    block_size = expected_probe_block_size(workload, engine)
+    for probe_input in (block_size + workload.commit_tail_tokens, 2 * block_size):
+        if probe_input + 1 > engine.max_seq_len:
+            raise PlanningError(
+                "cache probe plus output reserve exceeds engine.max_seq_len"
+            )
+        if probe_input + 1 > engine.max_batch_tokens:
+            raise PlanningError(
+                "cache probe plus output reserve exceeds engine.max_batch_tokens"
+            )
+        if (
+            workload.workspace_tokens is not None
+            and (probe_input + 1 + block_size - 1) // block_size * block_size
+            > workload.workspace_tokens
+        ):
+            raise PlanningError("cache probe exceeds workload.workspace_tokens")
     if workload.grids:
         cases = tuple(
             {**case, "grid_name": grid.name}

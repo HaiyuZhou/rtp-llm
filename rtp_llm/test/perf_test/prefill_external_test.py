@@ -173,6 +173,35 @@ class GroupedPrefillPlanningTest(unittest.TestCase):
         }
         return source
 
+    def test_cp_override_controls_group_alignment_and_padding(self):
+        from rtp_llm.test.perf_test.prefill.probe import resolve_probe_block_size
+
+        source = self.source()
+        source["engine"]["args"] = {
+            "prefill_cp_kv_cache_sharded": 1,
+            "seq_size_per_block": 8,
+        }
+        source["engine"].update(max_seq_len=256, max_batch_tokens=256)
+        source["workload"].update(
+            probe_block_size=16, commit_tail_tokens=16, workspace_tokens=96
+        )
+        source["workload"]["request_batches"] = [
+            {"request_groups": [{"count": 2, "input_len": 32, "cache_len": 16}]}
+        ]
+        config = parse_config(source)
+        self.assertEqual(16, resolve_probe_block_size(source))
+        self.assertEqual(1, len(plan_prefill_cases(config.workload, config.engine)))
+        # Two 33-token members each reserve 48 tokens at the explicit block size.
+        source["workload"]["workspace_tokens"] = 95
+        config = parse_config(source)
+        with self.assertRaisesRegex(PlanningError, "block-padded grouped"):
+            plan_prefill_cases(config.workload, config.engine)
+        source["workload"]["workspace_tokens"] = 96
+        source["workload"]["request_batches"][0]["request_groups"][0]["cache_len"] = 8
+        config = parse_config(source)
+        with self.assertRaisesRegex(PlanningError, "aligned to physical"):
+            plan_prefill_cases(config.workload, config.engine)
+
     def test_grouped_geometry_uses_member_maxima_and_independent_seeds(self):
         config = parse_config(self.source())
         (case,) = plan_prefill_cases(config.workload, config.engine)

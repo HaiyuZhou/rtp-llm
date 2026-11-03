@@ -42,6 +42,61 @@ def _parsed(payload=None):
 
 
 class PrefillPlannerTest(unittest.TestCase):
+    def test_cp_sharding_requires_explicit_probe_block_before_planning(self):
+        from rtp_llm.test.perf_test.prefill.probe import resolve_probe_block_size
+
+        for section, key, value in (
+            ("args", "prefill_cp_kv_cache_sharded", 1),
+            ("args", "prefill_cp_kv_cache_sharded", "1"),
+            ("env", "PREFILL_CP_KV_CACHE_SHARDED", "true"),
+        ):
+            payload = _payload()
+            payload["engine"][section] = {key: value}
+            workload, engine = _parsed(payload)
+            with self.subTest(section=section, value=value):
+                with self.assertRaisesRegex(PlanningError, "CP.*probe_block_size"):
+                    plan_prefill_cases(workload, engine)
+                with self.assertRaisesRegex(PlanningError, "CP.*probe_block_size"):
+                    resolve_probe_block_size(payload)
+                payload["workload"]["probe_block_size"] = 128
+                workload, engine = _parsed(payload)
+                self.assertTrue(plan_prefill_cases(workload, engine))
+                self.assertEqual(128, resolve_probe_block_size(payload))
+
+    def test_generated_probe_must_fit_all_budgets_without_override(self):
+        for named in (False, True):
+            for inferred in (False, True):
+                for limit in ("max_seq_len", "max_batch_tokens", "workspace_tokens"):
+                    payload = _payload()
+                    payload["workload"].update(
+                        max_input_len=32,
+                        min_compute_len=8,
+                        compute_steps=[8],
+                        cache_lengths=[0],
+                        batch_sizes=[1],
+                        commit_tail_tokens=64,
+                        cache_alignment=8 if inferred else 64,
+                    )
+                    if inferred:
+                        payload["engine"]["args"] = {"seq_size_per_block": 64}
+                    target = "workload" if limit == "workspace_tokens" else "engine"
+                    payload[target][limit] = 64
+                    if named:
+                        keys = (
+                            "max_input_len",
+                            "min_compute_len",
+                            "compute_steps",
+                            "cache_lengths",
+                            "batch_sizes",
+                            "seed",
+                        )
+                        grid = {key: payload["workload"].pop(key) for key in keys}
+                        payload["workload"]["grids"] = [{"name": "small", **grid}]
+                    workload, engine = _parsed(payload)
+                    with self.subTest(named=named, inferred=inferred, limit=limit):
+                        with self.assertRaisesRegex(PlanningError, "probe.*" + limit):
+                            plan_prefill_cases(workload, engine)
+
     def test_concurrent_contract_changes_case_id(self):
         workload, engine = _parsed()
         for identity in plan_prefill_cases(workload, engine):

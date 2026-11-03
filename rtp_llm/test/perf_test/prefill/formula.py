@@ -190,8 +190,8 @@ def write_fit_gap_svg(
         ),
         (
             f'<text x="900" y="82" text-anchor="middle" class="sub">'
-            f"{len(predictions):,} 个严格有效 geometry；"
-            "每个点取 3 次成功请求的 TTFT 中位数</text>"
+            f"{len(predictions):,} 个有效观测；"
+            "每个点取每轮最大服务端首 token 延迟的跨轮中位数</text>"
         ),
         (
             f'<text x="{left_x + panel_width / 2:.1f}" y="120" '

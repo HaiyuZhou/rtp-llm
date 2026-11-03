@@ -3,16 +3,19 @@
 from typing import Any, Mapping
 from uuid import uuid4
 
+from rtp_llm.test.perf_test.prefill.block_size import resolve_cache_block_size
 from rtp_llm.test.perf_test.prefill.prompts import PrefixPromptFactory
 from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
 
 
 def resolve_probe_block_size(config: Mapping[str, Any]) -> int:
     workload = config["workload"]
-    return int(
-        workload.get("probe_block_size")
-        or config["engine"].get("args", {}).get("seq_size_per_block")
-        or workload["cache_alignment"]
+    engine = config["engine"]
+    return resolve_cache_block_size(
+        workload.get("probe_block_size"),
+        workload["cache_alignment"],
+        engine.get("args", {}),
+        engine.get("env", {}),
     )
 
 

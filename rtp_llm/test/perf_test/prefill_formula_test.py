@@ -35,6 +35,18 @@ def observations(n=120):
 
 
 class FormulaTest(unittest.TestCase):
+    def test_svg_labels_observations_and_round_maximum_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gap.svg"
+            formula.write_fit_gap_svg(
+                [{"target_ms": 4, "predicted_ms": 5, "cache_len": 0}] * 2, path
+            )
+            svg = path.read_text()
+            self.assertIn("2 个有效观测", svg)
+            self.assertIn("每轮最大服务端首 token 延迟的跨轮中位数", svg)
+            self.assertNotIn("3 次", svg)
+            self.assertNotIn("geometry", svg)
+
     def test_full_distribution_features_and_grammar(self):
         row = formula.normalize_observations(observations(2))[0][1]
         terms = {t.name: t for t in build_candidate_library(1024)}

@@ -258,6 +258,36 @@ class BrokerClientTest(unittest.TestCase):
             request=transport,
         )
 
+    def test_default_transport_disables_ambient_proxies(self):
+        import rtp_llm.test.perf_test.aone.gang_worker as gang_worker_module
+
+        captured = []
+
+        def fake_request(method, url, **kwargs):
+            captured.append(
+                {"method": method, "url": url, "proxies": kwargs.get("proxies", "missing")}
+            )
+            return _FakeResponse(
+                200, {"status": "registered", "gang_state": "ready"}
+            )
+
+        client = BrokerClient("http://broker.example/", "secret-token", "run-1")
+        original = gang_worker_module.requests.request
+        gang_worker_module.requests.request = fake_request
+        try:
+            client.register(0, "host-0", 12333)
+        finally:
+            gang_worker_module.requests.request = original
+
+        first = captured[0]
+        self.assertEqual("POST", first["method"])
+        self.assertEqual(
+            {"http": None, "https": None},
+            first["proxies"],
+            "broker requests must bypass ambient http_proxy on remote workers",
+        )
+        self.assertTrue(captured, "register must issue at least one request")
+
     def test_members_sends_bearer_token_and_parses_members(self):
         transport = _FakeRequest(
             responses=[

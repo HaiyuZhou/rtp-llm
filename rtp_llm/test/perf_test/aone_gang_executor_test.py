@@ -296,7 +296,7 @@ def _write_master_run_tree_with_cases(outputs, plan, cases, status):
 
 def _write_testlogs_tree(base, plan, *, status="completed", master=True):
     for index in range(MACHINE_COUNT):
-        shard = base / f"shard_{index + 1}"
+        shard = base / f"shard_{index + 1}_of_{MACHINE_COUNT}"
         outputs = shard / "test.outputs"
         outputs.mkdir(parents=True)
         (shard / "test.log").write_text(f"shard {index} log\n", encoding="utf-8")
@@ -457,7 +457,7 @@ class GangSubmitFailureTest(_GangExecutorTestCase):
         cases = [_case_result(first), _case_result(second, status="request_failed")]
         base = self._shard_base()
         for index in range(MACHINE_COUNT):
-            shard = base / f"shard_{index + 1}"
+            shard = base / f"shard_{index + 1}_of_{MACHINE_COUNT}"
             outputs = shard / "test.outputs"
             outputs.mkdir(parents=True)
             (shard / "test.log").write_text(
@@ -635,7 +635,7 @@ class GangCollectionParityTest(_GangExecutorTestCase):
             staging_root = Path(staging)
             outputs = staging_root / "test.outputs"
             tree = _write_master_run_tree(outputs, plan)
-            master = base / "shard_1" / "test.outputs"
+            master = base / f"shard_1_of_{MACHINE_COUNT}" / "test.outputs"
             with zipfile.ZipFile(master / "outputs.zip", "w") as archive:
                 for path in sorted(tree.rglob("*")):
                     if path.is_file():

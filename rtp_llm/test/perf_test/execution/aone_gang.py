@@ -560,7 +560,7 @@ class GangAOneExecutor(AOneExecutor):
         target = self._testlogs_root / _package_path(package.targets[0])
         collection: Optional[CollectionOutcome] = None
         for shard_index in range(machine_count):
-            shard_dir = target / f"shard_{shard_index + 1}"
+            shard_dir = target / f"shard_{shard_index + 1}_of_{machine_count}"
             try:
                 outputs = self._shard_outputs(shard_dir)
             except CollectionError:

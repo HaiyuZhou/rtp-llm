@@ -142,6 +142,18 @@ def broker_coordinates(environ: Optional[Mapping[str, str]] = None) -> BrokerCoo
     )
 
 
+def _no_proxy_request(method: str, url: str, **kwargs: Any) -> Any:
+    """Issue a broker request that ignores ambient proxy environment variables.
+
+    Remote AOne workers run with ``http_proxy`` set; corporate proxies reject
+    private broker addresses instantly, which would fail every rendezvous
+    call before it reaches the broker. Explicitly disabling proxies keeps the
+    broker connection direct, mirroring the proven two-host CI pattern.
+    """
+    kwargs.setdefault("proxies", {"http": None, "https": None})
+    return requests.request(method, url, **kwargs)
+
+
 class BrokerClient:
     """Minimal authenticated HTTP client for the gang rendezvous broker.
 
@@ -154,7 +166,9 @@ class BrokerClient:
         {"gang_failed", "run_closed", "broker_stopped", "register_deadline_exceeded"}
     )
 
-    def __init__(self, url: str, token: str, run_id: str, *, request=requests.request):
+    def __init__(self, url: str, token: str, run_id: str, *, request=None):
+        if request is None:
+            request = _no_proxy_request
         self._base = url.rstrip("/")
         self._token = token
         self._run_id = run_id

@@ -1,5 +1,8 @@
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
 
@@ -134,6 +137,65 @@ class PrefillRunnerTest(unittest.TestCase):
         self.assertEqual("request_failed", result["status"])
         self.assertIsNone(result["metrics"])
         self.assertEqual([1, 2, 3], sorted(completed))
+
+    def test_round_setup_failure_aborts_and_drains_submitted_workers(self):
+        for failure in ("submit", "clock"):
+            with self.subTest(failure=failure):
+                release = threading.Event()
+                submitted = []
+                results = []
+                errors = []
+
+                class Executor(ThreadPoolExecutor):
+                    def submit(self, fn, *args, **kwargs):
+                        if failure == "submit" and submitted:
+                            raise RuntimeError("submission failed")
+                        future = super().submit(fn, *args, **kwargs)
+                        submitted.append(future)
+                        return future
+
+                def monotonic():
+                    raise RuntimeError("clock failed")
+
+                client = _Client([_response(16, 0)] * 4, 4)
+
+                def run():
+                    try:
+                        results.append(
+                            PrefillRunner(
+                                client,
+                                _Tokenizer(),
+                                commit_tail_tokens=4,
+                                monotonic=monotonic,
+                            ).run_case(_case(cache_len=0, batch_size=4, measure_runs=1))
+                        )
+                    except Exception as error:
+                        errors.append(error)
+
+                with patch(
+                    "rtp_llm.test.perf_test.prefill.runner.ThreadPoolExecutor", Executor
+                ), patch(
+                    "rtp_llm.test.perf_test.prefill.runner.threading",
+                    SimpleNamespace(Event=lambda: release),
+                ):
+                    worker = threading.Thread(target=run)
+                    worker.start()
+                    try:
+                        worker.join(timeout=2)
+                        self.assertFalse(worker.is_alive(), "round setup deadlocked")
+                    finally:
+                        # Unblock old/broken implementations so a RED run exits cleanly.
+                        release.set()
+                        worker.join(timeout=5)
+                self.assertEqual([], errors)
+                self.assertEqual(1 if failure == "submit" else 4, len(submitted))
+                self.assertTrue(all(future.done() for future in submitted))
+                self.assertEqual([], client.requests)
+                self.assertEqual(
+                    "request_failed" if failure == "submit" else "invalid_timing",
+                    results[0]["status"],
+                )
+                self.assertIsNone(results[0]["metrics"])
 
     def test_throughput_uses_complete_round_time_for_every_batch_size(self):
         for batch_size, expected in ((4, 160.0), (1, 40.0)):

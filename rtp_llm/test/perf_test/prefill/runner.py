@@ -120,9 +120,12 @@ class PrefillRunner:
         with ThreadPoolExecutor(max_workers=batch_size) as executor:
             for run_index in range(measure_runs):
                 release = threading.Event()
+                aborted = False
 
                 def request_member(member: int) -> Dict[str, Any]:
                     release.wait()
+                    if aborted:
+                        raise RuntimeError("round setup aborted")
                     prompts = members[member]
                     return self.client.request(
                         phase="measure",
@@ -134,12 +137,20 @@ class PrefillRunner:
                         output_length=1,
                     )
 
-                futures = [
-                    executor.submit(request_member, member)
-                    for member in range(batch_size)
-                ]
-                started = self.monotonic()
-                release.set()
+                futures = []
+                setup_failure = None
+                setup_status = "request_failed"
+                try:
+                    for member in range(batch_size):
+                        futures.append(executor.submit(request_member, member))
+                    setup_status = "invalid_timing"
+                    started = self.monotonic()
+                except Exception as error:
+                    aborted = True
+                    setup_failure = (setup_status, str(error))
+                finally:
+                    # Even partially submitted rounds must unblock before shutdown.
+                    release.set()
                 responses = []
                 failures = []
                 # Drain every submitted member before classifying the round.
@@ -148,6 +159,8 @@ class PrefillRunner:
                         responses.append(future.result())
                     except Exception as error:
                         failures.append(str(error))
+                if setup_failure is not None:
+                    return self._failure(case, *setup_failure)
                 elapsed_ms = (self.monotonic() - started) * 1000.0
                 if failures:
                     return self._failure(case, "request_failed", "; ".join(failures))

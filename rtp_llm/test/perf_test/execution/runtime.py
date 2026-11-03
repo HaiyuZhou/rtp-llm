@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
@@ -97,10 +98,51 @@ class HttpPrefillClient:
         *,
         post: Callable[..., Any] = requests.post,
         timeout_seconds: float = 300,
+        sleep: Callable[[float], None] = time.sleep,
+        scheduler_attempts: int = 20,
     ):
+        if type(scheduler_attempts) is not int or scheduler_attempts <= 0:
+            raise ValueError("scheduler_attempts must be a positive integer")
+        self._sleep = sleep
+        self._scheduler_attempts = scheduler_attempts
         self.endpoint = endpoint.rstrip("/")
         self._post = post
         self._timeout_seconds = timeout_seconds
+
+    def configure_scheduler(self, batch_size: int, mode: str = "prefill") -> None:
+        """Require an explicit acknowledgement before issuing prefill requests."""
+        if type(batch_size) is not int or batch_size <= 0:
+            raise ValueError("scheduler batch_size must be a positive integer")
+        if mode != "prefill":
+            raise ValueError(f"unsupported prefill scheduler mode: {mode}")
+        url = f"{self.endpoint}/update_scheduler_info"
+        payload = {"batch_size": batch_size, "mode": mode}
+        last_error = "missing scheduler acknowledgement"
+        for attempt in range(self._scheduler_attempts):
+            try:
+                response = self._post(url, json=payload, timeout=self._timeout_seconds)
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"HTTP {response.status_code}: {response.text[:500]}"
+                    )
+                acknowledgement = response.json()
+                if (
+                    not isinstance(acknowledgement, dict)
+                    or acknowledgement.get("status") != "ok"
+                    or "error" in acknowledgement
+                ):
+                    raise RuntimeError(
+                        f"invalid scheduler acknowledgement: {acknowledgement!r}"
+                    )
+                return
+            except Exception as error:
+                last_error = str(error)
+            if attempt + 1 < self._scheduler_attempts:
+                self._sleep(3)
+        raise RuntimeError(
+            f"failed to configure prefill scheduler at {url} with {payload} "
+            f"after {self._scheduler_attempts} attempts: {last_error}"
+        )
 
     @property
     def port(self) -> Optional[int]:

@@ -149,6 +149,27 @@ def _run_through_session(plan, session, run_root):
 
 
 class HttpPrefillClientEndpointTest(unittest.TestCase):
+    def test_scheduler_update_acknowledged_on_explicit_endpoint(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {"status": "ok"}
+        post = Mock(return_value=response)
+        session = ExternalPrefillSession(
+            "http://10.0.0.8:9000/prefill/", topology=TOPOLOGY
+        )
+        client = HttpPrefillClient(
+            session.client.endpoint,
+            post=post,
+            timeout_seconds=30,
+        )
+
+        client.configure_scheduler(4)
+
+        post.assert_called_once_with(
+            "http://10.0.0.8:9000/prefill/update_scheduler_info",
+            json={"batch_size": 4, "mode": "prefill"},
+            timeout=30,
+        )
+
     def test_client_posts_to_the_explicit_endpoint(self):
         response = Mock()
         response.status_code = 200
@@ -297,6 +318,7 @@ class ExternalPrefillSessionTest(unittest.TestCase):
         session = ExternalPrefillSession("http://10.0.0.8:9000/", topology=TOPOLOGY)
 
         self.assertIsInstance(session.client, HttpPrefillClient)
+        self.assertTrue(callable(session.client.configure_scheduler))
         self.assertEqual("http://10.0.0.8:9000", session.client.endpoint)
         self.assertEqual(TOPOLOGY, session.topology)
         self.assertIsInstance(session.diagnostics, EngineDiagnostics)

@@ -101,6 +101,8 @@ class RuntimeAdapterTest(unittest.TestCase):
 
         self.assertTrue(handle.wait_ready(120))
         self.assertTrue(handle.is_alive())
+        self.assertIsInstance(handle.client, HttpPrefillClient)
+        self.assertTrue(callable(handle.client.configure_scheduler))
         self.assertEqual(18000, handle.client.port)
         self.assertEqual("/tmp/process.log", handle.log_path)
         handle.stop()
@@ -113,6 +115,60 @@ class RuntimeAdapterTest(unittest.TestCase):
             timeout=120,
         )
         manager.stop_server.assert_called_once_with()
+
+    def test_scheduler_rejects_bad_ack_and_exhausted_retry(self):
+        for status, payload, diagnostic in (
+            (503, {"status": "ok"}, "HTTP 503"),
+            (200, {"error": "scheduler unavailable"}, "scheduler unavailable"),
+            (200, {"status": "ok", "error": "rejected"}, "rejected"),
+            (200, {}, "acknowledgement"),
+            (200, {"status": "pending"}, "acknowledgement"),
+        ):
+            with self.subTest(status=status, payload=payload):
+                response = Mock(status_code=status, text="unavailable")
+                response.json.return_value = payload
+                post = Mock(return_value=response)
+                sleep = Mock()
+                client = HttpPrefillClient(
+                    "http://10.0.0.8:9000",
+                    post=post,
+                    sleep=sleep,
+                    scheduler_attempts=2,
+                )
+                with self.assertRaisesRegex(RuntimeError, diagnostic) as raised:
+                    client.configure_scheduler(4)
+                self.assertIn("2 attempts", str(raised.exception))
+                self.assertIn("http://10.0.0.8:9000", str(raised.exception))
+                self.assertEqual(2, post.call_count)
+                self.assertEqual(1, sleep.call_count)
+
+    def test_scheduler_retries_transport_and_json_failures_until_acknowledged(self):
+        bad_json = Mock(status_code=200)
+        bad_json.json.side_effect = ValueError("invalid JSON")
+        good = Mock(status_code=200)
+        good.json.return_value = {"status": "ok"}
+        post = Mock(side_effect=[OSError("connection lost"), bad_json, good])
+        client = HttpPrefillClient(
+            "http://server:9000",
+            post=post,
+            sleep=lambda _: None,
+            scheduler_attempts=3,
+        )
+        client.configure_scheduler(4)
+        self.assertEqual(3, post.call_count)
+
+    def test_scheduler_validates_batch_mode_and_retry_limit(self):
+        post = Mock()
+        client = HttpPrefillClient("http://server:9000", post=post)
+        for batch in (0, -1, True, 1.5, "4"):
+            with self.subTest(batch=batch), self.assertRaises(ValueError):
+                client.configure_scheduler(batch)
+        with self.assertRaises(ValueError):
+            client.configure_scheduler(4, mode="decode")
+        for attempts in (0, -1, True, 1.5):
+            with self.subTest(attempts=attempts), self.assertRaises(ValueError):
+                HttpPrefillClient("http://server:9000", scheduler_attempts=attempts)
+        post.assert_not_called()
 
     def test_http_prefill_client_projects_server_timing_and_reuse(self):
         response = Mock()

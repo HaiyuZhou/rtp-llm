@@ -6,13 +6,31 @@ from rtp_llm.test.perf_test.regression.baseline import (
     BaselineSchemaError,
     compare_result_to_baseline,
 )
+from rtp_llm.test.perf_test.results import RESULT_SCHEMA_VERSION
 
 
 def _result():
-    identity = {"input_len": 128, "output_len": 16, "batch_size": 4}
+    identity = {
+        "workload_kind": "grid",
+        "input_lengths": [128] * 4,
+        "output_length": 16,
+        "batch_policy": {"strategy": "fixed", "size": 4},
+        "measure_runs": 1,
+        "warmup_runs": 0,
+        "generate_config": {},
+        "profiling": {
+            "enabled": False,
+            "runs": 1,
+            "steps": 3,
+            "enable_all_ranks": True,
+            "flush_timeout_seconds": 60,
+        },
+        "distribution": None,
+    }
+    latency = {"wait": 1.0, "prefill": 2.0, "decode": 8.0, "tpot": 0.5, "total": 11.0}
     key = case_id("decode", identity)
     return {
-        "schema_version": 1,
+        "schema_version": RESULT_SCHEMA_VERSION,
         "run_id": "run-001",
         "mode": "decode",
         "backend": "local",
@@ -25,7 +43,12 @@ def _result():
             "checkpoint": "/models/test",
             "topology": {"tp": 1, "dp": 1, "pp": 1, "ep": 1},
         },
-        "summary": {"planned_cases": 1, "successful_cases": 1, "failed_cases": 0},
+        "summary": {
+            "planned_cases": 1,
+            "successful_cases": 1,
+            "failed_cases": 0,
+            "profiling_failed_cases": 0,
+        },
         "cases": [
             {
                 "case_id": key,
@@ -41,21 +64,46 @@ def _result():
                     "topology": {"tp": 1, "dp": 1, "pp": 1, "ep": 1},
                     "successful_requests": 4,
                     "failed_requests": 0,
-                    "latency_ms": {
-                        "wait": 1.0,
-                        "prefill": 2.0,
-                        "decode": 8.0,
-                        "tpot": 0.5,
-                        "total": 11.0,
-                    },
+                    "latency_ms": latency,
                     "throughput_tokens_per_second": 8000.0,
-                    "measurements": [{"run": 0}],
+                    "measurements": [
+                        {
+                            "run": 0,
+                            "throughput_tokens_per_second": 8000.0,
+                            "worker_allocations": [],
+                            "requests": [
+                                {
+                                    "request_index": index,
+                                    "success": True,
+                                    "input_length": 128,
+                                    "output_length": 16,
+                                    "latency_ms": dict(latency),
+                                }
+                                for index in range(4)
+                            ],
+                        }
+                    ],
                     "search": None,
                     "distribution": None,
+                    "profiling": {
+                        "status": "disabled",
+                        "manifest_path": None,
+                        "error": None,
+                    },
                 },
             }
         ],
     }
+
+
+def _set_measured_metrics(result, *, throughput, total_latency):
+    metrics = result["cases"][0]["metrics"]
+    metrics["throughput_tokens_per_second"] = throughput
+    metrics["latency_ms"]["total"] = total_latency
+    measurement = metrics["measurements"][0]
+    measurement["throughput_tokens_per_second"] = throughput
+    for request in measurement["requests"]:
+        request["latency_ms"]["total"] = total_latency
 
 
 def _baseline(*entries):
@@ -76,8 +124,7 @@ class BaselineRegressionTest(unittest.TestCase):
     def test_higher_and_lower_is_better_include_threshold_boundary(self):
         result = _result()
         key = result["cases"][0]["case_id"]
-        result["cases"][0]["metrics"]["throughput_tokens_per_second"] = 7600.0
-        result["cases"][0]["metrics"]["latency_ms"]["total"] = 11.55
+        _set_measured_metrics(result, throughput=7600.0, total_latency=11.55)
 
         comparison = compare_result_to_baseline(
             result,
@@ -101,8 +148,7 @@ class BaselineRegressionTest(unittest.TestCase):
     def test_values_past_threshold_fail_with_actionable_diagnostics(self):
         result = _result()
         key = result["cases"][0]["case_id"]
-        result["cases"][0]["metrics"]["throughput_tokens_per_second"] = 7599.0
-        result["cases"][0]["metrics"]["latency_ms"]["total"] = 11.551
+        _set_measured_metrics(result, throughput=7599.0, total_latency=11.551)
 
         comparison = compare_result_to_baseline(
             result,

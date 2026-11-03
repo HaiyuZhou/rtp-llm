@@ -114,7 +114,7 @@ class ConfigResolutionTest(unittest.TestCase):
                 "kind": "distribution",
                 "distribution_file": "workloads/requests.json",
                 "output_length": 16,
-                "batch_sizes": [8],
+                "batch": {"strategy": "fixed", "sizes": [8]},
             }
             config_path = root / "perf.json"
             config_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -136,7 +136,7 @@ class ConfigResolutionTest(unittest.TestCase):
                 "kind": "distribution",
                 "distribution_file": "requests.json",
                 "output_length": 16,
-                "batch_sizes": [8],
+                "batch": {"strategy": "fixed", "sizes": [8]},
             }
             source.write_text("[128, 256]", encoding="utf-8")
             first = resolve_config(payload, source_dir=root)
@@ -155,7 +155,7 @@ class ConfigResolutionTest(unittest.TestCase):
                 "kind": "distribution",
                 "distribution_file": "requests.json",
                 "output_length": 16,
-                "batch_sizes": [8],
+                "batch": {"strategy": "fixed", "sizes": [8]},
             }
 
             with self.assertRaisesRegex(

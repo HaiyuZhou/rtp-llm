@@ -14,6 +14,7 @@ from rtp_llm.test.perf_test.regression.golden import (
     validate_golden,
     write_golden,
 )
+from rtp_llm.test.perf_test.results import RESULT_SCHEMA_VERSION
 
 
 def _prefill_case(input_length, cache_length, latency, throughput):
@@ -50,7 +51,7 @@ def _result():
         _prefill_case(1024, 512, 10.0, 51200.0),
     ]
     return {
-        "schema_version": 1,
+        "schema_version": RESULT_SCHEMA_VERSION,
         "run_id": "run-001",
         "mode": "prefill",
         "backend": "local",

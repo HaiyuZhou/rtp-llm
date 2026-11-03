@@ -5,11 +5,15 @@ import unittest
 
 from rtp_llm.test.perf_test.plan import case_id
 from rtp_llm.test.perf_test.publish.odps import OdpsPublisher
+from rtp_llm.test.perf_test.results import RESULT_SCHEMA_VERSION
 
 
 def _base(mode, case):
+    summary = {"planned_cases": 1, "successful_cases": 1, "failed_cases": 0}
+    if mode == "decode":
+        summary["profiling_failed_cases"] = 0
     return {
-        "schema_version": 1,
+        "schema_version": RESULT_SCHEMA_VERSION,
         "run_id": f"{mode}-run-001",
         "mode": mode,
         "backend": "local",
@@ -22,7 +26,7 @@ def _base(mode, case):
             "checkpoint": "/models/test",
             "topology": {"tp": 1, "dp": 1, "pp": 1, "ep": 1},
         },
-        "summary": {"planned_cases": 1, "successful_cases": 1, "failed_cases": 0},
+        "summary": summary,
         "cases": [case],
     }
 
@@ -59,7 +63,24 @@ def _prefill_result():
 
 
 def _decode_result():
-    identity = {"input_len": 128, "output_len": 16, "batch_size": 2}
+    identity = {
+        "workload_kind": "grid",
+        "input_lengths": [128, 128],
+        "output_length": 16,
+        "batch_policy": {"strategy": "fixed", "size": 2},
+        "measure_runs": 1,
+        "warmup_runs": 0,
+        "generate_config": {},
+        "profiling": {
+            "enabled": False,
+            "runs": 1,
+            "steps": 3,
+            "enable_all_ranks": True,
+            "flush_timeout_seconds": 60,
+        },
+        "distribution": None,
+    }
+    latency = {"wait": 1.0, "prefill": 2.0, "decode": 8.0, "tpot": 0.5, "total": 11.0}
     return _base(
         "decode",
         {
@@ -76,17 +97,33 @@ def _decode_result():
                 "topology": {"tp": 1, "dp": 1, "pp": 1, "ep": 1},
                 "successful_requests": 2,
                 "failed_requests": 0,
-                "latency_ms": {
-                    "wait": 1.0,
-                    "prefill": 2.0,
-                    "decode": 8.0,
-                    "tpot": 0.5,
-                    "total": 11.0,
-                },
+                "latency_ms": latency,
                 "throughput_tokens_per_second": 3200.0,
-                "measurements": [{"run": 0, "raw": "must-not-publish"}],
+                "measurements": [
+                    {
+                        "run": 0,
+                        "throughput_tokens_per_second": 3200.0,
+                        "worker_allocations": [],
+                        "requests": [
+                            {
+                                "request_index": index,
+                                "success": True,
+                                "input_length": 128,
+                                "output_length": 16,
+                                "latency_ms": dict(latency),
+                                "raw": "must-not-publish",
+                            }
+                            for index in range(2)
+                        ],
+                    }
+                ],
                 "search": None,
                 "distribution": None,
+                "profiling": {
+                    "status": "disabled",
+                    "manifest_path": None,
+                    "error": None,
+                },
             },
         },
     )

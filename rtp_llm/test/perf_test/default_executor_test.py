@@ -1,4 +1,5 @@
 import json
+import struct
 import tempfile
 import threading
 import unittest
@@ -363,6 +364,12 @@ class DefaultExecutorTest(unittest.TestCase):
 
 class PrefillBackendIntegrationTest(unittest.TestCase):
     def test_batch_four_uses_shared_http_runner_across_backends(self):
+        self._batch_four_across_backends("http_text")
+
+    def test_batch_four_uses_exact_dashsc_ids_across_backends(self):
+        self._batch_four_across_backends("dashsc_input_ids")
+
+    def _batch_four_across_backends(self, transport):
         from rtp_llm.test.perf_test.aone.collector import collect_aone_results
         from rtp_llm.test.perf_test.aone.gang_worker import (
             _default_prefill_master_executor,
@@ -383,6 +390,7 @@ class PrefillBackendIntegrationTest(unittest.TestCase):
                 root = Path(directory)
                 run_root = root / "run"
                 source = _source(root)
+                source["workload"]["transport"] = transport
                 source["engine"]["concurrency_limit"] = 4
                 source["workload"].update(batch_sizes=[4], compute_steps=[8, 4])
                 if backend == "aone":
@@ -407,6 +415,7 @@ class PrefillBackendIntegrationTest(unittest.TestCase):
                     result_directory=str(run_root),
                 )
                 events = []
+                wire_requests = []
                 barrier = threading.Barrier(4, timeout=3)
                 lock = threading.Lock()
                 endpoint = "http://fake-prefill:18000"
@@ -441,13 +450,84 @@ class PrefillBackendIntegrationTest(unittest.TestCase):
                         },
                     )
 
-                client = HttpPrefillClient(endpoint, post=post, scheduler_attempts=1)
+                http_client = HttpPrefillClient(
+                    endpoint, post=post, scheduler_attempts=1
+                )
+                client = http_client
+                tokenizer = _Tokenizer()
+                if transport == "dashsc_input_ids":
+                    from rtp_llm.dash_sc.proto import predict_v2_pb2
+                    from rtp_llm.test.perf_test.prefill.dashsc_transport import (
+                        DashScPrefillClient,
+                    )
+
+                    class Tokenizer:
+                        def __init__(self):
+                            self.tokens = {}
+
+                        def encode(self, text):
+                            with lock:
+                                return [
+                                    self.tokens.setdefault(word, len(self.tokens) + 1)
+                                    for word in text.split()
+                                ]
+
+                    tokenizer = Tokenizer()
+
+                    class Stub:
+                        def ModelStreamInfer(self, requests, **_kwargs):
+                            (request,) = list(requests)
+                            request = predict_v2_pb2.ModelInferRequest.FromString(
+                                request.SerializeToString()
+                            )
+                            wire_requests.append(request)
+                            ids = next(
+                                raw
+                                for tensor, raw in zip(
+                                    request.inputs, request.raw_input_contents
+                                )
+                                if tensor.name == "input_ids"
+                            )
+                            values = struct.unpack("<" + "i" * (len(ids) // 4), ids)
+                            # Decode IDs solely to reuse the same fake server contract;
+                            # the real client sent no text prompt.
+                            with lock:
+                                words = {
+                                    value: word
+                                    for word, value in tokenizer.tokens.items()
+                                }
+                            prompt = " ".join(words[value] for value in values)
+                            payload = post(endpoint, json={"prompt": prompt}).json()[
+                                "aux_info"
+                            ]
+                            response = predict_v2_pb2.ModelStreamInferResponse()
+                            infer = response.infer_response
+                            infer.parameters[
+                                "engine_first_token_cost_time_us"
+                            ].int64_param = 10000
+                            for name, value in (
+                                ("prompt_token_num", payload["input_len"]),
+                                ("prompt_cached_token_num", payload["reuse_len"]),
+                                ("generated_ids", 42),
+                            ):
+                                output = infer.outputs.add(name=name, datatype="INT32")
+                                output.shape.append(1)
+                                infer.raw_output_contents.append(
+                                    struct.pack("<i", value)
+                                )
+                            return iter([response])
+
+                    client = DashScPrefillClient(
+                        http_client, channel=Mock(), stub=Stub()
+                    )
+                    client.wait_ready = Mock()
+
                 session = _Session()
                 session.client = client
                 session.diagnostics = EngineDiagnostics()
                 with patch(
                     "rtp_llm.test.perf_test.test_util._load_tokenizer",
-                    return_value=_Tokenizer(),
+                    return_value=tokenizer,
                 ):
                     if backend == "local":
                         initialize_run_directory(
@@ -459,7 +539,7 @@ class PrefillBackendIntegrationTest(unittest.TestCase):
                         )
                         outcome = UnifiedLocalExecutor(
                             session_factory=lambda _plan: session,
-                            tokenizer_loader=lambda _plan: _Tokenizer(),
+                            tokenizer_loader=lambda _plan: tokenizer,
                         )(plan)
                         self.assertEqual(RunState.COMPLETED, outcome.state)
                         results = outcome.case_results
@@ -508,8 +588,11 @@ class PrefillBackendIntegrationTest(unittest.TestCase):
                             return_value=source["model"],
                         ), patch(
                             "rtp_llm.test.perf_test.multi_node.prefill_runtime.HttpPrefillClient",
+                            return_value=http_client,
+                        ) as client_factory, patch(
+                            "rtp_llm.test.perf_test.prefill.dashsc_transport.DashScPrefillClient",
                             return_value=client,
-                        ) as client_factory:
+                        ):
                             source["model"]["tokenizer"] = "/m"
                             code = _default_prefill_master_executor(
                                 SimpleNamespace(),
@@ -530,6 +613,8 @@ class PrefillBackendIntegrationTest(unittest.TestCase):
                 )
                 self.assertGreater(len(results), 1)
                 self.assertEqual(len(plan.cases) * 5 + 3, len(events))
+                if transport == "dashsc_input_ids":
+                    self.assertEqual(len(plan.cases) * 4 + 2, len(wire_requests))
                 self.assertEqual({"batch_size": 1, "mode": "prefill"}, events[0][1])
                 self.assertTrue(
                     (run_root / "checkpoints" / "prefill_cache_probe.json").is_file()

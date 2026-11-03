@@ -1,4 +1,4 @@
-"""Concrete engine launch and HTTP request adapters for unified local runs."""
+"""Concrete engine launch and prefill request adapters for unified local runs."""
 
 from __future__ import annotations
 
@@ -210,13 +210,22 @@ class MagaEngineHandle:
         checkpoint: str,
         model_type: str,
         tokenizer: str,
+        transport: str = "http_text",
     ):
         self._manager = manager
         self._checkpoint = checkpoint
         self._model_type = model_type
         self._tokenizer = tokenizer
         self._stopped = False
+        if transport not in ("http_text", "dashsc_input_ids"):
+            raise ValueError(f"unsupported prefill transport: {transport}")
         self.client = HttpPrefillClient(f"http://127.0.0.1:{manager.port}")
+        if transport == "dashsc_input_ids":
+            from rtp_llm.test.perf_test.prefill.dashsc_transport import (
+                DashScPrefillClient,
+            )
+
+            self.client = DashScPrefillClient(self.client)
 
     @property
     def log_path(self) -> Optional[str]:
@@ -227,7 +236,7 @@ class MagaEngineHandle:
         return self._manager.exit_code
 
     def wait_ready(self, timeout_seconds: int) -> bool:
-        return bool(
+        ready = bool(
             self._manager.start_server(
                 model_path=self._checkpoint,
                 model_type=self._model_type,
@@ -235,6 +244,10 @@ class MagaEngineHandle:
                 timeout=timeout_seconds,
             )
         )
+
+        if ready and hasattr(self.client, "wait_ready"):
+            self.client.wait_ready(timeout_seconds)
+        return ready
 
     def is_alive(self) -> bool:
         return (
@@ -247,7 +260,11 @@ class MagaEngineHandle:
         if self._stopped:
             return
         self._stopped = True
-        self._manager.stop_server()
+        try:
+            if hasattr(self.client, "close"):
+                self.client.close()
+        finally:
+            self._manager.stop_server()
 
 
 def create_maga_handle(plan: ExecutionPlan) -> MagaEngineHandle:
@@ -266,4 +283,5 @@ def create_maga_handle(plan: ExecutionPlan) -> MagaEngineHandle:
         checkpoint=spec.checkpoint,
         model_type=spec.model_type,
         tokenizer=spec.tokenizer,
+        transport=thaw(plan.resolved_config)["workload"].get("transport", "http_text"),
     )

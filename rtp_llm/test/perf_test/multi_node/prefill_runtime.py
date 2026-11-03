@@ -58,14 +58,29 @@ class ExternalPrefillSession:
     stopping a process: the gang worker owns the model service.
     """
 
-    def __init__(self, endpoint: str, *, topology: Dict[str, int]):
+    def __init__(
+        self, endpoint: str, *, topology: Dict[str, int], transport: str = "http_text"
+    ):
         self.endpoint = endpoint.rstrip("/")
         self.topology = dict(topology)
+        if transport not in ("http_text", "dashsc_input_ids"):
+            raise ValueError(f"unsupported prefill transport: {transport}")
         self._client = HttpPrefillClient(self.endpoint)
+        if transport == "dashsc_input_ids":
+            from rtp_llm.test.perf_test.prefill.dashsc_transport import (
+                DashScPrefillClient,
+            )
+
+            self._client = DashScPrefillClient(self._client)
+            try:
+                self._client.wait_ready(600)
+            except BaseException:
+                self._client.close()
+                raise
         self._diagnostics = EngineDiagnostics()
 
     @property
-    def client(self) -> HttpPrefillClient:
+    def client(self) -> Any:
         return self._client
 
     @property
@@ -73,7 +88,9 @@ class ExternalPrefillSession:
         return self._diagnostics
 
     def close(self) -> None:
-        """No-op: the caller owns the external service's lifecycle."""
+        """Release the inference channel; the caller owns the service process."""
+        if hasattr(self._client, "close"):
+            self._client.close()
 
     def __enter__(self) -> "ExternalPrefillSession":
         return self

@@ -964,8 +964,13 @@ def _default_prefill_master_executor(
     )
     commit_tail = int(merged["workload"]["commit_tail_tokens"])
     endpoint = f"http://127.0.0.1:{int(context.gang_plan['port_range']['start'])}"
-    session = prefill_runtime.ExternalPrefillSession(endpoint, topology=topology)
+    session = None
     try:
+        session = prefill_runtime.ExternalPrefillSession(
+            endpoint,
+            topology=topology,
+            transport=merged["workload"].get("transport", "http_text"),
+        )
         adapter = PrefillAdapter(
             lambda executor_context: PrefillRunner(
                 executor_context.session.client,
@@ -992,7 +997,8 @@ def _default_prefill_master_executor(
         store.write_manifest(manifest)
         raise
     finally:
-        session.close()
+        if session is not None:
+            session.close()
     try:
         generate_prefill_report(root, acquire_lock=False)
     except Exception:

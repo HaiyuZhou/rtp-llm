@@ -1370,6 +1370,17 @@ class DefaultPrefillMasterExecutorTest(_WorkerTestCase):
             "state"
         ]
 
+    def test_session_startup_failure_marks_the_manifest_failed(self):
+        with patch(
+            "rtp_llm.test.perf_test.multi_node.prefill_runtime.ExternalPrefillSession",
+            side_effect=RuntimeError("DashSC gRPC endpoint unavailable"),
+        ):
+            outcome = self._run_prefill_executor()
+
+        self.assertIsInstance(outcome["raised"], RuntimeError)
+        self.assertEqual([], outcome["report_calls"])
+        self.assertEqual("failed", self._manifest_state(outcome["run_root"]))
+
     def test_report_success_completes_the_manifest(self):
         outcome = self._run_prefill_executor()
 

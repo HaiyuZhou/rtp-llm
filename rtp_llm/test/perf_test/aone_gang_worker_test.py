@@ -1043,6 +1043,14 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
                     name: os.environ.get(name)
                     for name in ("MODEL_TYPE", "CHECKPOINT_PATH", "TOKENIZER_PATH")
                 }
+                self.applied_environment = {
+                    name: os.environ.get(name)
+                    for name in (
+                        "FT_DISABLE_CUSTOM_AR",
+                        "GANG_CONFIG_STRING",
+                        "CUDA_VISIBLE_DEVICES",
+                    )
+                }
         self.setup_args_calls = setup_args_calls
         return handle, runner, decode_calls, prefill_calls
 
@@ -1081,6 +1089,22 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
         self.assertEqual("qwen_2", self.model_env.get("MODEL_TYPE"))
         self.assertEqual("/resolved/checkpoint", self.model_env.get("CHECKPOINT_PATH"))
         self.assertEqual("/resolved/tokenizer", self.model_env.get("TOKENIZER_PATH"))
+
+    def test_multi_machine_gang_disables_cross_host_custom_all_reduce(self):
+        # Regression: symmetric-memory custom all-reduce passes file
+        # descriptors between TP ranks and cannot span machines; a
+        # multi-machine gang must disable it or engine startup dies in
+        # torch_symm_mem.rendezvous with "Failed to send fd".
+        plan = self._example_gang_plan()
+        merged_path = self._merged_example("decode")
+
+        self._run_default_server_runner(plan, merged_path)
+
+        self.assertEqual("1", self.applied_environment.get("FT_DISABLE_CUSTOM_AR"))
+
+        single_machine = dict(plan, machine_count=1)
+        self._run_default_server_runner(single_machine, merged_path)
+        self.assertIsNone(self.applied_environment.get("FT_DISABLE_CUSTOM_AR"))
 
     def test_cache_grid_workload_builds_the_prefill_rank_group_plan(self):
         plan = self._example_gang_plan()

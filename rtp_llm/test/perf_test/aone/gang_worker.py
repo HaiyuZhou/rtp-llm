@@ -745,6 +745,11 @@ def _default_server_runner(context: GangWorkerContext):
         "FAKE_BALANCE_EXPERT": "1",
         "PERF_TEST_RUN_ID": str(plan["run_id"]),
     }
+    if int(plan["machine_count"]) > 1:
+        # Symmetric-memory custom all-reduce passes file descriptors between
+        # TP ranks, which cannot cross machines; a multi-machine gang spans
+        # its TP group across hosts, so the custom AR must be disabled.
+        engine_environment["FT_DISABLE_CUSTOM_AR"] = "1"
     for key, value in engine_environment.items():
         os.environ[key] = value
 

@@ -1,8 +1,8 @@
 """External prefill planning and session access against a fake endpoint."""
 
 import json
-import threading
 import tempfile
+import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,10 +16,7 @@ from rtp_llm.test.perf_test.errors import (
     PlanningError,
 )
 from rtp_llm.test.perf_test.execution.engine_session import EngineDiagnostics
-from rtp_llm.test.perf_test.execution.runtime import (
-    HttpPrefillClient,
-    MagaEngineHandle,
-)
+from rtp_llm.test.perf_test.execution.runtime import HttpPrefillClient, MagaEngineHandle
 from rtp_llm.test.perf_test.modes.base import ModeExecutionContext
 from rtp_llm.test.perf_test.modes.prefill import PrefillAdapter
 from rtp_llm.test.perf_test.multi_node.prefill_runtime import (
@@ -119,9 +116,7 @@ class _FakeModelServer:
                 pass
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-        self._thread = threading.Thread(
-            target=self._server.serve_forever, daemon=True
-        )
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
     @property
@@ -202,6 +197,28 @@ class HttpPrefillClientEndpointTest(unittest.TestCase):
 
 
 class ExternalPrefillPlanTest(unittest.TestCase):
+    def test_multi_dp_batch_rejected_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _prefill_source(root / "results")
+            source["engine"]["concurrency_limit"] = 4
+            source["engine"]["max_batch_tokens"] = 96
+            path = root / "prefill.json"
+            for batch_size in (4, 1):
+                source["workload"]["batch_sizes"] = [batch_size]
+                path.write_text(json.dumps(source))
+                if batch_size > 1:
+                    with self.assertRaisesRegex(PlanningError, "DP.*batch"):
+                        build_external_prefill_plan(path, root / "run", TOPOLOGY)
+                else:
+                    plan, _source = build_external_prefill_plan(
+                        path, root / "run", TOPOLOGY
+                    )
+                    self.assertTrue(plan.cases)
+                self.assertEqual(
+                    ["prefill.json"], sorted(item.name for item in root.iterdir())
+                )
+
     def test_matching_topology_freezes_standard_cases_and_fingerprints(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -229,16 +246,17 @@ class ExternalPrefillPlanTest(unittest.TestCase):
             identity = dict(plan.cases[0].identity)
             self.assertEqual(CASE_INPUT_LEN, identity["input_len"])
             self.assertEqual(CASE_CACHE_LEN, identity["cache_len"])
-            self.assertEqual(
-                CASE_INPUT_LEN - CASE_CACHE_LEN, identity["compute_len"]
-            )
+            self.assertEqual(CASE_INPUT_LEN - CASE_CACHE_LEN, identity["compute_len"])
             self.assertEqual(resolved.config_fingerprint, plan.config_fingerprint)
             self.assertEqual(resolved.workload_fingerprint, plan.workload_fingerprint)
             self.assertFalse((root / "run").exists())
 
     def test_topology_mismatch_raises_before_any_filesystem_artifact(self):
         cases = (
-            ({"tp": 1, "dp": 1, "pp": 1, "ep": 1}, "does not match configured topology"),
+            (
+                {"tp": 1, "dp": 1, "pp": 1, "ep": 1},
+                "does not match configured topology",
+            ),
             ({"tp": 1, "pp": 1, "ep": 1}, "must supply positive integer"),
             ({"tp": 1, "dp": 0, "pp": 1, "ep": 1}, "must supply positive integer"),
         )
@@ -317,9 +335,7 @@ class ExternalPrefillSessionTest(unittest.TestCase):
                 self.assertIn(field, result)
             self.assertEqual("ok", result["status"])
             self.assertEqual(CASE_INPUT_LEN, result["metrics"]["input_length"])
-            self.assertEqual(
-                CASE_CACHE_LEN, result["metrics"]["observed_reuse_length"]
-            )
+            self.assertEqual(CASE_CACHE_LEN, result["metrics"]["observed_reuse_length"])
             self.assertEqual(12.5, result["metrics"]["latency_ms"])
             self.assertEqual(
                 (CASE_INPUT_LEN - CASE_CACHE_LEN) * 1000.0 / 12.5,
@@ -336,9 +352,7 @@ class ExternalPrefillSessionTest(unittest.TestCase):
             seed, measure = server.requests
             self.assertEqual("/", seed["path"])
             self.assertEqual("none", seed["headers"]["X-DashScope-LoggingConsent"])
-            self.assertEqual(
-                1, seed["body"]["generate_config"]["max_new_tokens"]
-            )
+            self.assertEqual(1, seed["body"]["generate_config"]["max_new_tokens"])
             self.assertNotEqual(seed["body"]["prompt"], measure["body"]["prompt"])
 
     def test_prefill_runner_flags_invalid_reuse_through_the_external_session(self):

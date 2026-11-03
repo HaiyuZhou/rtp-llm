@@ -3,6 +3,7 @@ import unittest
 
 from rtp_llm.test.perf_test.config_schema import ConfigError, parse_config
 from rtp_llm.test.perf_test.errors import PlanningError
+from rtp_llm.test.perf_test.plan import case_id
 from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
 
 
@@ -41,6 +42,31 @@ def _parsed(payload=None):
 
 
 class PrefillPlannerTest(unittest.TestCase):
+    def test_concurrent_contract_changes_case_id(self):
+        workload, engine = _parsed()
+        for identity in plan_prefill_cases(workload, engine):
+            self.assertEqual(
+                "concurrent_batch_v1", identity.get("measurement_contract")
+            )
+            old_identity = dict(identity)
+            old_identity.pop("measurement_contract")
+            self.assertNotEqual(
+                case_id("prefill", old_identity), case_id("prefill", identity)
+            )
+
+    def test_multi_dp_batch_rejected_before_side_effects(self):
+        workload, engine = _parsed()
+        engine = dataclasses.replace(engine, concurrency_limit=4)
+        with self.assertRaisesRegex(PlanningError, "DP.*batch"):
+            plan_prefill_cases(
+                dataclasses.replace(workload, batch_sizes=(4,)), engine, dp_size=2
+            )
+        self.assertTrue(
+            plan_prefill_cases(
+                dataclasses.replace(workload, batch_sizes=(1,)), engine, dp_size=2
+            )
+        )
+
     def test_fixed_cache_compute_sweep_is_deterministic_and_deduplicated(self):
         workload, engine = _parsed()
 

@@ -4,6 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from rtp_llm.test.perf_test.cli import parse_cli
+from rtp_llm.test.perf_test.entry import build_request_plan
+from rtp_llm.test.perf_test.errors import PlanningError
+
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "tools" / "perf_test"
 LOCAL = ROOT / "rtp_llm" / "test" / "perf_test" / "examples" / "prefill_local.json"
@@ -11,6 +15,29 @@ AONE = ROOT / "rtp_llm" / "test" / "perf_test" / "examples" / "prefill_aone.json
 
 
 class UnifiedEntryTest(unittest.TestCase):
+    def test_multi_dp_batch_rejected_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = json.loads(LOCAL.read_text())
+            source["model"]["topology"]["dp"] = 2
+            source["execution"]["devices"] = [0, 1]
+            source["output"]["result_root"] = str(root / "results")
+            path = root / "config.json"
+            for batch_size in (4, 1):
+                source["workload"]["batch_sizes"] = [batch_size]
+                path.write_text(json.dumps(source))
+                request = parse_cli(
+                    ["--mode=prefill", "--action=run", f"--config={path}"]
+                )
+                if batch_size > 1:
+                    with self.assertRaisesRegex(PlanningError, "DP.*batch"):
+                        build_request_plan(request)
+                else:
+                    self.assertTrue(build_request_plan(request)[0].cases)
+                self.assertEqual(
+                    ["config.json"], sorted(item.name for item in root.iterdir())
+                )
+
     def _run(self, *arguments, cwd=None):
         return subprocess.run(
             [str(SCRIPT), *arguments],

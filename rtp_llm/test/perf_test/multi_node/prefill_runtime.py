@@ -26,9 +26,7 @@ def build_external_prefill_plan(config_path, result_directory, actual_topology):
     resolved = load_resolved_config(config_path)
     config = parse_config(source)
     if not isinstance(config.workload, PrefillWorkloadConfig):
-        raise ConfigurationError(
-            "external prefill requires workload.kind=cache_grid"
-        )
+        raise ConfigurationError("external prefill requires workload.kind=cache_grid")
     configured = config.model.topology.as_tuple()
     actual = tuple(actual_topology.get(name) for name in ("tp", "dp", "pp", "ep"))
     if any(type(value) is not int or value <= 0 for value in actual):
@@ -39,7 +37,9 @@ def build_external_prefill_plan(config_path, result_directory, actual_topology):
         raise PlanningError(
             f"runtime topology {actual} does not match configured topology {configured}"
         )
-    cases = plan_prefill_cases(config.workload, config.engine)
+    cases = plan_prefill_cases(
+        config.workload, config.engine, dp_size=config.model.topology.dp
+    )
     plan = build_execution_plan(
         mode="prefill",
         action="run",
@@ -78,8 +78,6 @@ class ExternalPrefillSession:
     def __enter__(self) -> "ExternalPrefillSession":
         return self
 
-    def __exit__(
-        self, _type: Any, _value: Any, _traceback: Any
-    ) -> Optional[bool]:
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> Optional[bool]:
         self.close()
         return None

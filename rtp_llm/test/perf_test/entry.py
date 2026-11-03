@@ -65,7 +65,9 @@ def _planned_cases(
     if mode == "prefill":
         if not isinstance(workload, PrefillWorkloadConfig):
             raise ConfigurationError("--mode=prefill requires workload.kind=cache_grid")
-        return plan_prefill_cases(workload, config.engine)
+        return plan_prefill_cases(
+            workload, config.engine, dp_size=config.model.topology.dp
+        )
     if isinstance(
         workload, (DecodeGridWorkloadConfig, DecodeDistributionWorkloadConfig)
     ):

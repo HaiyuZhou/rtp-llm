@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple
 
 from rtp_llm.test.perf_test.config_schema import EngineConfig, PrefillWorkloadConfig
 from rtp_llm.test.perf_test.errors import PlanningError
+from rtp_llm.test.perf_test.prefill.measurement import PREFILL_MEASUREMENT_CONTRACT
 
 
 def _stable_rng(seed: int, namespace: str) -> random.Random:
@@ -104,9 +105,11 @@ def _cache_lengths(workload: PrefillWorkloadConfig, cache_step: int) -> Tuple[in
 
 
 def plan_prefill_cases(
-    workload: PrefillWorkloadConfig, engine: EngineConfig
+    workload: PrefillWorkloadConfig, engine: EngineConfig, *, dp_size: int = 1
 ) -> Tuple[Dict[str, object], ...]:
     """Expand fixed/random cache slices and compute refinements into identities."""
+    if dp_size > 1 and any(batch > 1 for batch in workload.batch_sizes):
+        raise PlanningError("prefill DP>1 requires batch_size=1")
     cache_step = _validate_contract(workload, engine)
     cache_lengths = _cache_lengths(workload, cache_step)
     cases: List[Dict[str, object]] = []
@@ -127,6 +130,7 @@ def plan_prefill_cases(
                     seen.add(geometry)
                     cases.append(
                         {
+                            "measurement_contract": PREFILL_MEASUREMENT_CONTRACT,
                             "batch_size": batch_size,
                             "input_len": input_len,
                             "cache_len": cache_len,

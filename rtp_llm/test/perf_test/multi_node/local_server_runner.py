@@ -6,12 +6,13 @@ for key, value in os.environ.items():
 import json
 import logging
 import pathlib
+import shlex
 import signal
 import socket
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 current_file_path = pathlib.Path(__file__).parent.absolute()
 sys.path.append(str(current_file_path.parent.parent.parent.absolute()))
@@ -180,6 +181,9 @@ def start_local_rank_group(
     context: LocalRankGroupContext,
     config: PyEnvConfigs,
     model_paths: Optional[str],
+    *,
+    engine_argv: Optional[Sequence[str]] = None,
+    engine_environment: Optional[Dict[str, str]] = None,
 ) -> ServerHandle:
     """Start this host's local rank group.
 
@@ -193,6 +197,13 @@ def start_local_rank_group(
     resolved path; resolution is idempotent for local paths). The server
     subprocess itself is launched by the caller through the returned
     handle so legacy failure, upload, and exit semantics are unchanged.
+
+    ``engine_argv``/``engine_environment`` are the unified launch-spec
+    projection of the resolved config (gang workers always supply them):
+    without ``engine_argv`` the server subprocess starts with no engine
+    arguments, so per-run switches such as ``reuse_cache`` would be lost.
+    The legacy ``__main__`` flow keeps its current behavior by omitting
+    them.
     """
     setup_and_configure_server(config)
     engine = context.plan.resolved_config["engine"]
@@ -222,7 +233,12 @@ def start_local_rank_group(
             os.path.expanduser(str(model_paths).strip())
         )
 
-    server = MagaServerManager(port=str(context.port))
+    manager_kwargs: Dict[str, Any] = {"port": str(context.port)}
+    if engine_argv is not None:
+        manager_kwargs["smoke_args_str"] = shlex.join(list(engine_argv))
+    if engine_environment:
+        manager_kwargs["env_args"] = dict(engine_environment)
+    server = MagaServerManager(**manager_kwargs)
     return ServerHandle(
         manager=server,
         tokenizer_path=tokenizer_path,

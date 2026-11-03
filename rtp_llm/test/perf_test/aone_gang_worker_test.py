@@ -907,14 +907,16 @@ class _RecordingRunnerModule:
     def __init__(self):
         self.rank_contexts = []
         self.starts = []
+        self.start_kwargs = []
 
     def LocalRankGroupContext(self, **kwargs):
         context = SimpleNamespace(**kwargs)
         self.rank_contexts.append(context)
         return context
 
-    def start_local_rank_group(self, rank_context, configs, model_paths):
+    def start_local_rank_group(self, rank_context, configs, model_paths, **kwargs):
         self.starts.append((rank_context, configs, model_paths))
+        self.start_kwargs.append(kwargs)
         return "handle-sentinel"
 
 
@@ -946,7 +948,7 @@ def _fake_execution_plan(label="fake-plan"):
                 "max_seq_len": 4097,
                 "max_batch_tokens": 8192,
                 "concurrency_limit": 2,
-                "args": {},
+                "args": {"reuse_cache": 1},
                 "env": {},
             },
         },
@@ -1076,6 +1078,25 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
         self.assertIn("--tp_size=2", argv_text)
         for worker_flag in ("--resolved-config", "--resolved-workload", "--gang-plan"):
             self.assertNotIn(worker_flag, argv_text)
+
+    def test_engine_argv_reaches_the_rank_group_startup(self):
+        # Regression: the gang engine subprocess used to start with no engine
+        # arguments (no smoke_args_str), silently losing per-run switches such
+        # as reuse_cache — prefix-cache reuse then always reported 0.
+        plan = self._example_gang_plan()
+        merged_path = self._merged_example("prefill")
+
+        handle, runner, _decode_calls, _prefill_calls = (
+            self._run_default_server_runner(plan, merged_path)
+        )
+
+        self.assertEqual(1, len(runner.start_kwargs))
+        kwargs = runner.start_kwargs[0]
+        engine_argv = list(kwargs.get("engine_argv") or ())
+        self.assertIn("--tp_size=2", engine_argv)
+        self.assertIn("--reuse_cache=1", engine_argv)
+        engine_environment = kwargs.get("engine_environment") or {}
+        self.assertEqual("2", engine_environment.get("WORLD_SIZE"))
 
     def test_engine_model_environment_is_exported_for_server_subprocess(self):
         # Regression: the engine subprocess reads MODEL_TYPE/CHECKPOINT_PATH/

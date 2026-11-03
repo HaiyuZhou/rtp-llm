@@ -782,7 +782,16 @@ def _default_server_runner(context: GangWorkerContext):
     os.environ.setdefault("MODEL_TYPE", str(model["type"]))
     os.environ.setdefault("CHECKPOINT_PATH", str(model["checkpoint"]))
     os.environ.setdefault("TOKENIZER_PATH", str(model["tokenizer"]))
-    return runner.start_local_rank_group(rank_context, configs, model["tokenizer"])
+    # The engine subprocess arguments come from the launch spec; without
+    # them per-run switches (reuse_cache, topology sizes) never reach the
+    # server and prefix-cache reuse silently disappears.
+    return runner.start_local_rank_group(
+        rank_context,
+        configs,
+        model["tokenizer"],
+        engine_argv=launch.argv,
+        engine_environment=launch.environment,
+    )
 
 
 def _resolve_model_paths(config_path: str, plan: Mapping[str, Any]) -> Mapping[str, Any]:

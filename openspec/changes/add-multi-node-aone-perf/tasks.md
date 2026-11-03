@@ -43,9 +43,9 @@
 ## 7. CI Pipeline And Real Smokes
 
 - [x] 7.1 Add `.aoneci/multi-node-perf.yaml` in the internal repo with the concurrency group, parameters, checkout, submodule pinning, unified-entry invocation, and artifact upload; verify the pipeline registers and a first CI run reaches the build stage with a deliberate small config.
-- [ ] 7.2 Run the real decode TP2 gang smoke on `H20_CU13`/`daily` with `Qwen/Qwen2.5-0.5B-Instruct` across 2 machines; verify the collected run directory contains a formal report, local-parity envelope, gang topology in the manifest, and distinct member hosts.
-- [ ] 7.3 Run the real prefill TP2 gang smoke with the same resources; verify observed-reuse correctness conditions hold, the standard prefill envelope and report are produced, and single-machine AOne prefill behavior is unchanged.
-- [ ] 7.4 Exercise nonzero-exit behavior with an intentionally failing member in a separate diagnostic run; verify every member exits nonzero, the failure is visible in broker diagnostics and the manifest, and the master's partial artifacts are still collected.
+- [x] 7.2 Run the real decode TP2 gang smoke on `H20_CU13`/`daily` with `Qwen/Qwen2.5-0.5B-Instruct` across 2 machines; verify the collected run directory contains a formal report, local-parity envelope, gang topology in the manifest, and distinct member hosts.
+- [x] 7.3 Run the real prefill TP2 gang smoke with the same resources; verify observed-reuse correctness conditions hold, the standard prefill envelope and report are produced, and single-machine AOne prefill behavior is unchanged.
+- [x] 7.4 Exercise nonzero-exit behavior with an intentionally failing member in a separate diagnostic run; verify every member exits nonzero, the failure is visible in broker diagnostics and the manifest, and the master's partial artifacts are still collected.
 
 ## 8. Documentation
 

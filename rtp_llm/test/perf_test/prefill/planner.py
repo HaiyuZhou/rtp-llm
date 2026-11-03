@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import random
+from dataclasses import asdict
 from typing import Dict, List, Tuple
 
 from rtp_llm.test.perf_test.config_schema import EngineConfig, PrefillWorkloadConfig
@@ -104,7 +105,7 @@ def _cache_lengths(workload: PrefillWorkloadConfig, cache_step: int) -> Tuple[in
     return tuple(sorted(rng.sample(candidates, workload.random_cache_count)))
 
 
-def plan_prefill_cases(
+def _plan_generated_cases(
     workload: PrefillWorkloadConfig, engine: EngineConfig, *, dp_size: int = 1
 ) -> Tuple[Dict[str, object], ...]:
     """Expand fixed/random cache slices and compute refinements into identities."""
@@ -151,3 +152,142 @@ def plan_prefill_cases(
             f"generated {len(cases)} cases, exceeding max_cases={workload.max_cases}"
         )
     return tuple(cases)
+
+
+GROUPED_PREFILL_MEASUREMENT_CONTRACT = "concurrent_grouped_batch_v1"
+
+
+def expected_probe_block_size(
+    workload: PrefillWorkloadConfig, engine: EngineConfig
+) -> int:
+    """Return the configured physical block expectation used by preflight."""
+    value = workload.probe_block_size or engine.args.get(
+        "seq_size_per_block", workload.cache_alignment
+    )
+    if type(value) is not int or value <= 0:
+        raise PlanningError(
+            "probe_block_size/seq_size_per_block must be a positive integer"
+        )
+    return value
+
+
+def _plan_grouped_cases(
+    workload: PrefillWorkloadConfig, engine: EngineConfig, dp_size: int
+):
+    if workload.workspace_tokens is None:
+        raise PlanningError("workload.workspace_tokens is required for request_batches")
+    block_size = expected_probe_block_size(workload, engine)
+    alignment = math.lcm(workload.cache_alignment, block_size)
+    if workload.commit_tail_tokens % alignment:
+        raise PlanningError(
+            "commit_tail_tokens must be aligned to physical cache blocks"
+        )
+    cases = []
+    for batch in workload.request_batches:
+        groups = batch.request_groups
+        batch_size = sum(group.count for group in groups)
+        if dp_size > 1 and batch_size > 1:
+            raise PlanningError("prefill DP>1 requires batch_size=1")
+        if batch_size > engine.concurrency_limit:
+            raise PlanningError("grouped batch exceeds engine.concurrency_limit")
+        for group in groups:
+            if group.input_len + 1 > engine.max_seq_len:
+                raise PlanningError(
+                    "group input_len plus one output token exceeds engine.max_seq_len"
+                )
+            if group.cache_len % alignment:
+                raise PlanningError(
+                    "group cache_len must be aligned to physical cache blocks"
+                )
+            if group.cache_len > group.input_len or (
+                group.cache_len
+                and group.input_len - group.cache_len < workload.commit_tail_tokens
+            ):
+                raise PlanningError(
+                    "group cache_len must leave the required commit tail"
+                )
+        packed = sum(group.count * (group.input_len + 1) for group in groups)
+        padded = sum(
+            group.count
+            * ((group.input_len + 1 + block_size - 1) // block_size * block_size)
+            for group in groups
+        )
+        if packed > engine.max_batch_tokens:
+            raise PlanningError(
+                "grouped input plus output reserve exceeds engine.max_batch_tokens"
+            )
+        if padded > workload.workspace_tokens:
+            raise PlanningError(
+                "block-padded grouped batch exceeds workload.workspace_tokens"
+            )
+        # Seeds run sequentially and therefore never multiply seed workspace by count.
+        for group in groups:
+            if group.cache_len:
+                seed_tokens = group.cache_len + workload.commit_tail_tokens + 1
+                if (
+                    seed_tokens > engine.max_seq_len
+                    or seed_tokens > engine.max_batch_tokens
+                ):
+                    raise PlanningError("sequential seed exceeds engine token limits")
+                if (
+                    seed_tokens + block_size - 1
+                ) // block_size * block_size > workload.workspace_tokens:
+                    raise PlanningError(
+                        "sequential seed exceeds workload.workspace_tokens"
+                    )
+        input_len = max(group.input_len for group in groups)
+        cache_len = max(group.cache_len for group in groups)
+        cases.append(
+            {
+                "measurement_contract": GROUPED_PREFILL_MEASUREMENT_CONTRACT,
+                "batch_size": batch_size,
+                "input_len": input_len,
+                "cache_len": cache_len,
+                "compute_len": max(
+                    group.input_len - group.cache_len for group in groups
+                ),
+                "measure_runs": workload.measure_runs,
+                "seed": workload.seed,
+                "prefix_policy": "independent",
+                "request_groups": [asdict(group) for group in groups],
+            }
+        )
+    return tuple(cases)
+
+
+def plan_prefill_cases(
+    workload: PrefillWorkloadConfig, engine: EngineConfig, *, dp_size: int = 1
+) -> Tuple[Dict[str, object], ...]:
+    """Plan flat workloads unchanged, or named grids in declaration order."""
+    if workload.probe_block_size is not None or workload.request_batches:
+        block_size = expected_probe_block_size(workload, engine)
+        for probe_input in (block_size + workload.commit_tail_tokens, 2 * block_size):
+            if probe_input + 1 > engine.max_seq_len:
+                raise PlanningError(
+                    "cache probe plus output reserve exceeds engine.max_seq_len"
+                )
+            if probe_input + 1 > engine.max_batch_tokens:
+                raise PlanningError(
+                    "cache probe plus output reserve exceeds engine.max_batch_tokens"
+                )
+            if (
+                workload.workspace_tokens is not None
+                and (probe_input + 1 + block_size - 1) // block_size * block_size
+                > workload.workspace_tokens
+            ):
+                raise PlanningError("cache probe exceeds workload.workspace_tokens")
+    if workload.grids:
+        cases = tuple(
+            {**case, "grid_name": grid.name}
+            for grid in workload.grids
+            for case in plan_prefill_cases(grid.workload, engine, dp_size=dp_size)
+        )
+    elif workload.request_batches:
+        cases = _plan_grouped_cases(workload, engine, dp_size)
+    else:
+        return _plan_generated_cases(workload, engine, dp_size=dp_size)
+    if workload.max_cases is not None and len(cases) > workload.max_cases:
+        raise PlanningError(
+            f"generated {len(cases)} cases, exceeding max_cases={workload.max_cases}"
+        )
+    return cases

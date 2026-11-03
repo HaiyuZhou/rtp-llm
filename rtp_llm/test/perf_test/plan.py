@@ -406,7 +406,11 @@ def build_execution_plan(
             raise PlanningError(f"duplicate case identity: {identifier}")
         seen.add(identifier)
         planned_cases.append(PlannedCase(identifier, freeze(identity)))
-    planned_cases.sort(key=lambda item: item.case_id)
+    grids = resolved.resolved_config["workload"].get("grids", ())
+    if mode == "prefill" and backend == "aone" and len(grids) > 1:
+        raise PlanningError("AOne prefill supports only one grid per run")
+    if not (mode == "prefill" and grids):
+        planned_cases.sort(key=lambda item: item.case_id)
 
     world_size = _world_size(resolved.resolved_config)
     if backend == "local":

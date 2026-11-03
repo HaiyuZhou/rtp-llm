@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 from rtp_llm.test.perf_test.decode.model import (
@@ -177,6 +177,31 @@ class EngineConfig:
 
 
 @dataclass(frozen=True)
+class RequestGroupConfig:
+    count: int
+    input_len: int
+    cache_len: int
+
+
+@dataclass(frozen=True)
+class RequestBatchConfig:
+    request_groups: Tuple[RequestGroupConfig, ...]
+
+
+@dataclass(frozen=True)
+class PrefillProfilingConfig:
+    backend: str = "kineto"
+    trace_timeout_seconds: float = 120.0
+    nsys_path: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PrefillGridConfig:
+    name: str
+    workload: "PrefillWorkloadConfig"
+
+
+@dataclass(frozen=True)
 class PrefillWorkloadConfig:
     kind: str
     max_input_len: int
@@ -192,6 +217,12 @@ class PrefillWorkloadConfig:
     random_cache_count: int = 8
     seed: int = 1
     max_cases: Optional[int] = None
+    request_batches: Tuple[RequestBatchConfig, ...] = ()
+    grids: Tuple[PrefillGridConfig, ...] = ()
+    transport: str = "http_text"
+    profiling: PrefillProfilingConfig = field(default_factory=PrefillProfilingConfig)
+    probe_block_size: Optional[int] = None
+    workspace_tokens: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -337,7 +368,162 @@ def _parse_engine(value: Any) -> EngineConfig:
     )
 
 
+def _parse_request_batches(value: Any) -> Tuple[RequestBatchConfig, ...]:
+    path = "workload.request_batches"
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"{path}: expected a non-empty array")
+    batches = []
+    for index, item in enumerate(value):
+        batch_path = f"{path}[{index}]"
+        raw = _object(batch_path, item)
+        _reject_unknown(batch_path, raw, {"request_groups"})
+        groups = _required(batch_path, raw, "request_groups")
+        if not isinstance(groups, list) or not groups:
+            raise ConfigError(
+                f"{batch_path}.request_groups: expected a non-empty array"
+            )
+        parsed = []
+        for group_index, group in enumerate(groups):
+            group_path = f"{batch_path}.request_groups[{group_index}]"
+            group = _object(group_path, group)
+            _reject_unknown(group_path, group, {"count", "input_len", "cache_len"})
+            parsed.append(
+                RequestGroupConfig(
+                    count=_positive_int(
+                        f"{group_path}.count", _required(group_path, group, "count")
+                    ),
+                    input_len=_positive_int(
+                        f"{group_path}.input_len",
+                        _required(group_path, group, "input_len"),
+                    ),
+                    cache_len=_non_negative_int(
+                        f"{group_path}.cache_len",
+                        _required(group_path, group, "cache_len"),
+                    ),
+                )
+            )
+        batches.append(RequestBatchConfig(tuple(parsed)))
+    return tuple(batches)
+
+
 def _parse_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
+    shared_fields = {
+        "kind",
+        "cache_alignment",
+        "commit_tail_tokens",
+        "measure_runs",
+        "transport",
+        "profiling",
+        "probe_block_size",
+        "workspace_tokens",
+        "max_cases",
+    }
+    generated_fields = {
+        "max_input_len",
+        "compute_steps",
+        "batch_sizes",
+        "min_compute_len",
+        "min_cache_len",
+        "max_cache_len",
+        "cache_lengths",
+        "random_cache_count",
+        "seed",
+    }
+    _reject_unknown(
+        "workload", raw, shared_fields | generated_fields | {"grids", "request_batches"}
+    )
+    transport = raw.get("transport", "http_text")
+    if transport not in ("http_text", "dashsc_input_ids"):
+        raise ConfigError("workload.transport: expected http_text or dashsc_input_ids")
+    profiling = _object("workload.profiling", raw.get("profiling", {}))
+    _reject_unknown(
+        "workload.profiling",
+        profiling,
+        {"backend", "trace_timeout_seconds", "nsys_path"},
+    )
+    backend = profiling.get("backend", "kineto")
+    if backend not in ("kineto", "nsys"):
+        raise ConfigError("workload.profiling.backend: expected kineto or nsys")
+    settings = dict(
+        transport=transport,
+        profiling=PrefillProfilingConfig(
+            backend=backend,
+            trace_timeout_seconds=_positive_number(
+                "workload.profiling.trace_timeout_seconds",
+                profiling.get("trace_timeout_seconds", 120.0),
+            ),
+            nsys_path=(
+                None
+                if profiling.get("nsys_path") is None
+                else _non_empty_string(
+                    "workload.profiling.nsys_path", profiling["nsys_path"]
+                )
+            ),
+        ),
+        probe_block_size=(
+            None
+            if "probe_block_size" not in raw
+            else _positive_int("workload.probe_block_size", raw["probe_block_size"])
+        ),
+        workspace_tokens=(
+            None
+            if "workspace_tokens" not in raw
+            else _positive_int("workload.workspace_tokens", raw["workspace_tokens"])
+        ),
+    )
+    if "grids" in raw:
+        if set(raw) & (generated_fields | {"request_batches"}):
+            raise ConfigError(
+                "workload.grids conflicts with top-level generated fields or request_batches"
+            )
+        grids = raw["grids"]
+        if not isinstance(grids, list) or not grids:
+            raise ConfigError("workload.grids: expected a non-empty array")
+        parsed_grids = []
+        names = set()
+        for index, item in enumerate(grids):
+            path = f"workload.grids[{index}]"
+            item = _object(path, item)
+            _reject_unknown(path, item, generated_fields | {"name", "request_batches"})
+            name = _non_empty_string(f"{path}.name", _required(path, item, "name"))
+            if name in names:
+                raise ConfigError("workload.grids names must be unique")
+            names.add(name)
+            child = {key: value for key, value in raw.items() if key in shared_fields}
+            child.update({key: value for key, value in item.items() if key != "name"})
+            parsed_grids.append(PrefillGridConfig(name, _parse_prefill_workload(child)))
+        base = parsed_grids[0].workload
+        return replace(base, grids=tuple(parsed_grids), request_batches=(), **settings)
+    if "request_batches" in raw:
+        if set(raw) & (generated_fields - {"seed"}):
+            raise ConfigError(
+                "workload.request_batches conflicts with generated grid fields"
+            )
+        batches = _parse_request_batches(raw["request_batches"])
+        if settings["workspace_tokens"] is None:
+            raise ConfigError("workload.workspace_tokens: required for request_batches")
+        base = {
+            key: value
+            for key, value in raw.items()
+            if key in shared_fields - set(settings)
+        }
+        base.update(
+            max_input_len=max(
+                group.input_len for batch in batches for group in batch.request_groups
+            ),
+            compute_steps=[1],
+            batch_sizes=[1],
+            cache_lengths=[0],
+            seed=raw.get("seed", 1),
+        )
+        return replace(
+            _parse_generated_prefill_workload(base), request_batches=batches, **settings
+        )
+    base = {key: value for key, value in raw.items() if key not in settings}
+    return replace(_parse_generated_prefill_workload(base), **settings)
+
+
+def _parse_generated_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
     allowed = {
         "kind",
         "max_input_len",
@@ -696,7 +882,7 @@ def parse_config(value: Any) -> PerfTestConfig:
         raise ConfigError(
             f"schema_version: expected integer {SCHEMA_VERSION}, got {version!r}"
         )
-    return PerfTestConfig(
+    config = PerfTestConfig(
         schema_version=version,
         model=_parse_model(_required("", raw, "model")),
         engine=_parse_engine(_required("", raw, "engine")),
@@ -706,3 +892,11 @@ def parse_config(value: Any) -> PerfTestConfig:
         regression=_parse_regression(_required("", raw, "regression")),
         publish=_parse_publish(_required("", raw, "publish")),
     )
+
+    if (
+        isinstance(config.workload, PrefillWorkloadConfig)
+        and isinstance(config.execution, AOneExecutionConfig)
+        and len(config.workload.grids) > 1
+    ):
+        raise ConfigError("AOne prefill supports only one grid per run")
+    return config

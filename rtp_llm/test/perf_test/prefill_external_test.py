@@ -151,6 +151,122 @@ def _run_through_session(plan, session, run_root):
     )
 
 
+class GroupedPrefillPlanningTest(unittest.TestCase):
+    def source(self):
+        source = _prefill_source("results")
+        source["model"]["topology"]["dp"] = 1
+        source["execution"]["devices"] = [0]
+        source["engine"].update(concurrency_limit=4, max_batch_tokens=80)
+        source["workload"] = {
+            "kind": "cache_grid",
+            "cache_alignment": 8,
+            "commit_tail_tokens": 8,
+            "workspace_tokens": 88,
+            "request_batches": [
+                {
+                    "request_groups": [
+                        {"count": 2, "input_len": 24, "cache_len": 16},
+                        {"count": 1, "input_len": 17, "cache_len": 8},
+                    ]
+                }
+            ],
+        }
+        return source
+
+    def test_grouped_geometry_uses_member_maxima_and_independent_seeds(self):
+        config = parse_config(self.source())
+        (case,) = plan_prefill_cases(config.workload, config.engine)
+        self.assertEqual("concurrent_grouped_batch_v1", case["measurement_contract"])
+        self.assertEqual(
+            (3, 24, 16), (case["batch_size"], case["input_len"], case["cache_len"])
+        )
+        self.assertEqual("independent", case["prefix_policy"])
+        self.assertEqual(2, case["request_groups"][0]["count"])
+
+    def test_grouped_static_padded_workspace_and_output_reserve(self):
+        for target, value, message in (
+            ("workspace_tokens", 87, "workspace"),
+            ("max_batch_tokens", 67, "max_batch_tokens"),
+            ("max_seq_len", 24, "max_seq_len"),
+        ):
+            source = self.source()
+            section = (
+                source["workload"] if target == "workspace_tokens" else source["engine"]
+            )
+            section[target] = value
+            config = parse_config(source)
+            with self.assertRaisesRegex(PlanningError, message):
+                plan_prefill_cases(config.workload, config.engine)
+
+    def test_grouped_rejects_dp_batches_and_unaligned_cache(self):
+        config = parse_config(self.source())
+        with self.assertRaisesRegex(PlanningError, "DP.*batch"):
+            plan_prefill_cases(config.workload, config.engine, dp_size=2)
+        source = self.source()
+        source["engine"]["args"] = {"seq_size_per_block": 16}
+        config = parse_config(source)
+        with self.assertRaisesRegex(PlanningError, "aligned"):
+            plan_prefill_cases(config.workload, config.engine)
+
+    def test_explicit_probe_geometry_must_fit_sequence_limit(self):
+        source = self.source()
+        source["workload"].update(probe_block_size=32, commit_tail_tokens=32)
+        source["workload"]["request_batches"] = [
+            {"request_groups": [{"count": 1, "input_len": 1, "cache_len": 0}]}
+        ]
+        config = parse_config(source)
+        with self.assertRaisesRegex(PlanningError, "probe.*max_seq_len"):
+            plan_prefill_cases(config.workload, config.engine)
+
+    def test_named_generated_grid_order_and_flat_identity_are_compatible(self):
+        source = _prefill_source("results")
+        config = parse_config(source)
+        flat = plan_prefill_cases(config.workload, config.engine)
+        generated = {
+            key: source["workload"].pop(key)
+            for key in (
+                "max_input_len",
+                "compute_steps",
+                "cache_lengths",
+                "batch_sizes",
+                "seed",
+            )
+        }
+        source["workload"]["grids"] = [{"name": "generated", **generated}]
+        config = parse_config(source)
+        named = plan_prefill_cases(config.workload, config.engine)
+        self.assertEqual(
+            flat,
+            tuple(
+                {key: value for key, value in case.items() if key != "grid_name"}
+                for case in named
+            ),
+        )
+
+    def test_named_grids_preserve_declared_order_through_execution_plan(self):
+        from rtp_llm.test.perf_test.config_resolver import resolve_config
+        from rtp_llm.test.perf_test.plan import build_execution_plan
+
+        source = self.source()
+        batches = source["workload"].pop("request_batches")
+        source["workload"]["grids"] = [
+            {"name": name, "request_batches": batches} for name in ("z-last", "a-first")
+        ]
+        config = parse_config(source)
+        cases = plan_prefill_cases(config.workload, config.engine)
+        self.assertEqual(["z-last", "a-first"], [case["grid_name"] for case in cases])
+        plan = build_execution_plan(
+            mode="prefill",
+            action="run",
+            resolved=resolve_config(source),
+            cases=cases,
+            result_directory="results/run",
+        )
+        self.assertEqual(
+            ["z-last", "a-first"], [case.identity["grid_name"] for case in plan.cases]
+        )
+
+
 class HttpPrefillClientEndpointTest(unittest.TestCase):
     def test_scheduler_update_acknowledged_on_explicit_endpoint(self):
         response = Mock(status_code=200)

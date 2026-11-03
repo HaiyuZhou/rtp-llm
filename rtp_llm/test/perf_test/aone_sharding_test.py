@@ -65,6 +65,22 @@ class AOneShardingTest(unittest.TestCase):
 
         self.assertEqual([100, 50, 32], [case_weight(case) for case in cases])
 
+    def test_grouped_weight_sums_each_member_attention_cost(self):
+        self.assertEqual(
+            201,
+            case_weight(
+                {
+                    "batch_size": 3,
+                    "input_len": 10,
+                    "cache_len": 5,
+                    "request_groups": [
+                        {"count": 2, "input_len": 10, "cache_len": 0},
+                        {"count": 1, "input_len": 1, "cache_len": 0},
+                    ],
+                }
+            ),
+        )
+
     def test_lpt_plan_is_complete_exclusive_deterministic_and_balanced(self):
         plan = _plan()
 

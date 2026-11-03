@@ -66,6 +66,73 @@ class UnifiedConfigTest(unittest.TestCase):
         self.assertFalse(config.publish.oss.enabled)
         self.assertFalse(config.publish.odps.enabled)
 
+    def test_prefill_explicit_batches_and_shared_settings(self):
+        payload = _base_config()
+        payload["workload"] = {
+            "kind": "cache_grid",
+            "cache_alignment": 8,
+            "commit_tail_tokens": 8,
+            "workspace_tokens": 128,
+            "probe_block_size": 8,
+            "transport": "dashsc_input_ids",
+            "profiling": {
+                "backend": "nsys",
+                "trace_timeout_seconds": 2.5,
+                "nsys_path": "/bin/nsys",
+            },
+            "request_batches": [
+                {"request_groups": [{"count": 2, "input_len": 24, "cache_len": 16}]}
+            ],
+        }
+        workload = parse_config(payload).workload
+        self.assertEqual(2, workload.request_batches[0].request_groups[0].count)
+        self.assertEqual("dashsc_input_ids", workload.transport)
+        self.assertEqual(2.5, workload.profiling.trace_timeout_seconds)
+        self.assertEqual(8, workload.probe_block_size)
+        del payload["workload"]["workspace_tokens"]
+        with self.assertRaisesRegex(ConfigError, "workspace_tokens"):
+            parse_config(payload)
+
+    def test_prefill_new_fields_are_strict(self):
+        for field, value in (
+            ("transport", "grpc"),
+            ("probe_block_size", True),
+            ("workspace_tokens", 0),
+            ("profiling", {"backend": "other"}),
+            ("profiling", {"trace_timeout_seconds": 0}),
+            ("request_batches", []),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = _base_config()
+                payload["workload"][field] = value
+                with self.assertRaisesRegex(ConfigError, field):
+                    parse_config(payload)
+
+    def test_named_grids_reject_duplicates_and_aone_multi_grid(self):
+        payload = _base_config()
+        generated = {
+            key: payload["workload"][key]
+            for key in ("max_input_len", "compute_steps", "batch_sizes")
+        }
+        payload["workload"] = {
+            "kind": "cache_grid",
+            "cache_alignment": 64,
+            "commit_tail_tokens": 64,
+            "grids": [{"name": "same", **generated}, {"name": "same", **generated}],
+        }
+        with self.assertRaisesRegex(ConfigError, "unique"):
+            parse_config(payload)
+        payload["workload"]["grids"][1]["name"] = "second"
+        payload["execution"] = {
+            "backend": "aone",
+            "resource": "gpu",
+            "gpu_type": "H20",
+            "max_parallel": 1,
+            "shard_count": 1,
+        }
+        with self.assertRaisesRegex(ConfigError, "AOne.*one grid"):
+            parse_config(payload)
+
     def test_decode_grid_preserves_declared_extension_maps(self):
         payload = _base_config()
         payload["engine"]["args"] = {"reuse_cache": 1, "act_type": "BF16"}

@@ -64,6 +64,27 @@ def _case_identity(case: Union[PlannedCase, Mapping[str, Any]]) -> Mapping[str, 
 def case_weight(case: Union[PlannedCase, Mapping[str, Any]]) -> int:
     """Estimate prefill attention work using the legacy cache-grid formula."""
     identity = _case_identity(case)
+    if "request_groups" in identity:
+        groups = identity["request_groups"]
+        if not isinstance(groups, (list, tuple)) or not groups:
+            raise PlanningError("AOne request_groups must be a non-empty array")
+        total = 0
+        for group in groups:
+            if not isinstance(group, Mapping):
+                raise PlanningError("AOne request group must be an object")
+            count = group.get("count")
+            if type(count) is not int or count <= 0:
+                raise PlanningError(
+                    "AOne request group count must be a positive integer"
+                )
+            total += case_weight(
+                {
+                    "batch_size": count,
+                    "input_len": group.get("input_len"),
+                    "cache_len": group.get("cache_len"),
+                }
+            )
+        return total
     values = []
     for name in ("batch_size", "input_len", "cache_len"):
         value = identity.get(name)

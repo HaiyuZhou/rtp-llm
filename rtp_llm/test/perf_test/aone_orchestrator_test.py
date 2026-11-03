@@ -7,7 +7,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.aone.sharding import plan_shards
+from rtp_llm.test.perf_test.cli import parse_cli
 from rtp_llm.test.perf_test.config_resolver import resolve_config
+from rtp_llm.test.perf_test.entry import run_request
 from rtp_llm.test.perf_test.errors import ReportError
 from rtp_llm.test.perf_test.execution.aone import AOneExecutor
 from rtp_llm.test.perf_test.execution.aone_bazel import create_default_aone_executor
@@ -159,6 +161,12 @@ class AOneOrchestratorTest(unittest.TestCase):
                 self.assertEqual(RunState.COMPLETED, outcome.state)
                 self.assertEqual(0, outcome.exit_code)
                 self.assertEqual("formal", outcome.report["report_kind"])
+                for artifact in (
+                    "latency.interactive.html",
+                    "tpm.interactive.html",
+                    "formula/fit_report.json",
+                ):
+                    self.assertTrue((root / "reports" / artifact).is_file(), artifact)
                 builder.assert_called_once()
                 self.assertEqual(shard_count, submitter.call_count)
                 self.assertEqual(shard_count, result_collector.call_count)
@@ -184,6 +192,10 @@ class AOneOrchestratorTest(unittest.TestCase):
                     replace(plan, action="report")
                 )
                 self.assertEqual("formal", offline_report["report_kind"])
+                alias_report = run_request(
+                    parse_cli(["--mode=prefill", "--skip-test", f"--run-dir={root}"])
+                )
+                self.assertEqual(offline_report, alias_report)
 
     def test_remote_failure_keeps_valid_cases_and_generates_diagnostic_report(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -53,6 +53,7 @@ class UnifiedEntryTest(unittest.TestCase):
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertIn("--mode", completed.stdout)
         self.assertIn("--action", completed.stdout)
+        self.assertIn("--skip-test", completed.stdout)
         self.assertNotIn("--partial", completed.stdout)
 
     def test_local_dry_run_prints_plan_without_creating_result_root(self):

@@ -5,6 +5,42 @@ from rtp_llm.test.perf_test.errors import ConfigurationError
 
 
 class CliParsingTest(unittest.TestCase):
+    def test_skip_test_alias_selects_offline_prefill_report(self):
+        request = parse_cli(["--mode=prefill", "--skip-test", "--run-dir=runs/example"])
+        self.assertEqual("report", request.action)
+        self.assertEqual("runs/example", request.run_dir)
+        explicit = parse_cli(
+            [
+                "--mode=prefill",
+                "--action=report",
+                "--skip-test",
+                "--run-dir=runs/example",
+            ]
+        )
+        self.assertEqual(request, explicit)
+
+    def test_skip_test_rejects_decode_and_incompatible_actions(self):
+        invalid = (
+            ["--mode=decode", "--skip-test", "--run-dir=runs/example"],
+            ["--mode=prefill", "--skip-test", "--action=run", "--run-dir=runs/example"],
+            [
+                "--mode=prefill",
+                "--skip-test",
+                "--action=resume",
+                "--run-dir=runs/example",
+            ],
+            [
+                "--mode=prefill",
+                "--skip-test",
+                "--action=profile",
+                "--run-dir=runs/example",
+            ],
+            ["--mode=prefill", "--skip-test", "--config=config.json"],
+        )
+        for argv in invalid:
+            with self.subTest(argv=argv), self.assertRaises(ConfigurationError):
+                parse_cli(argv)
+
     def test_run_accepts_only_config_source(self):
         request = parse_cli(
             [

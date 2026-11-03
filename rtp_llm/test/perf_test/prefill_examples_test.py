@@ -33,22 +33,28 @@ class PrefillExamplesTest(unittest.TestCase):
         self.assertEqual("local", config.execution.backend)
         self.assertGreater(len(cases), 0)
 
-    def test_every_documented_action_has_a_valid_dry_run_command(self):
+    def test_documented_commands_include_all_actions_and_valid_previews(self):
         commands = _documented_commands()
-        self.assertEqual(4, len(commands))
+        self.assertGreaterEqual(len(commands), 4)
         requests = []
         for command in commands:
             self.assertEqual("./tools/perf_test", command[0])
             request = parse_cli(command[1:])
-            self.assertTrue(request.dry_run)
             self.assertEqual("prefill", request.mode)
             requests.append(request)
+        self.assertTrue(any("--skip-test" in command for command in commands))
         self.assertEqual(
             {"run", "resume", "profile", "report"},
             {request.action for request in requests},
         )
 
-        run = next(request for request in requests if request.action == "run")
+        run = next(
+            request
+            for request in requests
+            if request.action == "run"
+            and request.config == str(EXAMPLE.relative_to(ROOT.parents[2]))
+        )
+        self.assertTrue(run.dry_run)
         self.assertEqual(
             "rtp_llm/test/perf_test/examples/prefill_local.json", run.config
         )

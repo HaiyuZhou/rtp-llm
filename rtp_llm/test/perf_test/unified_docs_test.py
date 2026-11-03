@@ -1,15 +1,44 @@
+import json
 import re
 import shlex
 import unittest
 from pathlib import Path
 
 from rtp_llm.test.perf_test.cli import parse_cli
+from rtp_llm.test.perf_test.config_schema import parse_config
+from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
 
 ROOT = Path(__file__).resolve().parent
 DOCS = tuple(sorted((ROOT / "docs").glob("*.md")))
 
 
 class UnifiedDocsTest(unittest.TestCase):
+    def test_prefill_docs_cover_offline_alias_and_grouped_grids(self):
+        prefill = (ROOT / "docs" / "prefill.md").read_text(encoding="utf-8")
+        reference = (ROOT / "docs" / "reference.md").read_text(encoding="utf-8")
+        self.assertIn("--skip-test", prefill)
+        self.assertIn("request_groups", prefill)
+        self.assertIn("workload.grids", prefill)
+        self.assertIn("prefill_grouped_local.json", prefill)
+        self.assertIn("prefill_multi_grid_local.json", prefill)
+        self.assertIn("--skip-test", reference)
+
+    def test_grouped_and_multi_grid_examples_plan(self):
+        examples = ROOT / "examples"
+        for filename in ("prefill_grouped_local.json", "prefill_multi_grid_local.json"):
+            with self.subTest(filename=filename):
+                config = parse_config(json.loads((examples / filename).read_text()))
+                cases = plan_prefill_cases(
+                    config.workload, config.engine, dp_size=config.model.topology.dp
+                )
+                self.assertTrue(cases)
+                self.assertTrue(any("request_groups" in case for case in cases))
+                if filename == "prefill_multi_grid_local.json":
+                    self.assertEqual(
+                        ["cold", "mixed"],
+                        list(dict.fromkeys(case["grid_name"] for case in cases)),
+                    )
+
     def test_reference_covers_capabilities_layout_exit_codes_and_ci(self):
         reference = (ROOT / "docs" / "reference.md").read_text(encoding="utf-8")
         for text in (

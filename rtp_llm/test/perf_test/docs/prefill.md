@@ -21,16 +21,42 @@ timing fails the whole case and leaves its metrics empty.
 Throughput uses the complete round's monotonic wall-clock duration, starting at
 the common release and ending after all requests finish. Prompt construction,
 seeding, and scheduler updates are outside this interval. Each round contributes
-`compute_len * B / round_elapsed_seconds`; the case reports the arithmetic mean
-of these round rates, including for B=1. Server first-token latency is a separate
-metric: the median across all measured member responses. It is not the throughput
-denominator. For example, B=4 and compute_len=8 over a 0.2-second round gives
+the total computed tokens divided by `round_elapsed_seconds`; the case reports
+the arithmetic mean of these round rates, including for B=1. Server first-token
+latency is a separate metric: the case records the median across measured member
+responses, while the report's batch latency is the median of each round's maximum
+member latency. For example, B=4 and compute_len=8 over a 0.2-second round gives
 160 tokens/s regardless of individual first-token latencies of 10–40 ms.
 
 Flattened member evidence records the run, member index, server latency, observed
 reuse length, shared `round_elapsed_ms`, and measurement contract
-`concurrent_batch_v1`. All member latencies and round durations must be finite and
-positive.
+`concurrent_batch_v1`. Explicit request groups use
+`concurrent_grouped_batch_v1` and include each member's input, reuse, and compute
+lengths. All member latencies and round durations must be finite and positive.
+
+## Grouped and ordered grids
+
+`examples/prefill_grouped_local.json` shows `request_batches`, where every batch
+has `request_groups` entries with `count`, `input_len`, and `cache_len`. Counts sum
+to the measured batch size. `workload.workspace_tokens` is required; planning
+checks raw and block-padded token budgets and every member's sequence length.
+The runner seeds cached members independently before measuring them together.
+
+`examples/prefill_multi_grid_local.json` shows `workload.grids`. Grid names are
+unique and execution follows their declared order in one local engine session.
+Each grid has generated cases or explicit `request_batches`; shared alignment,
+commit tail, measurement runs, and workspace settings stay at workload level.
+The merged report keeps each case's grid name. AOne accepts one grid per run.
+
+Preview either example before running it:
+
+```bash
+./tools/perf_test --mode=prefill --action=run --config=rtp_llm/test/perf_test/examples/prefill_grouped_local.json --dry-run
+```
+
+```bash
+./tools/perf_test --mode=prefill --action=run --config=rtp_llm/test/perf_test/examples/prefill_multi_grid_local.json --dry-run
+```
 
 ## Run
 
@@ -49,7 +75,12 @@ model.
 
 Remove `--dry-run` to execute the plan. The created run directory contains the
 source and resolved configs, immutable execution plan, manifest, per-case
-results, checkpoints, reports, profiles, and traces.
+results, checkpoints, reports, profiles, and traces. A successful local or AOne
+run generates `reports/prefill_report.json`, standalone interactive latency and
+tokens-per-minute charts, SVG fallbacks, and `reports/formula/fit_report.json`
+in the same command. The fit report records rejection when there is insufficient
+data or the validation gates fail; a formula text file appears only for a valid
+candidate.
 
 ## Resume
 
@@ -66,8 +97,9 @@ successful case, and reruns the remaining planned cases.
 ```
 
 Persisted prefill plans must mark every case with measurement contract
-`concurrent_batch_v1` to resume or profile, including dry runs. Older directories
-remain readable with offline `report`, but new measurements require a fresh
+`concurrent_batch_v1` or `concurrent_grouped_batch_v1` to resume or profile,
+including dry runs. Older directories remain readable with offline `report`,
+but new measurements require a fresh
 `run --config=...` in a new directory. Existing plans are never migrated in place.
 
 ## Profile
@@ -87,10 +119,15 @@ and summaries remain unchanged. Case IDs come from the run's execution plan.
 
 ## Report
 
-`report` is offline. It reads the immutable plan and committed case files,
+`report` is offline. `--skip-test` selects the same prefill report action when
+`--action` is omitted. It reads the immutable plan and committed case files,
 excludes missing or invalid points, and writes a formal report only when all
 planned cases are valid. Otherwise it writes a diagnostic report and exclusion
 reasons. It does not launch a model or modify measured cases.
+
+```bash
+./tools/perf_test --mode=prefill --skip-test --run-dir=perf_test_results/prefill-run
+```
 
 ```bash
 ./tools/perf_test \
@@ -100,9 +137,11 @@ reasons. It does not launch a model or modify measured cases.
   --dry-run
 ```
 
-`resume`, `profile`, and `report` never accept a config override. Local prefill
-supports all four actions; AOne prefill supports `run` and offline `report`
-only.
+`--skip-test` requires prefill mode and `--run-dir`; it accepts an optional
+`--action=report` and supports `--dry-run` preview. It cannot be combined with
+run, resume, profile, or a config override. `resume`, `profile`, and `report`
+never accept a config override. Local prefill supports all four actions; AOne
+prefill supports `run` and offline `report` only.
 
 ## Contract labels and migration
 

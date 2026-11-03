@@ -94,12 +94,17 @@ py_library(
         "multi_node/decode_runtime.py",
         "multi_node/multi_benchmark.py",
         "prefill/checkpoint.py",
+        "prefill/chart.py",
         "prefill/finalize.py",
         "prefill/dashsc_transport.py",
+        "prefill/formula.py",
         "prefill/profile.py",
         "prefill/prompts.py",
+        "prefill/probe.py",
         "prefill/report.py",
+        "prefill/restricted_symbolic.py",
         "prefill/runner.py",
+        "prefill/trace.py",
         "results.py",
         "test_util.py",
     ],
@@ -166,12 +171,17 @@ py_library(
         "prefill/plan_validation.py",
         "prefill/planner.py",
         "prefill/checkpoint.py",
+        "prefill/chart.py",
         "prefill/finalize.py",
         "prefill/dashsc_transport.py",
+        "prefill/formula.py",
         "prefill/prompts.py",
         "prefill/profile.py",
+        "prefill/probe.py",
         "prefill/report.py",
+        "prefill/restricted_symbolic.py",
         "prefill/runner.py",
+        "prefill/trace.py",
         "publish/__init__.py",
         "publish/archive.py",
         "publish/odps.py",
@@ -447,7 +457,10 @@ py_test(
 py_test(
     name = "unified_docs_test",
     srcs = ["unified_docs_test.py"],
-    data = glob(["docs/*.md"]),
+    data = glob(["docs/*.md"]) + [
+        "examples/prefill_grouped_local.json",
+        "examples/prefill_multi_grid_local.json",
+    ],
     deps = [
         ":perf_test_entry_lib",
     ],
@@ -531,6 +544,25 @@ py_test(
     deps = [
         ":perf_test_lib",
     ],
+)
+
+py_test(
+    name = "prefill_chart_test",
+    srcs = ["prefill_chart_test.py", "prefill_report_test.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
+    name = "prefill_formula_test",
+    srcs = ["prefill_formula_test.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
+    name = "prefill_offline_integration_test",
+    srcs = ["prefill_offline_integration_test.py"],
+    data = ["//tools:perf_test_script"],
+    deps = [":perf_test_lib"],
 )
 
 py_test(

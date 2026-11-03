@@ -403,6 +403,11 @@ class DefaultExecutorTest(unittest.TestCase):
             self.assertTrue((root / "results" / "result.json").is_file())
             self.assertTrue((root / "results" / "summary.json").is_file())
             self.assertTrue((root / "reports" / "prefill_report.json").is_file())
+            self.assertTrue((root / "reports" / "latency.interactive.html").is_file())
+            self.assertTrue((root / "reports" / "tpm.interactive.html").is_file())
+            self.assertTrue(
+                (root / "reports" / "formula" / "fit_report.json").is_file()
+            )
 
     def test_engine_failure_preserves_typed_outcome_without_finalizing_cases(self):
         with tempfile.TemporaryDirectory() as directory:

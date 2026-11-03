@@ -309,9 +309,9 @@ def generate_prefill_report(
                 ],
             },
             "chart": {
-                "x": "compute_length",
-                "y": "observed_reuse_length",
-                "z": "latency_ms",
+                "x": "total_compute_tokens",
+                "latency_y": "batch_latency_ms",
+                "tpm_y": "tokens_per_minute",
             },
         }
         from rtp_llm.test.perf_test.prefill.formula import fit_prefill_formula

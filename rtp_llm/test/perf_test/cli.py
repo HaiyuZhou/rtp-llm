@@ -27,8 +27,11 @@ class _ConfigArgumentParser(argparse.ArgumentParser):
 def create_parser() -> argparse.ArgumentParser:
     parser = _ConfigArgumentParser(prog="perf_test", add_help=True)
     parser.add_argument("--mode", required=True, choices=("prefill", "decode"))
+    parser.add_argument("--action", choices=("run", "resume", "profile", "report"))
     parser.add_argument(
-        "--action", required=True, choices=("run", "resume", "profile", "report")
+        "--skip-test",
+        action="store_true",
+        help="regenerate a prefill report from --run-dir without starting an engine",
     )
     parser.add_argument("--config")
     parser.add_argument("--run-dir")
@@ -46,11 +49,21 @@ def _non_empty(option: str, value: Optional[str]) -> Optional[str]:
 def parse_cli(argv: Sequence[str]) -> CliRequest:
     """Parse and validate inputs without loading config or persisted run state."""
     namespace = create_parser().parse_args(list(argv))
+    if namespace.skip_test:
+        if namespace.mode != "prefill":
+            raise ConfigurationError("--skip-test requires --mode=prefill")
+        if namespace.action not in (None, "report"):
+            raise ConfigurationError(
+                "--skip-test is only compatible with --action=report"
+            )
+    if namespace.action is None and not namespace.skip_test:
+        raise ConfigurationError("--action is required unless --skip-test is set")
+    action = "report" if namespace.skip_test else namespace.action
     config = _non_empty("--config", namespace.config)
     run_dir = _non_empty("--run-dir", namespace.run_dir)
     cases = tuple(namespace.cases)
 
-    if namespace.action == "run":
+    if action == "run":
         if config is None:
             raise ConfigurationError("--action=run requires --config")
         if run_dir is not None:
@@ -59,12 +72,12 @@ def parse_cli(argv: Sequence[str]) -> CliRequest:
             raise ConfigurationError("--cases is only valid with --action=profile")
     else:
         if run_dir is None:
-            raise ConfigurationError(f"--action={namespace.action} requires --run-dir")
+            raise ConfigurationError(f"--action={action} requires --run-dir")
         if config is not None:
             raise ConfigurationError(
-                f"--action={namespace.action} does not accept --config overrides"
+                f"--action={action} does not accept --config overrides"
             )
-        if cases and namespace.action != "profile":
+        if cases and action != "profile":
             raise ConfigurationError("--cases is only valid with --action=profile")
 
     if any(not case for case in cases):
@@ -74,7 +87,7 @@ def parse_cli(argv: Sequence[str]) -> CliRequest:
 
     return CliRequest(
         mode=namespace.mode,
-        action=namespace.action,
+        action=action,
         config=config,
         run_dir=run_dir,
         cases=cases,

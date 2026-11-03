@@ -918,6 +918,41 @@ class _RecordingRunnerModule:
         return "handle-sentinel"
 
 
+def _fake_execution_plan(label="fake-plan"):
+    """Minimal execution plan for exercising the engine-launch projection."""
+    from rtp_llm.test.perf_test.plan import AOneResourcePlan
+
+    return SimpleNamespace(
+        label=label,
+        resource_plan=AOneResourcePlan(
+            backend="aone",
+            resource="daily",
+            gpu_type="H20_CU13",
+            gpus_per_shard=2,
+            shard_count=None,
+            max_parallel=2,
+            gpus_per_machine=1,
+            machine_count=2,
+            local_world_size=1,
+        ),
+        resolved_config={
+            "model": {
+                "type": "qwen_2",
+                "checkpoint": "Qwen/Qwen2.5-0.5B-Instruct",
+                "tokenizer": "Qwen/Qwen2.5-0.5B-Instruct",
+                "topology": {"tp": 2, "dp": 1, "pp": 1, "ep": 1},
+            },
+            "engine": {
+                "max_seq_len": 4097,
+                "max_batch_tokens": 8192,
+                "concurrency_limit": 2,
+                "args": {},
+                "env": {},
+            },
+        },
+    )
+
+
 class DefaultServerRunnerPlanTest(_WorkerTestCase):
     """The default server runner picks the plan builder by gang mode.
 
@@ -956,11 +991,19 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
 
         def fake_decode_plan(path, **kwargs):
             decode_calls.append((path, kwargs))
-            return ("decode-plan", "decode-source")
+            return (_fake_execution_plan("decode-plan"), "decode-source")
 
         def fake_prefill_plan(path, **kwargs):
             prefill_calls.append((path, kwargs))
-            return ("prefill-plan", "prefill-source")
+            return (_fake_execution_plan("prefill-plan"), "prefill-source")
+
+        setup_args_calls = []
+
+        def fake_setup_args(argv=None):
+            setup_args_calls.append(argv)
+            return SimpleNamespace(
+                parallelism_config=object(), prefill_cp_config=object()
+            )
 
         with patch.dict(
             os.environ,
@@ -979,9 +1022,7 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
                 "rtp_llm.config.server_config_setup.set_parallelism_config"
             ), patch(
                 "rtp_llm.server.server_args.server_args.setup_args",
-                return_value=SimpleNamespace(
-                    parallelism_config=object(), prefill_cp_config=object()
-                ),
+                side_effect=fake_setup_args,
             ), patch(
                 "rtp_llm.test.perf_test.multi_node.decode_runtime"
                 ".build_external_decode_plan",
@@ -992,6 +1033,7 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
                 side_effect=fake_prefill_plan,
             ):
                 handle = _default_server_runner(context)
+        self.setup_args_calls = setup_args_calls
         return handle, runner, decode_calls, prefill_calls
 
     def _merged_example(self, mode):
@@ -999,6 +1041,23 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
         merged_path = self.root / f"merged_{mode}.json"
         merged_path.write_text(json.dumps(merged), encoding="utf-8")
         return merged_path
+
+    def test_setup_args_receives_plan_engine_argv_not_worker_flags(self):
+        # Regression: setup_args() parsed sys.argv, so the worker's own
+        # --resolved-config/--gang-plan flags reached the engine parser and
+        # aborted the shard. The engine argv must come from the plan instead.
+        plan = self._example_gang_plan()
+        merged_path = self._merged_example("decode")
+
+        self._run_default_server_runner(plan, merged_path)
+
+        self.assertEqual(1, len(self.setup_args_calls))
+        argv = self.setup_args_calls[0]
+        self.assertIsNotNone(argv, "engine argv must be explicit, never sys.argv")
+        argv_text = " ".join(argv)
+        self.assertIn("--tp_size=2", argv_text)
+        for worker_flag in ("--resolved-config", "--resolved-workload", "--gang-plan"):
+            self.assertNotIn(worker_flag, argv_text)
 
     def test_cache_grid_workload_builds_the_prefill_rank_group_plan(self):
         plan = self._example_gang_plan()
@@ -1019,7 +1078,7 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
         self.assertEqual(self.TOPOLOGY, kwargs["actual_topology"])
         # The prefill plan is what the local rank group starts from.
         self.assertEqual(1, len(runner.rank_contexts))
-        self.assertEqual("prefill-plan", runner.rank_contexts[0].plan)
+        self.assertEqual("prefill-plan", runner.rank_contexts[0].plan.label)
         self.assertEqual(1, len(runner.starts))
         rank_context, _configs, model_paths = runner.starts[0]
         self.assertIs(runner.rank_contexts[0], rank_context)
@@ -1041,7 +1100,7 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
         self.assertEqual(str(self.outputs / "run"), kwargs["result_directory"])
         self.assertEqual(self.TOPOLOGY, kwargs["actual_topology"])
         self.assertEqual(1, len(runner.rank_contexts))
-        self.assertEqual("decode-plan", runner.rank_contexts[0].plan)
+        self.assertEqual("decode-plan", runner.rank_contexts[0].plan.label)
 
 
 class DefaultMasterExecutorTest(_WorkerTestCase):

@@ -750,13 +750,22 @@ def _default_server_runner(context: GangWorkerContext):
 
     outputs = Path(os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR", os.getcwd()))
     log_dir = outputs / f"TEST_OUTPUT_{plan['run_id']}_{context.world_rank}"
-    configs = setup_args()
-    set_parallelism_config(
-        configs.parallelism_config, py_prefill_cp_config=configs.prefill_cp_config
-    )
     # The plan builder follows the gang mode: decode gangs keep the decode
     # plan, cache_grid (prefill) gangs build the prefill plan.
     execution_plan, _source = _build_rank_group_plan(config_path, context, outputs)
+    # Engine argv comes from the plan, never from this process's sys.argv:
+    # the worker's own flags (--resolved-config ...) would be rejected by the
+    # engine parser, which is exactly what setup_args() with no argument
+    # would parse.
+    from rtp_llm.test.perf_test.execution.runtime import build_engine_launch_spec
+
+    launch = build_engine_launch_spec(execution_plan)
+    for key, value in launch.environment.items():
+        os.environ.setdefault(key, value)
+    configs = setup_args(list(launch.argv))
+    set_parallelism_config(
+        configs.parallelism_config, py_prefill_cp_config=configs.prefill_cp_config
+    )
     rank_context = runner.LocalRankGroupContext(
         port=int(plan["port_range"]["start"]),
         world_rank=context.world_rank,

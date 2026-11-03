@@ -1243,7 +1243,11 @@ class DefaultPrefillMasterExecutorTest(_WorkerTestCase):
             side_effect=fake_initialize,
         ), patch(
             "rtp_llm.test.perf_test.aone.gang_worker._resolve_model_paths",
-            return_value="/tokenizer",
+            return_value={
+                "type": "qwen_2",
+                "checkpoint": "/resolved/checkpoint",
+                "tokenizer": "/tokenizer",
+            },
         ), patch(
             "rtp_llm.test.perf_test.test_util._load_tokenizer",
             return_value=object(),

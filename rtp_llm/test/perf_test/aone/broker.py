@@ -3,8 +3,8 @@
 The broker runs on the submit host and lets N symmetric gang members
 discover each other through a small authenticated HTTP API. Workers do not
 self-discover their routable address: the broker records each
-registration's HTTP source address and cross-checks the claimed hostname
-through an injectable resolver. The broker serves only bounded run
+registration's HTTP source address and keeps the claimed hostname alongside
+a best-effort reverse lookup for diagnostics. The broker serves only bounded run
 metadata — no commands, no source files, no filesystem paths beyond the
 state directory — and never persists the bearer token.
 """
@@ -191,7 +191,7 @@ class GangBroker:
 
     def stop(self) -> None:
         """Stop serving and wake every blocked rendezvous call."""
-        if self._stopped:
+        if not self._started or self._stopped:
             return
         self._stopped = True
         self._stop_event.set()
@@ -393,6 +393,8 @@ class GangBroker:
                 self._append_event_locked("gang_completed")
                 self._persist_state_locked()
                 self._condition.notify_all()
+            else:
+                self._persist_state_locked()
             return {"status": "recorded"}
 
     def cleanup(self) -> Dict[str, Any]:
@@ -503,6 +505,14 @@ class _BrokerServer(ThreadingHTTPServer):
         super().__init__(address, _BrokerHandler)
         self.broker = broker
 
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        """Keep routine client disconnects out of broker stderr."""
+        exception = sys.exc_info()[1]
+        if isinstance(exception, (BrokenPipeError, ConnectionResetError)):
+            _LOG.debug("broker client %s disconnected: %r", client_address, exception)
+            return
+        super().handle_error(request, client_address)
+
 
 class _BrokerHandler(BaseHTTPRequestHandler):
     """Loopback-safe request handler; errors are status codes plus JSON."""
@@ -514,22 +524,6 @@ class _BrokerHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args: Any) -> None:
         """Keep test and service output pristine."""
-
-    def handle_error(self, request: Any, client_address: Any) -> None:
-        """Collapse client-disconnect tracebacks to a single log line.
-
-        ``ThreadingHTTPServer`` funnels per-connection exceptions here and
-        prints a full traceback by default; a worker dropping its HTTP
-        connection mid-poll (timeout, shutdown race) is routine, so those
-        get one quiet line while every other error stays fully visible.
-        """
-        exception = sys.exc_info()[1]
-        if isinstance(exception, (BrokenPipeError, ConnectionResetError)):
-            _LOG.debug(
-                "broker client %s disconnected: %r", client_address, exception
-            )
-            return
-        super().handle_error(request, client_address)
 
     def version_string(self) -> str:
         return self.server_version

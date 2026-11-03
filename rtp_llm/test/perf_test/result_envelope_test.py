@@ -578,7 +578,9 @@ class ResultEnvelopeTest(unittest.TestCase):
         for value in (_decode_result(), _prefill_result()):
             with self.subTest(mode=value["mode"]):
                 value["backend"] = "remote"
-                with self.assertRaisesRegex(ResultSchemaError, "backend"):
+                with self.assertRaisesRegex(
+                    ResultSchemaError, "backend: expected local or aone"
+                ):
                     parse_result_envelope(value)
 
     def test_legacy_cache_grid_result_is_not_accepted_as_envelope(self):

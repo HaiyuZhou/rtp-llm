@@ -48,8 +48,8 @@ from rtp_llm.test.perf_test.execution.aone import (
     is_gang_plan,
 )
 from rtp_llm.test.perf_test.execution.aone_bazel import (
-    AONE_TEST_TIMEOUT_S,
     _MAX_ARCHIVE_MEMBERS,
+    AONE_TEST_TIMEOUT_S,
     _positive_integer,
     _safe_zip_member,
     _workspace_root,
@@ -243,14 +243,17 @@ class GangAOneExecutor(AOneExecutor):
                 stage="rendezvous",
                 status="running",
             )
-            broker = run_gang_broker(
-                resource.machine_count,
-                state_dir=root / "workload" / "gang_broker",
-                host=self._broker_host or resolve_broker_host(),
-            )
+            broker = None
             try:
+                broker = run_gang_broker(
+                    resource.machine_count,
+                    state_dir=root / "workload" / "gang_broker",
+                    host=self._broker_host or resolve_broker_host(),
+                )
                 broker.start()
             except Exception as error:
+                if broker is not None:
+                    self._quiet(broker.stop)
                 return self._stage_failure(
                     store=store, manifest=manifest, stage="rendezvous", error=error
                 )
@@ -276,7 +279,7 @@ class GangAOneExecutor(AOneExecutor):
                     raise
             finally:
                 self._quiet(broker.cleanup)
-                broker.stop()
+                self._quiet(broker.stop)
 
     # Stages ---------------------------------------------------------------
 
@@ -628,9 +631,7 @@ class GangAOneExecutor(AOneExecutor):
                 else:
                     shutil.copy2(source, target)
 
-    def _collect_master_tree(
-        self, root: Path, outputs: Path
-    ) -> CollectionOutcome:
+    def _collect_master_tree(self, root: Path, outputs: Path) -> CollectionOutcome:
         run_tree = outputs / "run"
         envelope_path = run_tree / "results" / "result.json"
         if not envelope_path.is_file():

@@ -705,7 +705,7 @@ def parse_result_envelope(value: Any) -> ResultEnvelope:
     # Both modes accept the aone backend: a gang run reports through the same
     # envelope as a local run (single-machine decode+aone never reaches one).
     if backend not in {"local", "aone"}:
-        raise ResultSchemaError("backend: unsupported for result mode")
+        raise ResultSchemaError("backend: expected local or aone")
     try:
         status = RunState(raw["status"])
     except ValueError as error:

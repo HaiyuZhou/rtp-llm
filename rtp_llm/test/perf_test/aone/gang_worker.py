@@ -122,7 +122,9 @@ class BrokerCoordinates:
     run_id: str
 
 
-def broker_coordinates(environ: Optional[Mapping[str, str]] = None) -> BrokerCoordinates:
+def broker_coordinates(
+    environ: Optional[Mapping[str, str]] = None
+) -> BrokerCoordinates:
     """Read the broker coordinates; every variable is mandatory."""
     environ = os.environ if environ is None else environ
     missing = [
@@ -132,8 +134,7 @@ def broker_coordinates(environ: Optional[Mapping[str, str]] = None) -> BrokerCoo
     ]
     if missing:
         raise WorkerConfigError(
-            "gang worker requires the environment variable(s): "
-            + ", ".join(missing)
+            "gang worker requires the environment variable(s): " + ", ".join(missing)
         )
     return BrokerCoordinates(
         url=environ[BROKER_URL_ENV].strip(),
@@ -179,7 +180,9 @@ class BrokerClient:
     def gang_state(self) -> Optional[str]:
         return self._gang_state
 
-    def register(self, shard_index: int, hostname: str, port: int) -> List[BrokerMember]:
+    def register(
+        self, shard_index: int, hostname: str, port: int
+    ) -> List[BrokerMember]:
         """Register this shard; returns the members when this call completes the gang."""
         body = self._call(
             "POST",
@@ -204,10 +207,15 @@ class BrokerClient:
 
     def heartbeat(self, shard_index: int) -> None:
         self._call(
-            "POST", "heartbeat", {"shard_index": shard_index}, timeout_s=HEARTBEAT_TIMEOUT_S
+            "POST",
+            "heartbeat",
+            {"shard_index": shard_index},
+            timeout_s=HEARTBEAT_TIMEOUT_S,
         )
 
-    def report(self, shard_index: int, state: str, detail: Optional[str] = None) -> None:
+    def report(
+        self, shard_index: int, state: str, detail: Optional[str] = None
+    ) -> None:
         self._call(
             "POST",
             "result",
@@ -219,7 +227,14 @@ class BrokerClient:
         """Close the rendezvous run. Only the submit side calls this."""
         self._call("POST", "cleanup", None, timeout_s=REPORT_TIMEOUT_S)
 
-    def _call(self, method: str, op: str, payload: Optional[Dict[str, Any]], *, timeout_s: float) -> Dict[str, Any]:
+    def _call(
+        self,
+        method: str,
+        op: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        timeout_s: float,
+    ) -> Dict[str, Any]:
         url = f"{self._base}/v1/runs/{self._run_id}/{op}"
         try:
             response = self._request(
@@ -240,7 +255,11 @@ class BrokerClient:
             body = {}
         if status == 200:
             return body if isinstance(body, dict) else {}
-        code = body.get("error", f"http_{status}") if isinstance(body, dict) else f"http_{status}"
+        code = (
+            body.get("error", f"http_{status}")
+            if isinstance(body, dict)
+            else f"http_{status}"
+        )
         if status == 504 or code in self._FAILURE_CODES:
             raise GangBrokerFailure(f"broker reported gang failure during {op}: {code}")
         raise BrokerRejectedError(f"broker rejected {op}: HTTP {status} {code}")
@@ -327,8 +346,14 @@ def load_gang_plan(path: Path) -> Dict[str, Any]:
         raise WorkerConfigError(
             f"unsupported gang plan schema_version: {plan.get('schema_version')!r}"
         )
-    for field in ("run_id", "machine_count", "local_world_size", "master_shard_index",
-                  "port_range", "topology"):
+    for field in (
+        "run_id",
+        "machine_count",
+        "local_world_size",
+        "master_shard_index",
+        "port_range",
+        "topology",
+    ):
         if field not in plan:
             raise WorkerConfigError(f"gang plan is missing required field {field!r}")
     if not isinstance(plan["run_id"], str) or not plan["run_id"]:
@@ -340,7 +365,10 @@ def load_gang_plan(path: Path) -> Dict[str, Any]:
     if type(local_world_size) is not int or local_world_size < 1:
         raise WorkerConfigError("gang plan local_world_size must be a positive integer")
     master_shard_index = plan["master_shard_index"]
-    if type(master_shard_index) is not int or not 0 <= master_shard_index < machine_count:
+    if (
+        type(master_shard_index) is not int
+        or not 0 <= master_shard_index < machine_count
+    ):
         raise WorkerConfigError(
             f"gang plan master_shard_index {master_shard_index!r} is outside the gang"
         )
@@ -368,7 +396,9 @@ def load_gang_plan(path: Path) -> Dict[str, Any]:
     return plan
 
 
-def shard_index_from_env(gang_plan: Dict[str, Any], environ: Optional[Mapping[str, str]] = None) -> int:
+def shard_index_from_env(
+    gang_plan: Dict[str, Any], environ: Optional[Mapping[str, str]] = None
+) -> int:
     """Derive this worker's shard index from the Bazel sharding env."""
     environ = os.environ if environ is None else environ
     raw_index = environ.get(SHARD_INDEX_ENV)
@@ -425,12 +455,10 @@ def _apply_environment(context: GangWorkerContext) -> None:
 
 
 def _canonical_local_hostname() -> str:
-    """Best-effort canonical hostname matching the broker's resolver.
+    """Choose a stable claimed hostname, falling back to the plain name.
 
-    The broker reverse-resolves each registration's source address and
-    cross-checks the claimed hostname, so claiming the canonical name for
-    our own address maximizes the match; any resolution failure falls back
-    to the plain hostname.
+    The broker records this claim and its own best-effort reverse lookup for
+    diagnostics; registration tolerates a mismatch between the two.
     """
     name = socket.gethostname()
     try:
@@ -484,7 +512,9 @@ def _run_master(
         )
     except Exception as error:
         _report_failure_vote(
-            broker, shard_index, f"master executor failed: {type(error).__name__}: {error}"
+            broker,
+            shard_index,
+            f"master executor failed: {type(error).__name__}: {error}",
         )
         raise GangExecutionError(
             f"master executor failed: {type(error).__name__}: {error}"
@@ -513,9 +543,7 @@ def _run_waiter(
     then follows the gang outcome: completed is success, any broker-
     reported failure is an immediate nonzero exit.
     """
-    broker.report(
-        shard_index, "completed", "rank group up; awaiting master completion"
-    )
+    broker.report(shard_index, "completed", "rank group up; awaiting master completion")
     while True:
         if heartbeats.failed.is_set():
             raise GangBrokerFailure("heartbeat rejected by the broker; gang failed")
@@ -530,7 +558,9 @@ def _report_failure_vote(broker: BrokerClient, shard_index: int, detail: str) ->
     try:
         broker.report(shard_index, "failed", detail)
     except GangWorkerError as report_error:
-        _LOG.warning("failure vote was rejected (gang already terminal): %s", report_error)
+        _LOG.warning(
+            "failure vote was rejected (gang already terminal): %s", report_error
+        )
 
 
 def _run_worker(
@@ -608,7 +638,11 @@ def run_gang_worker(
     kind. Partial ``run/`` artifacts always remain on disk.
     """
     outputs = Path(test_outputs_dir)
-    outcome: Dict[str, Any] = {"state": "completed", "exit_code": EXIT_SUCCESS, "detail": None}
+    outcome: Dict[str, Any] = {
+        "state": "completed",
+        "exit_code": EXIT_SUCCESS,
+        "detail": None,
+    }
     gang_plan: Optional[Dict[str, Any]] = None
     record: Dict[str, Any] = {}
     try:
@@ -819,7 +853,9 @@ def _replace_resolved_config(plan: Any, resolved_config: Dict[str, Any]) -> Any:
     return SimpleNamespace(**fields)
 
 
-def _resolve_model_paths(config_path: str, plan: Mapping[str, Any]) -> Mapping[str, Any]:
+def _resolve_model_paths(
+    config_path: str, plan: Mapping[str, Any]
+) -> Mapping[str, Any]:
     """Resolve the model section (type, checkpoint, tokenizer) locally.
 
     Hub repo ids are downloaded through the shared remote resolver; the
@@ -933,9 +969,7 @@ def _default_prefill_master_executor(
                 commit_tail_tokens=commit_tail,
             )
         )
-        result = adapter(
-            ModeExecutionContext(plan=plan, session=session, store=store)
-        )
+        result = adapter(ModeExecutionContext(plan=plan, session=session, store=store))
         finalize_prefill_run(
             root,
             plan=plan,
@@ -978,7 +1012,9 @@ def merged_config_mode(config_path: Path) -> str:
     raise WorkerConfigError(f"unsupported gang workload kind: {kind!r}")
 
 
-def _merge_workload(resolved_config: str, resolved_workload: str, outputs: Path) -> Path:
+def _merge_workload(
+    resolved_config: str, resolved_workload: str, outputs: Path
+) -> Path:
     """Combine the package's config and workload runfiles for plan building.
 
     Gang packages freeze the workload in its own runfile; the plan builders
@@ -1005,8 +1041,12 @@ def main(
     master_executor: Optional[Callable[..., int]] = None,
 ) -> int:
     """Bazel entry point: parse runfile args and drive one gang worker."""
-    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
-    parser = argparse.ArgumentParser(description="Run one multi-machine gang worker shard.")
+    logging.basicConfig(
+        level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s"
+    )
+    parser = argparse.ArgumentParser(
+        description="Run one multi-machine gang worker shard."
+    )
     parser.add_argument("--resolved-config", required=True)
     parser.add_argument("--resolved-workload", required=True)
     parser.add_argument("--gang-plan", required=True)
@@ -1016,10 +1056,14 @@ def main(
     try:
         outputs.mkdir(parents=True, exist_ok=True)
         coordinates = broker_coordinates()
-        merged_config = _merge_workload(args.resolved_config, args.resolved_workload, outputs)
+        merged_config = _merge_workload(
+            args.resolved_config, args.resolved_workload, outputs
+        )
         # Resolve the mode here so a bad workload kind fails setup with the
         # intended message and exit code instead of escaping as a traceback.
-        mode = None if master_executor is not None else merged_config_mode(merged_config)
+        mode = (
+            None if master_executor is not None else merged_config_mode(merged_config)
+        )
     except GangWorkerError as error:
         print(f"gang worker setup failed: {error}", file=sys.stderr)
         return error.exit_code
@@ -1041,7 +1085,9 @@ def main(
         merged_config,
         Path(args.gang_plan),
         broker=broker,
-        server_runner=_default_server_runner if server_runner is None else server_runner,
+        server_runner=(
+            _default_server_runner if server_runner is None else server_runner
+        ),
         test_outputs_dir=outputs,
         master_executor=executor,
     )

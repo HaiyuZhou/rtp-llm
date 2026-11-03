@@ -1,13 +1,17 @@
 """Loopback HTTP tests for the gang rendezvous broker."""
 
+import io
 import json
 import socket
+import struct
 import threading
 import time
 import unittest
+from contextlib import redirect_stderr
 from http.client import HTTPConnection
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from urllib.parse import urlsplit
 
 from rtp_llm.test.perf_test.aone.broker import (
@@ -143,6 +147,55 @@ class GangBrokerTest(unittest.TestCase):
         self.addCleanup(broker.stop)
         return broker
 
+    def test_stop_before_start_is_harmless(self):
+        broker = run_gang_broker(1, state_dir=self.state_dir, host=_LOOPBACK)
+
+        broker.stop()
+
+        self.assertFalse(self.state_dir.joinpath("broker_events.jsonl").exists())
+        broker.start()
+        broker.stop()
+
+    def test_disconnected_members_client_does_not_print_traceback(self):
+        broker = self._start_broker(machine_count=2)
+        entered = threading.Event()
+        original_await = broker.await_members
+
+        def await_members():
+            entered.set()
+            return original_await()
+
+        broker.await_members = await_members
+        target = urlsplit(broker.url)
+        client = socket.create_connection((target.hostname, target.port))
+        self.addCleanup(client.close)
+        client.sendall(
+            (
+                f"GET /v1/runs/{broker.run_id}/members HTTP/1.1\r\n"
+                f"Host: {target.hostname}\r\n"
+                f"Authorization: Bearer {broker.token}\r\n\r\n"
+            ).encode()
+        )
+        self.assertTrue(entered.wait(5.0))
+        error_handled = threading.Event()
+        original_handle_error = broker._server.handle_error
+
+        def handle_error(request, client_address):
+            try:
+                original_handle_error(request, client_address)
+            finally:
+                error_handled.set()
+
+        with patch.object(broker._server, "handle_error", side_effect=handle_error):
+            with redirect_stderr(io.StringIO()) as stderr:
+                client.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                )
+                client.close()
+                broker.cleanup()
+                self.assertTrue(error_handled.wait(5.0))
+            self.assertEqual("", stderr.getvalue())
+
     def test_register_records_source_address(self):
         broker = self._start_broker(machine_count=1)
 
@@ -203,6 +256,10 @@ class GangBrokerTest(unittest.TestCase):
         status, body = _request(broker, "explode", payload={})
         self.assertEqual(404, status)
         self.assertEqual({"error": "unknown_operation"}, body)
+
+        status, body = _request(broker, "members", method="POST")
+        self.assertEqual(405, status)
+        self.assertEqual({"error": "method_not_allowed"}, body)
 
     def test_duplicate_shard_registration_rejected(self):
         broker = self._start_broker(machine_count=2)
@@ -345,12 +402,13 @@ class GangBrokerTest(unittest.TestCase):
         self.assertEqual(200, _register(broker, 0, "host-a", 9000)[0])
 
         started = time.monotonic()
+        expected_remaining = max(0.0, broker._start_monotonic + 0.4 - started)
         status, body = _request(broker, "members", method="GET")
         elapsed = time.monotonic() - started
 
         self.assertEqual(504, status)
         self.assertEqual("register_deadline_exceeded", body["error"])
-        self.assertGreaterEqual(elapsed, 0.3)
+        self.assertGreaterEqual(elapsed, expected_remaining - 0.05)
         self.assertLess(elapsed, 10.0)
         self.assertEqual("failed", broker.gang_state)
         self.assertEqual((BrokerMember(0, _LOOPBACK, "host-a", 9000),), broker.members)
@@ -370,6 +428,8 @@ class GangBrokerTest(unittest.TestCase):
 
         self.assertTrue(_wait_for(lambda: broker.gang_state == "failed"))
         self.assertEqual("heartbeat_expired", broker.failure_reason)
+        state = json.loads((self.state_dir / "broker_state.json").read_text())
+        self.assertEqual([0], state["lost_shard_indices"])
 
     def test_run_deadline_fails_incomplete_gang(self):
         broker = self._start_broker(
@@ -418,6 +478,23 @@ class GangBrokerTest(unittest.TestCase):
         )
         self.assertEqual(409, status)
         self.assertEqual("duplicate_result", body["error"])
+
+    def test_partial_member_result_is_persisted_immediately(self):
+        broker = self._start_broker(machine_count=2)
+        self.assertEqual(200, _register(broker, 0, "host-a", 9000)[0])
+
+        status, _ = _request(
+            broker,
+            "result",
+            payload={"shard_index": 0, "state": "completed", "detail": "ok"},
+        )
+
+        self.assertEqual(200, status)
+        state = json.loads((self.state_dir / "broker_state.json").read_text())
+        self.assertEqual(
+            {"0": {"state": "completed", "detail": "ok"}}, state["results"]
+        )
+        self.assertEqual("registering", state["gang_state"])
 
     def test_member_failure_fails_gang(self):
         broker = self._start_broker(machine_count=1)

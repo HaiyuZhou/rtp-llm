@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from rtp_llm.test.perf_test.aone.broker import run_gang_broker
 from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.errors import CollectionError
 from rtp_llm.test.perf_test.execution.aone import is_gang_plan
@@ -139,23 +140,23 @@ def _case_result(case, status="ok"):
         "identity": identity,
         "status": status,
         "runs": 1,
-        "errors": []
-        if ok
-        else [{"code": status, "message": "remote case failed"}],
-        "metrics": {
-            "input_length": identity["input_len"],
-            "expected_reuse_length": identity["cache_len"],
-            "observed_reuse_length": identity["cache_len"],
-            "compute_length": identity["compute_len"],
-            "latency_ms": 10.0,
-            "throughput_tokens_per_second": 1000.0,
-            "validation": {"shape": True, "reuse": True, "timing": True},
-            "seed": 1,
-            "prefix_policy": {"kind": "shared_seed"},
-            "measurements": [{"run": 0, "latency_ms": 10.0}],
-        }
-        if ok
-        else None,
+        "errors": [] if ok else [{"code": status, "message": "remote case failed"}],
+        "metrics": (
+            {
+                "input_length": identity["input_len"],
+                "expected_reuse_length": identity["cache_len"],
+                "observed_reuse_length": identity["cache_len"],
+                "compute_length": identity["compute_len"],
+                "latency_ms": 10.0,
+                "throughput_tokens_per_second": 1000.0,
+                "validation": {"shape": True, "reuse": True, "timing": True},
+                "seed": 1,
+                "prefix_policy": {"kind": "shared_seed"},
+                "measurements": [{"run": 0, "latency_ms": 10.0}],
+            }
+            if ok
+            else None
+        ),
     }
 
 
@@ -321,9 +322,7 @@ class _GangExecutorTestCase(unittest.TestCase):
         return self.plan
 
     def _shard_base(self):
-        relative = (self.root / "workload" / "aone_package").relative_to(
-            self.workspace
-        )
+        relative = (self.root / "workload" / "aone_package").relative_to(self.workspace)
         return self.testlogs / relative / "gang"
 
     def _executor(self, runner, **kwargs):
@@ -354,10 +353,48 @@ class _GangExecutorTestCase(unittest.TestCase):
 
 
 class GangStageLifecycleTest(_GangExecutorTestCase):
+    def test_broker_constructor_failure_records_rendezvous_failure(self):
+        plan = self._setup_run()
+        with patch(
+            "rtp_llm.test.perf_test.execution.aone_gang.run_gang_broker",
+            side_effect=RuntimeError("broker construction failed"),
+        ):
+            outcome = self._executor(FakeBazelRun()).execute(plan)
+
+        self.assertEqual(RunState.FAILED, outcome.state)
+        self.assertIn("broker construction failed", str(outcome.failure))
+        self.assertEqual("failed", self._manifest()["stages"]["rendezvous"]["status"])
+
+    def test_broker_stop_failure_does_not_mask_build_failure(self):
+        plan = self._setup_run()
+
+        def broker_with_failing_stop(*args, **kwargs):
+            broker = run_gang_broker(*args, **kwargs)
+            original_stop = broker.stop
+
+            def stop():
+                original_stop()
+                raise RuntimeError("stop failed")
+
+            broker.stop = stop
+            return broker
+
+        with patch(
+            "rtp_llm.test.perf_test.execution.aone_gang.run_gang_broker",
+            side_effect=broker_with_failing_stop,
+        ):
+            outcome = self._executor(FakeBazelRun(returncodes=(1,))).execute(plan)
+
+        self.assertEqual(RunState.FAILED, outcome.state)
+        self.assertIn("Bazel gang build exited 1", str(outcome.failure))
+        self.assertNotIn("stop failed", str(outcome.failure))
+
     def test_completed_gang_persists_stages_in_order_and_exports_broker_env(self):
         plan = self._setup_run()
         _write_testlogs_tree(self._shard_base(), plan)
-        runner = FakeBazelRun(on_test_command=lambda command, env: _register_members(env, 1))
+        runner = FakeBazelRun(
+            on_test_command=lambda command, env: _register_members(env, 1)
+        )
 
         outcome = self._executor(runner).execute(plan)
 
@@ -373,10 +410,7 @@ class GangStageLifecycleTest(_GangExecutorTestCase):
         # explicitly inside every stage entry.
         self.assertEqual(
             {stage: index for index, stage in enumerate(STAGES)},
-            {
-                name: stage["stage_index"]
-                for name, stage in manifest["stages"].items()
-            },
+            {name: stage["stage_index"] for name, stage in manifest["stages"].items()},
         )
         test_entry = runner.test_entry
         test_command = test_entry["command"]
@@ -392,14 +426,17 @@ class GangStageLifecycleTest(_GangExecutorTestCase):
         # generated rule: they ride the submit environment, never the
         # command line (where the token would be visible to ps and logs).
         self.assertEqual(
-            [], [arg for arg in test_command if arg.startswith("--test_env=PERF_TEST_BROKER_")]
+            [],
+            [
+                arg
+                for arg in test_command
+                if arg.startswith("--test_env=PERF_TEST_BROKER_")
+            ],
         )
         rendezvous = manifest["stages"]["rendezvous"]
         submit_env = test_entry["env"]
         self.assertEqual(rendezvous["broker_url"], submit_env[BROKER_URL_ENV])
-        self.assertEqual(
-            rendezvous["broker_run_id"], submit_env[BROKER_RUN_ID_ENV]
-        )
+        self.assertEqual(rendezvous["broker_run_id"], submit_env[BROKER_RUN_ID_ENV])
         self.assertEqual(
             list(_BROKER_ENV_NAMES),
             manifest["stages"]["submit"]["env_inherit"],
@@ -413,7 +450,9 @@ class GangStageLifecycleTest(_GangExecutorTestCase):
     def test_manifest_records_gang_metadata_with_sanitized_hosts(self):
         plan = self._setup_run()
         _write_testlogs_tree(self._shard_base(), plan)
-        runner = FakeBazelRun(on_test_command=lambda command, env: _register_members(env, 1))
+        runner = FakeBazelRun(
+            on_test_command=lambda command, env: _register_members(env, 1)
+        )
 
         self._executor(runner).execute(plan)
 
@@ -451,6 +490,25 @@ class GangStageLifecycleTest(_GangExecutorTestCase):
 
 
 class GangSubmitFailureTest(_GangExecutorTestCase):
+    def test_nonzero_test_exit_overrides_completed_master_envelope(self):
+        plan = self._setup_run()
+        _write_testlogs_tree(self._shard_base(), plan, status="completed")
+
+        outcome = self._executor(FakeBazelRun(returncodes=(0, 3))).execute(plan)
+
+        self.assertEqual(RunState.FAILED, outcome.state)
+        self.assertIn("Bazel gang test exited 3", str(outcome.failure))
+        self.assertEqual("failed", self._manifest()["state"])
+
+    def test_test_jobs_cover_all_machines_even_with_lower_executor_limit(self):
+        plan = self._setup_run()
+        _write_testlogs_tree(self._shard_base(), plan)
+        runner = FakeBazelRun()
+
+        self._executor(runner, max_parallel=1).execute(plan)
+
+        self.assertIn(f"--jobs={MACHINE_COUNT}", runner.test_command)
+
     def test_submit_failure_records_stage_and_partial_collection_still_runs(self):
         plan = self._setup_run()
         first, second = plan.cases
@@ -460,9 +518,7 @@ class GangSubmitFailureTest(_GangExecutorTestCase):
             shard = base / f"shard_{index + 1}_of_{MACHINE_COUNT}"
             outputs = shard / "test.outputs"
             outputs.mkdir(parents=True)
-            (shard / "test.log").write_text(
-                f"shard {index} log\n", encoding="utf-8"
-            )
+            (shard / "test.log").write_text(f"shard {index} log\n", encoding="utf-8")
             (outputs / "gang_worker.json").write_text(
                 json.dumps({"shard_index": index, "state": "completed"}),
                 encoding="utf-8",
@@ -584,9 +640,7 @@ class GangSubmitTransportTest(_GangExecutorTestCase):
         _write_testlogs_tree(self._shard_base(), plan)
         runner = FakeBazelRun()
 
-        with patch.dict(
-            os.environ, {BROKER_URL_ENV: "http://preexisting.example"}
-        ):
+        with patch.dict(os.environ, {BROKER_URL_ENV: "http://preexisting.example"}):
             outcome = self._executor(runner).execute(plan)
             # Read inside the patch: patch.dict removes the exported value
             # again when the context exits.

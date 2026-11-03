@@ -14,7 +14,7 @@ from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.storage import RunStore
 
 
-def _setup(root, statuses=("ok", "ok"), *, concurrent=False):
+def _setup(root, statuses=("ok", "ok"), *, concurrent=False, measure_runs=1):
     config = {
         "schema_version": 1,
         "model": {"label": "test", "type": "registered", "checkpoint": "/m"},
@@ -43,7 +43,11 @@ def _setup(root, statuses=("ok", "ok"), *, concurrent=False):
     ]
     if concurrent:
         identities = [
-            {**identity, "measurement_contract": "concurrent_batch_v1"}
+            {
+                **identity,
+                "measure_runs": measure_runs,
+                "measurement_contract": "concurrent_batch_v1",
+            }
             for identity in identities
         ]
     plan = build_execution_plan(
@@ -86,6 +90,10 @@ def _setup(root, statuses=("ok", "ok"), *, concurrent=False):
                         "measurement_contract": "concurrent_batch_v1",
                     }
                 )
+                metrics["measurements"] = [
+                    {**metrics["measurements"][0], "run": run}
+                    for run in range(measure_runs)
+                ]
             errors = []
         store.write_case(
             case.case_id,
@@ -93,7 +101,7 @@ def _setup(root, statuses=("ok", "ok"), *, concurrent=False):
                 "case_id": case.case_id,
                 "identity": identity,
                 "status": status,
-                "runs": 1,
+                "runs": measure_runs if concurrent else 1,
                 "errors": errors,
                 "metrics": metrics,
             },
@@ -131,6 +139,25 @@ class PrefillReportTest(unittest.TestCase):
                 "concurrent_batch_v1",
                 (root / "reports" / "prefill_report.html").read_text(),
             )
+
+    def test_report_excludes_missing_entire_concurrent_round(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+            plan = _setup(root, concurrent=True, measure_runs=2)
+            self.assertEqual(2, generate_prefill_report(root)["counts"]["valid"])
+            case_path = root / "results" / "cases" / f"{plan.cases[0].case_id}.json"
+            stored = json.loads(case_path.read_text())
+            stored["runs"] = 1
+            stored["metrics"]["measurements"] = stored["metrics"]["measurements"][:1]
+            # Both rounds have equal timing, so the recomputed aggregates are unchanged.
+            case_path.write_text(json.dumps(stored))
+
+            report = generate_prefill_report(root)
+
+            self.assertEqual("diagnostic", report["report_kind"])
+            self.assertEqual(1, report["counts"]["valid"])
+            self.assertEqual(plan.cases[0].case_id, report["excluded"][0]["case_id"])
+            self.assertIn("measure_runs", report["excluded"][0]["reason"])
 
     def test_report_labels_legacy_without_rewriting(self):
         with tempfile.TemporaryDirectory() as temp_dir:

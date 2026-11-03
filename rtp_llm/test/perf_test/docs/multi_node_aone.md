@@ -174,9 +174,10 @@ fast — in worker setup or at the register deadline — instead of hanging.
 ## Prefill measurement contract
 
 Gang prefill uses the same `concurrent_batch_v1` contract as local execution.
-Prefill requires `model.topology.dp == 1`; TP/PP may span gang members, but
-independent DP engines cannot share one measured batch. Throughput comes from
-monotonic elapsed time for each complete concurrent round, excluding scheduler
+Prefill plans containing any `batch_size > 1` require `model.topology.dp == 1`;
+plans containing only batch size 1 still support DP > 1. TP/PP may span gang
+members, but independent DP engines cannot share one measured batch. Throughput
+comes from monotonic elapsed time for each complete concurrent round, excluding scheduler
 updates and serial seeding; server first-token latency is reported separately.
 
 The contract changes stable prefill case IDs. Existing baseline keys do not match

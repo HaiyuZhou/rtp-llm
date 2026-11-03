@@ -88,9 +88,10 @@ optional publisher preserves measurement success. Neither policy rewrites
 
 ## Concurrent prefill baseline migration
 
-New prefill runs use `concurrent_batch_v1`, require `model.topology.dp == 1`,
-and calculate throughput from complete concurrent round wall time rather than
-server first-token latency. The contract marker changes stable case IDs; an old
+New prefill runs use `concurrent_batch_v1`. Plans containing any `batch_size > 1`
+require `model.topology.dp == 1`; plans containing only batch size 1 still support
+DP > 1. Throughput is calculated from complete concurrent round wall time rather
+than server first-token latency. The contract marker changes stable case IDs; an old
 baseline case key produces a missing-case gate failure rather than matching the
 new measurement. The common result schema stays at v2.
 

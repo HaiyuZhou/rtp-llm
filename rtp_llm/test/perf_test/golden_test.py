@@ -23,6 +23,7 @@ def _prefill_case(input_length, cache_length, latency, throughput):
         "cache_len": cache_length,
         "compute_len": input_length - cache_length,
         "input_len": input_length,
+        "measure_runs": 1,
     }
     return {
         "case_id": case_id("prefill", identity),

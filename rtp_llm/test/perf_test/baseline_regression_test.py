@@ -130,6 +130,7 @@ class BaselineRegressionTest(unittest.TestCase):
             "cache_len": 0,
             "compute_len": 512,
             "batch_size": 1,
+            "measure_runs": 1,
         }
         old_key = case_id("prefill", legacy_identity)
         identity = {**legacy_identity, "measurement_contract": "concurrent_batch_v1"}

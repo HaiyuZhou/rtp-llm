@@ -145,7 +145,7 @@ class ResultEnvelopeTest(unittest.TestCase):
         value = _prefill_result()
         case = value["cases"][0]
         case["identity"].update(
-            batch_size=4, measurement_contract="concurrent_batch_v1"
+            batch_size=4, measure_runs=2, measurement_contract="concurrent_batch_v1"
         )
         case["runs"] = 2
         case["metrics"].update(latency_ms=4.5, throughput_tokens_per_second=153600.0)
@@ -162,6 +162,15 @@ class ResultEnvelopeTest(unittest.TestCase):
             for member in range(4)
         ]
         return value
+
+    def test_concurrent_prefill_rejects_missing_entire_round(self):
+        value = self._concurrent_prefill_result()
+        case = value["cases"][0]
+        case["runs"] = 1
+        case["metrics"]["measurements"] = case["metrics"]["measurements"][:4]
+        case["metrics"].update(latency_ms=2.5, throughput_tokens_per_second=204800.0)
+        with self.assertRaisesRegex(ResultSchemaError, "measure_runs"):
+            parse_result_envelope(value)
 
     def test_concurrent_prefill_evidence_rejects_tampering(self):
         mutations = {

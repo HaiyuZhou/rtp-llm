@@ -24,7 +24,9 @@ from rtp_llm.test.perf_test.dry_run import create_preview
 from rtp_llm.test.perf_test.errors import ConfigurationError, PerfTestError
 from rtp_llm.test.perf_test.orchestrator import Orchestrator
 from rtp_llm.test.perf_test.plan import ExecutionPlan, build_execution_plan
-from rtp_llm.test.perf_test.prefill.checkpoint import require_concurrent_prefill_plan
+from rtp_llm.test.perf_test.prefill.plan_validation import (
+    require_concurrent_prefill_plan,
+)
 from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
 from rtp_llm.test.perf_test.run_directory import (
     initialize_run_directory,

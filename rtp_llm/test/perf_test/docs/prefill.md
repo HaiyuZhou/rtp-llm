@@ -106,9 +106,10 @@ only.
 
 ## Contract labels and migration
 
-New prefill runs require `model.topology.dp == 1` on every backend; TP and PP
-remain supported. The concurrent batch measures one engine, so distributing
-members across independent DP engines would change its meaning.
+Prefill plans containing any `batch_size > 1` require `model.topology.dp == 1`
+on every backend. Plans containing only batch size 1 still support DP > 1; TP
+and PP remain supported. The concurrent batch measures one engine, so
+distributing members across independent DP engines would change its meaning.
 
 JSON observations and the HTML report expose `measurement_contract`:
 `concurrent_batch_v1` uses measured round wall time for throughput, while

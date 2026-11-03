@@ -9,7 +9,9 @@ from typing import Any, Callable, Dict, Sequence, Union
 
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.plan import ExecutionPlan, thaw
-from rtp_llm.test.perf_test.prefill.checkpoint import require_concurrent_prefill_plan
+from rtp_llm.test.perf_test.prefill.plan_validation import (
+    require_concurrent_prefill_plan,
+)
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock
 from rtp_llm.test.perf_test.storage import atomic_write_json
 

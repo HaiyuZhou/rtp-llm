@@ -20,6 +20,9 @@ def validate_concurrent_prefill_metrics(
     batch = identity.get("batch_size")
     if type(batch) is not int or batch <= 0 or type(runs) is not int or runs <= 0:
         raise ValueError("concurrent prefill requires positive batch size and runs")
+    planned_runs = identity.get("measure_runs")
+    if type(planned_runs) is not int or planned_runs <= 0 or runs != planned_runs:
+        raise ValueError("concurrent prefill runs must match planned measure_runs")
     expected = identity.get("cache_len")
     if (
         type(expected) is not int

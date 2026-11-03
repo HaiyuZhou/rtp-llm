@@ -758,15 +758,32 @@ def _default_server_runner(context: GangWorkerContext):
     # The plan builder follows the gang mode: decode gangs keep the decode
     # plan, cache_grid (prefill) gangs build the prefill plan.
     execution_plan, _source = _build_rank_group_plan(config_path, context, outputs)
-    # Engine argv comes from the plan, never from this process's sys.argv:
-    # the worker's own flags (--resolved-config ...) would be rejected by the
-    # engine parser, which is exactly what setup_args() with no argument
-    # would parse.
+    model = _resolve_model_paths(config_path, plan)
+    os.environ.setdefault("MODEL_TYPE", str(model["type"]))
+    os.environ.setdefault("CHECKPOINT_PATH", str(model["checkpoint"]))
+    os.environ.setdefault("TOKENIZER_PATH", str(model["tokenizer"]))
+    # Engine argv comes from the plan, never from this process's sys.argv
+    # (the worker's own --resolved-config flags would be rejected by the
+    # engine parser), and it must carry the RESOLVED model paths: hub repo
+    # ids in the argv would make the engine read config.json from a
+    # nonexistent "repo-id/config.json" path instead of the snapshot.
     from rtp_llm.test.perf_test.execution.runtime import build_engine_launch_spec
+    from rtp_llm.test.perf_test.plan import thaw
 
-    launch = build_engine_launch_spec(execution_plan)
+    resolved_config = thaw(execution_plan.resolved_config)
+    resolved_model = dict(resolved_config["model"])
+    resolved_model["checkpoint"] = model["checkpoint"]
+    resolved_model["tokenizer"] = model["tokenizer"]
+    resolved_config["model"] = resolved_model
+    launch = build_engine_launch_spec(
+        _replace_resolved_config(execution_plan, resolved_config)
+    )
     for key, value in launch.environment.items():
         os.environ.setdefault(key, value)
+    # Engine argv/environment reach the server subprocess through the rank
+    # group startup; without them per-run switches (reuse_cache, topology
+    # sizes) never reach the engine and prefix-cache reuse silently
+    # disappears.
     configs = setup_args(list(launch.argv))
     set_parallelism_config(
         configs.parallelism_config, py_prefill_cp_config=configs.prefill_cp_config
@@ -778,13 +795,6 @@ def _default_server_runner(context: GangWorkerContext):
         profiler_directory=log_dir,
         plan=execution_plan,
     )
-    model = _resolve_model_paths(config_path, plan)
-    os.environ.setdefault("MODEL_TYPE", str(model["type"]))
-    os.environ.setdefault("CHECKPOINT_PATH", str(model["checkpoint"]))
-    os.environ.setdefault("TOKENIZER_PATH", str(model["tokenizer"]))
-    # The engine subprocess arguments come from the launch spec; without
-    # them per-run switches (reuse_cache, topology sizes) never reach the
-    # server and prefix-cache reuse silently disappears.
     return runner.start_local_rank_group(
         rank_context,
         configs,
@@ -792,6 +802,21 @@ def _default_server_runner(context: GangWorkerContext):
         engine_argv=launch.argv,
         engine_environment=launch.environment,
     )
+
+
+def _replace_resolved_config(plan: Any, resolved_config: Dict[str, Any]) -> Any:
+    """Return a copy of ``plan`` with the resolved config replaced.
+
+    Real plans are frozen dataclasses; test doubles are plain namespaces.
+    """
+    import dataclasses
+    from types import SimpleNamespace
+
+    if dataclasses.is_dataclass(plan) and not isinstance(plan, type):
+        return dataclasses.replace(plan, resolved_config=resolved_config)
+    fields = dict(vars(plan))
+    fields["resolved_config"] = resolved_config
+    return SimpleNamespace(**fields)
 
 
 def _resolve_model_paths(config_path: str, plan: Mapping[str, Any]) -> Mapping[str, Any]:

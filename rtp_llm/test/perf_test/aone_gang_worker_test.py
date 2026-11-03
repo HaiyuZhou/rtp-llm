@@ -1095,6 +1095,10 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
         engine_argv = list(kwargs.get("engine_argv") or ())
         self.assertIn("--tp_size=2", engine_argv)
         self.assertIn("--reuse_cache=1", engine_argv)
+        # Hub repo ids must be resolved to local snapshot paths before the
+        # argv reaches the engine subprocess.
+        self.assertIn("--checkpoint_path=/resolved/checkpoint", engine_argv)
+        self.assertIn("--tokenizer_path=/resolved/tokenizer", engine_argv)
         engine_environment = kwargs.get("engine_environment") or {}
         self.assertEqual("2", engine_environment.get("WORLD_SIZE"))
 

@@ -13,6 +13,9 @@ from rtp_llm.test.perf_test.decode.metrics import (
     validate_decode_measurement,
 )
 from rtp_llm.test.perf_test.decode.model import DecodeBatchMeasurement
+from rtp_llm.test.perf_test.prefill.measurement import (
+    validate_concurrent_prefill_metrics,
+)
 from rtp_llm.test.perf_test.state import CaseState, RunState
 
 RESULT_SCHEMA_VERSION = 2
@@ -583,6 +586,11 @@ def parse_case_result(index: int, mode: str, value: Any) -> CaseResult:
             else _parse_decode_metrics(f"{path}.metrics", metrics_value)
         )
     runs = _count(f"{path}.runs", raw["runs"])
+    if mode == "prefill" and status == CaseState.OK:
+        try:
+            validate_concurrent_prefill_metrics(identity, metrics_value, runs)
+        except ValueError as error:
+            raise ResultSchemaError(f"{path}.metrics: {error}") from error
     if mode == "decode":
         if runs != identity["measure_runs"] or (
             metrics is not None and len(metrics.measurements) != runs

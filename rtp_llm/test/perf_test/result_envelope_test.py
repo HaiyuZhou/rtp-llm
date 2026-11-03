@@ -134,6 +134,77 @@ def _decode_result():
 
 
 class ResultEnvelopeTest(unittest.TestCase):
+    def test_concurrent_prefill_evidence_accepts_complete_rounds(self):
+        value = self._concurrent_prefill_result()
+        parsed = parse_result_envelope(value)
+        self.assertEqual(8, len(parsed.cases[0].metrics.measurements))
+        self.assertEqual(2, parse_result_envelope(_decode_result()).schema_version)
+
+    @staticmethod
+    def _concurrent_prefill_result():
+        value = _prefill_result()
+        case = value["cases"][0]
+        case["identity"].update(
+            batch_size=4, measurement_contract="concurrent_batch_v1"
+        )
+        case["runs"] = 2
+        case["metrics"].update(latency_ms=4.5, throughput_tokens_per_second=153600.0)
+        case["metrics"]["measurements"] = [
+            {
+                "run": run,
+                "request_index": member,
+                "latency_ms": run * 4 + member + 1,
+                "observed_reuse_length": 512,
+                "round_elapsed_ms": elapsed,
+                "measurement_contract": "concurrent_batch_v1",
+            }
+            for run, elapsed in enumerate((10.0, 20.0))
+            for member in range(4)
+        ]
+        return value
+
+    def test_concurrent_prefill_evidence_rejects_tampering(self):
+        mutations = {
+            "duplicate": lambda c: c["metrics"]["measurements"][1].update(
+                request_index=0
+            ),
+            "missing": lambda c: c["metrics"]["measurements"].pop(),
+            "run": lambda c: c["metrics"]["measurements"][0].update(run=2),
+            "member": lambda c: c["metrics"]["measurements"][0].update(request_index=4),
+            "marker": lambda c: c["metrics"]["measurements"][0].update(
+                measurement_contract="old"
+            ),
+            "elapsed_inconsistent": lambda c: c["metrics"]["measurements"][0].update(
+                round_elapsed_ms=11
+            ),
+            "elapsed_zero": lambda c: c["metrics"]["measurements"][0].update(
+                round_elapsed_ms=0
+            ),
+            "elapsed_nan": lambda c: c["metrics"]["measurements"][0].update(
+                round_elapsed_ms=float("nan")
+            ),
+            "reuse": lambda c: c["metrics"]["measurements"][0].update(
+                observed_reuse_length=511
+            ),
+            "latency_zero": lambda c: c["metrics"]["measurements"][0].update(
+                latency_ms=0
+            ),
+            "latency_nan": lambda c: c["metrics"]["measurements"][0].update(
+                latency_ms=float("nan")
+            ),
+            "latency_summary": lambda c: c["metrics"].update(latency_ms=5),
+            "throughput_summary": lambda c: c["metrics"].update(
+                throughput_tokens_per_second=204800
+            ),
+            "reuse_summary": lambda c: c["metrics"].update(observed_reuse_length=511),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                value = self._concurrent_prefill_result()
+                mutate(value["cases"][0])
+                with self.assertRaises(ResultSchemaError):
+                    parse_result_envelope(value)
+
     def test_search_outcomes_require_strings_on_formal_and_failed_paths(self):
         for location in ("metrics", "details"):
             for outcome_field in ("search", "observation"):

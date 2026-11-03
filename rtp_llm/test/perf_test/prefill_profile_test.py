@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -102,7 +103,18 @@ class PrefillProfileTest(unittest.TestCase):
                 "metrics": {"latency_ms": 1.0},
                 "errors": [],
             }
-            profiler = PrefillProfiler(lambda profile_dir: runner)
+
+            def factory(profile_dir):
+                (profile_dir / "trace.json").write_text(
+                    '{"traceEvents": [{"name": "kernel"}]}'
+                )
+                original = runner.run_case.side_effect
+                runner.run_case.side_effect = lambda case: dict(
+                    original(case), trace_files=["trace.json"]
+                )
+                return runner
+
+            profiler = PrefillProfiler(factory)
 
             outcome = profiler.run(
                 root, [plan.cases[0].case_id], session_id="profile-001"
@@ -135,6 +147,24 @@ class PrefillProfileTest(unittest.TestCase):
             )
 
             self.assertEqual("failed", outcome["status"])
+            self.assertEqual(before, _formal_bytes(root))
+
+    def test_successful_request_without_trace_is_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+            plan = _setup(root)
+            before = _formal_bytes(root)
+            runner = Mock()
+            runner.run_case.return_value = {"status": "ok"}
+            outcome = PrefillProfiler(lambda _: runner).run(
+                root, [plan.cases[0].case_id], session_id="no-trace"
+            )
+            self.assertEqual("failed", outcome["status"])
+            manifest = json.loads(
+                (root / "profiles/no-trace/manifest.json").read_text()
+            )
+            self.assertEqual("failed", manifest["status"])
+            self.assertTrue(manifest["diagnostic_only"])
             self.assertEqual(before, _formal_bytes(root))
 
     def test_invalid_case_id_creates_no_profile_session(self):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import shlex
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -267,12 +267,38 @@ class MagaEngineHandle:
             self._manager.stop_server()
 
 
-def create_maga_handle(plan: ExecutionPlan) -> MagaEngineHandle:
+def create_maga_handle(
+    plan: ExecutionPlan, *, profile_directory=None, nsys_session=None
+) -> MagaEngineHandle:
     """Create, but do not start, the real local model server handle."""
     from rtp_llm.test.utils.maga_server_manager import MagaServerManager
 
     spec = build_engine_launch_spec(plan)
+    extra = {}
+    if profile_directory is not None:
+        spec.environment["TORCH_CUDA_PROFILER_DIR"] = str(profile_directory)
+        # Explicit argv wins over environment in the server argument parser.
+        spec = replace(
+            spec,
+            argv=tuple(
+                arg
+                for arg in spec.argv
+                if not arg.startswith("--torch_cuda_profiler_dir=")
+            )
+            + ("--torch_cuda_profiler_dir=" + str(profile_directory),),
+        )
+        settings = thaw(plan.resolved_config)["workload"].get("profiling", {})
+        if settings.get("backend") == "nsys":
+            extra["process_prefix"] = [
+                settings.get("nsys_path") or "nsys",
+                "launch",
+                "--session-new=" + nsys_session,
+                "--show-output=true",
+                "--trace=cuda,nvtx,osrt",
+                "--wait=all",
+            ]
     manager = MagaServerManager(
+        **extra,
         env_args=spec.environment,
         device_ids=list(spec.device_ids),
         process_file_name="process.log",

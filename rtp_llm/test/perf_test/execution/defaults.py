@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Sequence
@@ -30,6 +31,7 @@ from rtp_llm.test.perf_test.prefill.probe import (
 from rtp_llm.test.perf_test.prefill.profile import PrefillProfiler
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
 from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
+from rtp_llm.test.perf_test.prefill.trace import ProfiledRunner
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock, inspect_run_directory
 from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.storage import RunStore
@@ -40,9 +42,9 @@ QueryBuilder = Callable[[ExecutionPlan, Sequence[int]], Mapping[int, str]]
 DecodeBatchExecutorFactory = Callable[..., DecodeBatchExecutor]
 
 
-def _default_session_factory(plan: ExecutionPlan) -> EngineSession:
+def _default_session_factory(plan: ExecutionPlan, **launch_options) -> EngineSession:
     return EngineSession(
-        launcher=lambda: create_maga_handle(plan),
+        launcher=lambda: create_maga_handle(plan, **launch_options),
         readiness_timeout_seconds=600,
         timeline_collector=lambda: (),
         coredump_collector=lambda: {},
@@ -171,22 +173,33 @@ class UnifiedLocalExecutor:
             return generate_prefill_report(root)
         if plan.action == "profile":
             tokenizer = self._tokenizer_loader(plan)
-            commit_tail = int(
-                thaw(plan.resolved_config)["workload"]["commit_tail_tokens"]
-            )
             selected = self._selected_case_ids or tuple(
                 case.case_id for case in plan.cases
             )
             session_id = datetime.now(timezone.utc).strftime("profile-%Y%m%dT%H%M%S%fZ")
-            with self._session_factory(plan) as session:
-                profiler = PrefillProfiler(
-                    lambda _profile_dir: PrefillRunner(
+            with ExitStack() as stack:
+
+                def runner_factory(profile_dir):
+                    options = {}
+                    if self._session_factory is _default_session_factory:
+                        options = {
+                            "profile_directory": profile_dir.resolve(),
+                            "nsys_session": session_id,
+                        }
+                    session = stack.enter_context(
+                        self._session_factory(plan, **options)
+                    )
+                    return ProfiledRunner(
                         session.client,
                         tokenizer,
-                        commit_tail_tokens=commit_tail,
+                        profile_dir,
+                        thaw(plan.resolved_config),
+                        session_id,
                     )
+
+                return PrefillProfiler(runner_factory).run(
+                    root, selected, session_id=session_id
                 )
-                return profiler.run(root, selected, session_id=session_id)
 
         if plan.action == "run":
             with RunDirectoryLock(root, action=f"{plan.mode}-run"):

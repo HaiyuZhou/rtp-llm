@@ -510,6 +510,16 @@ py_test(
 )
 
 py_test(
+    name = "prefill_probe_test",
+    srcs = [
+        "prefill_probe_test.py",
+        "prefill_resume_test.py",
+        "prefill_runner_test.py",
+    ],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
     name = "prefill_external_test",
     srcs = ["prefill_external_test.py"],
     deps = [
@@ -558,6 +568,12 @@ py_test(
 py_test(
     name = "prefill_formula_test",
     srcs = ["prefill_formula_test.py"],
+    deps = [":perf_test_lib"],
+)
+
+py_test(
+    name = "prefill_trace_test",
+    srcs = ["prefill_trace_test.py"],
     deps = [":perf_test_lib"],
 )
 

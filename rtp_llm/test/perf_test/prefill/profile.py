@@ -12,6 +12,7 @@ from rtp_llm.test.perf_test.plan import ExecutionPlan, thaw
 from rtp_llm.test.perf_test.prefill.plan_validation import (
     require_concurrent_prefill_plan,
 )
+from rtp_llm.test.perf_test.prefill.trace import capture_scope
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock
 from rtp_llm.test.perf_test.storage import atomic_write_json
 
@@ -78,54 +79,68 @@ class PrefillProfiler:
                 "status": "running",
                 "results": results,
             }
+            manifest["capture_scope"] = capture_scope(
+                manifest["profiling"].get("backend", "kineto")
+            )
             atomic_write_json(profile_dir / "manifest.json", manifest)
             try:
                 runner = self._runner_factory(profile_dir)
+                for case_id in case_ids:
+                    case = thaw(by_id[case_id].identity)
+                    case["case_id"] = case_id
+                    try:
+                        result = runner.run_case(case)
+                        if result.get("status") == "ok":
+                            artifacts = result.get("trace_files") or []
+                            if not artifacts:
+                                raise RuntimeError(
+                                    "profile produced no trace artifacts"
+                                )
+                            for artifact in artifacts:
+                                path = (profile_dir / artifact).resolve()
+                                if (
+                                    not path.is_relative_to(profile_dir.resolve())
+                                    or not path.is_file()
+                                    or path.stat().st_size == 0
+                                ):
+                                    raise RuntimeError(
+                                        f"invalid profile trace artifact: {artifact}"
+                                    )
+                    except Exception as error:
+                        result = {
+                            "case_id": case_id,
+                            "status": "request_failed",
+                            "metrics": None,
+                            "errors": [
+                                {"code": "profile_failed", "message": str(error)}
+                            ],
+                        }
+                    atomic_write_json(cases_dir / f"{case_id}.json", result)
+                    results.append(result)
+                outcome = {
+                    "schema_version": 1,
+                    "session_id": session_id,
+                    "run_id": plan.result_directory,
+                    "case_ids": list(case_ids),
+                    "status": (
+                        "completed"
+                        if all(result.get("status") == "ok" for result in results)
+                        else "failed"
+                    ),
+                    "results": results,
+                }
+                manifest.update(status=outcome["status"], results=results)
+                atomic_write_json(profile_dir / "manifest.json", manifest)
+                atomic_write_json(profile_dir / "profile_result.json", outcome)
+                return outcome
             except BaseException as error:
-                manifest.update(status="failed", error=str(error))
+                manifest.update(
+                    status=(
+                        "interrupted"
+                        if isinstance(error, (KeyboardInterrupt, SystemExit))
+                        else "failed"
+                    ),
+                    error=str(error),
+                )
                 atomic_write_json(profile_dir / "manifest.json", manifest)
                 raise
-            for case_id in case_ids:
-                case = thaw(by_id[case_id].identity)
-                case["case_id"] = case_id
-                try:
-                    result = runner.run_case(case)
-                    if result.get("status") == "ok":
-                        artifacts = result.get("trace_files") or []
-                        if not artifacts:
-                            raise RuntimeError("profile produced no trace artifacts")
-                        for artifact in artifacts:
-                            path = (profile_dir / artifact).resolve()
-                            if (
-                                not path.is_relative_to(profile_dir.resolve())
-                                or not path.is_file()
-                                or path.stat().st_size == 0
-                            ):
-                                raise RuntimeError(
-                                    f"invalid profile trace artifact: {artifact}"
-                                )
-                except Exception as error:
-                    result = {
-                        "case_id": case_id,
-                        "status": "request_failed",
-                        "metrics": None,
-                        "errors": [{"code": "profile_failed", "message": str(error)}],
-                    }
-                atomic_write_json(cases_dir / f"{case_id}.json", result)
-                results.append(result)
-            outcome = {
-                "schema_version": 1,
-                "session_id": session_id,
-                "run_id": plan.result_directory,
-                "case_ids": list(case_ids),
-                "status": (
-                    "completed"
-                    if all(result.get("status") == "ok" for result in results)
-                    else "failed"
-                ),
-                "results": results,
-            }
-            manifest.update(status=outcome["status"], results=results)
-            atomic_write_json(profile_dir / "manifest.json", manifest)
-            atomic_write_json(profile_dir / "profile_result.json", outcome)
-            return outcome

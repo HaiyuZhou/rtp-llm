@@ -11,6 +11,13 @@ from pathlib import Path
 import requests
 
 
+def capture_scope(backend):
+    """Describe the backend's actual capture boundary, independently of replay."""
+    if backend == "nsys":
+        return "one measured concurrent round; seeds excluded"
+    return "one forward step; seeds excluded"
+
+
 class TraceCapture:
     def __init__(
         self,
@@ -197,5 +204,5 @@ class ProfiledRunner:
                     {"code": "trace_stop_failed", "message": str(error)}
                 )
         result["nsys_commands"] = capture.commands
-        result["capture_scope"] = "one measured concurrent round; seeds excluded"
+        result["capture_scope"] = capture_scope(settings.get("backend", "kineto"))
         return result

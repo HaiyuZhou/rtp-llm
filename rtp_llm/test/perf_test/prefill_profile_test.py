@@ -165,7 +165,34 @@ class PrefillProfileTest(unittest.TestCase):
             )
             self.assertEqual("failed", manifest["status"])
             self.assertTrue(manifest["diagnostic_only"])
+            self.assertEqual(
+                "one forward step; seeds excluded", manifest["capture_scope"]
+            )
             self.assertEqual(before, _formal_bytes(root))
+
+    def test_interruption_persists_terminal_manifest_and_preserves_formal_files(self):
+        for stage in ("startup", "capture"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir) / "run"
+                plan = _setup(root)
+                before = _formal_bytes(root)
+                interruption = KeyboardInterrupt("cancelled")
+                runner = Mock()
+                runner.run_case.side_effect = interruption
+                factory = Mock(return_value=runner)
+                if stage == "startup":
+                    factory.side_effect = interruption
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    PrefillProfiler(factory).run(
+                        root, [plan.cases[0].case_id], session_id="interrupted"
+                    )
+                self.assertIs(interruption, raised.exception)
+                manifest = json.loads(
+                    (root / "profiles/interrupted/manifest.json").read_text()
+                )
+                self.assertEqual("interrupted", manifest["status"])
+                self.assertEqual("cancelled", manifest["error"])
+                self.assertEqual(before, _formal_bytes(root))
 
     def test_invalid_case_id_creates_no_profile_session(self):
         with tempfile.TemporaryDirectory() as temp_dir:

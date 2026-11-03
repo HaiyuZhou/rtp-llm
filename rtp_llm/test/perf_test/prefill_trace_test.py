@@ -183,3 +183,29 @@ class TraceTest(unittest.TestCase):
                 ["seed", "seed", "start", "member0", "member1", "stop"], events
             )
             self.assertEqual(1, result["runs"])
+            self.assertEqual(
+                "one measured concurrent round; seeds excluded", result["capture_scope"]
+            )
+
+    def test_kineto_result_describes_one_forward_step(self):
+        from unittest.mock import patch
+
+        from rtp_llm.test.perf_test.prefill.trace import ProfiledRunner
+
+        config = {
+            "model": {"topology": {"tp": 1}},
+            "workload": {"commit_tail_tokens": 4, "profiling": {"backend": "kineto"}},
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "rtp_llm.test.perf_test.prefill.runner.PrefillRunner"
+        ) as runner, patch(
+            "rtp_llm.test.perf_test.prefill.trace.TraceCapture"
+        ) as capture:
+            runner.return_value.run_case.return_value = {"status": "ok"}
+            capture.return_value.finish.return_value = ["trace.json"]
+            result = ProfiledRunner(Mock(), Mock(), tmp, config, "session").run_case(
+                {"case_id": "case"}
+            )
+            self.assertEqual(
+                "one forward step; seeds excluded", result["capture_scope"]
+            )

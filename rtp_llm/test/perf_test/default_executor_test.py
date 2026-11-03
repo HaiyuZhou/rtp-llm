@@ -24,6 +24,10 @@ class _Tokenizer:
 class _Client:
     port = 18000
 
+    def configure_scheduler(self, batch_size, mode="prefill"):
+        assert batch_size == 1
+        assert mode == "prefill"
+
     def request(self, **_request):
         return {
             "success": True,

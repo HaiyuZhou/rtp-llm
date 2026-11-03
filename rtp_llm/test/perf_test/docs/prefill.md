@@ -5,6 +5,33 @@ the exact cache reuse and compute lengths. It accepts only the versioned unified
 configuration format. Update the checkpoint, tokenizer, topology, and device
 fields in `examples/prefill_local.json` for the target environment.
 
+## Measurement semantics
+
+Local, AOne, and gang execution use the same prefill runner. Cached cases first
+require acknowledgement of prefill scheduler batch size 1, then seed each member
+serially. After all seeds pass validation, the runner requires acknowledgement of
+the target batch size B before measurement. Cold cases configure B directly.
+Scheduler or seed failure stops the case before any measured requests are sent.
+
+Each measured round submits B requests to a reusable B-worker pool and releases
+them with a common signal. The runner waits for every member to finish, including
+when one fails. Any failed request, invalid shape, incorrect reuse, or invalid
+timing fails the whole case and leaves its metrics empty.
+
+Throughput uses the complete round's monotonic wall-clock duration, starting at
+the common release and ending after all requests finish. Prompt construction,
+seeding, and scheduler updates are outside this interval. Each round contributes
+`compute_len * B / round_elapsed_seconds`; the case reports the arithmetic mean
+of these round rates, including for B=1. Server first-token latency is a separate
+metric: the median across all measured member responses. It is not the throughput
+denominator. For example, B=4 and compute_len=8 over a 0.2-second round gives
+160 tokens/s regardless of individual first-token latencies of 10–40 ms.
+
+Flattened member evidence records the run, member index, server latency, observed
+reuse length, shared `round_elapsed_ms`, and measurement contract
+`concurrent_batch_v1`. All member latencies and round durations must be finite and
+positive.
+
 ## Run
 
 `run` is the only action that accepts `--config`. The preview validates and

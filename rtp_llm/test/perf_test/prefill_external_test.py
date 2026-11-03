@@ -103,9 +103,11 @@ class _FakeModelServer:
                 outer.requests.append(
                     {"path": self.path, "headers": dict(self.headers), "body": body}
                 )
-                payload = json.dumps({"aux_info": outer._responses.pop(0)}).encode(
-                    "utf-8"
-                )
+                if self.path == "/update_scheduler_info":
+                    response = {"status": "ok"}
+                else:
+                    response = {"aux_info": outer._responses.pop(0)}
+                payload = json.dumps(response).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
@@ -141,6 +143,7 @@ def _run_through_session(plan, session, run_root):
             context.session.client,
             _Tokenizer(),
             commit_tail_tokens=COMMIT_TAIL_TOKENS,
+            monotonic=iter([0.0, 0.2]).__next__,
         )
     )
     return adapter(
@@ -360,7 +363,7 @@ class ExternalPrefillSessionTest(unittest.TestCase):
             self.assertEqual(CASE_CACHE_LEN, result["metrics"]["observed_reuse_length"])
             self.assertEqual(12.5, result["metrics"]["latency_ms"])
             self.assertEqual(
-                (CASE_INPUT_LEN - CASE_CACHE_LEN) * 1000.0 / 12.5,
+                40.0,
                 result["metrics"]["throughput_tokens_per_second"],
             )
             persisted = json.loads(
@@ -370,8 +373,11 @@ class ExternalPrefillSessionTest(unittest.TestCase):
             )
             self.assertEqual("ok", persisted["status"])
 
-            self.assertEqual(2, len(server.requests))
-            seed, measure = server.requests
+            self.assertEqual(4, len(server.requests))
+            configure_seed, seed, configure_measure, measure = server.requests
+            for update in (configure_seed, configure_measure):
+                self.assertEqual("/update_scheduler_info", update["path"])
+                self.assertEqual({"batch_size": 1, "mode": "prefill"}, update["body"])
             self.assertEqual("/", seed["path"])
             self.assertEqual("none", seed["headers"]["X-DashScope-LoggingConsent"])
             self.assertEqual(1, seed["body"]["generate_config"]["max_new_tokens"])

@@ -256,6 +256,9 @@ class DashScTransportTest(unittest.TestCase):
         response = predict_v2_pb2.ModelStreamInferResponse()
         infer = response.infer_response
         infer.parameters["engine_first_token_cost_time_us"].int64_param = 12500
+        infer.parameters["error_no"].int64_param = 0
+        infer.parameters["error_msg"].string_param = ""
+        infer.parameters["status_code"].int64_param = 200
         for name, shape, values in (
             ("prompt_token_num", [1], [3]),
             ("prompt_cached_token_num", [1], [2]),
@@ -304,6 +307,53 @@ class DashScTransportTest(unittest.TestCase):
             result = self._request(client)
             self.assertFalse(result["success"])
             self.assertTrue(result["error"])
+
+    def _assert_business_error_stream(self, *, valid_first):
+        from rtp_llm.dash_sc.proto import predict_v2_pb2
+
+        for fields in (
+            {"error_no": 5},
+            {"error_msg": "model unavailable"},
+            {"status_code": 503},
+            {"error_no": 5, "error_msg": "model unavailable", "status_code": 503},
+        ):
+            with self.subTest(fields=fields):
+                responses = []
+                if valid_first:
+                    valid = predict_v2_pb2.ModelStreamInferResponse()
+                    infer = valid.infer_response
+                    infer.parameters["engine_first_token_cost_time_us"].int64_param = (
+                        12500
+                    )
+                    for name, value in (
+                        ("prompt_token_num", 3),
+                        ("prompt_cached_token_num", 2),
+                        ("generated_ids", 42),
+                    ):
+                        output = infer.outputs.add(name=name, datatype="INT32")
+                        output.shape.append(1)
+                        infer.raw_output_contents.append(struct.pack("<i", value))
+                    responses.append(valid)
+                error = predict_v2_pb2.ModelStreamInferResponse()
+                for name, value in fields.items():
+                    parameter = error.infer_response.parameters[name]
+                    if isinstance(value, str):
+                        parameter.string_param = value
+                    else:
+                        parameter.int64_param = value
+                responses.append(error)
+                client, _, _ = self._client(responses)
+                result = self._request(client)
+                self.assertFalse(result["success"])
+                self.assertIn("DashSC", result["error"])
+                if "error_msg" in fields:
+                    self.assertIn("model unavailable", result["error"])
+
+    def test_business_error_only_stream_is_rejected(self):
+        self._assert_business_error_stream(valid_first=False)
+
+    def test_business_error_after_valid_frame_invalidates_request(self):
+        self._assert_business_error_stream(valid_first=True)
 
     def test_scheduler_still_requires_http_acknowledgement(self):
         client, _, _ = self._client([])

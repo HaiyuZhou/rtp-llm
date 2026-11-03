@@ -117,6 +117,31 @@ class DashScPrefillClient:
                     continue
                 seen_response = True
                 infer = response.infer_response
+                parameters = infer.parameters
+                error_no = (
+                    parameters["error_no"].int64_param
+                    if "error_no" in parameters
+                    else 0
+                )
+                error_msg = (
+                    parameters["error_msg"].string_param
+                    if "error_msg" in parameters
+                    else ""
+                )
+                status_code = (
+                    parameters["status_code"].int64_param
+                    if "status_code" in parameters
+                    else 0
+                )
+                if (
+                    error_no
+                    or error_msg
+                    or (status_code and not 200 <= status_code < 300)
+                ):
+                    raise RuntimeError(
+                        f"DashSC business error: error_no={error_no}, "
+                        f"status_code={status_code}, error_msg={error_msg}"
+                    )
                 if "engine_first_token_cost_time_us" in infer.parameters:
                     values["latency_ms"] = (
                         infer.parameters["engine_first_token_cost_time_us"].int64_param

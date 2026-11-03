@@ -246,16 +246,43 @@ class GangBrokerTest(unittest.TestCase):
             broker.members,
         )
 
-    def test_hostname_mismatch_rejected(self):
+    def test_hostname_mismatch_tolerated_and_recorded(self):
+        # Containerized workers claim their container name while reverse DNS
+        # returns the machine FQDN; the mismatch is legitimate and must not
+        # gate registration. Both names are recorded for diagnostics.
         broker = self._start_broker(machine_count=2)
 
-        status, body = _register(broker, 0, "host-b", 9000)
+        status, body = _register(broker, 0, "container-name", 9000)
 
-        self.assertEqual(400, status)
-        self.assertEqual("hostname_mismatch", body["error"])
-        self.assertEqual((), broker.members)
-        self.assertEqual(200, _register(broker, 0, "host-a", 9000)[0])
-        self.assertEqual("registering", broker.gang_state)
+        self.assertEqual(200, status)
+        member = broker.members[0]
+        self.assertEqual("container-name", member.hostname)
+        events = [
+            json.loads(line)
+            for line in (broker._state_dir / "broker_events.jsonl")
+            .read_text()
+            .splitlines()
+            if "member_registered" in line
+        ]
+        self.assertEqual(1, len(events))
+        self.assertIn("resolved_hostname", events[0])
+
+    @unittest.skipUnless(
+        _ALT_LOOPBACK_USABLE, "distinct loopback source address unavailable"
+    )
+    def test_duplicate_claimed_hostname_from_distinct_addresses_rejected(self):
+        # The claimed hostname stays unique per gang: a second member from a
+        # different address may not reuse it (same-container co-landing guard).
+        broker = self._start_broker(machine_count=2)
+
+        self.assertEqual(200, _register(broker, 0, "shared-name", 9000)[0])
+        status, body = _register(
+            broker, 1, "shared-name", 9001, source_address=_ALT_LOOPBACK
+        )
+
+        self.assertEqual(409, status)
+        self.assertEqual("duplicate_host", body["error"])
+        self.assertEqual("failed", broker.gang_state)
 
     def test_config_fingerprint_enforced(self):
         broker = self._start_broker(

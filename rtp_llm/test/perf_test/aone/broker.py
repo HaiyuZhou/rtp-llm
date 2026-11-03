@@ -270,9 +270,12 @@ class GangBroker:
             if config_fingerprint != self._expected_config_fingerprint:
                 raise _BrokerError(400, "config_fingerprint_mismatch")
         claimed = hostname.strip()
+        # Best-effort reverse lookup: in containerized worker pools the
+        # claimed hostname is the container's own name while reverse DNS
+        # returns the machine-level FQDN, so the two legitimately differ.
+        # Record both for diagnostics; uniqueness checks below are the
+        # same-host gate, not hostname equality.
         resolved = self._resolve_hostname(address)
-        if resolved is None or not _hostnames_equal(resolved, claimed):
-            raise _BrokerError(400, "hostname_mismatch")
         with self._condition:
             if self._cleaned:
                 raise _BrokerError(409, "run_closed")
@@ -298,6 +301,7 @@ class GangBroker:
                 shard_index=shard_index,
                 address=address,
                 hostname=claimed,
+                resolved_hostname=resolved,
                 port=port,
             )
             if len(self._members) >= self._machine_count:

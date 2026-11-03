@@ -31,6 +31,6 @@ Restore the one-command cache-aware prefill deliverable after the unified perf-t
 - Use the existing `plotly` dependency for self-contained interactive HTML and declare it in the Bazel runtime where needed. Keep an SVG fallback so a missing optional renderer does not remove the HTML chart.
 - Add integration tests against persisted unified run fixtures: concurrent B>1 timing separation, offline regeneration, partial/legacy labeling, insufficient data, formula acceptance/rejection, and unchanged formal case files. Update the public perf-test reference and example output documentation.
 
-## Open decision for review
+## Confirmed decision
 
-The proposed formula is a FlexLB-compatible **candidate** with validation and a separate production acceptance flag. If only an exploratory formula is wanted, the parser compatibility and production gate can be omitted.
+The formula is a FlexLB-compatible `PREFILL_TIME_FORMULA` **candidate** with validation and a separate production acceptance flag. The formula and its held-out error evidence remain reviewable even when the quality gate rejects production use.

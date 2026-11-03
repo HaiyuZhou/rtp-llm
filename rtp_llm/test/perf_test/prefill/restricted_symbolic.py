@@ -309,6 +309,7 @@ def fit_restricted_symbolic(
             relative_design * row_weights.sqrt()[:, None],
             row_weights.sqrt(),
             rcond=1e-10,
+            driver="gelsd",
         ).solution
 
     def solve_train(indices: Sequence[int]):
@@ -316,6 +317,7 @@ def fit_restricted_symbolic(
             gram[list(indices)][:, list(indices)],
             rhs[list(indices)],
             rcond=1e-12,
+            driver="gelsd",
         ).solution
 
     selected = [0]

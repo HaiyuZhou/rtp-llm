@@ -35,6 +35,62 @@ def observations(n=120):
 
 
 class FormulaTest(unittest.TestCase):
+    def test_00_identical_observations_reproduce_the_same_formula(self):
+        # A compact real Qwen3-4B sweep exposes nearly collinear library terms.
+        samples = (
+            (64, 0, 10.5315),
+            (128, 0, 11.1585),
+            (192, 0, 13.3785),
+            (256, 0, 14.1255),
+            (320, 0, 15.1785),
+            (384, 0, 11.787),
+            (448, 0, 12.8315),
+            (512, 0, 11.7085),
+            (128, 64, 10.749),
+            (192, 64, 10.029),
+            (256, 64, 9.567),
+            (320, 64, 9.636),
+            (384, 64, 13.108),
+            (448, 64, 13.2305),
+            (512, 64, 10.55),
+            (192, 128, 10.0605),
+            (256, 128, 9.959),
+            (320, 128, 9.1515),
+            (384, 128, 9.4215),
+            (448, 128, 9.5705),
+            (512, 128, 9.421),
+            (256, 192, 15.8005),
+            (320, 192, 16.169),
+            (384, 192, 14.7885),
+            (448, 192, 12.9285),
+            (512, 192, 14.9845),
+            (320, 256, 10.983),
+            (384, 256, 12.6145),
+            (448, 256, 12.3145),
+            (512, 256, 13.087),
+        )
+        rows = [
+            {
+                "case_id": str(index),
+                "batch_size": 1,
+                "fit_eligible": True,
+                "measurement_contract": "concurrent_batch_v1",
+                "request_distribution": [
+                    {"input_length": input_len, "expected_reuse_length": cache_len}
+                ],
+                "batch_latency_ms": latency_ms,
+            }
+            for index, (input_len, cache_len, latency_ms) in enumerate(samples)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            formulas = []
+            for index in range(4):
+                output = Path(directory) / str(index)
+                report = formula.fit_prefill_formula(rows, output, complete=True)
+                self.assertTrue(report["candidate_generated"])
+                formulas.append((output / "PREFILL_TIME_FORMULA.txt").read_bytes())
+            self.assertEqual([formulas[0]] * len(formulas), formulas)
+
     def test_svg_labels_observations_and_round_maximum_target(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "gap.svg"

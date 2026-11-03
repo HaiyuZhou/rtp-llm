@@ -19,9 +19,23 @@ Preview an input-length by output-length by global-batch decode grid:
 ./tools/perf_test --mode=decode --action=run --config=rtp_llm/test/perf_test/examples/decode_grid_local.json --dry-run
 ```
 
-Remove `--dry-run` to execute. Prefill supports local run, resume, profile,
-and offline report. Decode supports local run only. AOne and the CI macro support
-prefill only. Model and tokenizer paths must already be available in the runtime.
+Remove `--dry-run` to execute. Local prefill supports run, resume, profile,
+and offline report; local decode supports run. AOne supports prefill run and
+offline report after collection. AOne decode supports run only when the
+configuration derives a multi-machine gang. The `unified_prefill_ci_test`
+macro remains prefill-only. Model and tokenizer paths must already be
+available in the runtime.
+
+For an AOne decode gang, start from
+`rtp_llm/test/perf_test/examples/decode_aone_gang.json` and preview with:
+
+```bash
+./tools/perf_test --mode=decode --action=run --config=rtp_llm/test/perf_test/examples/decode_aone_gang.json --dry-run
+```
+
+`execution.gpus_per_machine` and `model.topology` derive the machine count;
+decode requires more than one machine. See `rtp_llm/test/perf_test/docs/multi_node_aone.md`
+for gang constraints and CI submission.
 
 See `rtp_llm/test/perf_test/docs/reference.md` for the capability matrix,
 run-directory layout, result contract, exit codes, AOne delivery, regression,

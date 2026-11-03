@@ -14,7 +14,9 @@ from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.storage import RunStore
 
 
-def _setup(root, statuses=("ok", "ok"), *, concurrent=False, measure_runs=1):
+def _setup(
+    root, statuses=("ok", "ok"), *, concurrent=False, measure_runs=1, grid_names=None
+):
     config = {
         "schema_version": 1,
         "model": {"label": "test", "type": "registered", "checkpoint": "/m"},
@@ -41,6 +43,11 @@ def _setup(root, statuses=("ok", "ok"), *, concurrent=False, measure_runs=1):
         {"input_len": 512, "cache_len": 0, "compute_len": 512, "batch_size": 1},
         {"input_len": 1024, "cache_len": 512, "compute_len": 512, "batch_size": 1},
     ]
+    if grid_names:
+        identities = [
+            dict(identity, grid_name=name)
+            for identity, name in zip(identities, grid_names)
+        ]
     if concurrent:
         identities = [
             {
@@ -117,6 +124,104 @@ def _case_bytes(root):
 
 
 class PrefillReportTest(unittest.TestCase):
+    def test_merged_grid_provenance_survives_offline_regeneration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            _setup(root, concurrent=True, grid_names=("cold", "cached"))
+            report = generate_prefill_report(root)
+            self.assertEqual(
+                {"cold", "cached"}, {row["grid_name"] for row in report["observations"]}
+            )
+            persisted = json.loads(
+                (root / "reports" / "prefill_observations.json").read_text()
+            )
+            self.assertEqual(report["observations"], persisted["observations"])
+            self.assertEqual(2, len(report["formula_input"]["rows"]))
+
+    def test_legacy_is_retained_but_excluded_from_fit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+            _setup(root)
+            report = generate_prefill_report(root)
+            self.assertEqual([], report["formula_input"]["rows"])
+            self.assertFalse(report["observations"][0]["fit_eligible"])
+
+    def test_grouped_and_homogeneous_round_targets_and_provenance(self):
+        from types import SimpleNamespace
+
+        from rtp_llm.test.perf_test.prefill.report import _observation
+
+        for grouped in (False, True):
+            contract = (
+                "concurrent_grouped_batch_v1" if grouped else "concurrent_batch_v1"
+            )
+            identity = dict(
+                input_len=1024,
+                cache_len=512,
+                compute_len=512,
+                batch_size=2,
+                measure_runs=2,
+                measurement_contract=contract,
+                grid_name="grouped" if grouped else "flat",
+            )
+            if grouped:
+                identity.update(
+                    prefix_policy="independent",
+                    request_groups=[
+                        dict(count=1, input_len=512, cache_len=0),
+                        dict(count=1, input_len=1024, cache_len=512),
+                    ],
+                )
+            members = []
+            for run, (latencies, elapsed) in enumerate([([1, 9], 20), ([2, 10], 40)]):
+                for index, latency in enumerate(latencies):
+                    member = dict(
+                        run=run,
+                        request_index=index,
+                        latency_ms=latency,
+                        round_elapsed_ms=elapsed,
+                        measurement_contract=contract,
+                        observed_reuse_length=0 if grouped and index == 0 else 512,
+                    )
+                    if grouped:
+                        member.update(
+                            input_length=512 if index == 0 else 1024,
+                            expected_reuse_length=0 if index == 0 else 512,
+                            compute_length=512,
+                            group_index=index,
+                        )
+                    members.append(member)
+            metrics = dict(
+                input_length=1536 if grouped else 1024,
+                expected_reuse_length=512,
+                observed_reuse_length=512,
+                compute_length=1024 if grouped else 512,
+                latency_ms=9.5 if grouped else 5.5,
+                throughput_tokens_per_second=38400,
+                validation=dict(shape=True, reuse=True, timing=True),
+                measurements=list(reversed(members)),
+            )
+            planned = SimpleNamespace(case_id="case", identity=identity)
+            committed = dict(identity=identity, status="ok", runs=2, metrics=metrics)
+            row, exclusion = _observation(planned, committed)
+            self.assertIsNone(exclusion)
+            self.assertIn("grid_name", row)
+            self.assertEqual(identity["grid_name"], row["grid_name"])
+            self.assertEqual(9.5, row["batch_latency_ms"])
+            self.assertEqual(2304000, row["tokens_per_minute"])
+            self.assertEqual(
+                [0, 1], [m["request_index"] for m in row["request_distribution"]]
+            )
+            if grouped:
+                self.assertEqual(
+                    [512, 1024],
+                    [m["input_length"] for m in row["request_distribution"]],
+                )
+            members[0]["observed_reuse_length"] = 99
+            row, exclusion = _observation(planned, committed)
+            self.assertIsNone(row)
+            self.assertIn("reuse", exclusion["reason"])
+
     def test_report_excludes_tampered_concurrent_round(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "run"

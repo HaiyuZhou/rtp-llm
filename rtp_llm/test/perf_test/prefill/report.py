@@ -6,6 +6,7 @@ import html
 import json
 import math
 import os
+import statistics
 import tempfile
 from contextlib import nullcontext
 from pathlib import Path
@@ -84,6 +85,42 @@ def _observation(
     latency_ms = metrics.get("latency_ms")
     throughput = metrics.get("throughput_tokens_per_second")
     measurements = metrics.get("measurements")
+    contract = identity.get("measurement_contract", "legacy_latency_derived_v1")
+    grouped = contract == "concurrent_grouped_batch_v1"
+    groups = (
+        identity.get("request_groups", [])
+        if grouped
+        else [
+            {
+                "count": identity["batch_size"],
+                "input_len": identity["input_len"],
+                "cache_len": identity["cache_len"],
+            }
+        ]
+    )
+    distribution = []
+    for group_index, group in enumerate(groups):
+        for _ in range(group["count"]):
+            distribution.append(
+                {
+                    "request_index": len(distribution),
+                    "group_index": group_index,
+                    "input_length": group["input_len"],
+                    "expected_reuse_length": group["cache_len"],
+                    "compute_length": group["input_len"] - group["cache_len"],
+                }
+            )
+    planned_input = (
+        sum(m["input_length"] for m in distribution)
+        if grouped
+        else identity.get("input_len")
+    )
+    planned_reuse = (
+        sum(m["expected_reuse_length"] for m in distribution)
+        if grouped
+        else identity.get("cache_len")
+    )
+    planned_compute = planned_input - planned_reuse
     lengths_valid = (
         type(input_length) is int
         and input_length > 0
@@ -92,9 +129,9 @@ def _observation(
         and type(compute_length) is int
         and compute_length > 0
         and expected_reuse + compute_length == input_length
-        and expected_reuse == identity.get("cache_len")
-        and compute_length == identity.get("compute_len")
-        and input_length == identity.get("input_len")
+        and expected_reuse == planned_reuse
+        and compute_length == planned_compute
+        and input_length == planned_input
     )
     if not lengths_valid:
         return None, _exclude(
@@ -122,8 +159,24 @@ def _observation(
     except ValueError as error:
         return None, _exclude(planned.case_id, "invalid_measurement", str(error))
 
+    eligible = contract in ("concurrent_batch_v1", "concurrent_grouped_batch_v1")
+    round_maxima = {}
+    if eligible:
+        for member in measurements:
+            run = member["run"]
+            round_maxima[run] = max(round_maxima.get(run, 0), member["latency_ms"])
     return {
         "case_id": planned.case_id,
+        "grid_name": identity.get("grid_name", "default"),
+        "request_distribution": distribution,
+        "batch_latency_ms": (
+            statistics.median(round_maxima.values()) if eligible else None
+        ),
+        "tokens_per_minute": throughput * 60,
+        "fit_eligible": eligible,
+        "fit_exclusion_reason": (
+            None if eligible else "historical latency-derived measurement contract"
+        ),
         "measurement_contract": identity.get(
             "measurement_contract", "legacy_latency_derived_v1"
         ),
@@ -247,8 +300,13 @@ def generate_prefill_report(
             "observations": observations,
             "excluded": excluded,
             "formula_input": {
-                "measurement_contract": "server_first_token_latency_ms",
-                "rows": observations,
+                "measurement_contract": "median_round_max_server_first_token_latency_ms",
+                "rows": [row for row in observations if row["fit_eligible"]],
+                "excluded": [
+                    {"case_id": row["case_id"], "reason": row["fit_exclusion_reason"]}
+                    for row in observations
+                    if not row["fit_eligible"]
+                ],
             },
             "chart": {
                 "x": "compute_length",
@@ -268,4 +326,8 @@ def generate_prefill_report(
         _atomic_write_text(
             snapshot.paths.reports / "prefill_report.html", _render_html(report)
         )
+        from rtp_llm.test.perf_test.prefill.chart import render_charts
+
+        for name, content in render_charts(report).items():
+            _atomic_write_text(snapshot.paths.reports / name, content)
         return report

@@ -148,6 +148,10 @@ class AOneGangPackageTest(unittest.TestCase):
             normalized = json.loads(package.resolved_config.read_text(encoding="utf-8"))
             self.assertNotIn("workload", normalized)
             self.assertEqual("/runtime/models/qwen", normalized["model"]["checkpoint"])
+            # Gang plans have no case shards: a serialized null shard_count
+            # would fail the worker-side config re-parse, so the runfile must
+            # omit the key entirely.
+            self.assertNotIn("shard_count", normalized["execution"])
             build = package.build_file.read_text(encoding="utf-8")
             self.assertIn("perf_test_gang_shard(", build)
             self.assertIn('resolved_config = "resolved_config.json"', build)

@@ -115,6 +115,15 @@ def generate_gang_package(
     gang_payload = build_gang_plan_payload(plan, run_id)
     resolved = thaw(plan.resolved_config)
     workload = resolved.pop("workload")
+    # Gang plans carry no case shards; a serialized ``null`` shard_count would
+    # fail the worker-side config re-parse, which expects the field absent or
+    # a positive integer.
+    execution = resolved.get("execution")
+    if isinstance(execution, dict) and execution.get("shard_count") is None:
+        execution_without_null = {
+            key: value for key, value in execution.items() if key != "shard_count"
+        }
+        resolved["execution"] = execution_without_null
 
     output = Path(root)
     package_name = _validated_package_name(output.name if package is None else package)

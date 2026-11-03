@@ -773,12 +773,21 @@ def _default_server_runner(context: GangWorkerContext):
         profiler_directory=log_dir,
         plan=execution_plan,
     )
-    model_paths = _resolve_model_paths(config_path, plan)
-    return runner.start_local_rank_group(rank_context, configs, model_paths)
+    model = _resolve_model_paths(config_path, plan)
+    os.environ.setdefault("MODEL_TYPE", str(model["type"]))
+    os.environ.setdefault("CHECKPOINT_PATH", str(model["checkpoint"]))
+    os.environ.setdefault("TOKENIZER_PATH", str(model["tokenizer"]))
+    return runner.start_local_rank_group(rank_context, configs, model["tokenizer"])
 
 
-def _resolve_model_paths(config_path: str, plan: Mapping[str, Any]) -> str:
-    """Resolve the tokenizer location through the shared remote resolver."""
+def _resolve_model_paths(config_path: str, plan: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Resolve the model section (type, checkpoint, tokenizer) locally.
+
+    Hub repo ids are downloaded through the shared remote resolver; the
+    engine subprocess only sees environment variables (MODEL_TYPE,
+    CHECKPOINT_PATH, TOKENIZER_PATH), so the worker must export the
+    resolved values before the rank-group server starts.
+    """
     from rtp_llm.test.perf_test.aone.worker import (
         RemoteInputs,
         resolve_remote_runtime_inputs,
@@ -796,7 +805,7 @@ def _resolve_model_paths(config_path: str, plan: Mapping[str, Any]) -> str:
             owned_cases=(),
         )
     )
-    return resolved.config["model"]["tokenizer"]
+    return resolved.config["model"]
 
 
 def _default_master_executor(

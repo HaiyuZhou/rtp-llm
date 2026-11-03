@@ -1017,7 +1017,11 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
                 return_value=runner,
             ), patch(
                 "rtp_llm.test.perf_test.aone.gang_worker._resolve_model_paths",
-                return_value="/resolved/tokenizer",
+                return_value={
+                    "type": "qwen_2",
+                    "checkpoint": "/resolved/checkpoint",
+                    "tokenizer": "/resolved/tokenizer",
+                },
             ), patch(
                 "rtp_llm.config.server_config_setup.set_parallelism_config"
             ), patch(
@@ -1033,6 +1037,12 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
                 side_effect=fake_prefill_plan,
             ):
                 handle = _default_server_runner(context)
+                # patch.dict restores os.environ on exit, so snapshot the
+                # engine model env the worker exported while still inside.
+                self.model_env = {
+                    name: os.environ.get(name)
+                    for name in ("MODEL_TYPE", "CHECKPOINT_PATH", "TOKENIZER_PATH")
+                }
         self.setup_args_calls = setup_args_calls
         return handle, runner, decode_calls, prefill_calls
 
@@ -1058,6 +1068,19 @@ class DefaultServerRunnerPlanTest(_WorkerTestCase):
         self.assertIn("--tp_size=2", argv_text)
         for worker_flag in ("--resolved-config", "--resolved-workload", "--gang-plan"):
             self.assertNotIn(worker_flag, argv_text)
+
+    def test_engine_model_environment_is_exported_for_server_subprocess(self):
+        # Regression: the engine subprocess reads MODEL_TYPE/CHECKPOINT_PATH/
+        # TOKENIZER_PATH from its environment; without them it aborts with
+        # "model_type is not set".
+        plan = self._example_gang_plan()
+        merged_path = self._merged_example("decode")
+
+        self._run_default_server_runner(plan, merged_path)
+
+        self.assertEqual("qwen_2", self.model_env.get("MODEL_TYPE"))
+        self.assertEqual("/resolved/checkpoint", self.model_env.get("CHECKPOINT_PATH"))
+        self.assertEqual("/resolved/tokenizer", self.model_env.get("TOKENIZER_PATH"))
 
     def test_cache_grid_workload_builds_the_prefill_rank_group_plan(self):
         plan = self._example_gang_plan()

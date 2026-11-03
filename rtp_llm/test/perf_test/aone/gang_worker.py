@@ -882,10 +882,11 @@ def _default_prefill_master_executor(
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     manifest["state"] = "running"
     store.write_manifest(manifest)
+    resolved_model = _resolve_model_paths(config_path, context.gang_plan)
     tokenizer = _load_tokenizer(
-        _resolve_model_paths(config_path, context.gang_plan),
-        checkpoint_path=str(merged["model"].get("checkpoint", "")),
-        model_type=str(merged["model"].get("type", "")),
+        resolved_model["tokenizer"],
+        checkpoint_path=str(resolved_model.get("checkpoint", "")),
+        model_type=str(resolved_model.get("type", "")),
     )
     commit_tail = int(merged["workload"]["commit_tail_tokens"])
     endpoint = f"http://127.0.0.1:{int(context.gang_plan['port_range']['start'])}"

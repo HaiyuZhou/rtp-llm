@@ -19,7 +19,7 @@
 - Ordered multi-grid execution is local-only; reject AOne multi-grid planning because AOne shards cannot enforce a global grid barrier.
 - Server first-token latency and client round wall time remain separate. Fit target is median over rounds of the maximum member server latency. Throughput uses measured round wall time.
 - Formal results and checkpoints never change during profile, report, or `--skip-test`.
-- No formula receives `production_acceptance=true` from partial, legacy, or mixed-contract observations.
+- No formula receives `production_acceptance=true` from partial or historical latency-derived observations. The two validated concurrent contracts may fit together using the same target definition.
 - Local and AOne prefill retain the same shared runner. Trace capture is local only.
 
 ## Review Focus
@@ -93,7 +93,7 @@
 
 **Interfaces:** `fit_prefill_formula(observations, output_dir, *, complete)` writes `model.json`, `fit_report.json`, `predictions.csv`, `fit_gap.svg`, and `PREFILL_TIME_FORMULA.txt` when data is sufficient. Use historical restricted grammar and deterministic train/validation/test separation; include grouped request distributions. `production_acceptance` is separate from candidate generation.
 
-- [ ] Write failing tests for generated syntax, held-out split, per-batch error gate, grouped features, insufficient rows, and partial/legacy rejection.
+- [ ] Write failing tests for generated syntax, held-out split, per-batch error gate, grouped and homogeneous combined features, insufficient rows, partial/legacy rejection, and clearing stale accepted artifacts.
 - [ ] Run and inspect failures.
 - [ ] Port and adapt the historical fit algorithm to validated unified observations, retaining FlexLB parser grammar and report artifacts.
 - [ ] Run formula/report tests; commit.

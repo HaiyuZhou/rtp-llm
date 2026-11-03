@@ -38,6 +38,11 @@ successful case, and reruns the remaining planned cases.
   --dry-run
 ```
 
+Persisted prefill plans must mark every case with measurement contract
+`concurrent_batch_v1` to resume or profile, including dry runs. Older directories
+remain readable with offline `report`, but new measurements require a fresh
+`run --config=...` in a new directory. Existing plans are never migrated in place.
+
 ## Profile
 
 `profile` reconstructs selected original requests from their stable case IDs.

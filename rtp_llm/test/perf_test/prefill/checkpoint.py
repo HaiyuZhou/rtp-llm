@@ -12,14 +12,28 @@ from rtp_llm.test.perf_test.config_resolver import canonical_json
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.modes.base import ModeExecutionContext, ModeExecutionResult
 from rtp_llm.test.perf_test.plan import ExecutionPlan
+from rtp_llm.test.perf_test.prefill.measurement import PREFILL_MEASUREMENT_CONTRACT
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock
 
 RUNNER_CONTRACT = {
     "name": "unified-prefill-runner",
-    "version": 1,
+    "version": 2,
     "prompt_contract": "exact-token-prefix-v1",
-    "measurement_contract": "exact-reuse-and-positive-latency-v1",
+    "measurement_contract": PREFILL_MEASUREMENT_CONTRACT,
 }
+
+
+def require_concurrent_prefill_plan(plan: ExecutionPlan) -> None:
+    """Reject persisted measurements whose batch semantics cannot be resumed."""
+    if any(
+        case.identity.get("measurement_contract") != PREFILL_MEASUREMENT_CONTRACT
+        for case in plan.cases
+    ):
+        raise PlanningError(
+            f"prefill resume/profile requires {PREFILL_MEASUREMENT_CONTRACT}; "
+            "rerun from config in a new directory for new measurements. "
+            "Existing directories remain available for offline reports."
+        )
 
 
 def _sha(value: Any) -> str:
@@ -54,12 +68,14 @@ def _validate_resume(context: ModeExecutionContext) -> ResumeSelection:
     plan = context.plan
     if plan.mode != "prefill" or plan.backend != "local" or plan.action != "resume":
         raise PlanningError("prefill resume requires a local prefill resume plan")
+    require_concurrent_prefill_plan(plan)
     root = Path(plan.result_directory)
     persisted = ExecutionPlan.from_dict(
         _read_json(root / "execution_plan.json", "execution plan")
     )
     if persisted.mode != "prefill" or persisted.backend != "local":
         raise PlanningError("persisted execution plan is not local prefill")
+    require_concurrent_prefill_plan(persisted)
     expected = resume_fingerprints(plan)
     persisted_fingerprints = resume_fingerprints(persisted)
     for name in (

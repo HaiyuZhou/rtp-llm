@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, Sequence, Union
 
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.plan import ExecutionPlan, thaw
+from rtp_llm.test.perf_test.prefill.checkpoint import require_concurrent_prefill_plan
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock
 from rtp_llm.test.perf_test.storage import atomic_write_json
 
@@ -32,6 +33,7 @@ class PrefillProfiler:
         plan = ExecutionPlan.from_dict(value)
         if plan.mode != "prefill" or plan.backend != "local":
             raise PlanningError("profile requires a local prefill run")
+        require_concurrent_prefill_plan(plan)
         return plan
 
     def run(

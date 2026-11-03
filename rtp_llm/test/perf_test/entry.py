@@ -24,6 +24,7 @@ from rtp_llm.test.perf_test.dry_run import create_preview
 from rtp_llm.test.perf_test.errors import ConfigurationError, PerfTestError
 from rtp_llm.test.perf_test.orchestrator import Orchestrator
 from rtp_llm.test.perf_test.plan import ExecutionPlan, build_execution_plan
+from rtp_llm.test.perf_test.prefill.checkpoint import require_concurrent_prefill_plan
 from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
 from rtp_llm.test.perf_test.run_directory import (
     initialize_run_directory,
@@ -110,6 +111,8 @@ def _persisted_plan(request: CliRequest) -> tuple[ExecutionPlan, Dict[str, Any]]
             f"--mode={request.mode} does not match persisted mode {plan.mode}"
         )
     validate_capability(request.mode, request.action, plan.backend)
+    if request.mode == "prefill" and request.action in ("resume", "profile"):
+        require_concurrent_prefill_plan(plan)
     if request.cases:
         known = {item.case_id for item in plan.cases}
         unknown = sorted(set(request.cases) - known)

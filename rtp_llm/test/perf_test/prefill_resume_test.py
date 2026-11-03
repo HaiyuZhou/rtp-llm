@@ -4,7 +4,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
+from rtp_llm.test.perf_test.cli import parse_cli
 from rtp_llm.test.perf_test.config_resolver import resolve_config
+from rtp_llm.test.perf_test.entry import run_request
 from rtp_llm.test.perf_test.errors import PlanningError, ResourceError
 from rtp_llm.test.perf_test.modes.base import ModeExecutionContext
 from rtp_llm.test.perf_test.modes.prefill import PrefillAdapter
@@ -66,12 +68,18 @@ CASES = [
 ]
 
 
-def _plan(root, action="run", config=None):
+def _plan(root, action="run", config=None, legacy=False):
     return build_execution_plan(
         mode="prefill",
         action=action,
         resolved=resolve_config(config or _config()),
-        cases=CASES,
+        cases=(
+            CASES
+            if legacy
+            else [
+                dict(case, measurement_contract="concurrent_batch_v1") for case in CASES
+            ]
+        ),
         result_directory=str(root),
     )
 
@@ -122,6 +130,39 @@ def _initialized(root):
 
 
 class PrefillResumeTest(unittest.TestCase):
+    def test_legacy_plan_resume_and_profile_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+            plan = _plan(root, legacy=True)
+            initialize_run_directory(
+                root,
+                source_config=_config(),
+                plan=plan,
+                run_id="run",
+                code_version="rev",
+            )
+            before = _tree(root)
+            for action in ("resume", "profile"):
+                with self.subTest(action=action):
+                    args = ["--mode=prefill", f"--action={action}", f"--run-dir={root}"]
+                    if action == "profile":
+                        args += ["--cases", plan.cases[0].case_id]
+                    factory = Mock(side_effect=AssertionError("executor started"))
+                    with self.assertRaisesRegex(PlanningError, "concurrent_batch_v1"):
+                        run_request(parse_cli(args), executor_factory=factory)
+                    factory.assert_not_called()
+            adapter = Mock()
+            with self.assertRaisesRegex(PlanningError, "concurrent_batch_v1"):
+                PrefillResume(adapter)(
+                    ModeExecutionContext(
+                        plan=_plan(root, action="resume"),
+                        session=object(),
+                        store=RunStore(root),
+                    )
+                )
+            adapter.run.assert_not_called()
+            self.assertEqual(before, _tree(root))
+
     def test_resume_preserves_ok_bytes_and_reruns_every_other_case(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "run"

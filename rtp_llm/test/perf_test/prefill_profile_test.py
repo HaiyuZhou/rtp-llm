@@ -11,7 +11,7 @@ from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.storage import RunStore
 
 
-def _setup(root):
+def _setup(root, legacy=False):
     config = {
         "schema_version": 1,
         "model": {"label": "test", "type": "registered", "checkpoint": "/m"},
@@ -43,6 +43,8 @@ def _setup(root):
         "seed": 1,
         "prefix_policy": "shared_seed",
     }
+    if not legacy:
+        identity["measurement_contract"] = "concurrent_batch_v1"
     plan = build_execution_plan(
         mode="prefill",
         action="run",
@@ -74,6 +76,20 @@ def _formal_bytes(root):
 
 
 class PrefillProfileTest(unittest.TestCase):
+    def test_legacy_plan_profile_rejected_before_runner_startup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+            plan = _setup(root, legacy=True)
+            before = _formal_bytes(root)
+            factory = Mock(side_effect=AssertionError("runner started"))
+            with self.assertRaisesRegex(PlanningError, "concurrent_batch_v1"):
+                PrefillProfiler(factory).run(
+                    root, [plan.cases[0].case_id], session_id="legacy"
+                )
+            factory.assert_not_called()
+            self.assertEqual(before, _formal_bytes(root))
+            self.assertFalse((root / "profiles" / "legacy").exists())
+
     def test_selected_case_is_reconstructed_into_isolated_profile_session(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "run"

@@ -3,7 +3,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from rtp_llm.test.perf_test.cli import parse_cli
 from rtp_llm.test.perf_test.config_resolver import resolve_config
+from rtp_llm.test.perf_test.entry import build_request_plan
 from rtp_llm.test.perf_test.execution.engine_session import EngineSession
 from rtp_llm.test.perf_test.plan import build_execution_plan, thaw
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
@@ -89,6 +91,24 @@ def _case_bytes(root):
 
 
 class PrefillReportTest(unittest.TestCase):
+    def test_legacy_plan_report_still_reads(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+            _setup(root)
+            plan_before = (root / "execution_plan.json").read_bytes()
+            cases_before = _case_bytes(root)
+            plan, _ = build_request_plan(
+                parse_cli(["--mode=prefill", "--action=report", f"--run-dir={root}"])
+            )
+            self.assertEqual("report", plan.action)
+            self.assertTrue(
+                all("measurement_contract" not in case.identity for case in plan.cases)
+            )
+            report = generate_prefill_report(root)
+            self.assertEqual(2, report["counts"]["valid"])
+            self.assertEqual(plan_before, (root / "execution_plan.json").read_bytes())
+            self.assertEqual(cases_before, _case_bytes(root))
+
     def test_complete_input_generates_formal_observations_formula_and_chart(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "run"

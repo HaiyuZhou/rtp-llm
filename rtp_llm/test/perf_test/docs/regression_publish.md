@@ -85,3 +85,23 @@ Each enabled publisher records a success or failure outcome in both
 `required: true` returns exit code 6 after recording the failure. A failed
 optional publisher preserves measurement success. Neither policy rewrites
 `results/result.json` or any per-case result.
+
+## Concurrent prefill baseline migration
+
+New prefill runs use `concurrent_batch_v1`, require `model.topology.dp == 1`,
+and calculate throughput from complete concurrent round wall time rather than
+server first-token latency. The contract marker changes stable case IDs; an old
+baseline case key produces a missing-case gate failure rather than matching the
+new measurement. The common result schema stays at v2.
+
+Create a fresh run, inspect its validated raw round evidence and report, then
+explicitly generate a baseline candidate using the workflow above. Review and
+promote that candidate to the accepted baseline deliberately. Use the explicit
+`generate_perf_test_golden` operation above only when approving a new golden;
+`validate_perf_test_golden` remains read-only and reports migration mismatches.
+No run or report automatically rewrites accepted baselines or goldens.
+
+Old directories remain readable offline. Their JSON/HTML observations carry
+`legacy_latency_derived_v1`; new observations carry `concurrent_batch_v1`.
+Reports exclude inconsistent new-contract rounds and become diagnostic, so use
+only a complete validated fresh run to regenerate reference artifacts.

@@ -103,3 +103,24 @@ reasons. It does not launch a model or modify measured cases.
 `resume`, `profile`, and `report` never accept a config override. Local prefill
 supports all four actions; AOne prefill supports `run` and offline `report`
 only.
+
+## Contract labels and migration
+
+New prefill runs require `model.topology.dp == 1` on every backend; TP and PP
+remain supported. The concurrent batch measures one engine, so distributing
+members across independent DP engines would change its meaning.
+
+JSON observations and the HTML report expose `measurement_contract`:
+`concurrent_batch_v1` uses measured round wall time for throughput, while
+`legacy_latency_derived_v1` labels historical latency-derived observations.
+Offline reports still read old directories without rewriting plans or results.
+New-contract reports validate member indices, reuse, shared round durations,
+and aggregate latency and throughput against the persisted raw evidence.
+Inconsistent cases are excluded and make the report diagnostic.
+
+The contract marker participates in stable case IDs, so fresh runs have different
+IDs even for the same lengths and batch size. Old baseline keys fail with missing
+cases; they never silently match the new measurements. Result schema v2 remains
+unchanged. Explicitly generate and review a new baseline candidate and golden
+from a fresh run; normal runs and report generation never rewrite accepted
+baselines or goldens. See `regression_publish.md` for the commands.

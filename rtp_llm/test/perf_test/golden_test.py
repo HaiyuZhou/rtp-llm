@@ -121,6 +121,36 @@ class GoldenTest(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(before_validation, output.read_bytes())
 
+    def test_contract_migration_requires_explicit_golden_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "golden.json"
+            write_golden(_result(), output)
+            before = output.read_bytes()
+            current = _result()
+            for case in current["cases"]:
+                case["identity"]["measurement_contract"] = "concurrent_batch_v1"
+                case["case_id"] = case_id("prefill", case["identity"])
+                metrics = case["metrics"]
+                metrics["throughput_tokens_per_second"] = (
+                    metrics["compute_length"] * 50.0
+                )
+                metrics["measurements"] = [
+                    {
+                        "run": 0,
+                        "request_index": 0,
+                        "latency_ms": metrics["latency_ms"],
+                        "observed_reuse_length": metrics["observed_reuse_length"],
+                        "round_elapsed_ms": 20.0,
+                        "measurement_contract": "concurrent_batch_v1",
+                    }
+                ]
+            with self.assertRaisesRegex(GoldenMismatchError, "does not match"):
+                validate_golden(current, output)
+            self.assertEqual(before, output.read_bytes())
+            write_golden(current, output)
+            validate_golden(current, output)
+            self.assertNotEqual(before, output.read_bytes())
+
     def test_validation_reports_mismatch_without_rewriting_golden(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "golden.json"

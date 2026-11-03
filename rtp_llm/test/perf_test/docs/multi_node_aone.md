@@ -170,3 +170,19 @@ development machine (phase B) additionally requires worker-to-host
 reachability and remote Bazel access from the submit host, and that
 connectivity is unproven; a gang whose members cannot reach the broker fails
 fast — in worker setup or at the register deadline — instead of hanging.
+
+## Prefill measurement contract
+
+Gang prefill uses the same `concurrent_batch_v1` contract as local execution.
+Prefill requires `model.topology.dp == 1`; TP/PP may span gang members, but
+independent DP engines cannot share one measured batch. Throughput comes from
+monotonic elapsed time for each complete concurrent round, excluding scheduler
+updates and serial seeding; server first-token latency is reported separately.
+
+The contract changes stable prefill case IDs. Existing baseline keys do not match
+new runs. Generate and review baseline candidates and goldens explicitly using
+`regression_publish.md`; submission, collection, and reporting never migrate
+accepted files automatically. Offline reports retain old directories with the
+`legacy_latency_derived_v1` label and expose `concurrent_batch_v1` on new points.
+Inconsistent new-contract evidence is excluded from diagnostic reports. The
+common result envelope remains schema v2.

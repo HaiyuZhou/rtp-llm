@@ -13,6 +13,9 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.plan import PlannedCase, thaw
+from rtp_llm.test.perf_test.prefill.measurement import (
+    validate_concurrent_prefill_metrics,
+)
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock, inspect_run_directory
 from rtp_llm.test.perf_test.storage import RunStore, atomic_write_json
 
@@ -114,8 +117,16 @@ def _observation(
             "measurements must be an array of objects",
         )
 
+    try:
+        validate_concurrent_prefill_metrics(identity, metrics, committed.get("runs"))
+    except ValueError as error:
+        return None, _exclude(planned.case_id, "invalid_measurement", str(error))
+
     return {
         "case_id": planned.case_id,
+        "measurement_contract": identity.get(
+            "measurement_contract", "legacy_latency_derived_v1"
+        ),
         "batch_size": identity["batch_size"],
         "input_length": input_length,
         "expected_reuse_length": expected_reuse,
@@ -160,6 +171,7 @@ def _render_html(report: Mapping[str, Any]) -> str:
         rows.append(
             "<tr>"
             f"<td>{html.escape(item['case_id'])}</td>"
+            f"<td>{html.escape(item['measurement_contract'])}</td>"
             f"<td>{item['batch_size']}</td>"
             f"<td>{item['input_length']}</td>"
             f"<td>{item['observed_reuse_length']}</td>"
@@ -182,8 +194,10 @@ def _render_html(report: Mapping[str, Any]) -> str:
 <h1>Prefill performance report</h1>
 <p>Report kind: {kind}</p>
 <p>Server first-token latency is measured in milliseconds.</p>
+<p>concurrent_batch_v1 throughput uses measured round wall time;
+legacy_latency_derived_v1 identifies historical latency-derived measurements.</p>
 <table>
-<thead><tr><th>Case</th><th>Batch</th><th>Input</th><th>Reused</th><th>Computed</th><th>Latency (ms)</th><th>Tokens/s</th></tr></thead>
+<thead><tr><th>Case</th><th>Measurement contract</th><th>Batch</th><th>Input</th><th>Reused</th><th>Computed</th><th>Latency (ms)</th><th>Tokens/s</th></tr></thead>
 <tbody>{rows}</tbody>
 </table>
 <h2>Excluded cases</h2><ul>{excluded}</ul>

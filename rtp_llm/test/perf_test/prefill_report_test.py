@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.storage import RunStore
 
 
-def _setup(root, statuses=("ok", "ok")):
+def _setup(root, statuses=("ok", "ok"), *, concurrent=False):
     config = {
         "schema_version": 1,
         "model": {"label": "test", "type": "registered", "checkpoint": "/m"},
@@ -40,6 +41,11 @@ def _setup(root, statuses=("ok", "ok")):
         {"input_len": 512, "cache_len": 0, "compute_len": 512, "batch_size": 1},
         {"input_len": 1024, "cache_len": 512, "compute_len": 512, "batch_size": 1},
     ]
+    if concurrent:
+        identities = [
+            {**identity, "measurement_contract": "concurrent_batch_v1"}
+            for identity in identities
+        ]
     plan = build_execution_plan(
         mode="prefill",
         action="run",
@@ -68,6 +74,18 @@ def _setup(root, statuses=("ok", "ok")):
                 "prefix_policy": {"kind": "shared_seed"},
                 "measurements": [{"run": 0, "latency_ms": 10.0 + index}],
             }
+            if concurrent:
+                metrics["throughput_tokens_per_second"] = (
+                    identity["compute_len"] * 1000.0 / 20.0
+                )
+                metrics["measurements"][0].update(
+                    {
+                        "request_index": 0,
+                        "round_elapsed_ms": 20.0,
+                        "observed_reuse_length": identity["cache_len"],
+                        "measurement_contract": "concurrent_batch_v1",
+                    }
+                )
             errors = []
         store.write_case(
             case.case_id,
@@ -91,6 +109,45 @@ def _case_bytes(root):
 
 
 class PrefillReportTest(unittest.TestCase):
+    def test_report_excludes_tampered_concurrent_round(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+            plan = _setup(root, concurrent=True)
+            case_path = root / "results" / "cases" / f"{plan.cases[0].case_id}.json"
+            stored = json.loads(case_path.read_text())
+            stored["metrics"]["measurements"][0]["round_elapsed_ms"] = 40.0
+            case_path.write_text(json.dumps(stored))
+
+            report = generate_prefill_report(root)
+
+            self.assertEqual("diagnostic", report["report_kind"])
+            self.assertEqual(1, report["counts"]["valid"])
+            self.assertEqual(plan.cases[0].case_id, report["excluded"][0]["case_id"])
+            self.assertIn("throughput", report["excluded"][0]["reason"])
+            self.assertEqual(
+                "concurrent_batch_v1", report["observations"][0]["measurement_contract"]
+            )
+            self.assertIn(
+                "concurrent_batch_v1",
+                (root / "reports" / "prefill_report.html").read_text(),
+            )
+
+    def test_report_labels_legacy_without_rewriting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+            _setup(root)
+            before = _case_bytes(root)
+            report = generate_prefill_report(root)
+            self.assertEqual(
+                {"legacy_latency_derived_v1"},
+                {row["measurement_contract"] for row in report["observations"]},
+            )
+            self.assertIn(
+                "legacy_latency_derived_v1",
+                (root / "reports" / "prefill_report.html").read_text(),
+            )
+            self.assertEqual(before, _case_bytes(root))
+
     def test_legacy_plan_report_still_reads(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "run"

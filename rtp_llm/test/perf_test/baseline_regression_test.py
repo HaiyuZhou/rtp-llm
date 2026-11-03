@@ -121,6 +121,55 @@ def _entry(key, metric, value, direction, threshold=0.05):
 
 
 class BaselineRegressionTest(unittest.TestCase):
+    def test_old_baseline_key_does_not_match_new_prefill_case(self):
+        result = _result()
+        result["mode"] = "prefill"
+        result["summary"].pop("profiling_failed_cases")
+        legacy_identity = {
+            "input_len": 512,
+            "cache_len": 0,
+            "compute_len": 512,
+            "batch_size": 1,
+        }
+        old_key = case_id("prefill", legacy_identity)
+        identity = {**legacy_identity, "measurement_contract": "concurrent_batch_v1"}
+        result["cases"] = [
+            {
+                "case_id": case_id("prefill", identity),
+                "identity": identity,
+                "status": "ok",
+                "runs": 1,
+                "errors": [],
+                "metrics": {
+                    "input_length": 512,
+                    "expected_reuse_length": 0,
+                    "observed_reuse_length": 0,
+                    "compute_length": 512,
+                    "latency_ms": 10.0,
+                    "throughput_tokens_per_second": 25600.0,
+                    "validation": {"shape": True, "reuse": True, "timing": True},
+                    "seed": 7,
+                    "prefix_policy": {"kind": "shared_seed"},
+                    "measurements": [
+                        {
+                            "run": 0,
+                            "request_index": 0,
+                            "latency_ms": 10.0,
+                            "observed_reuse_length": 0,
+                            "round_elapsed_ms": 20.0,
+                            "measurement_contract": "concurrent_batch_v1",
+                        }
+                    ],
+                },
+            }
+        ]
+        baseline = _baseline(_entry(old_key, "latency_ms", 10.0, "lower_is_better"))
+        before = copy.deepcopy(baseline)
+        comparison = compare_result_to_baseline(result, baseline)
+        self.assertFalse(comparison["passed"])
+        self.assertEqual("missing_case", comparison["comparisons"][0]["status"])
+        self.assertEqual(before, baseline)
+
     def test_higher_and_lower_is_better_include_threshold_boundary(self):
         result = _result()
         key = result["cases"][0]["case_id"]

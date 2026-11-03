@@ -7,15 +7,23 @@ Defines the supported local decode workloads, output-length constraint, data-par
 ## Requirements
 
 ### Requirement: Decode runs locally
-The system SHALL execute decode performance workloads only with the local backend and SHALL support the `run` action without decode resume or profile actions.
+The system SHALL execute decode performance workloads with the local backend and, when the derived gang machine count exceeds one, with the AOne backend, and SHALL support the `run` action without decode resume or profile actions.
 
 #### Scenario: Local decode run
 - **WHEN** a valid decode workload selects the local backend and `run`
 - **THEN** the system plans and executes the decode workload
 
+#### Scenario: Gang AOne decode run
+- **WHEN** a valid decode workload selects the AOne backend and derives a gang machine count above one
+- **THEN** the gang executes the unified decode plan on the master member with the same case semantics as a local run
+
 #### Scenario: Decode follow-up action
 - **WHEN** a user requests decode `resume` or `profile`
 - **THEN** the system rejects the action before modifying a run directory or launching a model
+
+#### Scenario: Single-machine AOne decode rejected
+- **WHEN** a decode workload selects the AOne backend and derives a machine count of one
+- **THEN** the system rejects the combination during planning before any side effect
 
 ### Requirement: Fixed decode grid
 The system SHALL generate exact-batch fixed decode cases from the Cartesian product of configured input lengths, output lengths, and batch sizes, and SHALL generate target-TPOT cases from the Cartesian product of input and output lengths.

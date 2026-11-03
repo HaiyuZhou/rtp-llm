@@ -80,10 +80,11 @@ bazel test invocation and carried to every remote shard by the generated
 rule's `env_inherit`, never on a command line — and is never persisted to
 the manifest, the run directory, or any log.
 
-The broker records each registration's HTTP source address and cross-checks
-the claimed hostname by reverse resolution. It rejects duplicate shard
-registrations, two members from one host, hostname mismatches, and config
-fingerprint mismatches. Three deadlines fail the gang instead of hanging it:
+The broker records each registration's HTTP source address, claimed hostname,
+and best-effort reverse-lookup result. Container hostnames may differ from
+machine FQDNs, so that mismatch is tolerated; duplicate source addresses or
+claimed hostnames, duplicate shard registrations, and config fingerprint
+mismatches are rejected. Three deadlines fail the gang instead of hanging it:
 registration must complete within 3600 seconds, the whole run ends at 43200
 seconds, and a member silent for 120 seconds is marked lost. Workers send a
 heartbeat every 30 seconds while they wait. Rendezvous state and events are

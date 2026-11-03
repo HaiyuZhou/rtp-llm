@@ -10,7 +10,7 @@
 ## 2. Rendezvous Broker
 
 - [x] 2.1 Implement the in-process HTTP broker core (register, members, heartbeat, result, cleanup) with bearer-token auth on every request; verify unit tests reject invalid tokens without disclosing run metadata and exercise each operation on loopback.
-- [x] 2.2 Implement member identity rules; verify unit tests reject duplicate shard registration, same-host registrations by address or hostname, hostname/source-address mismatch, and config-fingerprint mismatch, and confirm the recorded source address feeds the member list.
+- [x] 2.2 Implement member identity rules; verify unit tests reject duplicate shard registration, same-host registrations by source address or claimed hostname, and config-fingerprint mismatch; tolerate a claimed-hostname/reverse-lookup mismatch while recording both names, and confirm the recorded source address feeds the member list.
 - [x] 2.3 Implement deadline and heartbeat enforcement; verify unit tests fail the gang at the 3600 s register deadline when registration is incomplete, mark members lost after the 120 s heartbeat expiry, and fail the run at the 43200 s run-deadline safety net.
 - [x] 2.4 Persist rendezvous state and events under the run directory; verify unit tests write bounded, redacted diagnostics (no token values) that archive alongside collected outputs.
 

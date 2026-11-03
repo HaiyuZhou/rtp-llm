@@ -58,8 +58,12 @@ The system SHALL validate the mode, action, and backend combination before creat
 - **WHEN** backend is `aone` and the action is `resume` or `profile`
 - **THEN** validation fails before any local or remote side effect
 
+#### Scenario: Supported AOne decode run
+- **WHEN** mode is `decode`, backend is `aone`, and action is `run`
+- **THEN** capability validation succeeds and single-machine rejection, if any, is decided later by gang plan validation
+
 #### Scenario: Unsupported AOne decode
-- **WHEN** mode is `decode` and backend is `aone`
+- **WHEN** mode is `decode`, backend is `aone`, and the action is anything other than `run`
 - **THEN** validation fails before any local or remote side effect
 
 ### Requirement: Normalized immutable execution plan
@@ -92,6 +96,10 @@ The system SHALL support dry-run validation and planning without creating a form
 - **WHEN** a valid AOne prefill config is invoked with `--dry-run`
 - **THEN** the system reports shard and Bazel target plans without building or submitting them
 
+#### Scenario: Gang dry-run
+- **WHEN** a valid gang-mode AOne config is invoked with `--dry-run`
+- **THEN** the system reports the derived machine count, member layout, and final build and test commands without starting a broker or submitting jobs
+
 ### Requirement: One model lifecycle per local plan
 The system SHALL start the model once for a local run plan, share that session across its cases, and close it on success, failure, or process interruption.
 
@@ -104,11 +112,15 @@ The system SHALL start the model once for a local run plan, share that session a
 - **THEN** the system closes the model session and preserves already committed case results
 
 ### Requirement: AOne configuration is delivered as runfiles
-The system SHALL resolve and validate AOne input on the submit host and SHALL deliver normalized config, workload, and shard ownership files as Bazel runfiles without depending on submit-host local paths.
+The system SHALL resolve and validate AOne input on the submit host and SHALL deliver normalized config, workload, and shard or gang ownership files as Bazel runfiles without depending on submit-host local paths.
 
 #### Scenario: Remote shard starts
 - **WHEN** an AOne shard action starts
 - **THEN** it reads normalized config, workload, and shard plan from declared runfiles
+
+#### Scenario: Gang member starts
+- **WHEN** a gang member action starts
+- **THEN** it reads normalized config and the gang plan from declared runfiles
 
 #### Scenario: External workload input
 - **WHEN** the source config references a small grid or distribution file
@@ -117,6 +129,37 @@ The system SHALL resolve and validate AOne input on the submit host and SHALL de
 #### Scenario: Model path remains external
 - **WHEN** the config identifies a model checkpoint or tokenizer
 - **THEN** the normalized config retains a runtime-accessible path and does not package model data into the generated Bazel target
+
+### Requirement: Gang execution derivation and validation
+The system SHALL derive the gang machine count from the optional `execution.gpus_per_machine` field with `world_size` as its default, SHALL reject an explicit `machine_count` field, a `shard_count` field when the derived machine count exceeds one, a `world_size` that does not divide evenly, and `max_parallel` below the machine count during config validation, and SHALL keep machine count one on the existing single-machine AOne path.
+
+#### Scenario: Default keeps single machine
+- **WHEN** an AOne config omits `gpus_per_machine`
+- **THEN** the derived machine count is one and the existing single-machine path is selected unchanged
+
+#### Scenario: Gang derivation
+- **WHEN** an AOne config sets `gpus_per_machine` to a value below `world_size` that divides it evenly
+- **THEN** the derived machine count exceeds one and gang mode is selected
+
+#### Scenario: Explicit machine count rejected
+- **WHEN** a config supplies `execution.machine_count`
+- **THEN** validation fails with the reserved-field reason before any side effect
+
+#### Scenario: Shard count rejected in gang mode
+- **WHEN** a gang-mode config also supplies `shard_count`
+- **THEN** validation fails because case-shard and gang semantics are mutually exclusive
+
+#### Scenario: Non-divisible world size rejected
+- **WHEN** `gpus_per_machine` does not divide `world_size` evenly
+- **THEN** validation fails with the derived machine count and world size
+
+#### Scenario: Insufficient parallelism rejected
+- **WHEN** `max_parallel` is below the derived machine count
+- **THEN** validation fails rather than clamping the value
+
+#### Scenario: Single-machine decode AOne rejected
+- **WHEN** mode is `decode`, backend is `aone`, and the derived machine count is one
+- **THEN** planning fails with a message naming `gpus_per_machine` before any side effect
 
 ### Requirement: Externally managed local runtime boundary
 The system SHALL allow an externally managed local or multi-node server to supply runtime transport and prompt services to a normalized decode plan without transferring server lifecycle ownership to the decode case executor.

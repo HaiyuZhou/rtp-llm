@@ -1,10 +1,10 @@
-# Spec Delta
+# multi-node-aone-orchestration Specification
 
 ## Purpose
 
 Defines how one AOne performance-test task occupies multiple machines as one gang: machine exclusivity, token-authenticated rendezvous, the gang worker contract, gang result collection, and unified-entry execution staging.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Gang members hold exclusive machines
 The system SHALL request the registered per-host GPU count of the selected GPU type for every gang shard action and SHALL restrict each worker to its local world size in devices, so two gang members cannot occupy the same machine.
@@ -18,11 +18,11 @@ The system SHALL request the registered per-host GPU count of the selected GPU t
 - **THEN** the member exposes only its local world size in devices to the distributed server
 
 ### Requirement: Gang formation uses a token-authenticated rendezvous
-The system SHALL form a gang through a broker on the submit host that authenticates every request with a bearer token, serves only bounded run metadata, accepts one registration per shard, records each member's HTTP source address as its routable address with a hostname cross-check, and rejects duplicate-host registrations and fingerprint mismatches.
+The system SHALL form a gang through a broker on the submit host that authenticates every request with a bearer token, serves only bounded run metadata, accepts one registration per shard, records each member's HTTP source address as its routable address and the claimed hostname alongside a best-effort reverse lookup for diagnostics, and rejects duplicate source addresses, duplicate claimed hostnames, and fingerprint mismatches.
 
 #### Scenario: Register a member
 - **WHEN** a gang member registers with its shard index, hostname, and port
-- **THEN** the broker records the registration's source address as the member's routable address and confirms the hostname matches
+- **THEN** the broker records the source address as the member's routable address and records both the claimed hostname and best-effort reverse-lookup result, even when the two names differ
 
 #### Scenario: Invalid token
 - **WHEN** a request reaches the broker without the valid bearer token
@@ -33,7 +33,7 @@ The system SHALL form a gang through a broker on the submit host that authentica
 - **THEN** the broker rejects the second registration
 
 #### Scenario: Two members on one host
-- **WHEN** two registrations resolve to the same host address or hostname
+- **WHEN** two registrations use the same source address or claimed hostname
 - **THEN** the broker rejects the registration and the gang fails
 
 #### Scenario: Fingerprint mismatch

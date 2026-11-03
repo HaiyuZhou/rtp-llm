@@ -69,9 +69,9 @@
 
 **Files:** Modify `prefill/profile.py`, `execution/defaults.py`, `execution/runtime.py`; create `prefill/trace.py`; test `prefill_profile_test.py`, `default_executor_test.py`.
 
-**Interfaces:** Local `profile` accepts Kineto or nsys backend in the persisted config, selected case IDs, and trace timeout. Each selected case gets a trace session, manifest and artifact paths under `profiles/<session>/`; formal results are untouched. Trace files must be observed before success is recorded.
+**Interfaces:** Local `profile` accepts Kineto or nsys backend in the persisted config, selected case IDs, and trace timeout. Each selected case gets a trace session, manifest and artifact paths under `profiles/<session>/`; formal results are untouched. Trace files must be observed before success is recorded. Kineto manifests label the one-forward-step scope; nsys captures the complete selected round. Interrupted sessions persist a terminal manifest state.
 
-- [ ] Write failing tests for Kineto/NSys command and artifact handling, timeout/failure status, and formal result isolation.
+- [ ] Write failing tests for Kineto/NSys command and artifact handling, honest capture scope, timeout/failure/interrupted status, and formal result isolation.
 - [ ] Run and inspect failures.
 - [ ] Implement trace session management using historical profiler hooks, with process lifecycle cleanup and no trace timing in formal metrics.
 - [ ] Run focused tests; commit.

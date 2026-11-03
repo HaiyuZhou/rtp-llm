@@ -435,6 +435,7 @@ py_test(
     srcs = ["default_executor_test.py"],
     deps = [
         ":perf_test_runtime_lib",
+        ":perf_test_lib",
     ],
 )
 

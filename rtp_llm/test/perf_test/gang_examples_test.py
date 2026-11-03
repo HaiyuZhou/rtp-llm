@@ -1,4 +1,6 @@
+import io
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -6,6 +8,7 @@ from rtp_llm.test.perf_test.config_resolver import load_resolved_config
 from rtp_llm.test.perf_test.config_schema import parse_config
 from rtp_llm.test.perf_test.decode.planner import plan_decode_cases
 from rtp_llm.test.perf_test.dry_run import create_preview
+from rtp_llm.test.perf_test.entry import main
 from rtp_llm.test.perf_test.plan import build_execution_plan
 from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
 
@@ -34,6 +37,42 @@ def _planned_cases(mode, config, resolved):
 
 
 class GangExamplesTest(unittest.TestCase):
+    def test_multi_dp_batch_four_dry_run_rejects_without_output(self):
+        for example in (
+            "prefill_local.json",
+            "prefill_aone.json",
+            "prefill_aone_gang.json",
+        ):
+            with self.subTest(
+                example=example
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = json.loads((ROOT / "examples" / example).read_text())
+                source["model"]["topology"] = {"tp": 1, "dp": 2, "pp": 1, "ep": 1}
+                source["workload"]["batch_sizes"] = [4]
+                if source["execution"]["backend"] == "local":
+                    source["execution"]["devices"] = [0, 1]
+                source["output"]["result_root"] = str(root / "results")
+                config = root / "config.json"
+                config.write_text(json.dumps(source))
+                stdout, stderr = io.StringIO(), io.StringIO()
+                code = main(
+                    [
+                        "--mode=prefill",
+                        "--action=run",
+                        f"--config={config}",
+                        "--dry-run",
+                    ],
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+                self.assertNotEqual(0, code)
+                self.assertIn("DP", stderr.getvalue())
+                self.assertIn("batch", stderr.getvalue())
+                self.assertEqual(
+                    ["config.json"], sorted(item.name for item in root.iterdir())
+                )
+
     def test_gang_examples_parse_and_dry_run_two_machine_gangs(self):
         for mode, path in EXAMPLES.items():
             with self.subTest(mode=mode):

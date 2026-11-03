@@ -1,8 +1,10 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.config_schema import parse_config
@@ -349,6 +351,188 @@ class DefaultExecutorTest(unittest.TestCase):
             self.assertFalse((root / "results" / "result.json").exists())
             manifest = json.loads((root / "manifest.json").read_text())
             self.assertEqual("failed", manifest["state"])
+
+
+class PrefillBackendIntegrationTest(unittest.TestCase):
+    def test_batch_four_uses_shared_http_runner_across_backends(self):
+        from rtp_llm.test.perf_test.aone.collector import collect_aone_results
+        from rtp_llm.test.perf_test.aone.gang_worker import (
+            _default_prefill_master_executor,
+        )
+        from rtp_llm.test.perf_test.aone.package import generate_aone_package
+        from rtp_llm.test.perf_test.aone.sharding import plan_shards
+        from rtp_llm.test.perf_test.aone.worker import (
+            _default_executor,
+            load_remote_inputs,
+        )
+        from rtp_llm.test.perf_test.execution.runtime import HttpPrefillClient
+        from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
+
+        for backend in ("local", "aone", "gang"):
+            with self.subTest(
+                backend=backend
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run_root = root / "run"
+                source = _source(root)
+                source["engine"]["concurrency_limit"] = 4
+                source["workload"].update(batch_sizes=[4], compute_steps=[8, 4])
+                if backend == "aone":
+                    source["execution"] = {
+                        "backend": "aone",
+                        "resource": "daily",
+                        "gpu_type": "H20",
+                        "max_parallel": 1,
+                        "shard_count": 1,
+                    }
+                elif backend == "gang":
+                    example = Path(__file__).parent / "examples/prefill_aone_gang.json"
+                    gang_source = json.loads(example.read_text())
+                    source["execution"] = gang_source["execution"]
+                    source["model"]["topology"] = gang_source["model"]["topology"]
+                parsed = parse_config(source)
+                plan = build_execution_plan(
+                    mode="prefill",
+                    action="run",
+                    resolved=resolve_config(source),
+                    cases=plan_prefill_cases(parsed.workload, parsed.engine),
+                    result_directory=str(run_root),
+                )
+                events = []
+                barrier = threading.Barrier(4, timeout=3)
+                lock = threading.Lock()
+                endpoint = "http://fake-prefill:18000"
+
+                def post(url, *, json, **_kwargs):
+                    with lock:
+                        events.append((url, json))
+                    if url.endswith("/update_scheduler_info"):
+                        self.assertEqual({"batch_size": 4, "mode": "prefill"}, json)
+                        return Mock(status_code=200, json=lambda: {"status": "ok"})
+                    self.assertEqual(endpoint, url)
+                    barrier.wait()  # Sequential submission cannot complete this round.
+                    return Mock(
+                        status_code=200,
+                        json=lambda: {
+                            "aux_info": {
+                                "input_len": len(json["prompt"].split()),
+                                "output_len": 1,
+                                "reuse_len": 0,
+                                "first_token_cost_time": 10.0,
+                            }
+                        },
+                    )
+
+                client = HttpPrefillClient(endpoint, post=post, scheduler_attempts=1)
+                session = _Session()
+                session.client = client
+                session.diagnostics = EngineDiagnostics()
+                with patch(
+                    "rtp_llm.test.perf_test.test_util._load_tokenizer",
+                    return_value=_Tokenizer(),
+                ):
+                    if backend == "local":
+                        initialize_run_directory(
+                            run_root,
+                            source_config=source,
+                            plan=plan,
+                            run_id="integration",
+                            code_version="test",
+                        )
+                        outcome = UnifiedLocalExecutor(
+                            session_factory=lambda _plan: session,
+                            tokenizer_loader=lambda _plan: _Tokenizer(),
+                        )(plan)
+                        self.assertEqual(RunState.COMPLETED, outcome.state)
+                        results = outcome.case_results
+                    elif backend == "aone":
+                        shards = plan_shards(plan)
+                        package = generate_aone_package(
+                            root / "package",
+                            plan,
+                            run_id="integration",
+                            ownership=shards.ownership,
+                        )
+                        inputs = load_remote_inputs(
+                            resolved_config=package.resolved_config,
+                            resolved_workload=package.resolved_workload,
+                            shard_plan=package.shard_plan,
+                            shard_id="shard-0000",
+                        )
+                        with patch(
+                            "rtp_llm.test.perf_test.aone.worker.resolve_remote_runtime_inputs",
+                            side_effect=lambda value: value,
+                        ), patch(
+                            "rtp_llm.test.perf_test.execution.defaults._default_session_factory",
+                            return_value=session,
+                        ):
+                            remote = _default_executor(inputs).execute(inputs, run_root)
+                        collected = collect_aone_results(
+                            plan,
+                            run_id="integration",
+                            shard_plan=shards,
+                            results=[remote.to_dict()],
+                        )
+                        self.assertEqual(RunState.COMPLETED, collected.state)
+                        results = collected.cases
+                    else:
+                        config_path = root / "config.json"
+                        config_path.write_text(json.dumps(source))
+                        topology = source["model"]["topology"]
+                        context = SimpleNamespace(
+                            gang_plan={
+                                "topology": topology,
+                                "port_range": {"start": 18000},
+                            }
+                        )
+                        with patch(
+                            "rtp_llm.test.perf_test.aone.gang_worker._resolve_model_paths",
+                            return_value=source["model"],
+                        ), patch(
+                            "rtp_llm.test.perf_test.multi_node.prefill_runtime.HttpPrefillClient",
+                            return_value=client,
+                        ) as client_factory:
+                            source["model"]["tokenizer"] = "/m"
+                            code = _default_prefill_master_executor(
+                                SimpleNamespace(),
+                                context=context,
+                                config_path=str(config_path),
+                                result_directory=str(run_root),
+                            )
+                        self.assertEqual(0, code)
+                        client_factory.assert_called_once_with("http://127.0.0.1:18000")
+                        from rtp_llm.test.perf_test.storage import RunStore
+
+                        results = tuple(
+                            RunStore(run_root).read_committed_cases().values()
+                        )
+                self.assertCountEqual(
+                    [case.case_id for case in plan.cases],
+                    [result["case_id"] for result in results],
+                )
+                self.assertGreater(len(results), 1)
+                self.assertEqual(len(plan.cases) * 5, len(events))
+                for offset in range(0, len(events), 5):
+                    self.assertEqual(
+                        endpoint + "/update_scheduler_info", events[offset][0]
+                    )
+                    self.assertEqual(
+                        [endpoint] * 4,
+                        [url for url, _ in events[offset + 1 : offset + 5]],
+                    )
+                for result in results:
+                    self.assertEqual("ok", result["status"])
+                    self.assertEqual(
+                        "concurrent_batch_v1",
+                        result["identity"]["measurement_contract"],
+                    )
+                    records = result["metrics"]["measurements"]
+                    self.assertEqual(
+                        [0, 1, 2, 3], [record["request_index"] for record in records]
+                    )
+                    self.assertTrue(
+                        all(record["round_elapsed_ms"] > 0 for record in records)
+                    )
 
 
 if __name__ == "__main__":

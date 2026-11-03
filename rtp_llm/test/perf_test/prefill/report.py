@@ -314,6 +314,11 @@ def generate_prefill_report(
                 "z": "latency_ms",
             },
         }
+        from rtp_llm.test.perf_test.prefill.formula import fit_prefill_formula
+
+        report["formula_fit"] = fit_prefill_formula(
+            observations, snapshot.paths.reports / "formula", complete=not excluded
+        )
         atomic_write_json(snapshot.paths.reports / "prefill_report.json", report)
         atomic_write_json(
             snapshot.paths.reports / "prefill_observations.json",

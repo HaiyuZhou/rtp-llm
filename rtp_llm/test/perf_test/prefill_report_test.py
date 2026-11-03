@@ -124,6 +124,37 @@ def _case_bytes(root):
 
 
 class PrefillReportTest(unittest.TestCase):
+    def test_formula_rejection_replaces_stale_accepted_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            _setup(root, concurrent=True)
+            formula_dir = root / "reports" / "formula"
+            formula_dir.mkdir()
+            (formula_dir / "model.json").write_text('{"production_acceptance": true}')
+            (formula_dir / "PREFILL_TIME_FORMULA.txt").write_text("old accepted")
+            report = generate_prefill_report(root)
+            self.assertFalse(report["formula_fit"]["production_acceptance"])
+            self.assertEqual(
+                report["formula_fit"]["reason"], "insufficient_valid_geometries"
+            )
+            self.assertFalse((formula_dir / "model.json").exists())
+            self.assertFalse((formula_dir / "PREFILL_TIME_FORMULA.txt").exists())
+            self.assertEqual(
+                json.loads((formula_dir / "fit_report.json").read_text()),
+                report["formula_fit"],
+            )
+
+    def test_unexpected_formula_errors_fail_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            _setup(root, concurrent=True)
+            with patch(
+                "rtp_llm.test.perf_test.prefill.formula.fit_prefill_formula",
+                side_effect=RuntimeError("solver broken"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "solver broken"):
+                    generate_prefill_report(root)
+
     def test_merged_grid_provenance_survives_offline_regeneration(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "run"

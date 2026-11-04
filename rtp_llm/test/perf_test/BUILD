@@ -797,3 +797,12 @@ py_test(
     ],
     tags = ["manual"],
 )
+
+py_test(
+    name = "ci_delivery_test",
+    srcs = ["ci_delivery.py", "ci_delivery_test.py"],
+    data = [
+        "examples/decode_aone_gang.json",
+        "examples/prefill_aone_ci.json",
+    ],
+)

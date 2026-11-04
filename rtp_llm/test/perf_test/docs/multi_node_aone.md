@@ -230,3 +230,10 @@ runfiles, so its post-collection report regeneration uses bundled Plotly rather
 than depending on packages installed in the CI image. The build completes before
 the executable starts its own remote build/submit lifecycle. Decode keeps the
 source-tree launcher.
+
+For the multi-node CI pipeline, `ci_delivery.py` fixes prefill
+`output.result_root` to `perf_test_results`, including explicit config overrides,
+so artifact verification and upload always use the same root. Decode preserves
+the configured output root. The prefill gate requires persisted DashSC input-ID
+transport and successful batch-size-four measurements; formula production
+acceptance remains advisory.

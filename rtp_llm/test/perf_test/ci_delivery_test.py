@@ -76,6 +76,21 @@ class CiDeliveryTest(unittest.TestCase):
         )
         self.assertEqual(config["workload"], base["workload"])
 
+    def test_explicit_prefill_output_root_matches_ci_gate_and_upload(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                source = self.deliver(MODE=mode)
+                source["output"]["result_root"] = "custom-results"
+                delivered = self.deliver(MODE=mode, CONFIG=json.dumps(source))
+                expected = (
+                    "perf_test_results" if mode == "prefill" else "custom-results"
+                )
+                self.assertEqual(expected, delivered["output"]["result_root"])
+                self.assertEqual(
+                    expected,
+                    json.loads(self.destination.read_text())["output"]["result_root"],
+                )
+
     def test_explicit_path_is_relative_to_checkout(self):
         config = self.deliver(
             CONFIG="rtp_llm/test/perf_test/examples/decode_aone_gang.json",

@@ -1028,6 +1028,50 @@ def merged_config_mode(config_path: Path) -> str:
     raise WorkerConfigError(f"unsupported gang workload kind: {kind!r}")
 
 
+def _prefill_workload_source(workload: Dict[str, Any]) -> Dict[str, Any]:
+    """Restore source shape from a frozen gang workload, before strict parsing.
+
+    Dataclass serialization includes all three mutually exclusive workload
+    shapes. Named grids also wrap their child workload, unlike source JSON.
+    Keep this conversion at the runfile boundary, never in source validation.
+    """
+    generated = {
+        "max_input_len",
+        "compute_steps",
+        "batch_sizes",
+        "min_compute_len",
+        "min_cache_len",
+        "max_cache_len",
+        "cache_lengths",
+        "random_cache_count",
+        "seed",
+    }
+    source = {key: value for key, value in workload.items() if value is not None}
+    grids = source.pop("grids", [])
+    batches = source.pop("request_batches", [])
+    if grids:
+        source = {key: value for key, value in source.items() if key not in generated}
+        source["grids"] = [
+            dict(
+                name=grid["name"],
+                **{
+                    key: value
+                    for key, value in _prefill_workload_source(grid["workload"]).items()
+                    if key in generated | {"request_batches"}
+                },
+            )
+            for grid in grids
+        ]
+    elif batches:
+        source = {
+            key: value
+            for key, value in source.items()
+            if key not in generated - {"seed"}
+        }
+        source["request_batches"] = batches
+    return source
+
+
 def _merge_workload(
     resolved_config: str, resolved_workload: str, outputs: Path
 ) -> Path:
@@ -1043,7 +1087,11 @@ def _merge_workload(
         raise WorkerConfigError(f"cannot read gang runfiles: {error}") from error
     if not isinstance(config, dict) or not isinstance(workload, dict):
         raise WorkerConfigError("gang resolved config and workload must be objects")
-    config["workload"] = workload
+    config["workload"] = (
+        _prefill_workload_source(workload)
+        if workload.get("kind") == "cache_grid"
+        else workload
+    )
     merged = outputs / "resolved_config_with_workload.json"
     atomic_write_json(merged, config)
     return merged

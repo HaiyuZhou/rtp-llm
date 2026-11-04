@@ -20,6 +20,10 @@ class PrefillVerificationTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.build_artifacts(batch_size=4)
+
+    def build_artifacts(self, batch_size):
+        self.batch_size = batch_size
         self.cases = []
         for i in range(30):
             length = 128 + i * 64
@@ -27,12 +31,12 @@ class PrefillVerificationTest(unittest.TestCase):
                 input_len=length + 64,
                 cache_len=64,
                 compute_len=length + 64,
-                batch_size=2,
+                batch_size=self.batch_size,
                 measure_runs=1,
                 prefix_policy="independent",
                 measurement_contract="concurrent_grouped_batch_v1",
                 request_groups=[
-                    dict(count=1, input_len=length, cache_len=64),
+                    dict(count=self.batch_size - 1, input_len=length, cache_len=64),
                     dict(count=1, input_len=length + 64, cache_len=0),
                 ],
             )
@@ -40,7 +44,7 @@ class PrefillVerificationTest(unittest.TestCase):
                 dict(
                     run=0,
                     request_index=j,
-                    group_index=j,
+                    group_index=0 if j < self.batch_size - 1 else 1,
                     input_length=n,
                     expected_reuse_length=c,
                     observed_reuse_length=c,
@@ -49,13 +53,15 @@ class PrefillVerificationTest(unittest.TestCase):
                     round_elapsed_ms=20.0,
                     measurement_contract=identity["measurement_contract"],
                 )
-                for j, (n, c) in enumerate([(length, 64), (length + 64, 0)])
+                for j, (n, c) in enumerate(
+                    [(length, 64)] * (self.batch_size - 1) + [(length + 64, 0)]
+                )
             ]
-            compute = 2 * length
+            compute = (self.batch_size - 1) * (length - 64) + length + 64
             metrics = dict(
-                input_length=compute + 64,
-                expected_reuse_length=64,
-                observed_reuse_length=64,
+                input_length=compute + 64 * (self.batch_size - 1),
+                expected_reuse_length=64 * (self.batch_size - 1),
+                observed_reuse_length=64 * (self.batch_size - 1),
                 compute_length=compute,
                 latency_ms=10.0,
                 throughput_tokens_per_second=compute * 50.0,
@@ -90,6 +96,9 @@ class PrefillVerificationTest(unittest.TestCase):
             ),
             summary=dict(planned_cases=30, successful_cases=30, failed_cases=0),
             cases=self.cases,
+        )
+        self.write(
+            "resolved_config.json", dict(workload=dict(transport="dashsc_input_ids"))
         )
         self.write("results/result.json", self.result)
         from types import SimpleNamespace
@@ -158,8 +167,19 @@ class PrefillVerificationTest(unittest.TestCase):
     def test_candidate_without_production_acceptance_passes(self):
         self.assertEqual(self.verify(self.root)["valid_geometries"], 30)
 
+    def test_http_transport_evidence_fails(self):
+        self.write("resolved_config.json", dict(workload=dict(transport="http_text")))
+        with self.assertRaisesRegex(ValueError, "dashsc_input_ids"):
+            self.verify(self.root)
+
+    def test_missing_batch_four_evidence_fails(self):
+        self.build_artifacts(batch_size=2)
+        with self.assertRaisesRegex(ValueError, "batch size 4"):
+            self.verify(self.root)
+
     def test_missing_artifacts_fail(self):
         for name in (
+            "resolved_config.json",
             "results/result.json",
             "checkpoints/prefill_cache_probe.json",
             "reports/prefill_report.json",

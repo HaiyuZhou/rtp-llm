@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from rtp_llm.test.perf_test.config_resolver import load_resolved_config
-from rtp_llm.test.perf_test.config_schema import parse_config
+from rtp_llm.test.perf_test.config_schema import ConfigError, parse_config
 from rtp_llm.test.perf_test.decode.planner import plan_decode_cases
 from rtp_llm.test.perf_test.dry_run import create_preview
 from rtp_llm.test.perf_test.entry import main
@@ -99,6 +99,57 @@ class GangExamplesTest(unittest.TestCase):
         for command in preview["commands"]:
             self.assertIn("//generated/perf_test:gang", command["argv"])
         self.assertIn("--jobs=2", preview["commands"][1]["argv"])
+
+    def test_gang_prefill_runfiles_round_trip_grouped_and_named_workloads(self):
+        from rtp_llm.test.perf_test.aone.gang_package import generate_gang_package
+        from rtp_llm.test.perf_test.aone.gang_worker import _merge_workload
+        from rtp_llm.test.perf_test.multi_node.prefill_runtime import (
+            build_external_prefill_plan,
+        )
+
+        fixture = json.loads((ROOT / "examples/prefill_aone_ci.json").read_text())
+        for named in (False, True):
+            with self.subTest(named=named), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = json.loads(json.dumps(fixture))
+                if named:
+                    batches = source["workload"].pop("request_batches")
+                    seed = source["workload"].pop("seed", 1)
+                    source["workload"]["grids"] = [
+                        dict(name="ci", request_batches=batches, seed=seed)
+                    ]
+                path = root / "source.json"
+                path.write_text(json.dumps(source))
+                original, _ = build_external_prefill_plan(
+                    path, root / "run", source["model"]["topology"]
+                )
+                package = generate_gang_package(
+                    root / "generated", original, run_id="round-trip"
+                )
+                merged = _merge_workload(
+                    str(package.resolved_config), str(package.resolved_workload), root
+                )
+                rebuilt, _ = build_external_prefill_plan(
+                    merged, root / "run", source["model"]["topology"]
+                )
+                self.assertEqual(30, len(rebuilt.cases))
+                self.assertEqual(original.cases, rebuilt.cases)
+                self.assertEqual(
+                    original.config_fingerprint, rebuilt.config_fingerprint
+                )
+                self.assertEqual(
+                    original.workload_fingerprint, rebuilt.workload_fingerprint
+                )
+
+    def test_source_workload_shapes_remain_mutually_exclusive(self):
+        source = json.loads((ROOT / "examples/prefill_aone_ci.json").read_text())
+        source["workload"]["grids"] = []
+        with self.assertRaisesRegex(ConfigError, "conflicts"):
+            parse_config(source)
+        del source["workload"]["grids"]
+        source["workload"]["compute_steps"] = [1]
+        with self.assertRaisesRegex(ConfigError, "conflicts"):
+            parse_config(source)
 
     def test_multi_dp_batch_four_dry_run_rejects_without_output(self):
         for example in (

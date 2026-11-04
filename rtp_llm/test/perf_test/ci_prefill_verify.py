@@ -60,6 +60,11 @@ def verify_prefill_run(root: Path) -> dict:
         raw["model"]["topology"]["dp"] == 1,
         "concurrent grouped measurements require DP=1",
     )
+    config = _json(root, "resolved_config.json")
+    _require(
+        config.get("workload", {}).get("transport") == "dashsc_input_ids",
+        "expected persisted workload.transport=dashsc_input_ids",
+    )
     cases = raw["cases"]
     _require(
         cases and len({c["case_id"] for c in cases}) == len(cases),
@@ -89,6 +94,10 @@ def verify_prefill_run(root: Path) -> dict:
             f"{case['case_id']}: invalid measurement: {rejection}",
         )
         observations.append(row)
+    _require(
+        any(case["identity"].get("batch_size") == 4 for case in cases),
+        "at least one successfully measured batch size 4 case is required",
+    )
     _require(
         any(r["observed_reuse_length"] > 0 for r in observations),
         "no observed cache reuse",

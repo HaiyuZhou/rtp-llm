@@ -70,6 +70,9 @@ def deliver_config(env: Mapping[str, str], checkout: Path, destination: Path) ->
     execution["max_parallel"] = max(
         int(execution.get("max_parallel") or 0), world // gpus
     )
+    if mode == "prefill":
+        # Gate discovery and CI upload both consume this fixed artifact root.
+        base.setdefault("output", {})["result_root"] = "perf_test_results"
     destination.write_text(json.dumps(base, indent=2) + "\n", encoding="utf-8")
     return base
 

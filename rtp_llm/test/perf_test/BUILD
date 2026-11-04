@@ -806,3 +806,9 @@ py_test(
         "examples/prefill_aone_ci.json",
     ],
 )
+
+py_test(
+    name = "ci_prefill_verify_test",
+    srcs = ["ci_prefill_verify.py", "ci_prefill_verify_test.py"],
+    deps = [":perf_test_lib"],
+)

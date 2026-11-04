@@ -187,3 +187,34 @@ accepted files automatically. Offline reports retain old directories with the
 `legacy_latency_derived_v1` label and expose `concurrent_batch_v1` on new points.
 Inconsistent new-contract evidence is excluded from diagnostic reports. The
 common result envelope remains schema v2.
+
+## Full prefill CI artifact gate
+
+Set the pipeline parameters `mode=prefill` and `config=auto` to select
+`examples/prefill_aone_ci.json`, a 30-geometry grouped cache workload. The
+control plane delivers the config and invokes:
+
+```bash
+python3 -m rtp_llm.test.perf_test.ci_delivery
+PREFILL_RUN_STARTED_AT="$(python3 -c 'import time; print(time.time())')"
+./tools/perf_test --mode=prefill --action=run --config=multi_node_perf_config.json
+python3 -m rtp_llm.test.perf_test.ci_prefill_verify \
+  --results-root=perf_test_results --started-at="$PREFILL_RUN_STARTED_AT"
+```
+
+The gate requires exactly one fresh `prefill-*` directory. It checks persisted
+`results/result.json` for complete successful AOne prefill cases, concurrent
+grouped members and observed cache reuse, plus a successful one-block
+`checkpoints/prefill_cache_probe.json`. The formal
+`reports/prefill_report.json` must match those measured observations without
+exclusions. Required deliverables include `prefill_report.html`, standalone
+`latency.interactive.html` and `tpm.interactive.html` with embedded interactive
+Plotly code, and `latency.svg` and `tpm.svg`.
+
+`reports/formula/` must contain a generated candidate backed by at least 30
+valid distinct measured geometries: `fit_report.json`, `model.json`,
+`PREFILL_TIME_FORMULA.txt`, `predictions.csv`, and `fit_gap.svg`.
+`production_acceptance=false` is an advisory fit-quality outcome and does not
+fail CI. Missing candidates or measurement evidence do fail CI. The verifier
+runs only after successful prefill execution; decode skips it. Artifact upload
+retains `always()` so failed runs and failed gates preserve their diagnostics.

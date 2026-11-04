@@ -196,8 +196,11 @@ control plane delivers the config and invokes:
 
 ```bash
 python3 -m rtp_llm.test.perf_test.ci_delivery
+bazelisk build --config=cuda13 --config=daily_aone_bazel_cache \
+  --remote_download_outputs=all //rtp_llm/test/perf_test:perf_test
 PREFILL_RUN_STARTED_AT="$(python3 -c 'import time; print(time.time())')"
-./tools/perf_test --mode=prefill --action=run --config=multi_node_perf_config.json
+./bazel-bin/rtp_llm/test/perf_test/perf_test --mode=prefill --action=run \
+  --config=multi_node_perf_config.json
 python3 -m rtp_llm.test.perf_test.ci_prefill_verify \
   --results-root=perf_test_results --started-at="$PREFILL_RUN_STARTED_AT"
 ```
@@ -218,3 +221,12 @@ valid distinct measured geometries: `fit_report.json`, `model.json`,
 fail CI. Missing candidates or measurement evidence do fail CI. The verifier
 runs only after successful prefill execution; decode skips it. Artifact upload
 retains `always()` so failed runs and failed gates preserve their diagnostics.
+
+The full prefill CI chart contract is supported on CUDA13 x86. Both production
+Bazel libraries include Plotly only on that platform; other platforms preserve
+the optional static chart fallback and do not require Plotly lock entries.
+The control host builds and launches the prefill Bazel executable with downloaded
+runfiles, so its post-collection report regeneration uses bundled Plotly rather
+than depending on packages installed in the CI image. The build completes before
+the executable starts its own remote build/submit lifecycle. Decode keeps the
+source-tree launcher.

@@ -37,6 +37,69 @@ def _planned_cases(mode, config, resolved):
 
 
 class GangExamplesTest(unittest.TestCase):
+    def test_ci_prefill_plans_bounded_unique_concurrent_gang_batches(self):
+        path = ROOT / "examples" / "prefill_aone_ci.json"
+        self.assertTrue(path.is_file(), "CI prefill fixture is missing")
+        config = parse_config(json.loads(path.read_text(encoding="utf-8")))
+        workload = config.workload
+        self.assertEqual("dashsc_input_ids", workload.transport)
+        self.assertEqual(64, workload.probe_block_size)
+        self.assertIsNotNone(workload.workspace_tokens)
+        self.assertFalse(workload.grids)
+        cases = plan_prefill_cases(
+            workload, config.engine, dp_size=config.model.topology.dp
+        )
+        self.assertGreaterEqual(len(cases), 30)
+        self.assertTrue(any(case["batch_size"] == 4 for case in cases))
+        self.assertEqual(len(workload.request_batches), len(cases))
+        geometries = set()
+        for case in cases:
+            self.assertEqual(
+                "concurrent_grouped_batch_v1", case["measurement_contract"]
+            )
+            self.assertGreater(case["batch_size"], 1)
+            groups = case["request_groups"]
+            geometries.add(
+                tuple(
+                    sorted((g["count"], g["input_len"], g["cache_len"]) for g in groups)
+                )
+            )
+            self.assertTrue(any(g["cache_len"] == 0 for g in groups))
+            self.assertTrue(any(g["cache_len"] > 0 for g in groups))
+            self.assertGreater(
+                len({(g["input_len"], g["cache_len"]) for g in groups}), 1
+            )
+            self.assertLessEqual(
+                sum(g["count"] * (g["input_len"] + 1) for g in groups),
+                config.engine.max_batch_tokens,
+            )
+            self.assertLessEqual(
+                sum(g["count"] * ((g["input_len"] + 64) // 64 * 64) for g in groups),
+                workload.workspace_tokens,
+            )
+        self.assertEqual(len(cases), len(geometries))
+        self.assertEqual((2, 1), (config.model.topology.tp, config.model.topology.dp))
+        plan = build_execution_plan(
+            mode="prefill",
+            action="run",
+            resolved=load_resolved_config(path),
+            cases=cases,
+            result_directory="perf_test_results/prefill-ci-preview",
+        )
+        preview = create_preview(plan)
+        self.assertEqual("aone", preview["backend"])
+        self.assertEqual(len(cases), preview["cases"]["count"])
+        self.assertEqual(2, preview["gang"]["machine_count"])
+        self.assertEqual(1, preview["gang"]["gpus_per_machine"])
+        self.assertEqual(TWO_ONE_GPU_MEMBERS, preview["gang"]["members"])
+        self.assertEqual(
+            ["build", "remote-test"],
+            [c["stage"] for c in preview["commands"]],
+        )
+        for command in preview["commands"]:
+            self.assertIn("//generated/perf_test:gang", command["argv"])
+        self.assertIn("--jobs=2", preview["commands"][1]["argv"])
+
     def test_multi_dp_batch_four_dry_run_rejects_without_output(self):
         for example in (
             "prefill_local.json",

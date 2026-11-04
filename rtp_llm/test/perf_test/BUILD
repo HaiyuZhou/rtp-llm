@@ -692,6 +692,7 @@ py_test(
     data = [
         "examples/decode_aone_gang.json",
         "examples/prefill_aone_gang.json",
+        "examples/prefill_aone_ci.json",
     ],
     deps = [
         ":perf_test_lib",

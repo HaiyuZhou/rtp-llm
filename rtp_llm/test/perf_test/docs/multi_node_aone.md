@@ -134,7 +134,8 @@ Remote execution runs one Bazel build for the gang package followed by one
 remote Bazel test with a 7000-second test timeout. Collection copies the
 master member's full `run/` tree from the Bazel testlogs into the run
 directory — `results/` with the common envelope recording backend `aone`,
-`reports/`, `traces/`, and `profiles/` — giving local-run artifact parity.
+`reports/`, `traces/`, `profiles/`, and `checkpoints/` (including the prefill
+cache probe) — giving local-run artifact parity.
 Non-master members contribute logs only, collected under
 `workload/gang_shards/shard_N/` together with their token-free
 `gang_worker.json` summaries. The manifest's `gang` block records

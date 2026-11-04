@@ -653,6 +653,24 @@ class GangSubmitTransportTest(_GangExecutorTestCase):
 
 
 class GangCollectionParityTest(_GangExecutorTestCase):
+    def test_collection_preserves_master_prefill_cache_probe_checkpoint(self):
+        plan = self._setup_run()
+        outputs = self.workspace / "master.outputs"
+        master_run = _write_master_run_tree(outputs, plan)
+        checkpoint = master_run / "checkpoints" / "prefill_cache_probe.json"
+        checkpoint.parent.mkdir()
+        probe_bytes = b'{"status": "ok", "observed_reuse_length": 512}\n'
+        checkpoint.write_bytes(probe_bytes)
+
+        outcome = self._executor(FakeBazelRun())._collect_master_tree(
+            self.root, outputs
+        )
+
+        self.assertEqual(RunState.COMPLETED, outcome.state)
+        collected = self.root / "checkpoints" / "prefill_cache_probe.json"
+        self.assertTrue(collected.is_file(), "master cache probe was not collected")
+        self.assertEqual(probe_bytes, collected.read_bytes())
+
     def test_collection_copies_all_master_artifacts_and_non_master_logs(self):
         plan = self._setup_run()
         _write_testlogs_tree(self._shard_base(), plan)

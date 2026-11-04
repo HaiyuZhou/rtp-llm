@@ -73,7 +73,7 @@ BROKER_RUN_ID_ENV = "PERF_TEST_BROKER_RUN_ID"
 
 # The subtrees of the master's run directory that hold result artifacts.
 # Planning snapshots (execution plan, configs, manifest) stay submit-side.
-_MASTER_ARTIFACT_TREES = ("results", "reports", "traces", "profiles")
+_MASTER_ARTIFACT_TREES = ("results", "reports", "traces", "profiles", "checkpoints")
 
 # Stage execution order. Persisted manifests are key-sorted JSON, so the
 # order is recorded explicitly inside every stage entry.

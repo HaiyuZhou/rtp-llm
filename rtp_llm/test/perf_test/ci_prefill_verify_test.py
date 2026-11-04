@@ -139,12 +139,12 @@ class PrefillVerificationTest(unittest.TestCase):
             ("fit_gap.svg", "<svg></svg>"),
         ]:
             self.write_text("reports/formula/" + name, content)
-        for chart in ("latency", "tpm"):
-            self.write_text(f"reports/{chart}.svg", "<svg><circle/></svg>")
-            self.write_text(
-                f"reports/{chart}.interactive.html",
-                '<!doctype html><html><script>window.Plotly={};Plotly.newPlot("chart",[],{updatemenus:[]});</script></html>',
-            )
+        from rtp_llm.test.perf_test.prefill.chart import render_charts
+
+        if not hasattr(type(self), "chart_artifacts"):
+            type(self).chart_artifacts = render_charts(self.report)
+        for name, content in self.chart_artifacts.items():
+            self.write_text("reports/" + name, content)
         self.write_text("reports/prefill_report.html", "<html>formal report</html>")
 
     def write_text(self, name, content):
@@ -220,6 +220,32 @@ class PrefillVerificationTest(unittest.TestCase):
             self.write_text("reports/latency.interactive.html", html)
             with self.assertRaises(ValueError):
                 self.verify(self.root)
+
+    def test_grouped_measurements_require_single_dp_engine(self):
+        result = copy.deepcopy(self.result)
+        result["model"]["topology"]["dp"] = 2
+        self.write("results/result.json", result)
+        with self.assertRaisesRegex(ValueError, "DP=1"):
+            self.verify(self.root)
+
+    def test_empty_plotly_stub_fails(self):
+        self.write_text(
+            "reports/latency.interactive.html",
+            '<!doctype html><html><div id="chart"></div><script>'
+            'window.Plotly={};Plotly.newPlot("chart",[],{updatemenus:[]});'
+            "</script></html>",
+        )
+        with self.assertRaisesRegex(ValueError, "embedded Plotly"):
+            self.verify(self.root)
+
+    def test_chart_without_target_container_fails(self):
+        html = self.chart_artifacts["latency.interactive.html"]
+        self.write_text(
+            "reports/latency.interactive.html",
+            html.replace('<div id="chart"></div>', ""),
+        )
+        with self.assertRaisesRegex(ValueError, "chart container"):
+            self.verify(self.root)
 
     def test_insufficient_or_missing_candidate_fails(self):
         for data in (

@@ -56,6 +56,10 @@ def verify_prefill_run(root: Path) -> dict:
         == ("prefill", "aone", "completed"),
         "expected completed AOne prefill result",
     )
+    _require(
+        raw["model"]["topology"]["dp"] == 1,
+        "concurrent grouped measurements require DP=1",
+    )
     cases = raw["cases"]
     _require(
         cases and len({c["case_id"] for c in cases}) == len(cases),
@@ -130,6 +134,26 @@ def verify_prefill_run(root: Path) -> dict:
         _require(
             not re.search(r"<(?:script|link)\b[^>]*(?:src|href)\s*=", html, re.I),
             f"{name}: chart must embed its dependencies",
+        )
+        scripts = re.findall(r"<script\b[^>]*>(.*?)</script\s*>", html, re.I | re.S)
+        # The producer embeds the Plotly distribution, then calls it in a
+        # separate script. Require its version header and exported plotting
+        # APIs so an empty window.Plotly stub cannot stand in for that bundle.
+        _require(
+            any(
+                re.search(r"plotly\.js v\d+\.\d+\.\d+", script)
+                and re.search(r"window\.Plotly\s*=", script)
+                and all(
+                    re.search(r"\." + api + r"\s*=\s*[A-Za-z_$]", script)
+                    for api in ("newPlot", "react", "relayout")
+                )
+                for script in scripts
+            ),
+            f"{name}: missing embedded Plotly implementation",
+        )
+        _require(
+            re.search(r"<div\b[^>]*\bid\s*=\s*[\'\"]chart[\'\"]", html, re.I),
+            f"{name}: missing chart container",
         )
         _svg(root, f"reports/{chart}.svg")
     rows, excluded = normalize_observations(observations)

@@ -1,5 +1,9 @@
 package(default_visibility = ["//visibility:public"])
 
+load("@arch_config//:arch_select.bzl", "requirement")
+
+requirement(["plotly"])
+
 py_test(
     name = "decode_multi_node_analyzer_test",
     srcs = [
@@ -111,6 +115,7 @@ py_library(
         "test_util.py",
     ],
     deps = [
+        ":plotly",
         ":perf_test_entry_lib",
         "//rtp_llm:testlib",
         "//rtp_llm/test/utils:maga_server_manager",
@@ -205,6 +210,7 @@ py_library(
     ],
     data = glob(["examples/*.json"]),
     deps = [
+        ":plotly",
         "//rtp_llm:testlib",
         "//rtp_llm/test/utils:maga_server_manager",
         "//rtp_llm/test/utils:device_resource",

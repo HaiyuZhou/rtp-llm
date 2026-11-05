@@ -18,13 +18,15 @@ LoadAsyncContext::LoadAsyncContext(std::vector<TransferDescriptor>              
                                    const std::shared_ptr<LoadContextCoordinator>& coordinator,
                                    std::shared_ptr<StorageBackend>                storage_backend,
                                    StorageRequest                                 storage_request,
-                                   LoadSourceKind                                 source_kind):
+                                   LoadSourceKind                                 source_kind,
+                                   size_t                                         mock_device_prefix_blocks):
     coordinator_(coordinator),
     context_id_(context_id),
     source_kind_(source_kind),
     load_descs_(std::move(load_descs)),
     joined_load_(std::move(joined_load)),
     local_matched_blocks_(local_matched_blocks),
+    mock_device_prefix_blocks_(mock_device_prefix_blocks),
     matched_blocks_(local_matched_blocks),
     storage_backend_(std::move(storage_backend)),
     storage_request_(std::move(storage_request)),
@@ -45,7 +47,9 @@ LoadAsyncContext::~LoadAsyncContext() {
 void LoadAsyncContext::rebuildMatchedBlocksByTier() {
     matched_blocks_by_tier_.fill(0);
     if (source_kind_ == LoadSourceKind::MOCK_MEMORY) {
-        matched_blocks_by_tier_[static_cast<size_t>(Tier::HOST)] = local_matched_blocks_;
+        RTP_LLM_CHECK(mock_device_prefix_blocks_ <= local_matched_blocks_);
+        matched_blocks_by_tier_[static_cast<size_t>(Tier::DEVICE)] = mock_device_prefix_blocks_;
+        matched_blocks_by_tier_[static_cast<size_t>(Tier::HOST)]   = local_matched_blocks_ - mock_device_prefix_blocks_;
         return;
     }
     std::unordered_map<size_t, Tier> reuse_tier_by_path;
@@ -475,7 +479,8 @@ std::shared_ptr<LoadAsyncContext> LoadContextCoordinator::create(std::vector<Tra
                                                                  size_t                          matched_blocks,
                                                                  std::shared_ptr<StorageBackend> storage_backend,
                                                                  StorageRequest                  storage_request,
-                                                                 LoadSourceKind                  source_kind) {
+                                                                 LoadSourceKind                  source_kind,
+                                                                 size_t mock_device_prefix_blocks) {
     const auto coordinator = shared_from_this();
     uint64_t   context_id  = 0;
     {
@@ -492,7 +497,8 @@ std::shared_ptr<LoadAsyncContext> LoadContextCoordinator::create(std::vector<Tra
                                               coordinator,
                                               std::move(storage_backend),
                                               std::move(storage_request),
-                                              source_kind);
+                                              source_kind,
+                                              mock_device_prefix_blocks);
 }
 
 bool LoadContextCoordinator::registerContext(const std::shared_ptr<LoadAsyncContext>& context) {

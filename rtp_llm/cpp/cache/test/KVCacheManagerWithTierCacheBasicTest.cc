@@ -75,6 +75,157 @@ TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryColdPrefixLoadsFromReservedHos
     manager_->free(FreeInfo{resource, tokens});
 }
 
+TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryRealMatchDoesNotInventColdPrefix) {
+    ASSERT_NO_FATAL_FAILURE(initManager(16, 8, 1.0, 1, true));
+    auto       resource     = makeResource(cache_config_);
+    const int  block_tokens = static_cast<int>(cache_config_.seq_size_per_block);
+    auto       tokens       = makeTokenIds(0, 4 * block_tokens, 4 * block_tokens, block_tokens);
+    MallocInfo info{resource, tokens};
+    info.reuse_cache         = true;
+    info.enable_cache_lookup = true;
+    const auto result        = manager_->malloc(info);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.reuse_len, 0);
+    EXPECT_EQ(result.async_context, nullptr);
+    ASSERT_TRUE(resource->mockMemoryCachePlan().has_value());
+    EXPECT_EQ(resource->mockMemoryCachePlan()->eligible_blocks, 0u);
+    EXPECT_EQ(resource->mockMemoryCachePlan()->planned_host_blocks, 0u);
+    EXPECT_EQ(transfer_engine_->submittedDescriptorCount(), 0u);
+    manager_->free(FreeInfo{resource, tokens});
+}
+
+TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryRealMatchForcesGpuSuffixThroughHostLoad) {
+    ASSERT_NO_FATAL_FAILURE(initManager(16, 8, 0.5, 1, true));
+    auto seed = seedDevicePrefix(manager_, cache_config_, 0, 3);
+    ASSERT_TRUE(seed.has_value());
+    const int  block_tokens = static_cast<int>(cache_config_.seq_size_per_block);
+    auto       resource     = makeResource(cache_config_);
+    auto       tokens       = makeTokenIds(0, 3 * block_tokens, 3 * block_tokens, block_tokens);
+    MallocInfo info{resource, tokens};
+    info.reuse_cache         = true;
+    info.enable_cache_lookup = true;
+    const auto result        = manager_->malloc(info);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.reuse_len, block_tokens);
+    ASSERT_NE(result.async_context, nullptr);
+    result.async_context->waitDone();
+    ASSERT_TRUE(result.async_context->success());
+    auto context = std::dynamic_pointer_cast<LoadAsyncContext>(result.async_context);
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(context->localMatchedBlocks(), 2u);
+    EXPECT_EQ(context->matchedBlocks(Tier::DEVICE), 1u);
+    EXPECT_EQ(context->matchedBlocks(Tier::HOST), 1u);
+    EXPECT_EQ(context->sourceKind(), LoadSourceKind::MOCK_MEMORY);
+    ASSERT_TRUE(resource->mockMemoryCachePlan().has_value());
+    EXPECT_EQ(resource->mockMemoryCachePlan()->eligible_blocks, 2u);
+    EXPECT_EQ(resource->mockMemoryCachePlan()->planned_host_blocks, 1u);
+    for (const auto& tag : kDsv4FullGroupTags) {
+        EXPECT_EQ(resource->blocks(0, tag)[0], seed->blocks_by_group.at(tag)[0]);
+        EXPECT_NE(resource->blocks(0, tag)[1], seed->blocks_by_group.at(tag)[1]);
+    }
+    for (const auto& desc : context->loadDescs()) {
+        EXPECT_EQ(desc.node, nullptr);
+        EXPECT_EQ(desc.path_index, 1u);
+        EXPECT_EQ(desc.source_tier, Tier::HOST);
+    }
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*manager_->blockTreeCache());
+    const auto& metrics = manager_->blockTreeCache()->metrics_reporter_->mock_memory_metrics_;
+    EXPECT_EQ(metrics.eligible_blocks, 2);
+    EXPECT_EQ(metrics.planned_host_blocks, 1);
+    EXPECT_EQ(metrics.successful_h2d_blocks, 1);
+    manager_->free(FreeInfo{resource, tokens});
+}
+
+TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryRealMatchZeroRatioReusesGpuPrefix) {
+    ASSERT_NO_FATAL_FAILURE(initManager(16, 8, 0.0, 1, true));
+    auto seed = seedDevicePrefix(manager_, cache_config_, 0, 3);
+    ASSERT_TRUE(seed.has_value());
+    const int  block_tokens = static_cast<int>(cache_config_.seq_size_per_block);
+    auto       resource     = makeResource(cache_config_);
+    auto       tokens       = makeTokenIds(0, 3 * block_tokens, 3 * block_tokens, block_tokens);
+    MallocInfo info{resource, tokens};
+    info.reuse_cache         = true;
+    info.enable_cache_lookup = true;
+    const auto result        = manager_->malloc(info);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.reuse_len, 2 * block_tokens);
+    EXPECT_EQ(result.async_context, nullptr);
+    EXPECT_EQ(resource->mockMemoryCachePlan()->eligible_blocks, 2u);
+    EXPECT_EQ(resource->mockMemoryCachePlan()->planned_host_blocks, 0u);
+    for (const auto& tag : kDsv4FullGroupTags) {
+        EXPECT_EQ(resource->blocks(0, tag)[0], seed->blocks_by_group.at(tag)[0]);
+    }
+    EXPECT_EQ(transfer_engine_->submittedDescriptorCount(), 0u);
+    manager_->free(FreeInfo{resource, tokens});
+}
+
+TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryRealMatchFailedCopyKeepsTreeAndReleasesRequestRefs) {
+    ASSERT_NO_FATAL_FAILURE(initManager(16, 8, 0.5, 1, true));
+    auto seed = seedDevicePrefix(manager_, cache_config_, 0, 3);
+    ASSERT_TRUE(seed.has_value());
+    auto       cache         = manager_->blockTreeCache();
+    const auto device_before = snapshotDevicePools(manager_);
+    const auto lower_before  = snapshotLowerPools(*cache, GetParam());
+    transfer_engine_->enqueue(false);
+    const int  block_tokens = static_cast<int>(cache_config_.seq_size_per_block);
+    auto       resource     = makeResource(cache_config_);
+    auto       tokens       = makeTokenIds(0, 3 * block_tokens, 3 * block_tokens, block_tokens);
+    MallocInfo info{resource, tokens};
+    info.reuse_cache         = true;
+    info.enable_cache_lookup = true;
+    const auto result        = manager_->malloc(info);
+    ASSERT_TRUE(result.success);
+    ASSERT_NE(result.async_context, nullptr);
+    result.async_context->waitDone();
+    EXPECT_FALSE(result.async_context->success());
+    manager_->free(FreeInfo{resource, tokens});
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+    ASSERT_NO_FATAL_FAILURE(expectPoolSnapshotsEq(device_before, snapshotDevicePools(manager_)));
+    ASSERT_NO_FATAL_FAILURE(expectPoolSnapshotsEq(lower_before, snapshotLowerPools(*cache, GetParam())));
+    const auto path = cache->tree()->findNode(seed->cache_keys);
+    ASSERT_GE(path.size(), 2u);
+    EXPECT_EQ(path[0]->group_set_resources[0].getTopTier(), Tier::DEVICE);
+    EXPECT_EQ(cache->metrics_reporter_->mock_memory_metrics_.failed_h2d_blocks, 1);
+}
+
+TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryRealMatchReadsMockHostForNaturalHostPrefix) {
+    ASSERT_NO_FATAL_FAILURE(initManager(16, 8, 0.5, 1, true));
+    auto cache = manager_->blockTreeCache();
+    auto seed  = seedDevicePrefix(manager_, cache_config_, 0, 3);
+    ASSERT_TRUE(seed.has_value());
+    std::vector<std::shared_ptr<IBlockPool>> device_pools;
+    for (const auto& group : cache->groupSets()) {
+        device_pools.insert(device_pools.end(), group->devicePools().begin(), group->devicePools().end());
+    }
+    ASSERT_NO_FATAL_FAILURE(
+        moveAllPathResourcesToTier(cache, *seed, Tier::DEVICE, Tier::HOST, device_pools, transfer_engine_));
+    const int  block_tokens = static_cast<int>(cache_config_.seq_size_per_block);
+    auto       resource     = makeResource(cache_config_);
+    auto       tokens       = makeTokenIds(0, 3 * block_tokens, 3 * block_tokens, block_tokens);
+    MallocInfo info{resource, tokens};
+    info.reuse_cache         = true;
+    info.enable_cache_lookup = true;
+    const auto result        = manager_->malloc(info);
+    ASSERT_TRUE(result.success);
+    ASSERT_NE(result.async_context, nullptr);
+    result.async_context->waitDone();
+    ASSERT_TRUE(result.async_context->success());
+    auto context = std::dynamic_pointer_cast<LoadAsyncContext>(result.async_context);
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(context->localMatchedBlocks(), 2u);
+    EXPECT_EQ(context->matchedBlocks(Tier::HOST), 2u);
+    EXPECT_EQ(context->matchedBlocks(Tier::DEVICE), 0u);
+    EXPECT_EQ(resource->mockMemoryCachePlan()->planned_host_blocks, 2u);
+    for (const auto& desc : context->loadDescs()) {
+        EXPECT_EQ(desc.node, nullptr);
+        EXPECT_EQ(desc.source_tier, Tier::HOST);
+    }
+    const auto path = cache->tree()->findNode(seed->cache_keys);
+    ASSERT_GE(path.size(), 2u);
+    EXPECT_EQ(path[0]->group_set_resources[0].getTopTier(), Tier::HOST);
+    manager_->free(FreeInfo{resource, tokens});
+}
+
 TEST_P(KVCacheManagerWithTierCacheTest, MockMemoryExplicitFalseUsesNaturalDeviceMatch) {
     ASSERT_NO_FATAL_FAILURE(initManager(16, 8, 1.0));
     auto seed = seedDevicePrefix(manager_, cache_config_, 0, 3);

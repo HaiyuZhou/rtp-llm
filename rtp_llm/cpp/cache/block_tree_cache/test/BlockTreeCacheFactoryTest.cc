@@ -2213,9 +2213,18 @@ TEST_F(BlockTreeCacheFactoryTest, DisabledMockMemoryCachePreservesOrdinaryStartu
     auto          allocator = initAllocator<CoordinatorCacheManager>(config);
     KVCacheConfig options;
     EXPECT_FALSE(options.mock_memory_cache);
+    EXPECT_FALSE(options.mock_memory_cache_real_match);
     EXPECT_EQ(options.mock_memory_cache_hit_ratio, 0.0);
     EXPECT_EQ(options.mock_memory_cache_source_blocks, 64);
     EXPECT_NE(createBlockTreeCache(config, options, allocator), nullptr);
+}
+
+TEST_F(BlockTreeCacheFactoryTest, RealMatchMockModeRequiresMockMemoryService) {
+    const auto    config    = makeHybridConfig();
+    auto          allocator = initAllocator<CoordinatorCacheManager>(config);
+    KVCacheConfig options;
+    options.mock_memory_cache_real_match = true;
+    EXPECT_EQ(createBlockTreeCache(config, options, allocator), nullptr);
 }
 
 TEST_F(BlockTreeCacheFactoryTest, MockMemorySourceReservesConfiguredHostBlocksForCacheLifetime) {

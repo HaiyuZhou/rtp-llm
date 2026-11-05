@@ -293,16 +293,18 @@ mock 请求结束后会释放 request Device 引用并异步写回 Host，因此
 
 `tree_then_mock_memory` 严格执行 seed → real fill → steady → measurement → drain；有尚未完成的采集时，measurement 后可进入 support，再 drain。block-size probe、seed、fill、steady、support 请求显式发送 `mock_memory_cache_request=false`，只有在传输边界被归类为 measurement 的请求发送 `true`。先完成 token/protobuf 准备，再在 RPC 前判定阶段并写入该布尔值；排队请求跨越 steady/measurement 或 measurement/support 边界时，以实际发送阶段为准。这样准备流量不进入 mock 累计块控制器。
 
+混合 profile 额外启用 `--mock_memory_cache_real_match=1`：measurement 仍先在本地 BlockTree 做真实 cache key/有效前缀匹配；未匹配的后缀正常 prefill。已匹配的 GPU 前缀可直接复用，其余匹配后缀从启动时预留的 mock Host source 实际执行 H2D，不读取原 tree entry 的 KV 内容。独立 `mock_memory` profile 未启用该开关，仍保持绕过自然匹配的旧语义。real-match 模式不执行远端 StorageBackend 匹配。
+
 混合策略不采用纯 mock 的 seed 后直接 steady 快捷路径，也不做 tiered rewarm（`rewarm.planned=0`）。fill 使用正常树分配和淘汰，建立真实 Device 高水位及 Host 占用；Host 达到 `fill_host_max_ratio=0.8` 时仍以 `fill_headroom_exhausted` 终止，不能为了跳过 rewarm 放宽余量。准备阶段的 readiness 和 measurement 压力覆盖均继续要求真实 Device/Host 驻留、水位触发及普通 D2H 发布。mock 计数的增长不能替代树压力。
 
-measurement mock H2D 读取服务启动时已有的不可变随机 Host reservoir（seed 决定 source ring offset，payload 实际清零并预建 CRC），**不会读取某条由 fill 产生的指定 tree entry**。成功完成的 mock 请求执行真实异步 D2H 写回；它不改变 reservoir。迁移验收要求 measurement 窗口内 mock `successful_h2d_blocks`、`d2h_completed_blocks` 均有成功增量，并且 `failed_h2d_blocks`、`d2h_failed_blocks` 无增量，同时真实树压力覆盖通过；seed/fill/steady 的普通迁移与窗口外完成都不能充当该窗口的 mock 成功证据。计数必须带受支持的 `terminal_outcome_version=1`，按物理终态记录，不能用稍后的 settlement poll 把事件移入窗口。比例仍按块对齐的 eligible token blocks 累计计算，不按请求数计算。
+measurement mock H2D 读取服务启动时已有的不可变 Host reservoir（seed 决定 source ring offset，payload 实际清零并预建 CRC），**不会读取某条由 fill 产生的指定 tree entry**。成功完成的 mock 请求执行真实异步 D2H 写回；它不改变 reservoir。迁移验收要求 measurement 窗口内 mock `successful_h2d_blocks`、`d2h_completed_blocks` 均有成功增量，并且 `failed_h2d_blocks`、`d2h_failed_blocks` 无增量，同时真实树压力覆盖通过；seed/fill/steady 的普通迁移与窗口外完成都不能充当该窗口的 mock 成功证据。计数必须带受支持的 `terminal_outcome_version=1`，按物理终态记录，不能用稍后的 settlement poll 把事件移入窗口。real-match 模式的 eligible 只统计**真实匹配成功**且可复用的逻辑块；若真实 Host/Disk 后缀本身已超过配置比例，为保持完整匹配前缀，实际 mock H2D 可能高于目标，累计控制器会在后续请求追平。完全未匹配的请求不产生 mock H2D。
 
 验收必须保留 `profile.snapshot.json`、`grid.snapshot.json`、`cache_perf_launch.json`、原始指标、请求/采样 JSONL 和原始 timeline，并逐项记录：
 
-1. 在 measurement 末尾读取同一 owner/controller 的累计 E/P，检查 `abs(P - floor(E * ratio))` 不超过一个有效复用块单元；窗口开始也保存累计基线，不能把窗口增量误当从零开始的目标。
+1. 在 measurement 末尾读取同一 owner/controller 的累计 E/P，检查 `P/E` 与配置比例的差距并报告；real-match 模式可能因真实非 Device 后缀而上偏，不能把上偏伪装成精确达标。窗口开始也保存累计基线，不能把窗口增量误当从零开始的目标。
 2. 分开报告 `planned_ratio_ppm / 1e6` 与 `success_ratio_ppm / 1e6`（均以 eligible 逻辑块为分母）。`successful_h2d_blocks` / `failed_h2d_blocks` 是终态 load attempt 计数；重试可增加传输次数而不增加计划，须结合请求日志解释重试、失败、取消和窗口边界导致的差异。
 3. pressure RPC 在 mock 模式下必须携带 feature completion/failure counters；measurement 内 `successful_h2d_blocks` 与 `d2h_completed_blocks` 均有正增量，`failed_h2d_blocks` 与 `d2h_failed_blocks` 均无增量。原始 CUDA timeline 中 admission 还必须有真实 Host-to-Device load，成功请求完成后有真实 Device-to-Host store；`d2h_submitted_blocks` 与 completed/failed 分开列出，D2H 计数是物理 Host records，实际字节/延时仍以原有 transfer 指标为准。
-4. 初始 mock attribution 的 Device/Disk reuse 均为 0；`source_blocks` / `source_bytes` 和每池 `mock_source_ref_blocks` / bytes 整段流量恒定，无 source 插入普通树。
+4. 纯 mock 模式的初始 Device/Disk reuse 均为 0；real-match 模式允许真实 GPU 前缀复用，但强制加载的后缀仍通过 mock Host H2D。`source_blocks` / `source_bytes` 和每池 `mock_source_ref_blocks` / bytes 整段流量恒定，无 source 插入普通树。
 5. 请求发出时间和 backlog 证明在途压力持续，不能出现每 32 请求等待全体完成后才发下一组的空洞。
 6. 保留既有 transfer 与 scheduler spans，分别分析计划、descriptor 构造、调度、H2D 等待/唤醒、D2H worker 和 model-forward 区间。当前 `cache.mock_memory.plan_and_descriptors` 是合并 span，需要结合其子调用/CPU 栈区分计划与 descriptor 开销，不能把整个 span 都算作控制器成本。
 

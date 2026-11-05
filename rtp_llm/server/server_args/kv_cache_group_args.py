@@ -192,6 +192,14 @@ def init_kv_cache_group_args(parser, kv_cache_config):
         help="Enable mock Memory KVCache pressure testing; model outputs are invalid",
     )
     kv_cache_group.add_argument(
+        "--mock_memory_cache_real_match",
+        env_name="MOCK_MEMORY_CACHE_REAL_MATCH",
+        bind_to=(kv_cache_config, "mock_memory_cache_real_match"),
+        type=str2bool,
+        default=False,
+        help="Match real local cache prefixes before forcing mock Host-to-Device loads",
+    )
+    kv_cache_group.add_argument(
         "--mock_memory_cache_hit_ratio",
         env_name="MOCK_MEMORY_CACHE_HIT_RATIO",
         bind_to=(kv_cache_config, "mock_memory_cache_hit_ratio"),

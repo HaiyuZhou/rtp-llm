@@ -29,6 +29,10 @@ public:
     // Throws if the counter would overflow or no prefix (including zero) is valid;
     // failed calls do not change the cumulative counters.
     MockMemoryHitDecision plan(size_t eligible_blocks, const std::function<bool(size_t)>& is_valid_prefix);
+    // Real-match mode may need more Host loads than the ratio target when the
+    // matched prefix is already absent from Device. Choose the first feasible
+    // Host suffix at or above the cumulative target and carry any overshoot.
+    MockMemoryHitDecision planAtLeast(size_t eligible_blocks, const std::function<bool(size_t)>& is_valid_host_suffix);
     MockMemoryHitSnapshot snapshot() const;
 
 private:

@@ -54,9 +54,10 @@ public:
                      size_t                                         local_matched_blocks,
                      uint64_t                                       context_id,
                      const std::shared_ptr<LoadContextCoordinator>& coordinator,
-                     std::shared_ptr<StorageBackend>                storage_backend = nullptr,
-                     StorageRequest                                 storage_request = {},
-                     LoadSourceKind                                 source_kind     = LoadSourceKind::TREE);
+                     std::shared_ptr<StorageBackend>                storage_backend           = nullptr,
+                     StorageRequest                                 storage_request           = {},
+                     LoadSourceKind                                 source_kind               = LoadSourceKind::TREE,
+                     size_t                                         mock_device_prefix_blocks = 0);
     ~LoadAsyncContext() override;
 
     bool           empty() const;
@@ -120,6 +121,7 @@ private:
     std::vector<TransferDescriptor>         load_descs_;
     std::vector<bool>                       joined_load_;
     const size_t                            local_matched_blocks_{0};
+    const size_t                            mock_device_prefix_blocks_{0};
     size_t                                  matched_blocks_{0};
     size_t                                  backend_matched_blocks_{0};
     std::array<size_t, 3>                   matched_blocks_by_tier_{};
@@ -164,7 +166,8 @@ public:
                                              size_t                          matched_blocks,
                                              std::shared_ptr<StorageBackend> storage_backend = nullptr,
                                              StorageRequest                  storage_request = {},
-                                             LoadSourceKind                  source_kind     = LoadSourceKind::TREE);
+                                             LoadSourceKind                  source_kind     = LoadSourceKind::TREE,
+                                             size_t                          mock_device_prefix_blocks = 0);
     bool                              registerContext(const std::shared_ptr<LoadAsyncContext>& context);
     bool                              commit(uint64_t context_id);
     bool                              abort(LoadAsyncContext& context) noexcept;

@@ -391,16 +391,22 @@ size_t CoordinatorCacheManager::loadTargetPosition(size_t                       
 }
 
 std::shared_ptr<LoadAsyncContext>
-CoordinatorCacheManager::prepareKVCache(const CacheKeysType&                 cache_keys,
-                                        BatchKVCacheResource&                kv_resource,
-                                        const std::shared_ptr<CPSlotMapper>& cp_mapper,
-                                        PreparedKVCache&                     prepared,
-                                        const std::function<bool(size_t)>&   valid_prefix) {
-    if (!block_tree_cache_ || cache_keys.empty()) {
+CoordinatorCacheManager::prepareKVCache(const CacheKeysType&                         cache_keys,
+                                        BatchKVCacheResource&                        kv_resource,
+                                        const std::shared_ptr<CPSlotMapper>&         cp_mapper,
+                                        PreparedKVCache&                             prepared,
+                                        const std::function<bool(size_t)>&           valid_prefix,
+                                        const std::function<BlockTreeMatchResult()>& match_override) {
+    if (!block_tree_cache_) {
         return nullptr;
     }
-    const int                         cp_scale     = (cp_mapper && cp_mapper->isSharded()) ? cp_mapper->cpSize() : 1;
-    BlockTreeMatchResult              match_result = block_tree_cache_->match(cache_keys, valid_prefix);
+    const int            cp_scale = (cp_mapper && cp_mapper->isSharded()) ? cp_mapper->cpSize() : 1;
+    BlockTreeMatchResult match_result =
+        match_override ? match_override() : block_tree_cache_->match(cache_keys, valid_prefix);
+    if (match_result.mock_load_failed) {
+        prepared.materialize_status = MallocStatus::INTERNAL_ERROR;
+        return nullptr;
+    }
     std::shared_ptr<LoadAsyncContext> load_context = std::move(match_result.async_context);
     prepared.matched_device_blocks                 = match_result.matched_device_blocks;
     prepared.total_logical_blocks =
@@ -481,7 +487,55 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
             match_keys.pop_back();
         }
         const int64_t begin_us = currentTimeUs();
-        if (mock_memory) {
+        if (mock_memory && mock_memory_hit_controller_ && block_tree_cache_->config().mock_memory_cache_real_match) {
+            RTP_LLM_PROFILE_SCOPE("cache.mock_memory.real_match_and_plan");
+            const auto valid_prefix = [tokens = malloc_info.complete_token_ids, reuse_unit_tokens](size_t count) {
+                return tokens->isValidReuseLength(static_cast<int>(count) * reuse_unit_tokens);
+            };
+            load_context = prepareKVCache(
+                match_keys,
+                *kv_resource,
+                cp_mapper,
+                prepared,
+                valid_prefix,
+                [this, &match_keys, &valid_prefix, &kv_resource, request_id = malloc_info.request_id]() {
+                    return block_tree_cache_->matchMockMemory(
+                        match_keys,
+                        valid_prefix,
+                        [this, &kv_resource, request_id](size_t                             eligible_blocks,
+                                                         const std::function<bool(size_t)>& valid_host_suffix) {
+                            const bool retry = kv_resource->mockMemoryCachePlan().has_value();
+                            if (!retry) {
+                                const auto decision =
+                                    mock_memory_hit_controller_->planAtLeast(eligible_blocks, valid_host_suffix);
+                                kv_resource->setMockMemoryCachePlan(
+                                    {decision.eligible_blocks, decision.planned_host_blocks});
+                            }
+                            block_tree_cache_->reportMockMemoryPlan(mock_memory_hit_controller_->snapshot());
+                            const size_t planned = kv_resource->mockMemoryCachePlan()->planned_host_blocks;
+                            RTP_LLM_LOG_DEBUG(
+                                "mock_memory_cache real_match request=%ld eligible=%zu planned=%zu retry=%d",
+                                request_id,
+                                eligible_blocks,
+                                planned,
+                                retry);
+                            return planned;
+                        });
+                });
+            if (load_context) {
+                const size_t eligible_blocks = kv_resource->mockMemoryCachePlan()->eligible_blocks;
+                const size_t planned_blocks  = kv_resource->mockMemoryCachePlan()->planned_host_blocks;
+                load_context->onDone(
+                    [request_id = malloc_info.request_id, eligible_blocks, planned_blocks](ErrorInfo error) {
+                        RTP_LLM_LOG_DEBUG(
+                            "mock_memory_cache real_match request=%ld eligible=%zu planned=%zu successful_host=%zu",
+                            request_id,
+                            eligible_blocks,
+                            planned_blocks,
+                            error.ok() ? planned_blocks : 0);
+                    });
+            }
+        } else if (mock_memory) {
             RTP_LLM_PROFILE_SCOPE("cache.mock_memory.plan_and_descriptors");
             if (mock_memory_hit_controller_) {
                 const bool retry = kv_resource->mockMemoryCachePlan().has_value();
@@ -566,6 +620,10 @@ MallocResult CoordinatorCacheManager::initMallocForCommonLen(const MallocInfo& m
         }
         return result;
     };
+
+    if (prepared.materialize_status != MallocStatus::NONE) {
+        return rollback();
+    }
 
     if (load_context && load_context->needBackendMatch()) {
         auto deferred_prepared = std::make_shared<PreparedKVCache>(std::move(prepared));

@@ -75,6 +75,27 @@ TEST(MockMemoryHitControllerTest, RoundsDownToLargestValidPrefixAndRecoversDefic
     EXPECT_EQ(controller.snapshot().cumulative_planned_host_blocks, 12u);
 }
 
+TEST(MockMemoryHitControllerTest, RealMatchRoundsUpToFeasibleHostSuffixAndCarriesOvershoot) {
+    MockMemoryHitController controller(0.5);
+    // The first real match has no reusable Device prefix, so all four blocks
+    // must be copied from Host. Later all-Device matches repay the overshoot.
+    const auto first = controller.planAtLeast(4, [](size_t host) { return host == 4; });
+    EXPECT_EQ(first.planned_host_blocks, 4u);
+    const auto second = controller.planAtLeast(4, anyPrefix);
+    EXPECT_EQ(second.planned_host_blocks, 0u);
+    const auto third = controller.planAtLeast(4, [](size_t host) { return host == 0 || host >= 4; });
+    EXPECT_EQ(third.planned_host_blocks, 4u);
+    EXPECT_EQ(controller.snapshot().cumulative_eligible_blocks, 12u);
+    EXPECT_EQ(controller.snapshot().cumulative_planned_host_blocks, 8u);
+}
+
+TEST(MockMemoryHitControllerTest, RealMatchPlanningFailureDoesNotChargeCounters) {
+    MockMemoryHitController controller(0.5);
+    EXPECT_THROW(controller.planAtLeast(2, [](size_t) { return false; }), std::invalid_argument);
+    EXPECT_EQ(controller.snapshot().cumulative_eligible_blocks, 0u);
+    EXPECT_EQ(controller.snapshot().cumulative_planned_host_blocks, 0u);
+}
+
 TEST(MockMemoryHitControllerTest, CarriedDeficitNeverExceedsCurrentRequestCapacity) {
     MockMemoryHitController controller(1.0);
     EXPECT_EQ(controller.plan(10, [](size_t n) { return n == 0; }).planned_host_blocks, 0u);

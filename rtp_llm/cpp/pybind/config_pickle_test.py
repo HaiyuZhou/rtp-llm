@@ -34,28 +34,32 @@ class KVCacheConfigPickleTest(unittest.TestCase):
     def test_mock_memory_cache_defaults_round_trip(self):
         config = pickle.loads(pickle.dumps(KVCacheConfig()))
         self.assertFalse(config.mock_memory_cache)
+        self.assertFalse(config.mock_memory_cache_real_match)
         self.assertEqual(config.mock_memory_cache_hit_ratio, 0.0)
         self.assertEqual(config.mock_memory_cache_seed, 1)
         self.assertEqual(config.mock_memory_cache_source_blocks, 64)
 
     def test_mock_memory_cache_values_round_trip(self):
         config = KVCacheConfig()
-        self.assertEqual(config.__getstate__()[:2], ("KVCacheConfig", 8))
+        self.assertEqual(config.__getstate__()[:2], ("KVCacheConfig", 9))
         config.mock_memory_cache = True
+        config.mock_memory_cache_real_match = True
         config.mock_memory_cache_hit_ratio = 0.625
         config.mock_memory_cache_seed = 18446744073709551615
         config.mock_memory_cache_source_blocks = 17
         self.assertEqual(
-            config.__getstate__()[69:], (True, 0.625, 18446744073709551615, 17)
+            config.__getstate__()[69:], (True, 0.625, 18446744073709551615, 17, True)
         )
 
         restored = pickle.loads(pickle.dumps(config))
         self.assertTrue(restored.mock_memory_cache)
+        self.assertTrue(restored.mock_memory_cache_real_match)
         self.assertEqual(restored.mock_memory_cache_hit_ratio, 0.625)
         self.assertEqual(restored.mock_memory_cache_seed, 18446744073709551615)
         self.assertEqual(restored.mock_memory_cache_source_blocks, 17)
         for text in (
             "mock_memory_cache: 1",
+            "mock_memory_cache_real_match: 1",
             "mock_memory_cache_hit_ratio: 0.625",
             "mock_memory_cache_seed: 18446744073709551615",
             "mock_memory_cache_source_blocks: 17",
@@ -86,13 +90,17 @@ class KVCacheConfigPickleTest(unittest.TestCase):
         self.assertEqual(restored.kv_cache_event_instance_id, "test-id")
         self.assertEqual(restored.kv_cache_event_host_ip_port, "127.0.0.1:1234")
         self.assertFalse(restored.mock_memory_cache)
+        self.assertFalse(restored.mock_memory_cache_real_match)
         self.assertEqual(restored.mock_memory_cache_hit_ratio, 0.0)
         self.assertEqual(restored.mock_memory_cache_seed, 1)
         self.assertEqual(restored.mock_memory_cache_source_blocks, 64)
 
-    def test_rejects_newer_versions_and_truncated_version_eight(self):
+    def test_version_eight_defaults_real_match_and_rejects_invalid_states(self):
         state = KVCacheConfig().__getstate__()
-        for version, fields in ((9, state), (8, state[:69])):
+        previous = _new_config(KVCacheConfig)
+        previous.__setstate__((state[0], 8, *state[2:73]))
+        self.assertFalse(previous.mock_memory_cache_real_match)
+        for version, fields in ((10, state), (8, state[:69]), (9, state[:73])):
             with self.subTest(version=version), self.assertRaisesRegex(
                 RuntimeError, "invalid KVCacheConfig state"
             ):

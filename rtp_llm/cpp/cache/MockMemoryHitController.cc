@@ -43,6 +43,30 @@ MockMemoryHitDecision MockMemoryHitController::plan(size_t                      
     return {eligible_blocks, candidate, state_.cumulative_eligible_blocks, state_.cumulative_planned_host_blocks};
 }
 
+MockMemoryHitDecision MockMemoryHitController::planAtLeast(size_t                             eligible_blocks,
+                                                           const std::function<bool(size_t)>& is_valid_host_suffix) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (eligible_blocks > std::numeric_limits<uint64_t>::max() - state_.cumulative_eligible_blocks) {
+        throw std::overflow_error("mock memory hit cumulative eligible blocks overflow");
+    }
+    const uint64_t eligible_next = state_.cumulative_eligible_blocks + eligible_blocks;
+    const uint64_t target =
+        static_cast<uint64_t>((static_cast<unsigned __int128>(eligible_next) * ratio_ppm_) / kRatioScale);
+    const uint64_t deficit =
+        target > state_.cumulative_planned_host_blocks ? target - state_.cumulative_planned_host_blocks : 0;
+    size_t candidate = static_cast<size_t>(std::min<uint64_t>(deficit, eligible_blocks));
+    while (!is_valid_host_suffix(candidate)) {
+        if (candidate == eligible_blocks) {
+            throw std::invalid_argument("mock memory hit planning has no valid Host suffix");
+        }
+        ++candidate;
+    }
+
+    state_.cumulative_eligible_blocks = eligible_next;
+    state_.cumulative_planned_host_blocks += candidate;
+    return {eligible_blocks, candidate, state_.cumulative_eligible_blocks, state_.cumulative_planned_host_blocks};
+}
+
 MockMemoryHitSnapshot MockMemoryHitController::snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return state_;

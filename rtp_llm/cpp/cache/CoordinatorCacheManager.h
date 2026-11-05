@@ -26,6 +26,7 @@ namespace rtp_llm {
 class CPSlotMapper;
 class LoadAsyncContext;
 class BlockTreeCache;
+struct BlockTreeMatchResult;
 using BlockTreeCachePtr = std::shared_ptr<BlockTreeCache>;
 class SingleTypeCacheManager;
 using SingleTypeCacheManagerPtr = std::shared_ptr<SingleTypeCacheManager>;
@@ -245,11 +246,12 @@ protected:
         MallocStatus                   materialize_status = MallocStatus::NONE;
     };
 
-    std::shared_ptr<LoadAsyncContext> prepareKVCache(const CacheKeysType&                 cache_keys,
-                                                     BatchKVCacheResource&                kv_resource,
-                                                     const std::shared_ptr<CPSlotMapper>& cp_mapper,
-                                                     PreparedKVCache&                     prepared,
-                                                     const std::function<bool(size_t)>&   valid_prefix = {});
+    std::shared_ptr<LoadAsyncContext> prepareKVCache(const CacheKeysType&                         cache_keys,
+                                                     BatchKVCacheResource&                        kv_resource,
+                                                     const std::shared_ptr<CPSlotMapper>&         cp_mapper,
+                                                     PreparedKVCache&                             prepared,
+                                                     const std::function<bool(size_t)>&           valid_prefix   = {},
+                                                     const std::function<BlockTreeMatchResult()>& match_override = {});
     bool                              materializeInitialBlocks(const MallocInfo& malloc_info,
                                                                PreparedKVCache&  prepared,
                                                                LoadAsyncContext* context,

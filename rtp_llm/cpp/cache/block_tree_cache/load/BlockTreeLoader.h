@@ -23,6 +23,8 @@ class MockMemoryCacheSource;
 
 struct BlockTreeMatchResult {
     size_t                                              matched_device_blocks{0};
+    size_t                                              mock_memory_blocks{0};
+    bool                                                mock_load_failed{false};
     std::vector<MultiNodeResource>                      matched_device_resources;
     std::shared_ptr<LoadAsyncContext>                   async_context;
     std::vector<BlockTreeCacheReuseTimeMetricsSnapshot> reuse_time_metrics_snapshots;
@@ -33,7 +35,8 @@ struct BlockTreeMatchResult {
 class BlockTreeLoader {
 public:
     // Invoked with the shared cache mutex held.
-    using SettledFn = std::function<void(bool check_watermark)>;
+    using SettledFn         = std::function<void(bool check_watermark)>;
+    using MockMemoryPlanner = std::function<size_t(size_t, const std::function<bool(size_t)>&)>;
 
     BlockTreeLoader(BlockTree*                                   tree,
                     BlockTreeEvictor&                            evictor,
@@ -51,17 +54,23 @@ public:
     // The caller must hold the shared BlockTreeCache mutex.
     BlockTreeMatchResult matchLocked(const CacheKeysType&               cache_keys,
                                      const std::function<bool(size_t)>& valid_prefix = {});
+    // Performs real local tree/prefix validation, then replaces a suffix of
+    // matched blocks with request-owned H2D copies from the mock Host source.
+    BlockTreeMatchResult matchMockMemoryLocked(const CacheKeysType&               cache_keys,
+                                               const std::function<bool(size_t)>& valid_prefix,
+                                               const MockMemoryPlanner&           planner);
     BlockIndicesType     matchedBlocksForGroup(std::string_view                      group_tag,
                                                const std::vector<MultiNodeResource>& matched_resources) const;
     bool                 abortPendingLoad(const std::shared_ptr<AsyncContext>& context);
     // The caller holds the shared cache mutex; no tree lookup or mutation.
-    std::shared_ptr<LoadAsyncContext> mockMemoryLoad(size_t logical_blocks);
+    std::shared_ptr<LoadAsyncContext> mockMemoryLoad(size_t logical_blocks, size_t device_prefix_blocks = 0);
     void                              shutdown();
 
 private:
     bool                                                validMatch(std::vector<TreeNode*>&            path,
                                                                    std::vector<bool>&                 candidate_valid,
-                                                                   const std::function<bool(size_t)>& valid_prefix) const;
+                                                                   const std::function<bool(size_t)>& valid_prefix,
+                                                                   std::vector<bool>*                 structural_valid = nullptr) const;
     std::vector<BlockTreeCacheReuseTimeMetricsSnapshot> collectReuseTimeSnapshots(const std::vector<TreeNode*>& path,
                                                                                   size_t  matched_device_blocks,
                                                                                   int64_t access_time_us) const;

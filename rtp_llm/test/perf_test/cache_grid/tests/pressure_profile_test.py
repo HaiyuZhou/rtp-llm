@@ -780,6 +780,15 @@ class PressureProfileTest(unittest.TestCase):
         self.assertIn("DIAGNOSTIC ONLY", summary["label"])
         self.assertIn("OUTPUT CORRECTNESS INVALID", summary["label"])
 
+    def test_tree_then_mock_memory_profile_enables_real_prefix_matching(self):
+        from rtp_llm.test.perf_test.cache_grid.config.perf_profile import load_profile
+
+        config = Path(__file__).resolve().parents[1] / "config"
+        profile = load_profile(
+            config / "continuous_full_pressure_dsv4.tree_then_mock_memory.example.jsonc"
+        )
+        self.assertEqual(profile["engine_args"]["--mock_memory_cache_real_match"], 1)
+
     def test_two_markers_cannot_own_the_same_launch(self):
         trace = actual_trace()
         marker = copy.deepcopy(trace["traceEvents"][4])

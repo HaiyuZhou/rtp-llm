@@ -384,6 +384,10 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
                                        std::shared_ptr<StorageBackend>            storage_backend,
                                        std::shared_ptr<BroadcastManager>          broadcast_manager,
                                        std::shared_ptr<kmonitor::MetricsReporter> metrics_reporter) {
+    if (kv_cache_config.mock_memory_cache_real_match && !kv_cache_config.mock_memory_cache) {
+        RTP_LLM_LOG_ERROR("mock_memory_cache_real_match requires mock_memory_cache=true");
+        return nullptr;
+    }
     if (kv_cache_config.mock_memory_cache) {
         if (!kv_cache_config.reuse_cache) {
             RTP_LLM_LOG_ERROR("mock_memory_cache requires reuse_cache=true");
@@ -664,6 +668,7 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     const bool owns_mutable_block_tree =
         parallelism_config.tp_rank == 0 && !parallelism_config.ffn_disaggregate_config.is_ffn_service();
     config.mock_memory_cache             = kv_cache_config.mock_memory_cache;
+    config.mock_memory_cache_real_match  = kv_cache_config.mock_memory_cache_real_match;
     config.mock_memory_cache_hit_ratio   = kv_cache_config.mock_memory_cache_hit_ratio;
     config.mock_memory_cache_coordinator = owns_mutable_block_tree;
     config.full_prefix_scan_interval_ms  = owns_mutable_block_tree ? configured_scan_interval_ms : 0;

@@ -163,6 +163,26 @@ BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType&               ca
     return result;
 }
 
+BlockTreeMatchResult BlockTreeCache::matchMockMemory(const CacheKeysType&                      cache_keys,
+                                                     const std::function<bool(size_t)>&        valid_prefix,
+                                                     const BlockTreeLoader::MockMemoryPlanner& planner) {
+    BlockTreeMatchResult result;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        result = loader_.matchMockMemoryLocked(cache_keys, valid_prefix, planner);
+    }
+    metrics_reporter_->reportCacheReuseTimeMetrics(result.reuse_time_metrics_snapshots);
+    if (result.async_context) {
+        result.async_context->setTransferOutcomeCallback(
+            [reporter = metrics_reporter_, logical_blocks = result.mock_memory_blocks](ErrorInfo error) {
+                reporter->recordMockMemoryH2D(logical_blocks, error.ok());
+            });
+    } else if (result.mock_load_failed) {
+        metrics_reporter_->recordMockMemoryH2D(result.mock_memory_blocks, false);
+    }
+    return result;
+}
+
 std::shared_ptr<LoadAsyncContext> BlockTreeCache::mockMemoryLoad(size_t logical_blocks) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto                        context = loader_.mockMemoryLoad(logical_blocks);

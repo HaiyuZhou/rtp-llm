@@ -44,24 +44,26 @@ BlockTreeLoader::BlockTreeLoader(BlockTree*                                   tr
     load_context_coordinator_(std::make_shared<LoadContextCoordinator>(
         [this](const std::shared_ptr<LoadAsyncContext>& context) { return commitLoad(context); },
         [this](LoadAsyncContext& context) {
-            std::lock_guard<std::mutex> lock(mutex_);
             if (context.sourceKind() == LoadSourceKind::MOCK_MEMORY) {
                 // Pending mock contexts have neither source LOAD holds nor target LOAD holds.
                 return;
             }
+            std::lock_guard<std::mutex> lock(mutex_);
             abortLoadLocked(
                 context.loadDescs(), context.joinedLoads(), 0, context.contextId(), /*release_transferred_refs=*/false);
         })) {}
 
-std::shared_ptr<LoadAsyncContext> BlockTreeLoader::mockMemoryLoad(size_t logical_blocks) {
-    if (!mock_memory_cache_source_ || logical_blocks == 0) {
+std::shared_ptr<LoadAsyncContext> BlockTreeLoader::mockMemoryLoad(size_t logical_blocks, size_t device_prefix_blocks) {
+    if (!mock_memory_cache_source_ || logical_blocks == 0 || device_prefix_blocks >= logical_blocks) {
         return nullptr;
     }
     std::vector<TransferDescriptor> descriptors;
     for (size_t group_set_id = 0; group_set_id < tree_->groupSets().size(); ++group_set_id) {
         const auto&  group_set   = tree_->groupSets()[group_set_id];
         const size_t reuse_count = std::min(logical_blocks, group_set->computeReuseBlockCount(logical_blocks));
-        for (size_t path_index = logical_blocks - reuse_count; path_index < logical_blocks; ++path_index) {
+        for (size_t path_index = std::max(logical_blocks - reuse_count, device_prefix_blocks);
+             path_index < logical_blocks;
+             ++path_index) {
             descriptors.push_back({nullptr,
                                    group_set_id,
                                    path_index,
@@ -70,12 +72,16 @@ std::shared_ptr<LoadAsyncContext> BlockTreeLoader::mockMemoryLoad(size_t logical
                                    {mock_memory_cache_source_->blockFor(group_set->groupSetId(), path_index)}});
         }
     }
+    if (descriptors.empty()) {
+        return nullptr;
+    }
     auto context = load_context_coordinator_->create(descriptors,
                                                      std::vector<bool>(descriptors.size(), false),
                                                      logical_blocks,
                                                      nullptr,
                                                      {},
-                                                     LoadSourceKind::MOCK_MEMORY);
+                                                     LoadSourceKind::MOCK_MEMORY,
+                                                     device_prefix_blocks);
     if (!context || !load_context_coordinator_->registerContext(context)) {
         return nullptr;
     }
@@ -98,9 +104,80 @@ BlockTreeMatchResult BlockTreeLoader::matchLocked(const CacheKeysType&          
     return result;
 }
 
+BlockTreeMatchResult BlockTreeLoader::matchMockMemoryLocked(const CacheKeysType&               cache_keys,
+                                                            const std::function<bool(size_t)>& valid_prefix,
+                                                            const MockMemoryPlanner&           planner) {
+    RTP_LLM_CHECK(planner != nullptr);
+    std::vector<TreeNode*> path = tree_->findNode(cache_keys);
+    std::vector<bool>      candidate_valid;
+    std::vector<bool>      structural_valid;
+    if (!path.empty()) {
+        validMatch(path, candidate_valid, valid_prefix, &structural_valid);
+    }
+    const size_t matched_blocks      = path.size();
+    const auto   device_prefix_valid = [this, &path, &structural_valid](size_t device_blocks) {
+        if (device_blocks == 0) {
+            return true;
+        }
+        if (device_blocks > path.size() || !structural_valid[device_blocks - 1]) {
+            return false;
+        }
+        for (size_t group_set_id = 0; group_set_id < tree_->groupSets().size(); ++group_set_id) {
+            const GroupSetPtr& group_set = tree_->groupSets()[group_set_id];
+            const size_t       reuse_count = std::min(group_set->computeReuseBlockCount(device_blocks), device_blocks);
+            for (size_t index = device_blocks - reuse_count; index < device_blocks; ++index) {
+                if (!path[index]->group_set_resources[group_set_id].hasCompleteDeviceValue()) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    const size_t         mock_blocks = planner(matched_blocks, [&](size_t candidate) {
+        return candidate <= matched_blocks && device_prefix_valid(matched_blocks - candidate);
+    });
+    BlockTreeMatchResult result;
+    if (mock_blocks > matched_blocks || !device_prefix_valid(matched_blocks - mock_blocks)) {
+        // A retry can observe a changed tree after its one-time plan was charged.
+        // Do not fabricate a hit or charge the cumulative controller again.
+        RTP_LLM_LOG_WARNING(
+            "mock real-match plan no longer fits current prefix: matched=%zu planned=%zu", matched_blocks, mock_blocks);
+        return result;
+    }
+    result.matched_device_blocks = matched_blocks - mock_blocks;
+    result.mock_memory_blocks    = mock_blocks;
+    result.reuse_time_metrics_snapshots =
+        collectReuseTimeSnapshots(path, result.matched_device_blocks, currentTimeUs());
+
+    if (mock_blocks != 0) {
+        result.async_context = mockMemoryLoad(matched_blocks, result.matched_device_blocks);
+        if (!result.async_context) {
+            result.mock_load_failed = true;
+            return result;
+        }
+    }
+    for (size_t group_set_id = 0; group_set_id < tree_->groupSets().size(); ++group_set_id) {
+        const GroupSetPtr& group_set = tree_->groupSets()[group_set_id];
+        const size_t       reuse_count =
+            std::min(group_set->computeReuseBlockCount(result.matched_device_blocks), result.matched_device_blocks);
+        MultiNodeResource resource{group_set_id, Tier::DEVICE};
+        for (size_t index = result.matched_device_blocks - reuse_count; index < result.matched_device_blocks; ++index) {
+            const GroupSetResource& matched = path[index]->group_set_resources[group_set_id];
+            resource.node_blocks.emplace_back(nullptr, matched.getBlocks(Tier::DEVICE));
+        }
+        if (!resource.node_blocks.empty()) {
+            group_set->referenceBlocks(resource);
+            result.matched_device_resources.push_back(std::move(resource));
+        }
+    }
+    evictor_.onMatched(path);
+    return result;
+}
+
 bool BlockTreeLoader::validMatch(std::vector<TreeNode*>&            path,
                                  std::vector<bool>&                 candidate_valid,
-                                 const std::function<bool(size_t)>& valid_prefix) const {
+                                 const std::function<bool(size_t)>& valid_prefix,
+                                 std::vector<bool>*                 structural_valid) const {
     size_t valid_block_count = 0;
     candidate_valid.reserve(path.size());
     std::vector<std::unique_ptr<MatchValidator>> match_validators;
@@ -116,6 +193,9 @@ bool BlockTreeLoader::validMatch(std::vector<TreeNode*>&            path,
                 all_groups_valid = false;
             }
         }
+        if (structural_valid != nullptr) {
+            structural_valid->push_back(all_groups_valid);
+        }
         all_groups_valid = all_groups_valid && (!valid_prefix || valid_prefix(i + 1));
         if (all_groups_valid) {
             valid_block_count = i + 1;
@@ -125,6 +205,9 @@ bool BlockTreeLoader::validMatch(std::vector<TreeNode*>&            path,
 
     path.resize(valid_block_count);
     candidate_valid.resize(valid_block_count);
+    if (structural_valid != nullptr) {
+        structural_valid->resize(valid_block_count);
+    }
     return valid_block_count > 0;
 }
 

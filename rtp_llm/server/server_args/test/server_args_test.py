@@ -143,6 +143,7 @@ class CacheConfigArgumentsTest(TestCase):
     def test_mock_memory_cache_defaults(self):
         config = self.parse_cache_config([], {})
         self.assertFalse(config.mock_memory_cache)
+        self.assertFalse(config.mock_memory_cache_real_match)
         self.assertEqual(config.mock_memory_cache_hit_ratio, 0.0)
         self.assertEqual(config.mock_memory_cache_seed, 1)
         self.assertEqual(config.mock_memory_cache_source_blocks, 64)
@@ -150,6 +151,7 @@ class CacheConfigArgumentsTest(TestCase):
     def test_mock_memory_cache_cli_and_environment(self):
         samples = {
             "mock_memory_cache": True,
+            "mock_memory_cache_real_match": True,
             "mock_memory_cache_hit_ratio": 0.625,
             "mock_memory_cache_seed": 18446744073709551615,
             "mock_memory_cache_source_blocks": 17,
@@ -172,6 +174,8 @@ class CacheConfigArgumentsTest(TestCase):
             [
                 "--mock_memory_cache",
                 "0",
+                "--mock_memory_cache_real_match",
+                "0",
                 "--mock_memory_cache_hit_ratio",
                 "0.0",
                 "--mock_memory_cache_seed",
@@ -182,6 +186,7 @@ class CacheConfigArgumentsTest(TestCase):
             env,
         )
         self.assertFalse(config.mock_memory_cache)
+        self.assertFalse(config.mock_memory_cache_real_match)
         self.assertEqual(config.mock_memory_cache_hit_ratio, 0.0)
         self.assertEqual(config.mock_memory_cache_seed, 0)
         self.assertEqual(config.mock_memory_cache_source_blocks, 0)

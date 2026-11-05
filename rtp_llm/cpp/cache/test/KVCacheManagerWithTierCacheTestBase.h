@@ -1367,7 +1367,8 @@ protected:
     void initManager(uint32_t              device_blocks,
                      int64_t               lower_cache_size_mb = 8,
                      std::optional<double> mock_hit_ratio      = std::nullopt,
-                     int                   min_replay_tokens   = 1) {
+                     int                   min_replay_tokens   = 1,
+                     bool                  mock_real_match     = false) {
         ASSERT_FALSE(disk_dir_.path().empty());
         cache_config_                         = makeCompactDsv4CacheConfig(device_blocks);
         cache_config_.cache_min_replay_tokens = min_replay_tokens;
@@ -1375,6 +1376,7 @@ protected:
         auto tier_config = makeTierConfig(GetParam(), disk_dir_.path(), lower_cache_size_mb);
         if (mock_hit_ratio) {
             tier_config.mock_memory_cache               = true;
+            tier_config.mock_memory_cache_real_match    = mock_real_match;
             tier_config.mock_memory_cache_hit_ratio     = *mock_hit_ratio;
             tier_config.mock_memory_cache_source_blocks = 2;
         }

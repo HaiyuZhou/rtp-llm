@@ -70,6 +70,13 @@ their identifiers are `4,5`. AOne shards and gang members also use the allocated
 devices; a gang reserves the full per-host allocation and uses its local rank
 group. Invalid or insufficient allocations fail before model startup.
 
+The test-only batch scheduler uses a fixed 30-second cache-admission timeout per stream.
+It does not evict or reschedule other streams to reclaim device KV blocks, so
+a batch that cannot fit in KV memory could otherwise keep retrying indefinitely
+when no request timeout is set. Once a stream times out, later streams in the
+same selected batch get one state-machine attempt; those that cannot enter
+RUNNING fail immediately without waiting. The timeout flag resets for the next batch.
+
 Start with a JSON file in `examples/` and set model, tokenizer, topology and
 devices for the execution host. Prefill supports generated cache grids,
 `request_batches` with explicit groups, ordered named `grids`, and random or

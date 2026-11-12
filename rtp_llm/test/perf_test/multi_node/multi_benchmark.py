@@ -490,6 +490,7 @@ def execute_task(
                     "ip_lists": task_config["ip_lists"],
                     "run_user": task_config["run_user"],
                     "ssh_port": task_config["ssh_port"],
+                    "ft_work_dir": task_config.get("ft_work_dir"),
                     "ft_sub_dir": task_config["ft_sub_dir"],
                     "task_output_dir": task_output_dir,
                     "perf_test_run_id": multi_runner_env["PERF_TEST_RUN_ID"],
@@ -518,6 +519,7 @@ def execute_task(
                         "ip_lists": task_config["ip_lists"],
                         "run_user": task_config["run_user"],
                         "ssh_port": task_config["ssh_port"],
+                        "ft_work_dir": task_config.get("ft_work_dir"),
                         "ft_sub_dir": task_config["ft_sub_dir"],
                         "task_output_dir": str(
                             Path(task_output_dir)
@@ -540,6 +542,7 @@ def execute_task(
                     "ip_lists": task_config["ip_lists"],
                     "run_user": task_config["run_user"],
                     "ssh_port": task_config["ssh_port"],
+                    "ft_work_dir": task_config.get("ft_work_dir"),
                     "ft_sub_dir": task_config["ft_sub_dir"],
                 },
                 clean_log_path=task_clean_output_path,
@@ -564,6 +567,7 @@ def execute_task(
                 "ip_lists": task_config["ip_lists"],
                 "run_user": task_config["run_user"],
                 "ssh_port": task_config["ssh_port"],
+                "ft_work_dir": task_config.get("ft_work_dir"),
                 "ft_sub_dir": task_config["ft_sub_dir"],
             },
             clean_log_path=task_clean_output_path,
@@ -1010,6 +1014,7 @@ def main():
     multi_kill_script(copy_kill_config, kill_log_path=kill_log_path)
     # Make sure all test result files are cleaned before running benchmarks
     copy_clean_config = copy.deepcopy(machine_config)
+    copy_clean_config["ft_work_dir"] = build_config.get("ft_work_dir")
     copy_clean_config["ft_sub_dir"] = build_config["ft_sub_dir"]
     multi_clean_script(copy_clean_config, clean_log_path=clean_log_path)
     # Run all benchmarks

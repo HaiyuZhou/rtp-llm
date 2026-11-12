@@ -95,6 +95,16 @@ RPC. Client failure details are retained in the case error. Profiling flush,
 engine readiness and the outer test/watchdog have separate limits; increasing
 the request budget does not extend those limits.
 
+Seeds run in concurrent batches of at most 8 requests. Each batch reserves
+`cache_len + commit_tail_tokens + 1` tokens per seed against
+`engine.max_batch_tokens`; the extra token reserves the output. When
+`workload.workspace_tokens` is set, the sum of seed reservations rounded up
+individually to physical cache blocks must also fit that limit. No separate
+seed budget setting is required. Cold members need no seed. Each seed batch
+uses its actual request count as the scheduler target, including the final
+batch. All seeds must complete and pass validation before measurement starts;
+a failed batch is fully drained and stops the case.
+
 Decode examples cover fixed input/output/global-batch grids
 (`decode_grid_local.json`), a materialized input-length distribution
 (`decode_distribution_local.json`), and bounded target-TPOT search

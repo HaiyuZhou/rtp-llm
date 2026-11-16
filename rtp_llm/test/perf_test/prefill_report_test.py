@@ -4,6 +4,7 @@ import copy
 import itertools
 import json
 import tempfile
+import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -442,6 +443,24 @@ class PrefillReportTest(unittest.TestCase):
 
 
 class PrefillChartTest(unittest.TestCase):
+
+    def test_plotly_available_tracks_the_offline_import(self):
+        from rtp_llm.test.perf_test.prefill.chart import plotly_available
+
+        with patch.dict(
+            "sys.modules",
+            {"plotly": None, "plotly.graph_objects": None, "plotly.offline": None},
+        ):
+            self.assertFalse(plotly_available())
+        offline = types.ModuleType("plotly.offline")
+        offline.get_plotlyjs = lambda: ""
+        package = types.ModuleType("plotly")
+        package.offline = offline
+        with patch.dict(
+            "sys.modules",
+            {"plotly": package, "plotly.offline": offline},
+        ):
+            self.assertTrue(plotly_available())
 
     def test_standalone_charts_and_static_fallback(self):
         with tempfile.TemporaryDirectory() as directory:

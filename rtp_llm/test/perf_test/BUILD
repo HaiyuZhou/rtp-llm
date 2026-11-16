@@ -265,6 +265,45 @@ py_library(
     visibility = ["//visibility:public"],
 )
 
+# Site-CI adapters: deliver pipeline parameters onto a strict config and
+# gate collected prefill artifacts. Portable helpers; CI invokes them
+# explicitly, they never run as part of a normal perf test.
+py_library(
+    name = "ci_helpers",
+    srcs = [
+        "ci_delivery.py",
+        "ci_prefill_verify.py",
+    ],
+    data = [
+        "examples/decode_aone_gang.json",
+        "examples/prefill_aone_ci.json",
+    ],
+    deps = [
+        ":perf_test_lib",
+    ],
+)
+
+py_binary(
+    name = "ci_delivery",
+    srcs = ["ci_delivery.py"],
+    deps = [":ci_helpers"],
+)
+
+py_binary(
+    name = "ci_prefill_verify",
+    srcs = ["ci_prefill_verify.py"],
+    deps = [":ci_helpers"],
+)
+
+py_test(
+    name = "ci_test",
+    srcs = ["ci_test.py"],
+    deps = [
+        ":perf_test_lib",
+        ":ci_helpers",
+    ],
+)
+
 py_binary(
     name = "perf_test",
     main = "main.py",

@@ -132,6 +132,20 @@ def _points(report: Mapping[str, Any]) -> list[dict[str, Any]]:
     return points
 
 
+def plotly_available() -> bool:
+    """Whether the optional Plotly dependency interactive charts need is importable.
+
+    Platform targets that do not ship Plotly get the static SVG fallback, so
+    callers must probe this helper instead of ``import plotly``: it mirrors the
+    exact lazy import ``render_interactive_chart`` performs below.
+    """
+    try:
+        from plotly.offline import get_plotlyjs  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def render_interactive_chart(
     report: Mapping[str, Any], *, default_metric: str, fallback_svg: str
 ) -> str:
@@ -146,11 +160,11 @@ def render_interactive_chart(
         )
         + "</ul>"
     )
-    try:
-        from plotly.offline import get_plotlyjs
-    except ImportError:
+    if not plotly_available():
         body = "<p>Plotly unavailable; showing static chart.</p>" + fallback_svg
     else:
+        from plotly.offline import get_plotlyjs
+
         data = (
             json.dumps(points, ensure_ascii=True)
             .replace("<", "\\u003c")

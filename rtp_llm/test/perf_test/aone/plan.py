@@ -113,6 +113,7 @@ AONE_GPU_PLATFORMS = {
     "H20_CU13": "cuda13",
     "L20D_DEV": "cuda13",
     "L20_CU13": "cuda13",
+    "RTX_5000_PRO_CU13": "cuda13",
     "SM100_ARM_CU13": "cuda13_arm",
     "SM103_CU13": "cuda13",
 }
@@ -122,7 +123,8 @@ AONE_GPU_HOSTS = {
     "H20_CU13": 8,
     "L20D_DEV": 8,
     "L20_CU13": 8,
-    "SM100_ARM_CU13": 8,
+    "RTX_5000_PRO_CU13": 8,
+    "SM100_ARM_CU13": 4,
     "SM103_CU13": 8,
 }
 

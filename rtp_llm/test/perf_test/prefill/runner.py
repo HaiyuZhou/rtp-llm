@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Tuple
 
 from rtp_llm.test.perf_test.prefill.measurement import PREFILL_MEASUREMENT_CONTRACT
 from rtp_llm.test.perf_test.prefill.prompts import (
@@ -46,7 +46,19 @@ class PrefillRunner:
         cache_block_size: int | None = None,
         input_ids_only: bool = False,
         monotonic: Callable[[], float] = time.monotonic,
+        warmup_deviation_threshold: float = 0.25,
+        warmup_sweep_budget_s: float = 1200.0,
+        warmup_sweep_profiles: int = 3,
     ):
+        if not 0.0 < float(warmup_deviation_threshold) <= 1.0:
+            raise ValueError(
+                "warmup_deviation_threshold must be in (0, 1], got "
+                f"{warmup_deviation_threshold!r}"
+            )
+        if float(warmup_sweep_budget_s) <= 0:
+            raise ValueError("warmup_sweep_budget_s must be positive")
+        if int(warmup_sweep_profiles) < 1:
+            raise ValueError("warmup_sweep_profiles must be >= 1")
         self.monotonic = monotonic
         self.client = client
         self.factory = PrefixPromptFactory(tokenizer)
@@ -55,7 +67,11 @@ class PrefillRunner:
         self.workspace_tokens = workspace_tokens
         self.cache_block_size = cache_block_size or commit_tail_tokens
         self.input_ids_only = input_ids_only
+        self.warmup_deviation_threshold = float(warmup_deviation_threshold)
+        self.warmup_sweep_budget_s = float(warmup_sweep_budget_s)
+        self.warmup_sweep_profiles = int(warmup_sweep_profiles)
         self._validated_cases: set[str] = set()
+        self._warmed_shapes: set[int] = set()
 
     @staticmethod
     def _identity(case: Dict[str, Any]) -> Dict[str, Any]:
@@ -317,6 +333,7 @@ class PrefillRunner:
         measure_runs = int(case["measure_runs"])
         # The first prompt is a fixed warmup; formal rounds retain their IDs.
         prompt_count = measure_runs + 1
+        include_warmup = self._should_warmup(batch_size, measure_runs)
         input_len = int(case["input_len"])
         cache_len = int(case["cache_len"])
         grouped = "request_groups" in case
@@ -357,13 +374,17 @@ class PrefillRunner:
 
         measurements: List[Dict[str, Any]] = []
         round_rates: List[float] = []
+        per_run_elapsed_ms: List[float] = []
         compute_length = (
             sum(item["input_len"] - item["cache_len"] for item in members)
             if grouped
             else int(case["compute_len"])
         )
         with ThreadPoolExecutor(max_workers=batch_size) as executor:
-            for prompt_index in range(prompt_count):
+            # Skipping the warmup round still executes the same formal prompts
+            # (indices 1..measure_runs), keeping measurements comparable.
+            prompt_start = 0 if include_warmup else 1
+            for prompt_index in range(prompt_start, prompt_count):
                 run_index = prompt_index - 1
                 warmup = run_index < 0
                 release = threading.Event()
@@ -455,6 +476,7 @@ class PrefillRunner:
                     )
                 if warmup:
                     continue
+                per_run_elapsed_ms.append(elapsed_ms)
                 round_rates.append(
                     compute_length
                     * (1 if grouped else batch_size)
@@ -462,11 +484,35 @@ class PrefillRunner:
                     / elapsed_ms
                 )
 
+        if include_warmup:
+            self._warmed_shapes.add(batch_size)
+        warmup_anomaly = None
+        if not include_warmup and len(per_run_elapsed_ms) >= 2:
+            first_elapsed = per_run_elapsed_ms[0]
+            reference = statistics.median(per_run_elapsed_ms[1:])
+            slowest = max(first_elapsed, reference)
+            deviation = (first_elapsed - reference) / slowest if slowest > 0 else 0.0
+            if deviation > self.warmup_deviation_threshold:
+                # The first formal round likely absorbed a lazy-compile cost the
+                # sweep missed; drop it so the polluted round cannot skew stats.
+                warmup_anomaly = {
+                    "deviation_ratio": round(deviation, 6),
+                    "dropped_runs": [0],
+                }
+                measurements = [item for item in measurements if item["run"] != 0]
+                round_rates = round_rates[1:]
+        if not measurements or not round_rates:
+            return self._failure(
+                case,
+                "invalid_timing",
+                "all measured rounds were discarded by the warmup deviation check",
+            )
+        measured_runs_present = sorted({item["run"] for item in measurements})
         latencies = [float(item["latency_ms"]) for item in measurements]
         median_latency = statistics.median(
             [
                 max(item["latency_ms"] for item in measurements if item["run"] == run)
-                for run in range(measure_runs)
+                for run in measured_runs_present
             ]
             if grouped
             else latencies
@@ -480,7 +526,7 @@ class PrefillRunner:
                         for item in measurements
                         if item["run"] == run
                     )
-                    for run in range(measure_runs)
+                    for run in measured_runs_present
                 ]
                 if grouped
                 else waits
@@ -511,5 +557,160 @@ class PrefillRunner:
                 "seed": int(case["seed"]),
                 "prefix_policy": {"kind": case["prefix_policy"]},
                 "measurements": measurements,
+                "warmup_used": include_warmup,
+                **({"warmup_anomaly": warmup_anomaly} if warmup_anomaly else {}),
             },
         }
+
+    def _should_warmup(self, batch_size: int, measure_runs: int) -> bool:
+        if measure_runs < 2:
+            # Without a second round there is no deviation sentinel, so keep
+            # the per-case warmup round to protect the single measurement.
+            return True
+        return batch_size not in self._warmed_shapes
+
+    def warmup_sweep(
+        self,
+        cases: List[Dict[str, Any]],
+        *,
+        budget_s: float | None = None,
+        profiles_per_shape: int | None = None,
+    ) -> Dict[str, Any]:
+        """Pre-warm representative batch/length combinations once per session.
+
+        Executes synthetic cases built from the shard's own shapes with fresh
+        prompt material (distinct case IDs, so token sequences never collide
+        with real cases) and discards their results. Shapes warmed here let
+        ``run_case`` skip the per-case warmup round; the first-round deviation
+        sentinel remains the safety net for anything the sweep misses.
+        """
+        report: Dict[str, Any] = {
+            "schema_version": 1,
+            "combos": [],
+            "warmed_shapes": 0,
+            "failures": [],
+            "budget_exhausted": False,
+        }
+        if len(cases) <= 1:
+            # A single case warms itself lazily on its first round; a sweep
+            # would only duplicate that case's full cost ahead of it.
+            return report
+        budget = self.warmup_sweep_budget_s if budget_s is None else float(budget_s)
+        profiles = (
+            self.warmup_sweep_profiles
+            if profiles_per_shape is None
+            else int(profiles_per_shape)
+        )
+        deadline = self.monotonic() + budget
+        for combo in self._sweep_combinations(cases, profiles_per_shape=profiles):
+            if self.monotonic() > deadline:
+                report["budget_exhausted"] = True
+                break
+            began = self.monotonic()
+            result = self.run_case(combo["case"])
+            duration_s = self.monotonic() - began
+            entry = {
+                "case_id": combo["case"]["case_id"],
+                "batch_size": combo["batch_size"],
+                "profile": combo["profile"],
+                "status": result.get("status"),
+                "duration_s": round(duration_s, 3),
+            }
+            report["combos"].append(entry)
+            if result.get("status") != "ok":
+                # A failed combo only costs warmup coverage; the deviation
+                # sentinel still guards the real measurements.
+                report["failures"].append(entry)
+        report["warmed_shapes"] = len(
+            {
+                entry["batch_size"]
+                for entry in report["combos"]
+                if entry["status"] == "ok"
+            }
+        )
+        return report
+
+    @staticmethod
+    def _case_length_score(case: Dict[str, Any]) -> int:
+        if "request_groups" in case:
+            return sum(
+                int(group["input_len"]) * int(group.get("count", 1))
+                for group in case["request_groups"]
+            )
+        return int(case["input_len"]) * int(case["batch_size"])
+
+    @staticmethod
+    def _profile_indices(count: int, profiles: int) -> List[int]:
+        if count <= 0:
+            return []
+        if profiles <= 1 or count == 1:
+            return [0]
+        step = (count - 1) / (profiles - 1)
+        return sorted(
+            {min(count - 1, int(round(index * step))) for index in range(profiles)}
+        )
+
+    @classmethod
+    def _sweep_combinations(
+        cls, cases: List[Dict[str, Any]], *, profiles_per_shape: int
+    ) -> List[Dict[str, Any]]:
+        by_shape: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
+        for case in cases:
+            by_shape.setdefault(int(case["batch_size"]), []).append(
+                (cls._case_length_score(case), case)
+            )
+        combos: List[Dict[str, Any]] = []
+        for batch_size in sorted(by_shape):
+            entries = sorted(
+                by_shape[batch_size],
+                key=lambda pair: (pair[0], str(pair[1].get("case_id", ""))),
+            )
+            for profile, index in enumerate(
+                cls._profile_indices(len(entries), profiles_per_shape)
+            ):
+                combos.append(
+                    {
+                        "batch_size": batch_size,
+                        "profile": profile,
+                        "case": cls._make_sweep_case(entries[index][1], profile),
+                    }
+                )
+        return combos
+
+    @staticmethod
+    def _make_sweep_case(case: Dict[str, Any], profile: int) -> Dict[str, Any]:
+        sweep: Dict[str, Any] = {
+            "case_id": f"warmup-sweep-{case['case_id']}-p{profile}",
+            "batch_size": case["batch_size"],
+            "measure_runs": 1,
+            "seed": case.get("seed", 1),
+            "prefix_policy": case["prefix_policy"],
+        }
+        for key in ("input_len", "cache_len", "compute_len"):
+            if key in case:
+                sweep[key] = case[key]
+        if "request_groups" in case:
+            sweep["request_groups"] = copy.deepcopy(case["request_groups"])
+        return sweep
+
+
+def resolve_warmup_settings(workload: Mapping[str, Any] | None) -> Dict[str, Any]:
+    """Warmup runner settings from the resolved workload config.
+
+    The startup shape sweep is always enabled; only its tunables are
+    configurable (``workload.warmup_deviation_threshold``,
+    ``workload.warmup_sweep_budget_s``, ``workload.warmup_sweep_profiles``).
+    """
+    workload = workload or {}
+
+    def resolve(key: str, default):
+        value = workload.get(key)
+        return default if value is None else value
+
+    return {
+        "warmup_deviation_threshold": float(
+            resolve("warmup_deviation_threshold", 0.25)
+        ),
+        "warmup_sweep_budget_s": float(resolve("warmup_sweep_budget_s", 1200.0)),
+        "warmup_sweep_profiles": int(resolve("warmup_sweep_profiles", 3)),
+    }

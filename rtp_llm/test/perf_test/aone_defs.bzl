@@ -1,8 +1,11 @@
 # Keep in sync with execution/aone_bazel.py:AONE_TEST_TIMEOUT_S. The GPU wrapper
 # otherwise kills the action after its default 1800s, before the declared budget.
+# Generators pass an explicit watchdog_seconds (from RTP_AONE_TEST_TIMEOUT_S on
+# the submit host) so raised --test_timeout budgets stay aligned with the
+# worker-side watchdog.
 _PERF_TEST_WATCHDOG_SECONDS = "7000"
 
-def unified_prefill_ci_test(name, config, gpu_type, gpu_count, data = [], deps = []):
+def unified_prefill_ci_test(name, config, gpu_type, gpu_count, data = [], deps = [], watchdog_seconds = _PERF_TEST_WATCHDOG_SECONDS):
     """Run one strict unified prefill config in an AOne Bazel test action."""
     native.py_test(
         name = name,
@@ -11,7 +14,7 @@ def unified_prefill_ci_test(name, config, gpu_type, gpu_count, data = [], deps =
         timeout = "eternal",
         env = {
             "GPU_COUNT": str(gpu_count),
-            "RTP_TEST_WATCHDOG_SECONDS": _PERF_TEST_WATCHDOG_SECONDS,
+            "RTP_TEST_WATCHDOG_SECONDS": str(watchdog_seconds),
         },
         deps = [
             "//rtp_llm/test/perf_test:perf_test_entry_lib",
@@ -35,7 +38,7 @@ def unified_prefill_ci_test(name, config, gpu_type, gpu_count, data = [], deps =
     return name
 
 
-def perf_test_aone_shard(name, resolved_config, resolved_workload, shard_plan, shard_id, gpu_type, gpu_count):
+def perf_test_aone_shard(name, resolved_config, resolved_workload, shard_plan, shard_id, gpu_type, gpu_count, watchdog_seconds = _PERF_TEST_WATCHDOG_SECONDS):
     """Define one unified prefill shard using only declared runfiles."""
     native.py_test(
         name = name,
@@ -62,12 +65,12 @@ def perf_test_aone_shard(name, resolved_config, resolved_workload, shard_plan, s
         },
         env = {
             "WORLD_SIZE": str(gpu_count),
-            "RTP_TEST_WATCHDOG_SECONDS": _PERF_TEST_WATCHDOG_SECONDS,
+            "RTP_TEST_WATCHDOG_SECONDS": str(watchdog_seconds),
         },
     )
 
 
-def perf_test_gang_shard(name, resolved_config, resolved_workload, gang_plan, gpu_type, gpus_per_host, machine_count):
+def perf_test_gang_shard(name, resolved_config, resolved_workload, gang_plan, gpu_type, gpus_per_host, machine_count, watchdog_seconds = _PERF_TEST_WATCHDOG_SECONDS):
     """Define one multi-machine gang run as sharded remote test actions.
 
     The single target expands to ``machine_count`` test shards and every
@@ -84,7 +87,7 @@ def perf_test_gang_shard(name, resolved_config, resolved_workload, gang_plan, gp
         shard_count = machine_count,
         env = {
             "GPU_COUNT": str(gpus_per_host),
-            "RTP_TEST_WATCHDOG_SECONDS": _PERF_TEST_WATCHDOG_SECONDS,
+            "RTP_TEST_WATCHDOG_SECONDS": str(watchdog_seconds),
         },
         deps = ["//rtp_llm/test/perf_test:aone_lib"],
         data = [
@@ -109,7 +112,7 @@ def perf_test_gang_shard(name, resolved_config, resolved_workload, gang_plan, gp
     )
 
 
-def unified_decode_remote_test(name, config, gpu_type, gpu_count, data = [], deps = []):
+def unified_decode_remote_test(name, config, gpu_type, gpu_count, data = [], deps = [], watchdog_seconds = _PERF_TEST_WATCHDOG_SECONDS):
     """Run all local-backend decode cases in one ordinary GPU test action.
 
     Config and optional workload inputs are declared runfiles. Model and
@@ -123,7 +126,7 @@ def unified_decode_remote_test(name, config, gpu_type, gpu_count, data = [], dep
         timeout = "eternal",
         env = {
             "GPU_COUNT": str(gpu_count),
-            "RTP_TEST_WATCHDOG_SECONDS": _PERF_TEST_WATCHDOG_SECONDS,
+            "RTP_TEST_WATCHDOG_SECONDS": str(watchdog_seconds),
         },
         deps = [
             "//rtp_llm/test/perf_test:perf_test_entry_lib",

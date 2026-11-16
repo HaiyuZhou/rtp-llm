@@ -21,6 +21,7 @@ from rtp_llm.test.perf_test.prefill.prompts import (
 )
 from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
+from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.storage import RunStore
 from rtp_llm.test.perf_test.tests.support.prefill import (
     SeedBatchClient,
@@ -88,7 +89,7 @@ class PreflightReuseTest(unittest.TestCase):
                 commit_tail_tokens=4,
                 max_batch_tokens=4096,
                 cache_block_size=4,
-                **kwargs
+                **kwargs,
             ),
             client,
         )
@@ -282,7 +283,7 @@ class SeedBatchTest(unittest.TestCase):
         max_batch_tokens=4096,
         workspace_tokens=None,
         cache_block_size=4,
-        client=None
+        client=None,
     ):
         client = client or SeedBatchClient(cache_lengths)
         case = dict(
@@ -791,6 +792,296 @@ class ProbeTest(unittest.TestCase):
                 (root / "checkpoints" / "prefill_cache_probe.json").read_text()
             )
             self.assertEqual("failed", artifact["status"])
+
+
+class WarmupPhaseClient:
+    """Scripted client recording phases with per-round latency control."""
+
+    def __init__(
+        self,
+        cache_lengths,
+        *,
+        default_latency_ms=10.0,
+        round_latency_ms=None,
+        raise_on=(),
+    ):
+        self.cache_lengths = list(cache_lengths)
+        self.default_latency_ms = default_latency_ms
+        self.round_latency_ms = round_latency_ms or {}
+        self.raise_on = set(raise_on)
+        self.requests = []
+        self.scheduler_calls = []
+
+    def configure_scheduler(self, batch_size, mode="prefill"):
+        assert mode == "prefill"
+        self.scheduler_calls.append(batch_size)
+
+    def request(self, **request):
+        self.requests.append(request)
+        if request["phase"] in self.raise_on:
+            raise RuntimeError(f"{request['phase']} transport failed")
+        seed = request["phase"] == "seed"
+        member = request["request_index"]
+        if seed:
+            latency = self.round_latency_ms.get("seed", self.default_latency_ms)
+            reuse = 0
+        else:
+            round_key = (
+                "warmup" if request["phase"] == "warmup" else request["run_index"]
+            )
+            latency = self.round_latency_ms.get(round_key, self.default_latency_ms)
+            reuse = self.cache_lengths[member]
+        return prefill_runner_response(
+            len(request["input_ids"]), reuse, latency=latency
+        )
+
+
+def _warmup_runner(client, *, monotonic=None, **kwargs):
+    kwargs.setdefault("commit_tail_tokens", 4)
+    kwargs.setdefault("max_batch_tokens", 1024)
+    if monotonic is not None:
+        kwargs["monotonic"] = iter(monotonic).__next__
+    return PrefillRunner(client, prefill_runner_Tokenizer(), **kwargs)
+
+
+class WarmupSweepModeTest(unittest.TestCase):
+    """Conditional warmup rounds with a deviation sentinel in sweep mode."""
+
+    def test_first_case_of_shape_warms_and_second_skips(self):
+        client = WarmupPhaseClient([8])
+        # Keep round durations stable so thread scheduling cannot trip the sentinel.
+        runner = _warmup_runner(client, monotonic=[0.0, 1.0] * 5)
+        first = runner.run_case(
+            prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2)
+        )
+        self.assertEqual("ok", first["status"])
+        self.assertTrue(first["metrics"]["warmup_used"])
+        self.assertEqual(
+            1, sum(1 for request in client.requests if request["phase"] == "warmup")
+        )
+        second = runner.run_case(
+            prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2)
+        )
+        self.assertEqual("ok", second["status"])
+        self.assertFalse(second["metrics"]["warmup_used"])
+        self.assertIsNone(second["metrics"].get("warmup_anomaly"))
+        self.assertEqual(
+            1, sum(1 for request in client.requests if request["phase"] == "warmup")
+        )
+
+    def test_single_measure_run_always_keeps_warmup(self):
+        client = WarmupPhaseClient([8])
+        runner = _warmup_runner(client)
+        result = runner.run_case(
+            prefill_runner_case(cache_len=8, batch_size=1, measure_runs=1)
+        )
+        self.assertEqual("ok", result["status"])
+        self.assertTrue(result["metrics"]["warmup_used"])
+        self.assertEqual(
+            1, sum(1 for request in client.requests if request["phase"] == "warmup")
+        )
+
+    def test_sentinel_drops_polluted_first_round(self):
+        client = WarmupPhaseClient([8])
+        runner = _warmup_runner(client, monotonic=[0.0, 100.0, 0.0, 10.0])
+        runner._warmed_shapes.add(1)  # simulate an already-swept shape
+        client.requests.clear()
+        result = runner.run_case(
+            prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2)
+        )
+        self.assertEqual("ok", result["status"])
+        self.assertFalse(result["metrics"]["warmup_used"])
+        anomaly = result["metrics"]["warmup_anomaly"]
+        self.assertAlmostEqual(0.9, anomaly["deviation_ratio"], places=3)
+        self.assertEqual([0], anomaly["dropped_runs"])
+        runs = {measurement["run"] for measurement in result["metrics"]["measurements"]}
+        self.assertEqual({1}, runs)
+
+    def test_sentinel_tolerates_healthy_rounds(self):
+        client = WarmupPhaseClient([8])
+        runner = _warmup_runner(client, monotonic=[0.0, 10.0, 0.0, 10.0])
+        runner._warmed_shapes.add(1)  # simulate an already-swept shape
+        client.requests.clear()
+        result = runner.run_case(
+            prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2)
+        )
+        self.assertEqual("ok", result["status"])
+        self.assertIsNone(result["metrics"].get("warmup_anomaly"))
+        runs = {measurement["run"] for measurement in result["metrics"]["measurements"]}
+        self.assertEqual({0, 1}, runs)
+
+
+class WarmupSweepCombinationsTest(unittest.TestCase):
+    def test_profiles_span_the_length_axis(self):
+        cases = [
+            dict(
+                prefill_runner_case(cache_len=8, batch_size=2, measure_runs=2),
+                case_id=f"prefill-case-{index}",
+                input_len=16 + index * 8,
+                compute_len=8 + index * 8,
+            )
+            for index in range(5)
+        ]
+        combos = PrefillRunner._sweep_combinations(cases, profiles_per_shape=3)
+        self.assertEqual([0, 1, 2], [combo["profile"] for combo in combos])
+        self.assertEqual([16, 32, 48], [combo["case"]["input_len"] for combo in combos])
+        self.assertTrue(
+            all(
+                combo["case"]["case_id"].startswith("warmup-sweep-") for combo in combos
+            )
+        )
+        self.assertTrue(all(combo["case"]["measure_runs"] == 1 for combo in combos))
+
+    def test_make_sweep_case_clones_grouped_shape_with_fresh_identity(self):
+        grouped = prefill_runner_grouped_case()
+        sweep = PrefillRunner._make_sweep_case(grouped, 1)
+        self.assertTrue(sweep["case_id"].startswith("warmup-sweep-"))
+        self.assertEqual(1, sweep["measure_runs"])
+        self.assertEqual(grouped["batch_size"], sweep["batch_size"])
+        self.assertEqual(grouped["request_groups"], sweep["request_groups"])
+        self.assertIsNot(grouped["request_groups"], sweep["request_groups"])
+        self.assertNotIn("sample_index", sweep)
+
+
+class WarmupSweepExecutionTest(unittest.TestCase):
+    def test_sweep_warms_shapes_and_real_cases_skip_warmup(self):
+        client = WarmupPhaseClient([8, 0, 0])
+        runner = _warmup_runner(client)
+        report = runner.warmup_sweep(
+            [
+                prefill_runner_grouped_case(),
+                prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2),
+            ]
+        )
+        self.assertEqual(2, report["warmed_shapes"])
+        self.assertEqual([], report["failures"])
+        self.assertFalse(report["budget_exhausted"])
+        self.assertEqual({1, 3}, set(runner._warmed_shapes))
+        result = runner.run_case(
+            prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2)
+        )
+        self.assertEqual("ok", result["status"])
+        self.assertFalse(result["metrics"]["warmup_used"])
+        # grouped warmup round issues one request per member (3) plus one for
+        # the ungrouped combo; the real case afterwards skips its warmup round.
+        self.assertEqual(
+            4,
+            sum(1 for request in client.requests if request["phase"] == "warmup"),
+        )
+
+    def test_sweep_uses_fresh_prompt_material(self):
+        client = WarmupPhaseClient([8])
+        runner = _warmup_runner(client)
+        runner.warmup_sweep(
+            [
+                prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2),
+                dict(
+                    prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2),
+                    case_id="prefill-case-b",
+                ),
+            ]
+        )
+        sweep_seed_ids = [
+            request["input_ids"]
+            for request in client.requests
+            if request["phase"] == "seed"
+        ]
+        runner.run_case(prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2))
+        real_seed_ids = [
+            request["input_ids"]
+            for request in client.requests
+            if request["phase"] == "seed"
+        ][len(sweep_seed_ids) :]
+        self.assertGreaterEqual(len(sweep_seed_ids), 1)
+        self.assertEqual(1, len(real_seed_ids))
+        for sweep_ids in sweep_seed_ids:
+            self.assertNotEqual(sweep_ids, real_seed_ids[0])
+
+    def test_sweep_respects_wall_clock_budget(self):
+        client = WarmupPhaseClient([8])
+        runner = _warmup_runner(client, monotonic=[0.0, 10_000.0])
+        report = runner.warmup_sweep(
+            [
+                prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2),
+                dict(
+                    prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2),
+                    case_id="prefill-case-b",
+                ),
+            ]
+        )
+        self.assertTrue(report["budget_exhausted"])
+        self.assertEqual(0, report["warmed_shapes"])
+        self.assertEqual([], client.requests)
+
+    def test_sweep_tolerates_failing_combos(self):
+        client = WarmupPhaseClient([8], raise_on=("seed",))
+        runner = _warmup_runner(client)
+        report = runner.warmup_sweep(
+            [
+                prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2),
+                dict(
+                    prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2),
+                    case_id="prefill-case-b",
+                ),
+            ]
+        )
+        self.assertEqual(2, len(report["failures"]))
+        self.assertEqual(0, report["warmed_shapes"])
+        self.assertEqual("request_failed", report["combos"][0]["status"])
+
+
+class WarmupSweepAdapterTest(unittest.TestCase):
+    def test_adapter_records_sweep_checkpoint_and_skips_case_warmup(self):
+        client = WarmupPhaseClient([8])
+        case = prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2)
+        second = dict(case, case_id="prefill-case-b")
+        planned = [
+            SimpleNamespace(case_id=case["case_id"], identity=case),
+            SimpleNamespace(case_id=second["case_id"], identity=second),
+        ]
+        checkpoints = []
+
+        class Store:
+            @staticmethod
+            def write_checkpoint(name, payload):
+                checkpoints.append((name, payload))
+
+            @staticmethod
+            def write_prefill_case(case_id, result):
+                pass
+
+            @staticmethod
+            def read_prefill_cases(plan):
+                return {}
+
+        adapter = PrefillAdapter(
+            lambda context: PrefillRunner(
+                context.session,
+                prefill_runner_Tokenizer(),
+                commit_tail_tokens=4,
+                max_batch_tokens=1024,
+            )
+        )
+        result = adapter(
+            ModeExecutionContext(
+                plan=SimpleNamespace(mode="prefill", cases=planned),
+                session=client,
+                store=Store(),
+            )
+        )
+        self.assertEqual(RunState.COMPLETED, result.state)
+        self.assertEqual(["prefill_warmup_sweep"], [name for name, _ in checkpoints])
+        self.assertEqual(1, checkpoints[0][1]["warmed_shapes"])
+        # Only the sweep's own combos issue warmup rounds; both real cases
+        # skip theirs because the shape was already warmed.
+        warmup_rounds = sum(
+            1 for request in client.requests if request["phase"] == "warmup"
+        )
+        sweep_combos = len(checkpoints[0][1]["combos"])
+        self.assertGreaterEqual(sweep_combos, 1)
+        self.assertEqual(sweep_combos, warmup_rounds)
+        for case_result in result.case_results:
+            self.assertFalse(case_result["metrics"]["warmup_used"])
 
 
 if __name__ == "__main__":

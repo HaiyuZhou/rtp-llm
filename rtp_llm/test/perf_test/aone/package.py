@@ -86,7 +86,27 @@ def _validated_ownership(
     return tuple(normalized)
 
 
+def _watchdog_seconds() -> str:
+    """Submit-side watchdog budget baked into generated shard targets.
+
+    Reads ``RTP_AONE_TEST_TIMEOUT_S`` so one environment variable keeps the
+    worker-side hang watchdog aligned with the entry's ``--test_timeout``
+    (see execution/aone_bazel.py); defaults to the historical 7000s budget.
+    """
+    raw = os.environ.get("RTP_AONE_TEST_TIMEOUT_S", "").strip()
+    if not raw:
+        return "7000"
+    try:
+        seconds = int(raw)
+    except ValueError:
+        raise PlanningError(f"RTP_AONE_TEST_TIMEOUT_S must be an integer, got {raw!r}")
+    if seconds <= 0:
+        raise PlanningError("RTP_AONE_TEST_TIMEOUT_S must be positive")
+    return str(seconds)
+
+
 def _build_file(resource: AOneResourcePlan, ownership: Iterable[Sequence[str]]) -> str:
+    watchdog = _watchdog_seconds()
     lines = [
         'load("//rtp_llm/test/perf_test:aone_defs.bzl", "perf_test_aone_shard")',
         "",
@@ -102,6 +122,7 @@ def _build_file(resource: AOneResourcePlan, ownership: Iterable[Sequence[str]]) 
                 f'    shard_id = "shard-{index:04d}",',
                 f'    gpu_type = "{resource.gpu_type}",',
                 f"    gpu_count = {resource.gpus_per_shard},",
+                f'    watchdog_seconds = "{watchdog}",',
                 ")",
                 "",
             ]
@@ -288,6 +309,7 @@ def _gang_build_file(resource: AOneResourcePlan) -> str:
         f'    gpu_type = "{resource.gpu_type}",',
         f"    gpus_per_host = {_per_host_gpu_count(resource.gpu_type)},",
         f"    machine_count = {resource.machine_count},",
+        f'    watchdog_seconds = "{_watchdog_seconds()}",',
         ")",
         "",
         "test_suite(",

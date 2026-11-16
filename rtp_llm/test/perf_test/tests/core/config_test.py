@@ -52,6 +52,36 @@ def unified_config_base_config():
 
 class ConfigResolutionTest(unittest.TestCase):
 
+    def test_warmup_settings_are_resolved_and_validated(self):
+        source = unified_config_base_config()
+        defaults = resolve_config(source).resolved_config["workload"]
+        self.assertEqual(0.25, defaults["warmup_deviation_threshold"])
+        self.assertEqual(1200.0, defaults["warmup_sweep_budget_s"])
+        self.assertEqual(3, defaults["warmup_sweep_profiles"])
+        custom = dict(
+            warmup_deviation_threshold=0.5,
+            warmup_sweep_budget_s=60,
+            warmup_sweep_profiles=2,
+        )
+        source["workload"].update(custom)
+        resolved = resolve_config(source).resolved_config["workload"]
+        for key, expected in custom.items():
+            self.assertEqual(expected, resolved[key])
+        for key, invalid in (
+            ("warmup_deviation_threshold", 0),
+            ("warmup_deviation_threshold", 1.1),
+            ("warmup_deviation_threshold", True),
+            ("warmup_sweep_budget_s", 0),
+            ("warmup_sweep_budget_s", float("inf")),
+            ("warmup_sweep_profiles", 0),
+            ("warmup_sweep_profiles", 1.5),
+        ):
+            with self.subTest(key=key, invalid=invalid):
+                bad = copy.deepcopy(source)
+                bad["workload"][key] = invalid
+                with self.assertRaises(ConfigError):
+                    resolve_config(bad)
+
     def test_derived_ep_and_explicit_ep_have_the_same_fingerprint(self):
         source = unified_config_base_config()
         source["model"]["topology"] = {"tp": 2, "dp": 2, "pp": 1}

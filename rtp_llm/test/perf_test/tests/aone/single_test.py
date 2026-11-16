@@ -1,6 +1,7 @@
 """Performance framework behavior and failure regressions."""
 
 import json
+import os
 import tempfile
 import unittest
 import zipfile
@@ -116,6 +117,39 @@ class AOneSingleTest(unittest.TestCase):
                     AONE_TEST_TIMEOUT_S,
                     int(action.get("env", {}).get("RTP_TEST_WATCHDOG_SECONDS", 1800)),
                 )
+        # Generators raise the watchdog with the test budget: an explicit
+        # watchdog_seconds must override the historical default.
+        raised = []
+        scope["native"] = SimpleNamespace(py_test=lambda **kw: raised.append(kw))
+        scope["perf_test_aone_shard"](
+            name="raised",
+            resolved_config="config.json",
+            resolved_workload="workload.json",
+            shard_plan="shards.json",
+            shard_id="0",
+            gpu_type="H20_CU13",
+            gpu_count=2,
+            watchdog_seconds=19500,
+        )
+        self.assertEqual("19500", raised[0]["env"]["RTP_TEST_WATCHDOG_SECONDS"])
+
+    def test_generated_build_bakes_env_overridden_watchdog(self):
+        from rtp_llm.test.perf_test.aone.package import _build_file
+        from rtp_llm.test.perf_test.plan import AOneResourcePlan
+
+        resource = AOneResourcePlan(
+            backend="aone",
+            resource="daily",
+            gpu_type="H20_CU13",
+            gpus_per_shard=4,
+            shard_count=2,
+            max_parallel=2,
+        )
+        default_text = _build_file(resource, (("a",), ("b",)))
+        self.assertIn('watchdog_seconds = "7000"', default_text)
+        with patch.dict(os.environ, {"RTP_AONE_TEST_TIMEOUT_S": "19500"}):
+            raised_text = _build_file(resource, (("a",), ("b",)))
+        self.assertIn('watchdog_seconds = "19500"', raised_text)
 
     def test_normal_submission_collects_portable_shards_and_formal_report(self):
         with tempfile.TemporaryDirectory() as directory:

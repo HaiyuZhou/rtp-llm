@@ -103,7 +103,7 @@ class PrefillResumeTest(unittest.TestCase):
             (run_plan, store) = prefill_resume_initialized(root)
             ok_path = root / "results" / "cases.jsonl"
             ok_before = ok_path.read_bytes()
-            runner = Mock()
+            runner = Mock(spec=["run_case"])
             runner.run_case.side_effect = lambda case: prefill_resume_case_result(
                 next(
                     (item for item in run_plan.cases if item.case_id == case["case_id"])
@@ -152,7 +152,7 @@ class PrefillResumeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "run"
             (_, store) = prefill_resume_initialized(root)
-            runner = Mock()
+            runner = Mock(spec=["run_case"])
             resume = PrefillResume(PrefillAdapter(lambda _context: runner))
             with RunDirectoryLock(root, action="resume"):
                 before = prefill_resume_tree(root)
@@ -174,7 +174,7 @@ class PrefillAdapterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             plan = prefill_adapter_plan(root)
-            runner = Mock()
+            runner = Mock(spec=["run_case"])
             runner.run_case.side_effect = lambda case: prefill_adapter_result(
                 case, "request_failed" if case["cache_len"] == 0 else "ok"
             )
@@ -198,7 +198,7 @@ class PrefillAdapterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             plan = prefill_adapter_plan(root)
-            runner = Mock()
+            runner = Mock(spec=["run_case"])
             calls = 0
 
             def execute(case):

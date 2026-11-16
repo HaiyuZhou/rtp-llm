@@ -52,9 +52,9 @@ from rtp_llm.test.perf_test.errors import (
 from rtp_llm.test.perf_test.execution.aone import AOneExecutionOutcome, bazel_argv
 from rtp_llm.test.perf_test.execution.aone_bazel import (
     _MAX_ARCHIVE_MEMBERS,
-    AONE_TEST_TIMEOUT_S,
     _positive_integer,
     _safe_zip_member,
+    _test_timeout_seconds,
     _workspace_root,
 )
 from rtp_llm.test.perf_test.execution.artifacts import (
@@ -346,7 +346,7 @@ class GangAOneExecutor:
                 f"--config={self._resource}_aone_bazel_remote",
                 "--strategy=TestRunner=remote",
                 f"--jobs={details['jobs']}",
-                f"--test_timeout={AONE_TEST_TIMEOUT_S}",
+                f"--test_timeout={_test_timeout_seconds()}",
                 "--test_output=errors",
                 "--keep_going",
                 "--remote_download_outputs=all",

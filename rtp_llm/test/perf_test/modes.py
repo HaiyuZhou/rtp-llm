@@ -153,14 +153,14 @@ class PrefillAdapter:
             if selected_case_ids is None
             else set(selected_case_ids)
         )
-        if selected and hasattr(runner, "preflight"):
+        cases: List[Dict[str, Any]] = []
+        for planned in context.plan.cases:
+            if planned.case_id in selected:
+                case = thaw(planned.identity)
+                case["case_id"] = planned.case_id
+                cases.append(case)
+        if cases and hasattr(runner, "preflight"):
             _assert_engine_healthy(context.session)
-            cases = []
-            for planned in context.plan.cases:
-                if planned.case_id in selected:
-                    case = thaw(planned.identity)
-                    case["case_id"] = planned.case_id
-                    cases.append(case)
             try:
                 runner.preflight(cases)
             except Exception:
@@ -179,6 +179,20 @@ class PrefillAdapter:
                 raise
             _assert_engine_healthy(context.session)
             context.store.write_checkpoint("prefill_cache_probe", probe_result)
+        if cases and hasattr(runner, "warmup_sweep"):
+            _assert_engine_healthy(context.session)
+            try:
+                warmup_report = runner.warmup_sweep(cases)
+            except Exception as error:
+                _assert_engine_healthy(context.session)
+                warmup_report = {
+                    "schema_version": 1,
+                    "status": "failed",
+                    "error": str(error),
+                }
+            else:
+                _assert_engine_healthy(context.session)
+            context.store.write_checkpoint("prefill_warmup_sweep", warmup_report)
         for planned_case in context.plan.cases:
             if planned_case.case_id not in selected:
                 continue
@@ -219,7 +233,10 @@ def create_prefill_adapter(config: Mapping[str, Any], tokenizer: Any) -> Prefill
         probe_cache_block,
         resolve_probe_block_size,
     )
-    from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
+    from rtp_llm.test.perf_test.prefill.runner import (
+        PrefillRunner,
+        resolve_warmup_settings,
+    )
 
     workload = config["workload"]
     commit_tail = int(workload["commit_tail_tokens"])
@@ -234,6 +251,7 @@ def create_prefill_adapter(config: Mapping[str, Any], tokenizer: Any) -> Prefill
             input_ids_only=workload.get("transport", DEFAULT_PREFILL_TRANSPORT)
             == "dashsc_input_ids",
             cache_block_size=block_size,
+            **resolve_warmup_settings(workload),
         ),
         probe=lambda context: probe_cache_block(
             context.session.client, tokenizer, block_size, commit_tail

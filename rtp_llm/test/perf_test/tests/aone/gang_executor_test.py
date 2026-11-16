@@ -79,6 +79,24 @@ class BrokerProxyTest(unittest.TestCase):
 
 class GangExecutorTest(unittest.TestCase):
 
+    def test_timeout_override_reaches_bazel_and_generated_watchdog(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ", {"RTP_AONE_TEST_TIMEOUT_S": "19500"}
+        ):
+            root, _, outcome, calls = self._gang_flow(Path(directory))
+            self.assertEqual(RunState.COMPLETED, outcome.state)
+            command = next(command for command, _ in calls if "test" in command)
+            self.assertIn("--test_timeout=19500", command)
+            actions = []
+            scope = {
+                "native": SimpleNamespace(py_test=lambda **kw: actions.append(kw)),
+                "load": lambda *args: None,
+                "test_suite": lambda **kw: None,
+            }
+            exec((PERF_TEST_ROOT / "aone_defs.bzl").read_text(), scope)
+            exec((root / "workload/aone_package/BUILD.bazel").read_text(), scope)
+            self.assertEqual("19500", actions[0]["env"]["RTP_TEST_WATCHDOG_SECONDS"])
+
     def test_master_collection_rejects_results_from_another_run_or_plan(self):
         mutations = {
             "run_id": lambda result: result.update(run_id="other-run"),

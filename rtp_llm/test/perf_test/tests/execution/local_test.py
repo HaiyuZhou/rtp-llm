@@ -454,7 +454,11 @@ class PrefillBackendIntegrationTest(unittest.TestCase):
                 [result["case_id"] for result in results],
             )
             self.assertGreater(len(results), 1)
-            self.assertEqual(len(plan.cases) * 9 + 3, len(events))
+            # Three length profiles warm the shared batch size before cases.
+            self.assertEqual((len(plan.cases) + 3) * 9 + 3, len(events))
+            self.assertTrue(
+                (run_root / "checkpoints" / "prefill_warmup_sweep.json").is_file()
+            )
             self.assertEqual({"batch_size": 1, "mode": "prefill"}, events[0][1])
             self.assertTrue(
                 (run_root / "checkpoints" / "prefill_cache_probe.json").is_file()

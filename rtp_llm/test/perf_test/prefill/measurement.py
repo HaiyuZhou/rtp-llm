@@ -51,11 +51,14 @@ def validate_concurrent_prefill_metrics(
     ):
         raise ValueError("concurrent prefill lengths must match identity")
     measurements = metrics.get("measurements")
-    if not isinstance(measurements, (list, tuple)) or len(measurements) != batch * runs:
+    if not isinstance(measurements, (list, tuple)) or not measurements:
         raise ValueError(
-            "concurrent prefill requires exactly batch size members per round"
+            "concurrent prefill requires at least one measured round; the "
+            "first-round deviation sentinel may drop a polluted round but "
+            "never all of them"
         )
     seen = set()
+    members_by_run = {}
     elapsed_by_run = {}
     latencies = []
     round_latencies = {}
@@ -75,6 +78,7 @@ def validate_concurrent_prefill_metrics(
                 "concurrent prefill requires unique planned round/member indices"
             )
         seen.add((run, index))
+        members_by_run[run] = members_by_run.get(run, 0) + 1
         if grouped:
             length, cached, group_index = geometry[index]
             for field, value in (
@@ -107,6 +111,10 @@ def validate_concurrent_prefill_metrics(
         elapsed_by_run[run] = elapsed
         latencies.append(latency)
         round_latencies[run] = max(round_latencies.get(run, 0), latency)
+    if any(count != batch for count in members_by_run.values()):
+        raise ValueError(
+            "concurrent prefill requires exactly batch size members per round"
+        )
     compute = metrics.get("compute_length")
     if not positive_number(compute):
         raise ValueError("concurrent prefill compute length must be positive")
@@ -114,7 +122,7 @@ def validate_concurrent_prefill_metrics(
         raise ValueError("grouped prefill compute must equal aggregate uncached length")
     throughput = statistics.mean(
         (1 if grouped else batch) * compute * 1000.0 / elapsed_by_run[run]
-        for run in range(runs)
+        for run in sorted(elapsed_by_run)
     )
     for field, expected_value in (
         (

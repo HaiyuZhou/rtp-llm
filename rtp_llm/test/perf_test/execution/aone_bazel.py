@@ -27,6 +27,25 @@ _MAX_COMPRESSION_RATIO = 1000.0
 AONE_TEST_TIMEOUT_S = 7000
 
 
+def _test_timeout_seconds() -> int:
+    """Bazel --test_timeout; keep RTP_AONE_TEST_TIMEOUT_S in sync on submits.
+
+    The same environment variable also drives the watchdog value baked into
+    generated shard BUILD files (aone/package.py), so both sides of the
+    budget move together.
+    """
+    raw = os.environ.get("RTP_AONE_TEST_TIMEOUT_S", "").strip()
+    if not raw:
+        return AONE_TEST_TIMEOUT_S
+    try:
+        seconds = int(raw)
+    except ValueError:
+        raise ValueError(f"RTP_AONE_TEST_TIMEOUT_S must be an integer, got {raw!r}")
+    if seconds <= 0:
+        raise ValueError("RTP_AONE_TEST_TIMEOUT_S must be positive")
+    return seconds
+
+
 @dataclass(frozen=True)
 class BazelShardJob:
     target: str
@@ -191,7 +210,7 @@ class BazelAOneIntegration:
                 f"--config={self._resource}_aone_bazel_remote",
                 "--strategy=TestRunner=remote",
                 f"--jobs={self._max_parallel}",
-                f"--test_timeout={AONE_TEST_TIMEOUT_S}",
+                f"--test_timeout={_test_timeout_seconds()}",
                 "--test_output=errors",
                 "--keep_going",
                 "--remote_download_outputs=all",

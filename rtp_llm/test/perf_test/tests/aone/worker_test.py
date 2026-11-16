@@ -134,7 +134,7 @@ class AOneWorkerTest(unittest.TestCase):
             plan, package = self._package(root, "run-remote")
             session = _FakeSession()
             session_factory = Mock(return_value=session)
-            runner = Mock()
+            runner = Mock(spec=["run_case"])
             runner.run_case.side_effect = _case_result
             executor = RemoteShardExecutor(
                 session_factory=session_factory,

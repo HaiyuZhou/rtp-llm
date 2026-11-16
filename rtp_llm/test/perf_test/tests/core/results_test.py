@@ -83,6 +83,39 @@ class ResultEnvelopeTest(unittest.TestCase):
         with self.assertRaisesRegex(ResultSchemaError, "measure_runs"):
             parse_result_envelope(value)
 
+    def test_prefill_warmup_metadata_round_trips_and_checks_types(self):
+        value = result_envelope_prefill_result()
+        metrics = value["cases"][0]["metrics"]
+        metrics.update(
+            warmup_used=False,
+            warmup_anomaly={"deviation_ratio": 0.9, "dropped_runs": [0]},
+        )
+        self.assertEqual(value, parse_result_envelope(value).to_dict())
+        for field, invalid in (("warmup_used", 1), ("warmup_anomaly", [])):
+            with self.subTest(field=field):
+                bad = copy.deepcopy(value)
+                bad["cases"][0]["metrics"][field] = invalid
+                with self.assertRaises(ResultSchemaError):
+                    parse_result_envelope(bad)
+
+    def test_concurrent_prefill_accepts_complete_round_after_sentinel_drop(self):
+        value = self._concurrent_prefill_result()
+        case = value["cases"][0]
+        case["metrics"]["measurements"] = case["metrics"]["measurements"][4:]
+        case["metrics"].update(
+            latency_ms=6.5,
+            throughput_tokens_per_second=102400.0,
+            warmup_used=False,
+            warmup_anomaly={"deviation_ratio": 0.9, "dropped_runs": [0]},
+        )
+        self.assertEqual(value, parse_result_envelope(value).to_dict())
+
+    def test_concurrent_prefill_rejects_no_remaining_rounds(self):
+        value = self._concurrent_prefill_result()
+        value["cases"][0]["metrics"]["measurements"] = []
+        with self.assertRaises(ResultSchemaError):
+            parse_result_envelope(value)
+
     def test_concurrent_prefill_evidence_rejects_tampering(self):
         mutations = {
             "duplicate": lambda c: c["metrics"]["measurements"][1].update(

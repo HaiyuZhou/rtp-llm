@@ -263,6 +263,9 @@ class PrefillWorkloadConfig:
     profiling: PrefillProfilingConfig = field(default_factory=PrefillProfilingConfig)
     probe_block_size: Optional[int] = None
     workspace_tokens: Optional[int] = None
+    warmup_deviation_threshold: float = 0.25
+    warmup_sweep_budget_s: float = 1200.0
+    warmup_sweep_profiles: int = 3
 
 
 @dataclass(frozen=True)
@@ -609,6 +612,9 @@ def _parse_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
         "workspace_tokens",
         "max_cases",
         "seed",
+        "warmup_deviation_threshold",
+        "warmup_sweep_budget_s",
+        "warmup_sweep_profiles",
     }
     generated_fields = {
         "max_input_len",
@@ -805,6 +811,13 @@ def _parse_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
     return replace(_parse_generated_prefill_workload(base), **settings)
 
 
+def _deviation_threshold_field(value: Any) -> float:
+    threshold = _positive_number("workload.warmup_deviation_threshold", value)
+    if threshold > 1.0:
+        raise ConfigError("workload.warmup_deviation_threshold: must be within (0, 1]")
+    return threshold
+
+
 def _parse_generated_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
     allowed = {
         "kind",
@@ -821,6 +834,9 @@ def _parse_generated_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkload
         "random_cache_count",
         "seed",
         "max_cases",
+        "warmup_deviation_threshold",
+        "warmup_sweep_budget_s",
+        "warmup_sweep_profiles",
     }
     _reject_unknown("workload", raw, allowed)
     compute_steps = _int_tuple(
@@ -884,6 +900,15 @@ def _parse_generated_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkload
             None
             if max_cases is None
             else _positive_int("workload.max_cases", max_cases)
+        ),
+        warmup_deviation_threshold=_deviation_threshold_field(
+            raw.get("warmup_deviation_threshold", 0.25)
+        ),
+        warmup_sweep_budget_s=_positive_number(
+            "workload.warmup_sweep_budget_s", raw.get("warmup_sweep_budget_s", 1200.0)
+        ),
+        warmup_sweep_profiles=_positive_int(
+            "workload.warmup_sweep_profiles", raw.get("warmup_sweep_profiles", 3)
         ),
     )
 

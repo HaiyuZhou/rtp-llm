@@ -26,6 +26,12 @@ class ResultSchemaError(ValueError):
     """Raised when a persisted result does not match the common envelope."""
 
 
+def _boolean(path: str, value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ResultSchemaError(f"{path}: expected a boolean")
+    return value
+
+
 def _object(path: str, value: Any) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ResultSchemaError(f"{path}: expected an object")
@@ -98,6 +104,8 @@ class PrefillMetrics:
     measurements: Tuple[Dict[str, Any], ...]
     ttft_ms: Optional[Union[int, float]] = None
     wait_time_ms: Optional[Union[int, float]] = None
+    warmup_used: Optional[bool] = None
+    warmup_anomaly: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -116,6 +124,10 @@ class PrefillMetrics:
             result["ttft_ms"] = self.ttft_ms
         if self.wait_time_ms is not None:
             result["wait_time_ms"] = self.wait_time_ms
+        if self.warmup_used is not None:
+            result["warmup_used"] = self.warmup_used
+        if self.warmup_anomaly is not None:
+            result["warmup_anomaly"] = copy.deepcopy(self.warmup_anomaly)
         return result
 
 
@@ -217,7 +229,9 @@ def _parse_prefill_metrics(path: str, value: Any) -> PrefillMetrics:
         "measurements",
     }
     _required(path, raw, fields)
-    unknown = sorted(set(raw) - fields - {"ttft_ms", "wait_time_ms"})
+    unknown = sorted(
+        set(raw) - fields - {"ttft_ms", "wait_time_ms", "warmup_used", "warmup_anomaly"}
+    )
     if unknown:
         raise ResultSchemaError(f"{path}.{unknown[0]}: unknown field")
     input_length = _positive_int(f"{path}.input_length", raw["input_length"])
@@ -254,6 +268,18 @@ def _parse_prefill_metrics(path: str, value: Any) -> PrefillMetrics:
         wait_time_ms=(
             _number(f"{path}.wait_time_ms", raw["wait_time_ms"])
             if raw.get("wait_time_ms") is not None
+            else None
+        ),
+        warmup_used=(
+            _boolean(f"{path}.warmup_used", raw["warmup_used"])
+            if raw.get("warmup_used") is not None
+            else None
+        ),
+        warmup_anomaly=(
+            copy.deepcopy(
+                dict(_object(f"{path}.warmup_anomaly", raw["warmup_anomaly"]))
+            )
+            if raw.get("warmup_anomaly") is not None
             else None
         ),
     )

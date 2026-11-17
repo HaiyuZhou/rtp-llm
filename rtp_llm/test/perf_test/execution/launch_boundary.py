@@ -49,7 +49,7 @@ LAUNCHER_CONFIG_FIELDS = frozenset(
         "build_from_scratch",
         "benchmark_name",
         "task_output_dir",
-        "perf_test_run_id",
+        "run_context",
         "collect_diagnostics",
         "diagnostics_only",
     }

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -x;
+PYTHON_BIN="/opt/conda310/bin/python"
 
 enter_work_dir() {
   # Determine work dir: use env HIPPO_APP_WORKDIR if it is set, otherwise use home
@@ -80,13 +81,12 @@ checkout_code() {
 install_requirements() {
   if [ "${BUILD_FROM_SCRATCH:-2}" -gt 1 ]; then
     # The manual SSH path must work from an open-source-only checkout.
-    local python_bin="${PERF_TEST_PYTHON_BIN:-/opt/conda310/bin/python3}"
     if [ `uname -m` == "aarch64" ]; then
-      ("$python_bin" -m pip install -r ./deps/requirements_lock_cuda13_arm.txt) || exit 1;
+      ("$PYTHON_BIN" -m pip install -r ./deps/requirements_lock_cuda13_arm.txt) || exit 1;
     else
       # The lock already lists the full resolved graph; pip re-resolution
       # conflicts with the CUDA13 overrides used to generate it.
-      ("$python_bin" -m pip install --no-deps -r ./deps/requirements_lock_torch_gpu_cuda13.txt) || exit 1;
+      ("$PYTHON_BIN" -m pip install --no-deps -r ./deps/requirements_lock_torch_gpu_cuda13.txt) || exit 1;
     fi
   fi
 }
@@ -121,7 +121,6 @@ build_code() {
 configure_env() {
   # Configure fixed environment variables
   export PYTHONPATH="./";
-  export PYTHON_BIN="/opt/conda310/bin/python";
     export NCCL_TOPO_DUMP_FILE="/tmp/nccl_topo.xml";
   # Local (uncommitted) adaptation: system libstdc++ is too old for the
   # fastsafetensors wheel (needs GLIBCXX_3.4.29); conda ships a new one.
@@ -146,20 +145,22 @@ configure_env() {
 
 run_server() {
   if [ "${BUILD_FROM_SCRATCH:-2}" -eq 0 ]; then
-    SERVER_CMD="$PYTHON_BIN ./rtp_llm/test/perf_test/multi_node/local_server_runner.py";
+    local server_cmd=("$PYTHON_BIN" ./rtp_llm/test/perf_test/multi_node/local_server_runner.py --run-context "$run_context_path")
     if [ "${CUDA_ASAN:-0}" -eq 1 ]; then
-        /usr/local/cuda/compute-sanitizer/compute-sanitizer --print-limit 10000 --target-processes all $SERVER_CMD || exit 1;
+        /usr/local/cuda/compute-sanitizer/compute-sanitizer --print-limit 10000 --target-processes all "${server_cmd[@]}" || exit 1;
     else
-      $SERVER_CMD || exit 1;
+      "${server_cmd[@]}" || exit 1;
     fi
   fi
 }
 
 find_test_output_path() {
-  if [ -n "$PERF_TEST_RUN_ID" ]; then
-    TEST_OUTPUT_PATH=$(readlink -f -- "TEST_OUTPUT_${PERF_TEST_RUN_ID}_${WORLD_RANK:-0}") || return 1
+  if [ -n "$run_context_path" ]; then
+    local run_id
+    run_id=$(python3 rtp_llm/test/perf_test/run_context.py "$run_context_path" run_id) || return 1
+    TEST_OUTPUT_PATH=$(readlink -f -- "TEST_OUTPUT_${run_id}_${WORLD_RANK:-0}") || return 1
     if [ ! -d "$TEST_OUTPUT_PATH" ]; then
-      echo "No output directory for attempt ${PERF_TEST_RUN_ID}, rank ${WORLD_RANK:-0}" >&2
+      echo "No output directory for attempt ${run_id}, rank ${WORLD_RANK:-0}" >&2
       return 1
     fi
     return 0
@@ -232,8 +233,8 @@ local_clean_script() {
 }
 
 local_test_script() {
-  if [ -z "$PERF_TEST_CONFIG_PATH" ] || [ ! -r "$PERF_TEST_CONFIG_PATH" ]; then
-    echo "PERF_TEST_CONFIG_PATH must name the delivered perf config"
+  if [ -z "$run_context_path" ] || [ ! -r "$run_context_path" ]; then
+    echo "run_context_path must name the delivered run descriptor"
     exit 1
   fi
   # Kill all running processes related to rtp_llm and conda310
@@ -248,6 +249,16 @@ local_test_script() {
 }
 
 main() {
+  local run_context_path=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run-context)
+        [ "$#" -ge 2 ] || { echo "--run-context requires a path" >&2; return 2; }
+        run_context_path="$2"; shift 2 ;;
+      --run-context=*) run_context_path="${1#*=}"; shift ;;
+      *) echo "Unknown argument: $1" >&2; return 2 ;;
+    esac
+  done
   SUB_CMD=${SUB_CMD}
 
   case ${SUB_CMD} in
@@ -273,4 +284,6 @@ main() {
   esac
 }
 
-main;
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

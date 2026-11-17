@@ -14,52 +14,43 @@ class CiDeliveryTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.destination = Path(self.temp.name) / "delivered.json"
 
-    def deliver(self, **values):
+    def deliver(self, *, MODE="decode", CONFIG="auto"):
         return deliver_config(
-            {"PERF_TEST_" + key: value for key, value in values.items()},
+            MODE,
+            CONFIG,
             self.checkout,
             self.destination,
         )
 
-    def test_missing_ep_uses_effective_tp_dp_after_ci_overrides(self):
+    def test_missing_ep_is_resolved_by_planner(self):
         base = self.deliver(MODE="prefill")
         base["model"]["topology"].pop("ep")
-        delivered = self.deliver(
-            MODE="prefill", CONFIG=json.dumps(base), TP_SIZE="2", DP_SIZE="2"
+        delivered = self.deliver(MODE="prefill", CONFIG=json.dumps(base))
+        self.assertNotIn("ep", delivered["model"]["topology"])
+        self.assertEqual(
+            2, self.plan_delivered("prefill").resolved_config["model"]["topology"]["ep"]
         )
-        self.assertEqual(dict(tp=2, dp=2, pp=1, ep=4), delivered["model"]["topology"])
 
-    def test_explicit_inline_config_and_overrides_win(self):
+    def test_explicit_inline_config_is_authoritative(self):
         base = self.deliver(MODE="prefill")
         base["model"]["label"] = "custom"
+        base["model"]["type"] = "configured"
+        base["model"]["checkpoint"] = "/configured/model"
+        base["model"]["tokenizer"] = "/configured/tokenizer"
         base["execution"]["backend"] = "local"
         config = self.deliver(
             MODE="prefill",
             CONFIG=json.dumps(base),
-            MODEL_TYPE="other",
-            CHECKPOINT_PATH="/model",
-            TOKENIZER_PATH="/tokenizer",
-            TP_SIZE="4",
-            DP_SIZE="2",
-            PP_SIZE="1",
-            EP_SIZE="2",
-            GPUS_PER_MACHINE="2",
-            GPU_TYPE="custom-gpu",
-            RESOURCE="online",
         )
-        self.assertEqual(config["model"]["label"], "custom")
-        self.assertEqual(config["model"]["type"], "other")
-        self.assertEqual(config["model"]["checkpoint"], "/model")
-        self.assertEqual(config["model"]["tokenizer"], "/tokenizer")
-        self.assertEqual(config["model"]["topology"], dict(tp=4, dp=2, pp=1, ep=2))
+        self.assertEqual(config["model"], base["model"])
         self.assertEqual(
             config["execution"],
             dict(
                 backend="aone",
-                resource="online",
-                gpu_type="custom-gpu",
-                max_parallel=4,
-                gpus_per_machine=2,
+                resource="daily",
+                gpu_type="H20_CU13",
+                max_parallel=2,
+                gpus_per_machine=1,
             ),
         )
         self.assertEqual(config["workload"], base["workload"])
@@ -87,34 +78,32 @@ class CiDeliveryTest(unittest.TestCase):
             )
         )[0]
 
-    def test_auto_gpu_count_preserves_single_host_case_shards(self):
+    def test_single_host_config_preserves_case_shards(self):
         base = self.deliver(MODE="prefill")
         base["model"]["topology"] = dict(tp=2, dp=1, pp=1, ep=1)
         base["execution"].update(shard_count=2, max_parallel=2)
         base["execution"].pop("gpus_per_machine", None)
-        for value in ("", "auto"):
-            with self.subTest(value=value):
-                config = self.deliver(
-                    MODE="prefill", CONFIG=json.dumps(base), GPUS_PER_MACHINE=value
-                )
+        source_path = Path(self.temp.name) / "single_host.json"
+        source_path.write_text(json.dumps(base))
+        for spec in (json.dumps(base), str(source_path)):
+            with self.subTest(spec=spec):
+                config = self.deliver(MODE="prefill", CONFIG=spec)
                 self.assertNotIn("gpus_per_machine", config["execution"])
                 plan = self.plan_delivered("prefill")
                 self.assertEqual(1, plan.resource_plan.machine_count)
                 self.assertEqual(2, plan.resource_plan.shard_count)
 
-    def test_explicit_gang_override_replaces_case_sharding(self):
+    def test_explicit_gang_config_selects_machine_count(self):
         base = self.deliver(MODE="prefill")
         base["model"]["topology"] = dict(tp=2, dp=1, pp=1, ep=1)
         base["execution"] = dict(
             backend="aone",
             resource="daily",
             gpu_type="H20_CU13",
-            shard_count=2,
             max_parallel=2,
+            gpus_per_machine=1,
         )
-        config = self.deliver(
-            MODE="prefill", CONFIG=json.dumps(base), GPUS_PER_MACHINE="1"
-        )
+        config = self.deliver(MODE="prefill", CONFIG=json.dumps(base))
         self.assertNotIn("shard_count", config["execution"])
         self.assertEqual(2, self.plan_delivered("prefill").resource_plan.machine_count)
 
@@ -189,14 +178,10 @@ class CiDeliveryTest(unittest.TestCase):
 class PrefillVerificationTest(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(
-            importlib.util.find_spec(
-                "rtp_llm.test.perf_test.ci_prefill_verify"
-            ),
+            importlib.util.find_spec("rtp_llm.test.perf_test.ci_prefill_verify"),
             "collected-artifact verifier is absent",
         )
-        from rtp_llm.test.perf_test.ci_prefill_verify import (
-            verify_prefill_run,
-        )
+        from rtp_llm.test.perf_test.ci_prefill_verify import verify_prefill_run
 
         self.verify = verify_prefill_run
         # Platform targets without plotly render the static chart fallback;

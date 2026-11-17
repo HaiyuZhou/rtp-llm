@@ -105,6 +105,12 @@ def parse_offline_args():
     )
     bench.add_argument("--tp_size", type=int, default=1)
     bench.add_argument(
+        "--existing-server-port",
+        type=int,
+        default=None,
+        help="Connect to an existing local engine instead of starting a server",
+    )
+    bench.add_argument(
         "--server_start_timeout",
         type=int,
         default=1600,
@@ -112,6 +118,11 @@ def parse_offline_args():
     )
 
     args, remaining = parser.parse_known_args()
+    if (
+        args.existing_server_port is not None
+        and not 1 <= args.existing_server_port <= 65535
+    ):
+        parser.error("--existing-server-port must be between 1 and 65535")
     return args, remaining
 
 

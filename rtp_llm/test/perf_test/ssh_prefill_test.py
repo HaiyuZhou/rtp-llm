@@ -9,6 +9,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import typing
 import unittest
@@ -27,6 +28,7 @@ from rtp_llm.test.perf_test.execution.launch_boundary import (
 from rtp_llm.test.perf_test.multi_node import multi_benchmark, prefill_runtime
 from rtp_llm.test.perf_test.multi_node.decode_runtime import run_external_rank
 from rtp_llm.test.perf_test.multi_node.decode_sync import validate_decode_layout
+from rtp_llm.test.perf_test.run_context import read_run_context
 from rtp_llm.test.perf_test.test_support import (
     prefill_external_aux,
     prefill_external_CASE_CACHE_LEN,
@@ -35,6 +37,7 @@ from rtp_llm.test.perf_test.test_support import (
     prefill_external_Tokenizer,
     prefill_external_TOPOLOGY,
     prefill_external_write_prefill_config,
+    run_context_path,
 )
 
 
@@ -234,6 +237,8 @@ class SshPrefillTest(unittest.TestCase):
                 namespace = dict(
                     vars(typing),
                     os=os,
+                    argparse=__import__("argparse"),
+                    read_run_context=read_run_context,
                     pathlib=__import__("pathlib"),
                     time=__import__("time"),
                     sys=__import__("sys"),
@@ -281,12 +286,19 @@ class SshPrefillTest(unittest.TestCase):
                     ),
                     namespace,
                 )
-                with patch.dict(
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "worker",
+                        "--run-context",
+                        run_context_path(
+                            root, config_path=str(config), mode=mode, run_id="contract"
+                        ),
+                    ],
+                ), patch.dict(
                     os.environ,
                     {
-                        "PERF_TEST_CONFIG_PATH": str(config),
-                        "PERF_TEST_MODE": mode,
-                        "PERF_TEST_RUN_ID": "contract",
                         "WORLD_RANK": "1",
                         "LOCAL_WORLD_SIZE": "1",
                         "USE_BATCH_DECODE_SCHEDULER": "0",
@@ -294,7 +306,9 @@ class SshPrefillTest(unittest.TestCase):
                         "UPLOAD_OSS_PATH": "",
                         **runtime_environment,
                     },
-                ), patch.object(os, "setpgrp"):
+                ), patch.object(
+                    os, "setpgrp"
+                ):
                     with patch.object(
                         os.path, "abspath", side_effect=lambda p: str(root / p)
                     ):
@@ -458,7 +472,7 @@ class SshPrefillTest(unittest.TestCase):
             executor.write_text(
                 "import json, os\nfrom pathlib import Path\nPath(os.environ['CAPTURE']).write_text(json.dumps(dict(os.environ)))\n"
             )
-            shell = 'scp() { :; }\nssh() {\n  local command="${@: -1}"\n  command="${command/bash \\/tmp\\/multi_local_executor.sh/python3 $EXECUTOR}"\n  /bin/bash -c "$command"\n}\nexport -f scp ssh\nsource "$1"\n'
+            shell = 'scp() { :; }\nssh() {\n  local command="${@: -1}"\n  command="${command/bash \\/tmp\\/multi_local_executor.sh/python3 $EXECUTOR}"\n  /bin/bash -c "$command"\n}\nexport -f scp ssh\nsource "$1"\nmain\n'
             arguments = " --jobs 64 --verbose_failures --config=cuda13 "
             for action in ("build", "kill", "clean"):
                 with self.subTest(action=action):
@@ -607,16 +621,20 @@ class SshPrefillTest(unittest.TestCase):
 
             def run(args, *, env, **_kwargs):
                 (remote, _) = prefill_runtime.build_external_prefill_plan(
-                    env["PERF_TEST_CONFIG_PATH"],
+                    read_run_context(args[args.index("--run-context") + 1])[
+                        "config_path"
+                    ],
                     root / "remote-run",
                     {"tp": 1, "dp": 1, "pp": 1, "ep": 1},
                     **(
                         {
-                            "resolved_workload_path": env[
-                                "PERF_TEST_RESOLVED_WORKLOAD_PATH"
-                            ]
+                            "resolved_workload_path": read_run_context(
+                                args[args.index("--run-context") + 1]
+                            )["resolved_workload_path"]
                         }
-                        if env.get("PERF_TEST_RESOLVED_WORKLOAD_PATH")
+                        if read_run_context(args[args.index("--run-context") + 1]).get(
+                            "resolved_workload_path"
+                        )
                         else {}
                     ),
                 )
@@ -629,9 +647,18 @@ class SshPrefillTest(unittest.TestCase):
                     original.resolved_config["workload"],
                     remote.resolved_config["workload"],
                 )
-                source = json.loads(Path(env["PERF_TEST_CONFIG_PATH"]).read_text())
+                source = json.loads(
+                    Path(
+                        read_run_context(args[args.index("--run-context") + 1])[
+                            "config_path"
+                        ]
+                    ).read_text()
+                )
                 captured.update(source["workload"])
-                self.assertEqual("prefill", env["PERF_TEST_MODE"])
+                self.assertEqual(
+                    "prefill",
+                    read_run_context(args[args.index("--run-context") + 1])["mode"],
+                )
                 return subprocess.CompletedProcess(args, 7)
 
             with patch.object(
@@ -677,17 +704,17 @@ class SshPrefillTest(unittest.TestCase):
                     [
                         "bash",
                         "-c",
-                        'source "$1"; cd "$2"; install_requirements',
+                        'source "$1"; PYTHON_BIN="$3"; cd "$2"; install_requirements',
                         "bash",
                         str(script),
                         str(root),
+                        str(fake_python),
                     ],
                     env={
                         **os.environ,
                         "PATH": str(root) + os.pathsep + os.environ["PATH"],
                         "TEST_ARCH": architecture,
                         "BUILD_FROM_SCRATCH": "2",
-                        "PERF_TEST_PYTHON_BIN": str(fake_python),
                         "ARGS_FILE": str(args_file),
                     },
                     capture_output=True,
@@ -749,6 +776,8 @@ class SshPrefillTest(unittest.TestCase):
 
             namespace = {
                 "os": os,
+                "argparse": __import__("argparse"),
+                "read_run_context": read_run_context,
                 "Dict": typing.Dict,
                 "pathlib": __import__("pathlib"),
                 "time": __import__("time"),
@@ -776,12 +805,19 @@ class SshPrefillTest(unittest.TestCase):
                 "execute_master_prefill": master,
                 "try_upload_log": lambda *_args: None,
             }
-            with patch.dict(
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "worker",
+                    "--run-context",
+                    run_context_path(
+                        root, config_path=str(config), mode="prefill", run_id="test-run"
+                    ),
+                ],
+            ), patch.dict(
                 os.environ,
                 {
-                    "PERF_TEST_CONFIG_PATH": str(config),
-                    "PERF_TEST_MODE": "prefill",
-                    "PERF_TEST_RUN_ID": "test-run",
                     "UPLOAD_OSS_PATH": "",
                 },
             ):

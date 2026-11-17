@@ -261,3 +261,10 @@ def fixture_engine(**overrides):
         **{"max_seq_len": 4096, "max_batch_tokens": 8192, "concurrency_limit": 8},
         **overrides,
     }
+
+
+def run_context_path(root, **fields):
+    """Create the file descriptor used by an existing launcher fixture."""
+    from rtp_llm.test.perf_test.run_context import write_run_context
+
+    return str(write_run_context(root / "run_context.json", **fields))

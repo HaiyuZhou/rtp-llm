@@ -1,3 +1,4 @@
+import argparse
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ from rtp_llm.test.perf_test.multi_node.prefill_runtime import (
     execute_master_prefill,
 )
 from rtp_llm.test.perf_test.plan import ExecutionPlan
+from rtp_llm.test.perf_test.run_context import read_run_context
 from rtp_llm.test.perf_test.test_util import create_query
 from rtp_llm.test.utils.maga_server_manager import MagaServerManager
 from rtp_llm.utils.fuser import fetch_remote_file_to_local
@@ -272,13 +274,15 @@ def start_local_rank_group(
 
 
 if __name__ == "__main__":
-    config_path = os.environ.get("PERF_TEST_CONFIG_PATH")
-    if not config_path:
-        raise RuntimeError("PERF_TEST_CONFIG_PATH is required for multi-node perf")
-
-    mode = os.environ.get("PERF_TEST_MODE", "decode")
+    parser = argparse.ArgumentParser(description="Start a perf-test rank group")
+    parser.add_argument("--run-context", required=True)
+    args, engine_args = parser.parse_known_args()
+    sys.argv[1:] = engine_args
+    run_context = read_run_context(args.run_context, required=True)
+    config_path = run_context["config_path"]
+    mode = run_context["mode"]
     if mode not in ("decode", "prefill"):
-        raise RuntimeError(f"unsupported PERF_TEST_MODE: {mode}")
+        raise RuntimeError(f"unsupported run descriptor mode: {mode}")
 
     configure_perf_environment(preserve=HOST_MODEL_ENVIRONMENT_KEYS)
     py_env_configs: PyEnvConfigs = setup_args()
@@ -288,7 +292,7 @@ if __name__ == "__main__":
     )
     port = py_env_configs.server_config.start_port
     world_rank = py_env_configs.parallelism_config.world_rank
-    run_id = os.environ.setdefault("PERF_TEST_RUN_ID", f"{mode}-{time.time_ns()}")
+    run_id = run_context["run_id"]
     log_dir_name = f"TEST_OUTPUT_{run_id}_{world_rank}"
     log_dir_path = os.path.abspath(log_dir_name)
     runtime_profiler_directory = pathlib.Path(log_dir_path)
@@ -299,8 +303,8 @@ if __name__ == "__main__":
     plan, source = build_plan(
         config_path,
         **(
-            {"resolved_workload_path": os.environ["PERF_TEST_RESOLVED_WORKLOAD_PATH"]}
-            if mode == "prefill" and os.environ.get("PERF_TEST_RESOLVED_WORKLOAD_PATH")
+            {"resolved_workload_path": run_context["resolved_workload_path"]}
+            if mode == "prefill" and run_context.get("resolved_workload_path")
             else {}
         ),
         result_directory=str(pathlib.Path(log_dir_path) / "run"),
@@ -332,7 +336,7 @@ if __name__ == "__main__":
         if host_value != planned_value:
             raise RuntimeError(
                 f"host model {key} conflicts with the frozen perf config; "
-                "set the model in PERF_TEST_CONFIG_PATH and remove the host override"
+                "set the model in the run descriptor config and remove the host override"
             )
     launch = build_engine_launch_spec(plan)
     launch = replace(launch, environment=_host_engine_environment(launch.environment))
@@ -416,12 +420,10 @@ if __name__ == "__main__":
                 endpoint=f"http://127.0.0.1:{port}",
                 prompt_for_length=lambda length: input_query_dict[length],
             )
-            control_port = int(
-                os.environ.get("PERF_TEST_DECODE_CONTROL_PORT", port + 1024)
-            )
+            control_port = port + 1024
             if not 0 < control_port < 65536:
                 raise ValueError(
-                    "PERF_TEST_DECODE_CONTROL_PORT must be a valid TCP port"
+                    "derived decode control port must be between 1 and 65535"
                 )
             if world_rank == 0:
                 cluster = ClusterDecodeTransport(
@@ -456,6 +458,7 @@ if __name__ == "__main__":
                     tokenizer_path=server_handle.tokenizer_path,
                     server_log_path=server_handle.log_file_path,
                     profiler_directory=runtime_profiler_directory,
+                    run_context=run_context,
                 )
             )
             if mode == "prefill"
@@ -467,6 +470,7 @@ if __name__ == "__main__":
                 server_log_path=server_handle.log_file_path,
                 profiler_directory=runtime_profiler_directory,
                 transport=cluster,
+                run_context=run_context,
             )
         )
         result = run_external_rank(

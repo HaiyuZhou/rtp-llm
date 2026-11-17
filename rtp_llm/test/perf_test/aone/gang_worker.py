@@ -9,8 +9,8 @@ finish (every other shard). Every exit path casts exactly one terminal
 vote to the broker and returns a process exit code; a broker-reported
 gang failure is always a nonzero exit, never an endless retry.
 
-The broker coordinates arrive through ``PERF_TEST_BROKER_URL``,
-``PERF_TEST_BROKER_TOKEN``, and ``PERF_TEST_BROKER_RUN_ID``. The token is
+The broker URL and run ID are declared in ``gang_plan.json``. Only the token
+arrives through ``PERF_TEST_BROKER_TOKEN``. The token is
 only ever sent in the authorization header; it never reaches worker logs
 or persisted artifacts.
 """
@@ -57,18 +57,16 @@ from rtp_llm.test.perf_test.execution.devices import (
 )
 from rtp_llm.test.perf_test.multi_node.gang_config import build_gang_config_string
 from rtp_llm.test.perf_test.plan import build_execution_plan
+from rtp_llm.test.perf_test.run_context import read_run_context, write_run_context
 from rtp_llm.test.perf_test.storage import atomic_write_json
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, heavy at runtime
     from rtp_llm.test.perf_test.multi_node.local_server_runner import ServerHandle
 
-BROKER_URL_ENV = "PERF_TEST_BROKER_URL"
 BROKER_TOKEN_ENV = "PERF_TEST_BROKER_TOKEN"
-BROKER_RUN_ID_ENV = "PERF_TEST_BROKER_RUN_ID"
 
 SHARD_INDEX_ENV = "TEST_SHARD_INDEX"
 TOTAL_SHARDS_ENV = "TEST_TOTAL_SHARDS"
-CONFIG_PATH_ENV = "PERF_TEST_CONFIG_PATH"
 
 # Client-side request bounds. The broker serves ``members`` as a blocking
 # call until the gang completes or the register deadline (3600 s default)
@@ -132,7 +130,7 @@ class GangExecutionError(GangWorkerError):
 
 @dataclass(frozen=True)
 class BrokerCoordinates:
-    """Broker location and credentials derived from the environment."""
+    """Broker location from the gang plan, with an inherited token."""
 
     url: str
     token: str
@@ -140,23 +138,24 @@ class BrokerCoordinates:
 
 
 def broker_coordinates(
-    environ: Optional[Mapping[str, str]] = None
+    gang_plan: Mapping[str, Any], environ: Optional[Mapping[str, str]] = None
 ) -> BrokerCoordinates:
-    """Read the broker coordinates; every variable is mandatory."""
+    """Read the connection from the plan and authentication from the environment."""
+    run_id = gang_plan.get("broker_run_id")
+    url = gang_plan.get("broker_url")
+    if not isinstance(url, str) or not url.strip():
+        raise WorkerConfigError("gang plan broker_url must be a non-empty string")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise WorkerConfigError("gang plan broker_run_id must be a non-empty string")
     environ = os.environ if environ is None else environ
-    missing = [
-        name
-        for name in (BROKER_URL_ENV, BROKER_TOKEN_ENV, BROKER_RUN_ID_ENV)
-        if not str(environ.get(name, "")).strip()
-    ]
-    if missing:
+    if not str(environ.get(BROKER_TOKEN_ENV, "")).strip():
         raise WorkerConfigError(
-            "gang worker requires the environment variable(s): " + ", ".join(missing)
+            f"gang worker requires the environment variable: {BROKER_TOKEN_ENV}"
         )
     return BrokerCoordinates(
-        url=environ[BROKER_URL_ENV].strip(),
+        url=url.strip(),
         token=environ[BROKER_TOKEN_ENV].strip(),
-        run_id=environ[BROKER_RUN_ID_ENV].strip(),
+        run_id=run_id,
     )
 
 
@@ -891,17 +890,12 @@ def _build_gang_execution_plan(config_path, context, result_directory):
     )
 
 
-def _default_server_runner(context: GangWorkerContext):
+def _default_server_runner(context: GangWorkerContext, *, config_path: str):
     """Start this host's rank group through the extracted legacy startup."""
     from rtp_llm.config.server_config_setup import set_parallelism_config
     from rtp_llm.server.server_args.server_args import setup_args
 
     runner = _load_local_server_runner()
-    config_path = os.environ.get(CONFIG_PATH_ENV)
-    if not config_path:
-        raise WorkerConfigError(
-            f"gang server runner requires {CONFIG_PATH_ENV} (set by the worker main)"
-        )
     plan = context.gang_plan
     topology = plan["topology"]
     engine_environment = {
@@ -917,7 +911,6 @@ def _default_server_runner(context: GangWorkerContext):
         # Match the legacy decode runner's engine switches.
         "USE_BATCH_DECODE_SCHEDULER": "1",
         "FAKE_BALANCE_EXPERT": "1",
-        "PERF_TEST_RUN_ID": str(plan["run_id"]),
     }
     if int(plan["machine_count"]) > 1:
         # Symmetric-memory custom all-reduce passes file descriptors between
@@ -1049,10 +1042,10 @@ def _is_distributed_decode(config_path: Path, context: GangWorkerContext) -> boo
 
 def _decode_control_port(context: GangWorkerContext) -> int:
     start = int(context.gang_plan["port_range"]["start"])
-    port = int(os.environ.get("PERF_TEST_DECODE_CONTROL_PORT", start + 1024))
+    port = start + 1024
     if not 0 < port < 65536:
         raise WorkerConfigError(
-            "PERF_TEST_DECODE_CONTROL_PORT must be a valid TCP port"
+            "derived decode control port must be between 1 and 65535"
         )
     return port
 
@@ -1152,6 +1145,7 @@ def _default_master_executor(
             # which the rank-group startup points at the member's log dir.
             profiler_directory=Path(handle.log_dir),
             transport=cluster,
+            run_context=context.gang_plan,
         )
     finally:
         if cluster is not None:
@@ -1185,13 +1179,15 @@ def _default_prefill_master_executor(
     merged = json.loads(Path(config_path).read_text(encoding="utf-8"))
     plan, source = _build_gang_execution_plan(config_path, context, result_directory)
     root = Path(result_directory)
-    run_id = os.environ.get("PERF_TEST_RUN_ID", root.name)
+    run_context = context.gang_plan
+    run_id = run_context.get("run_id", root.name)
     initialize_run_directory(
         root,
         source_config=source,
         plan=plan,
         run_id=run_id,
         code_version=os.environ.get("BUILD_SCM_REVISION", "unknown"),
+        repository_revisions=run_context.get("repository_revisions", {}),
     )
     store = RunStore(root)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
@@ -1381,7 +1377,8 @@ def main(
     outputs = Path(os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR", "."))
     try:
         outputs.mkdir(parents=True, exist_ok=True)
-        coordinates = broker_coordinates()
+        gang_plan = load_gang_plan(Path(args.gang_plan))
+        coordinates = broker_coordinates(gang_plan)
         merged_config = _merge_workload(
             args.resolved_config, args.resolved_workload, outputs
         )
@@ -1390,11 +1387,18 @@ def main(
         mode = (
             None if master_executor is not None else merged_config_mode(merged_config)
         )
-    except GangWorkerError as error:
+        # The descriptor is local to this worker; controller paths are never inherited.
+        context_path = write_run_context(
+            outputs / "run_context.json",
+            config_path=str(merged_config.resolve()),
+            run_id=gang_plan["run_id"],
+            repository_revisions=gang_plan.get("repository_revisions", {}),
+            **({"mode": mode} if mode is not None else {}),
+        )
+        run_context = read_run_context(context_path, required=True)
+    except (GangWorkerError, ValueError, OSError) as error:
         print(f"gang worker setup failed: {error}", file=sys.stderr)
-        return error.exit_code
-    # The legacy startup and the plan builders read the config from here.
-    os.environ[CONFIG_PATH_ENV] = str(merged_config)
+        return getattr(error, "exit_code", EXIT_CONFIG_ERROR)
     factory = BrokerClient if broker_factory is None else broker_factory
     broker = factory(coordinates.url, coordinates.token, coordinates.run_id)
     # The master path follows the resolved config's mode: decode keeps the
@@ -1412,7 +1416,13 @@ def main(
         Path(args.gang_plan),
         broker=broker,
         server_runner=(
-            _default_server_runner if server_runner is None else server_runner
+            (
+                lambda context: _default_server_runner(
+                    context, config_path=run_context["config_path"]
+                )
+            )
+            if server_runner is None
+            else server_runner
         ),
         test_outputs_dir=outputs,
         master_executor=executor,

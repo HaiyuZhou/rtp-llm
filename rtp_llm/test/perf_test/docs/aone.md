@@ -111,11 +111,12 @@ not establish worker-to-host reachability. If the remote probe fails, stop
 before allocating a full gang and use the CI control host.
 
 The broker binds and advertises the same hostname, defaulting to the submit
-host FQDN; `PERF_TEST_BROKER_HOST` changes both. It must remain reachable for
+host FQDN; `--broker-host` changes both. It must remain reachable for
 the entire run. Separate bind/advertise addresses or a relay are not implemented.
 Broker HTTP clients bypass ambient proxy settings. The per-run token travels
 through inherited worker environment, never command-line arguments or saved
-artifacts, and is removed before engine/rank subprocess launch. Workers register,
+artifacts, and is removed before engine/rank subprocess launch. The broker URL
+and run ID are declared in `gang_plan.json`. Workers register,
 exchange members, send heartbeats, and cast terminal votes; any member failure
 fails the gang. A bare `bazel test` does not start this submit-host broker.
 
@@ -164,16 +165,39 @@ under `bazel-testlogs/<package>/<target>/test.outputs/`, possibly in
 `outputs.zip`, with a `decode-*/` run directory. This path uses neither the
 AOne case collector nor the gang broker.
 
-The AOne entry accepts these environment overrides:
+The AOne entry always invokes `bazelisk`. Execution settings use explicit
+command-line arguments:
 
-| Variable | Purpose |
+| Argument | Purpose |
 | --- | --- |
-| `PERF_TEST_WORKSPACE_ROOT` | Public Bazel workspace; otherwise `BUILD_WORKSPACE_DIRECTORY` or current directory |
-| `PERF_TEST_BAZEL` | Bazel executable, default `bazelisk` |
-| `PERF_TEST_BAZEL_STARTUP_ARGS` | Startup options, including a worktree-specific output root |
-| `PERF_TEST_BAZEL_ARGS` | Extra build/test arguments required by the site |
-| `PERF_TEST_BAZEL_BUILD_JOBS` | Build concurrency; distinct from remote `max_parallel` |
-| `PERF_TEST_BAZEL_TESTLOGS` | Collection root; default workspace `bazel-testlogs` |
+| `--bazel-startup-arg=VALUE` | Repeat for startup options, including an isolated output root |
+| `--bazel-arg=VALUE` | Repeat for build/test arguments required by the site |
+| `--broker-host=HOST` | Routable broker host for gangs; default submit-host FQDN |
+| `--run-context=PATH` | Run metadata/provenance JSON |
+
+For options beginning with `--`, use the equals form, for example
+`--bazel-startup-arg=--output_user_root=/tmp/perf-bazel` or
+`--bazel-arg=--jobs=32`. Each value remains one argv element; no shell splitting
+is applied. The workspace comes from Bazel's `BUILD_WORKSPACE_DIRECTORY`,
+falling back to the current directory. Results are collected through its
+`bazel-testlogs` symlink, including with a separate output root. Build concurrency
+defaults to the submit host's CPU count. Extra Bazel arguments apply to both
+build and test, so `--bazel-arg=--jobs=N` also overrides test concurrency derived
+from `execution.max_parallel`.
+
+The CI delivery adapter accepts `--mode` and `--config`. The CI platform binds
+its inputs at the script boundary; the script passes quoted arguments and drops
+the bindings before launching the programs. Public entry points and executors do
+not read those bindings as environment overrides.
+An empty or `auto` config selects `examples/prefill_aone_ci.json` or
+`examples/decode_aone_gang.json` by mode. Otherwise, provide a config file path
+or an inline JSON object. Put model paths, topology, GPU type, resource pool,
+and parallelism in that JSON; individual environment overrides are not read.
+For gangs, configure `gpus_per_machine` and `max_parallel` explicitly and omit
+single-host `shard_count`. Delivery pins `execution.backend` to `aone` and
+`output.result_root` to `perf_test_results` for collection and CI upload. Relative
+distribution paths resolve against the config file's directory, or the checkout
+directory for inline JSON.
 
 ## Results and failure evidence
 

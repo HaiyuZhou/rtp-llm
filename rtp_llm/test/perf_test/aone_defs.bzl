@@ -104,9 +104,7 @@ def perf_test_gang_shard(name, resolved_config, resolved_workload, gang_plan, gp
             "gpu_count": str(gpus_per_host),
         },
         env_inherit = [
-            "PERF_TEST_BROKER_URL",
             "PERF_TEST_BROKER_TOKEN",
-            "PERF_TEST_BROKER_RUN_ID",
         ],
     )
 

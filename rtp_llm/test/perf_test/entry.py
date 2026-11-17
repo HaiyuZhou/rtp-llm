@@ -31,6 +31,7 @@ from rtp_llm.test.perf_test.plan import (
     build_execution_plan,
 )
 from rtp_llm.test.perf_test.prefill.planner import require_concurrent_prefill_plan
+from rtp_llm.test.perf_test.run_context import read_run_context
 from rtp_llm.test.perf_test.run_directory import (
     initialize_run_directory,
     inspect_run_directory,
@@ -219,7 +220,14 @@ def _default_executors(
             create_default_aone_executor,
         )
 
-        return {"aone": create_default_aone_executor}
+        return {
+            "aone": lambda plan: create_default_aone_executor(
+                plan,
+                startup_args=request.bazel_startup_args if request else (),
+                common_args=request.bazel_args if request else (),
+                broker_host=request.broker_host if request else None,
+            )
+        }
     from rtp_llm.test.perf_test.execution.local import create_default_local_executor
 
     selected = () if request is None else request.cases
@@ -235,23 +243,34 @@ def run_request(
 ) -> Any:
     """Plan first; keep dry-run outside every filesystem/execution side effect."""
     plan, source = build_request_plan(request)
+    if plan.backend != "aone" and (
+        request.bazel_startup_args or request.bazel_args or request.broker_host
+    ):
+        raise ConfigurationError(
+            "Bazel options and --broker-host require the AOne backend"
+        )
     if request.dry_run:
         preview = create_preview(
             plan, preview_renderer=aone_preview if plan.backend == "aone" else None
         )
         if request.cases:
             preview["selected_case_ids"] = list(request.cases)
+        if plan.backend == "aone":
+            for command in preview["commands"]:
+                command["argv"][1:1] = request.bazel_startup_args
+                command["argv"].extend(request.bazel_args)
+            if request.broker_host and "gang" in preview:
+                preview["gang"]["broker_host"] = request.broker_host
         return preview
     if request.action == "run":
+        run_context = read_run_context(request.run_context)
         initialize_run_directory(
             plan.result_directory,
             source_config=source,
             plan=plan,
             run_id=Path(plan.result_directory).name,
             code_version=os.environ.get("BUILD_SCM_REVISION", "unknown"),
-            repository_revisions=json.loads(
-                os.environ.get("PERF_TEST_REPOSITORY_REVISIONS", "{}")
-            ),
+            repository_revisions=run_context.get("repository_revisions", {}),
         )
     executors = (
         _default_executors(request, backend=plan.backend)

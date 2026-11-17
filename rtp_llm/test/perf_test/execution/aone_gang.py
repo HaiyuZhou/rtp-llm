@@ -5,11 +5,11 @@ Local submission requires separate worker-to-broker connectivity validation.
 
 The gang executor owns the submit side of a multi-machine AOne run. It
 starts the rendezvous broker on a routable host, generates the gang Bazel
-package, drives the remote build/test invocations (the broker coordinates
-reach the remote shards through the generated rule's ``env_inherit``,
-exported into the environment of the bazel test invocation), collects the
-master shard's full ``run/`` tree plus non-master logs from the testlogs
-tree, and produces the standard envelope report.
+package, and drives the remote build/test invocations. The broker URL and run
+ID are declared in the gang plan; only the token reaches remote shards through
+the generated rule's ``env_inherit``. It collects the master shard's full
+``run/`` tree plus non-master logs from the testlogs tree, and produces the
+standard envelope report.
 
 Stage order is rendezvous -> build -> submit -> collect -> report, every
 transition persists to the manifest, partial collection always runs, and
@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import shutil
 import socket
 import subprocess
@@ -64,10 +63,7 @@ from rtp_llm.test.perf_test.run_directory import RunDirectoryLock, inspect_run_d
 from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.storage import RunStore, atomic_write_json
 
-BROKER_HOST_ENV = "PERF_TEST_BROKER_HOST"
-BROKER_URL_ENV = "PERF_TEST_BROKER_URL"
 BROKER_TOKEN_ENV = "PERF_TEST_BROKER_TOKEN"
-BROKER_RUN_ID_ENV = "PERF_TEST_BROKER_RUN_ID"
 
 # The subtrees of the master's run directory that hold result artifacts.
 # Planning snapshots (execution plan, configs, manifest) stay submit-side.
@@ -76,18 +72,6 @@ _MASTER_ARTIFACT_TREES = ("results", "reports", "traces", "profiles", "checkpoin
 # Stage execution order. Persisted manifests are key-sorted JSON, so the
 # order is recorded explicitly inside every stage entry.
 _STAGE_ORDER = {"rendezvous": 0, "build": 1, "submit": 2, "collect": 3, "report": 4}
-
-
-def resolve_broker_host(environ: Optional[Mapping[str, str]] = None) -> str:
-    """Return the host the broker must bind so workers can reach it.
-
-    Binding 0.0.0.0 would make ``broker.url`` advertise 127.0.0.1, which
-    remote workers cannot reach, so the default is the submit host's fully
-    qualified domain name; ``PERF_TEST_BROKER_HOST`` overrides it.
-    """
-    environ = os.environ if environ is None else environ
-    override = str(environ.get(BROKER_HOST_ENV, "")).strip()
-    return override or socket.getfqdn()
 
 
 def _forbidden_stage_seam(stage: str) -> Callable[..., Any]:
@@ -124,7 +108,6 @@ class GangAOneExecutor(AOneExecutor):
         resource: str,
         gpu_type: str,
         max_parallel: int,
-        bazel: str = "bazelisk",
         build_jobs: Optional[int] = None,
         startup_args: Sequence[str] = (),
         common_args: Sequence[str] = (),
@@ -156,7 +139,7 @@ class GangAOneExecutor(AOneExecutor):
         self._resource = resource
         self._platform = AONE_GPU_PLATFORMS[gpu_type]
         self._max_parallel = _positive_integer("max_parallel", max_parallel)
-        self._bazel = bazel
+        self._bazel = "bazelisk"
         self._startup_args = tuple(startup_args)
         self._build_jobs = _positive_integer(
             "build_jobs", build_jobs if build_jobs is not None else os.cpu_count() or 1
@@ -246,7 +229,7 @@ class GangAOneExecutor(AOneExecutor):
                 broker = run_gang_broker(
                     resource.machine_count,
                     state_dir=root / "workload" / "gang_broker",
-                    host=self._broker_host or resolve_broker_host(),
+                    host=self._broker_host or socket.getfqdn(),
                 )
                 broker.start()
             except Exception as error:
@@ -290,7 +273,7 @@ class GangAOneExecutor(AOneExecutor):
         run_id: str,
         broker: GangBroker,
     ) -> AOneExecutionOutcome:
-        built = self._run_build_stage(plan, root, store, manifest, run_id)
+        built = self._run_build_stage(plan, root, store, manifest, run_id, broker)
         if isinstance(built, AOneExecutionOutcome):
             return built
         test_failure = self._run_submit_stage(plan, store, manifest, built, broker)
@@ -308,6 +291,7 @@ class GangAOneExecutor(AOneExecutor):
         store: RunStore,
         manifest: Dict[str, Any],
         run_id: str,
+        broker: GangBroker,
     ):
         self._write_stage(store, manifest, stage="build", status="running")
         package: Optional[GeneratedAOnePackage] = None
@@ -316,6 +300,11 @@ class GangAOneExecutor(AOneExecutor):
             package = generate_gang_package(
                 package_root, plan, run_id=run_id, package=package_name
             )
+            gang_plan = json.loads(package.shard_plan.read_text(encoding="utf-8"))
+            gang_plan["broker_run_id"] = broker.run_id
+            gang_plan["broker_url"] = broker.url
+            gang_plan["repository_revisions"] = manifest.get("repository_revisions", {})
+            atomic_write_json(package.shard_plan, gang_plan)
             command = self._bazel_command(
                 "build",
                 package.targets,
@@ -366,7 +355,7 @@ class GangAOneExecutor(AOneExecutor):
             # The generated gang rule declares env_inherit for these names,
             # so exporting them into the submit environment is what carries
             # them to every remote shard.
-            "env_inherit": [BROKER_URL_ENV, BROKER_TOKEN_ENV, BROKER_RUN_ID_ENV],
+            "env_inherit": [BROKER_TOKEN_ENV],
         }
         submit_env, saved_env = self._export_broker_env(broker)
         try:
@@ -414,28 +403,21 @@ class GangAOneExecutor(AOneExecutor):
     def _export_broker_env(
         self, broker: GangBroker
     ) -> Tuple[Dict[str, str], Dict[str, Optional[str]]]:
-        """Export the broker coordinates into the submit environment.
+        """Export the broker token into the submit environment.
 
-        The generated gang rule declares ``env_inherit`` for these names, so
-        they must be present in the bazel invocation's environment to reach
-        the remote shards. They are never placed on the command line, where
-        the token would be visible to process listings and command logs.
+        The generated rule inherits this token from the Bazel invocation's
+        environment. It is never placed on the command line, where it would
+        be visible to process listings and command logs.
         """
-        saved: Dict[str, Optional[str]] = {}
+        saved = {BROKER_TOKEN_ENV: os.environ.get(BROKER_TOKEN_ENV)}
         submit_env = dict(self._process_env)
-        for name, value in (
-            (BROKER_URL_ENV, broker.url),
-            (BROKER_TOKEN_ENV, broker.token),
-            (BROKER_RUN_ID_ENV, broker.run_id),
-        ):
-            saved[name] = os.environ.get(name)
-            os.environ[name] = value
-            submit_env[name] = value
+        submit_env[BROKER_TOKEN_ENV] = broker.token
+        os.environ[BROKER_TOKEN_ENV] = broker.token
         return submit_env, saved
 
     @staticmethod
     def _restore_broker_env(saved: Mapping[str, Optional[str]]) -> None:
-        """Drop the exported coordinates so later stages never see them."""
+        """Drop the exported token so later stages never see it."""
         for name, value in saved.items():
             if value is None:
                 os.environ.pop(name, None)
@@ -789,7 +771,13 @@ class GangAOneExecutor(AOneExecutor):
             pass
 
 
-def create_default_gang_executor(plan: ExecutionPlan):
+def create_default_gang_executor(
+    plan: ExecutionPlan,
+    *,
+    startup_args: Sequence[str] = (),
+    common_args: Sequence[str] = (),
+    broker_host: Optional[str] = None,
+):
     """Build and run the production gang executor from the AOne environment."""
     resource = plan.resource_plan
     if not isinstance(resource, AOneResourcePlan):  # pragma: no cover - upstream
@@ -799,12 +787,7 @@ def create_default_gang_executor(plan: ExecutionPlan):
         resource=resource.resource,
         gpu_type=resource.gpu_type,
         max_parallel=resource.max_parallel,
-        bazel=os.environ.get("PERF_TEST_BAZEL", "bazelisk"),
-        build_jobs=_positive_integer(
-            "PERF_TEST_BAZEL_BUILD_JOBS",
-            os.environ.get("PERF_TEST_BAZEL_BUILD_JOBS", os.cpu_count() or 1),
-        ),
-        startup_args=shlex.split(os.environ.get("PERF_TEST_BAZEL_STARTUP_ARGS", "")),
-        common_args=shlex.split(os.environ.get("PERF_TEST_BAZEL_ARGS", "")),
-        testlogs_root=os.environ.get("PERF_TEST_BAZEL_TESTLOGS"),
+        startup_args=startup_args,
+        common_args=common_args,
+        broker_host=broker_host,
     ).execute(plan)

@@ -56,7 +56,15 @@ class TestOfflineBenchMain(unittest.TestCase):
         failed_metrics = OfflineMetrics(
             total_submitted=2, success_requests=0, fail_requests=2
         )
-        argv = ["prog", "--checkpoint_path", "/tmp/model", "--concurrency_limit", "2"]
+        argv = [
+            "prog",
+            "--checkpoint_path",
+            "/tmp/model",
+            "--concurrency_limit",
+            "2",
+            "--existing-server-port",
+            "23456",
+        ]
         with patch.object(sys, "argv", argv), patch.object(
             offline_bench, "resolve_engine_paths", side_effect=lambda args: args
         ), patch.object(offline_bench, "EngineServer") as engine_server, patch.object(
@@ -81,6 +89,8 @@ class TestOfflineBenchMain(unittest.TestCase):
             engine_server.return_value = server
             with self.assertRaisesRegex(RuntimeError, "no requests succeeded"):
                 offline_bench.main()
+        self.assertEqual(23456, engine_server.call_args.args[0].existing_server_port)
+        self.assertNotIn("--existing-server-port", engine_server.call_args.args[1])
         server.stop.assert_called_once()
 
     def test_manual_concurrency_is_forwarded_to_server_and_runner(self):

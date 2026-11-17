@@ -350,9 +350,15 @@ class GangExecutorTest(unittest.TestCase):
             return SimpleNamespace(returncode=remote_exit if "test" in command else 0)
 
         def executor(**kwargs):
-            return GangAOneExecutor(**kwargs, run_command=run, broker_host="127.0.0.1")
+            return GangAOneExecutor(**kwargs, run_command=run)
 
-        with patch(
+        with patch.dict(
+            "os.environ",
+            {
+                "PERF_TEST_BAZEL_BUILD_JOBS": "obsolete",
+                "PERF_TEST_BAZEL_TESTLOGS": "/obsolete/testlogs",
+            },
+        ), patch(
             "rtp_llm.test.perf_test.execution.aone_gang.run_gang_broker",
             side_effect=broker_factory,
         ), patch(
@@ -362,7 +368,15 @@ class GangExecutorTest(unittest.TestCase):
             "rtp_llm.test.perf_test.execution.aone_gang.GangAOneExecutor",
             side_effect=executor,
         ):
-            outcome = create_default_aone_executor(plan)
+            outcome = create_default_aone_executor(
+                plan,
+                broker_host="127.0.0.1",
+                startup_args=("--batch",),
+                common_args=("--announce_rc",),
+            )
+        for command, _kwargs in calls:
+            self.assertEqual(["bazelisk", "--batch"], command[:2])
+            self.assertIn("--announce_rc", command)
         return (root, plan, outcome, calls)
 
     def test_failed_member_overrides_successful_bazel_and_master_result(self):
@@ -624,7 +638,6 @@ class GangWorkerTest(unittest.TestCase):
         with patch.dict(
             "os.environ",
             {
-                "PERF_TEST_CONFIG_PATH": str(self.config_path),
                 "TEST_UNDECLARED_OUTPUTS_DIR": str(self.root),
                 "RTP_LLM_GPU_LOCKED_DEVICES": "4,5,6,7,0,1,2,3",
             },
@@ -644,7 +657,7 @@ class GangWorkerTest(unittest.TestCase):
             "rtp_llm.config.server_config_setup.set_parallelism_config"
         ):
             context = build_worker_context(self.gang, self.members, 1)
-            _default_server_runner(context)
+            _default_server_runner(context, config_path=str(self.config_path))
             import os
 
             self.assertEqual("1", os.environ["FT_DISABLE_CUSTOM_AR"])
@@ -1079,13 +1092,15 @@ class FrozenGangInputsTest(unittest.TestCase):
                         seen.append(plan)
                         return 0
 
+                    gang_payload = json.loads(package.shard_plan.read_text())
+                    gang_payload["broker_run_id"] = "frozen"
+                    gang_payload["broker_url"] = "http://localhost:1234"
+                    package.shard_plan.write_text(json.dumps(gang_payload))
                     with patch.dict(
                         "os.environ",
                         {
                             "TEST_UNDECLARED_OUTPUTS_DIR": str(outputs),
-                            "PERF_TEST_BROKER_URL": "http://localhost:1234",
                             "PERF_TEST_BROKER_TOKEN": "test",
-                            "PERF_TEST_BROKER_RUN_ID": "frozen",
                         },
                     ), patch.object(
                         gang_worker, "run_gang_worker", side_effect=startup

@@ -201,14 +201,50 @@ new run. Older checkpoints without this identity remain readable for reports
 but cannot be resumed. The initial fingerprint reads available libraries once;
 subsequent checks reuse digests only while their file identity remains unchanged.
 
-For reproducible automation, set `PERF_TEST_REPOSITORY_REVISIONS` to a JSON
-object mapping repository labels to full lowercase Git commit IDs (40 or 64
-hexadecimal characters). The entry validates and stores this mapping as
+The SSH launcher and rank-group entry also accept `--run-context=PATH`; the
+launcher forwards the path to each remote host as an explicit argument. No
+ambient environment variable selects the descriptor.
+
+For reproducible automation, pass a run descriptor through
+`--run-context=/absolute/path/run_context.json`. Its
+`repository_revisions` field maps repository labels to full lowercase Git commit
+IDs (40 or 64 hexadecimal characters). The entry validates and stores this mapping as
 `manifest.json.repository_revisions` before execution, including when execution
 later fails. The launcher discovers the relevant checkout IDs; public code
-contains no repository paths or discovery policy. Without the variable, the
+contains no repository paths or discovery policy. Without a descriptor, the
 mapping is empty. `BUILD_SCM_REVISION` remains the independent legacy
 `manifest.json.code_version` value, defaulting to `unknown`.
+
+The descriptor is a schema-version-1 JSON object. SSH bundles also supply
+`mode`, `run_id`, `config_path`, and optional `resolved_workload_path`. File
+references are relative to the descriptor, so copying the bundle preserves
+their meaning. Config and workload contents remain in their existing files;
+credentials must not be stored in the descriptor. For example:
+
+```json
+{"schema_version": 1, "mode": "prefill", "run_id": "prefill-example",
+ "config_path": "config.json", "resolved_workload_path": "resolved_workload.json",
+ "repository_revisions": {"public": "0123456789abcdef0123456789abcdef01234567"}}
+```
+
+CI may supply only `schema_version` and `repository_revisions`; the public entry
+continues to select its configuration and mode through CLI arguments. SSH
+launchers generate a fresh run ID for each retry and copy the descriptor with
+its configuration and workload files. AOne workers construct their local
+descriptor from the declared runfiles and gang plan. The broker URL and run ID
+travel in `gang_plan.json`; only the token uses inherited environment.
+
+The standalone offline throughput entry
+(`python -m rtp_llm.test.perf_test.offline_bench_test`) accepts
+`--existing-server-port=PORT` to connect to an existing local engine. This replaces
+the former environment override. It checks the service's health and leaves the
+service running when the benchmark ends. Continue to provide the benchmark's
+model/tokenizer and workload settings explicitly. Without this argument, the
+entry starts and stops its own engine.
+
+SSH workers use `/opt/conda310/bin/python` for both dependency installation and
+service startup. Distributed decode control ports derive from the service start
+port plus 1024; both SSH and AOne paths reject ports outside 1–65535.
 
 Traffic-sampled prefill resolves its distribution file on the controller and
 records the digest and sampling summary in `resolved_config.json`; the execution

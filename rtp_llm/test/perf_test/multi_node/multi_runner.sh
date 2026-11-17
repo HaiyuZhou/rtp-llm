@@ -66,6 +66,8 @@ multi_kill_script() {
 }
 
 multi_copy_script() {
+  local run_id
+  run_id=$(python3 "${SCRIPT_DIRECTORY}/../run_context.py" "$run_context_path" run_id) || exit 1
   # Split ip list by comma
   IFS=',' read -r -a IP_ARRAY <<< "$IP_LISTS"
   # Check essential environment variables
@@ -86,8 +88,9 @@ multi_copy_script() {
     do
       (
         # Concat all environment variables
+        printf -v context_arg '%q' "/tmp/rtp_llm_perf_${run_id}/run_context.json"
         ENV_STR=$(remote_environment)
-        TEST_OUTPUT_PATH=$(ssh "${RUN_USER}@${IP}" -p "${SSH_PORT}" "env $ENV_STR bash /tmp/multi_local_executor.sh") || exit 1
+        TEST_OUTPUT_PATH=$(ssh "${RUN_USER}@${IP}" -p "${SSH_PORT}" "env $ENV_STR bash /tmp/multi_local_executor.sh --run-context $context_arg") || exit 1
         echo "TEST_OUTPUT_PATH=${TEST_OUTPUT_PATH}";
         TEST_OUTPUT_NAME=$(basename "$TEST_OUTPUT_PATH")
         if [ "${DIAGNOSTICS_ONLY:-0}" -eq 1 ]; then
@@ -160,16 +163,14 @@ multi_clean_script() {
 }
 
 multi_test_script() {
-  if [ -z "$PERF_TEST_CONFIG_PATH" ] || [ ! -r "$PERF_TEST_CONFIG_PATH" ]; then
-    echo "PERF_TEST_CONFIG_PATH must name a readable perf config"
+  if [ -z "$run_context_path" ] || [ ! -r "$run_context_path" ]; then
+    echo "run_context_path must name a readable run descriptor"
     exit 1
   fi
-  local config_path="$PERF_TEST_CONFIG_PATH"
-  local run_id="${PERF_TEST_RUN_ID:-${START_PORT:-12333}}"
-  if [[ ! "$run_id" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-    echo "Invalid PERF_TEST_RUN_ID"
-    exit 1
-  fi
+  local run_id
+  run_id=$(python3 "${SCRIPT_DIRECTORY}/../run_context.py" "$run_context_path" run_id) || exit 1
+  local config_dir
+  config_dir=$(dirname -- "$run_context_path")
   local remote_config_dir="/tmp/rtp_llm_perf_${run_id}"
   # Split ip list by comma
   IFS=',' read -r -a IP_ARRAY <<< "$IP_LISTS"
@@ -228,20 +229,13 @@ multi_test_script() {
     do
       (
         ssh "${RUN_USER}@${IP}" -p "${SSH_PORT}" "mkdir -p '${remote_config_dir}'" || exit 1
-        scp -P "${SSH_PORT}" "$config_path" "${RUN_USER}@${IP}:${remote_config_dir}/config.json" || exit 1
-        if [ -n "$PERF_TEST_DISTRIBUTION_PATH" ]; then
-          scp -P "${SSH_PORT}" "$PERF_TEST_DISTRIBUTION_PATH" "${RUN_USER}@${IP}:${remote_config_dir}/distribution.json" || exit 1
-        fi
-        if [ -n "$PERF_TEST_RESOLVED_WORKLOAD_PATH" ]; then
-          scp -P "${SSH_PORT}" "$PERF_TEST_RESOLVED_WORKLOAD_PATH" "${RUN_USER}@${IP}:${remote_config_dir}/resolved_workload.json" || exit 1
-          export PERF_TEST_RESOLVED_WORKLOAD_PATH="${remote_config_dir}/resolved_workload.json"
-        fi
-        export PERF_TEST_CONFIG_PATH="${remote_config_dir}/config.json"
+        scp -r -P "${SSH_PORT}" "${config_dir}/." "${RUN_USER}@${IP}:${remote_config_dir}/" || exit 1
+        printf -v context_arg '%q' "${remote_config_dir}/run_context.json"
         scp -P "${SSH_PORT}" "${SCRIPT_DIRECTORY}/multi_local_executor.sh" "${RUN_USER}@${IP}:/tmp/multi_local_executor.sh" || exit 1
         # Concat all environment variables
         ENV_STR=$(remote_environment);
         echo "Environment variables: $ENV_STR";
-        ssh "${RUN_USER}@${IP}" -p "${SSH_PORT}" "env $ENV_STR bash /tmp/multi_local_executor.sh" || exit 1
+        ssh "${RUN_USER}@${IP}" -p "${SSH_PORT}" "env $ENV_STR bash /tmp/multi_local_executor.sh --run-context $context_arg" || exit 1
       ) &
       pids+=("$!")
       export WORLD_RANK=$((WORLD_RANK + LOCAL_WORLD_SIZE));
@@ -255,6 +249,16 @@ multi_test_script() {
 }
 
 main() {
+  local run_context_path=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run-context)
+        [ "$#" -ge 2 ] || { echo "--run-context requires a path" >&2; return 2; }
+        run_context_path="$2"; shift 2 ;;
+      --run-context=*) run_context_path="${1#*=}"; shift ;;
+      *) echo "Unknown argument: $1" >&2; return 2 ;;
+    esac
+  done
   SUB_CMD=${SUB_CMD}
 
   case ${SUB_CMD} in
@@ -281,4 +285,6 @@ main() {
   esac
 }
 
-main;
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

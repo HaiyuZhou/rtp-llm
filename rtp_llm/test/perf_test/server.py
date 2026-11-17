@@ -9,8 +9,6 @@ from rtp_llm.test.perf_test.dataset import extract_arg
 from rtp_llm.test.perf_test.execution.scheduler import configure_scheduler
 from rtp_llm.test.utils.maga_server_manager import MagaServerManager
 
-EXISTING_SERVER_PORT_ENV = "CACHE_PERF_EXISTING_SERVER_PORT"
-
 
 class EngineServer:
     """Engine server lifecycle management (start / stop / port)."""
@@ -19,7 +17,12 @@ class EngineServer:
         self._args = args
         self._remaining_args = remaining_args
         self._server: Optional[MagaServerManager] = None
-        self._existing_port = self._read_existing_port()
+        self._existing_port = getattr(args, "existing_server_port", None)
+        if self._existing_port is not None and (
+            type(self._existing_port) is not int
+            or not 1 <= self._existing_port <= 65535
+        ):
+            raise ValueError("existing_server_port must be between 1 and 65535")
 
     def start(
         self,
@@ -89,21 +92,6 @@ class EngineServer:
             return self._existing_port
         assert self._server is not None, "Server not started"
         return self._server.port
-
-    @staticmethod
-    def _read_existing_port() -> Optional[int]:
-        value = os.environ.get(EXISTING_SERVER_PORT_ENV)
-        if value is None or not value.strip():
-            return None
-        try:
-            port = int(value)
-        except ValueError as error:
-            raise ValueError(
-                f"{EXISTING_SERVER_PORT_ENV} must be an integer"
-            ) from error
-        if not 1 <= port <= 65535:
-            raise ValueError(f"{EXISTING_SERVER_PORT_ENV} must be between 1 and 65535")
-        return port
 
     @property
     def log_file_path(self) -> Optional[str]:

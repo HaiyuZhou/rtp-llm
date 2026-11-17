@@ -17,6 +17,10 @@ class CliRequest:
     run_dir: Optional[str]
     cases: Tuple[str, ...]
     dry_run: bool
+    run_context: Optional[str] = None
+    bazel_startup_args: Tuple[str, ...] = ()
+    bazel_args: Tuple[str, ...] = ()
+    broker_host: Optional[str] = None
 
 
 class _ConfigArgumentParser(argparse.ArgumentParser):
@@ -37,6 +41,10 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-dir")
     parser.add_argument("--cases", nargs="+", default=[])
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--run-context", help="Path to run metadata/provenance JSON")
+    parser.add_argument("--bazel-startup-arg", action="append", default=[])
+    parser.add_argument("--bazel-arg", action="append", default=[])
+    parser.add_argument("--broker-host", help="Worker-reachable AOne broker host")
     return parser
 
 
@@ -92,4 +100,8 @@ def parse_cli(argv: Sequence[str]) -> CliRequest:
         run_dir=run_dir,
         cases=cases,
         dry_run=namespace.dry_run,
+        run_context=_non_empty("--run-context", namespace.run_context),
+        bazel_startup_args=tuple(namespace.bazel_startup_arg),
+        bazel_args=tuple(namespace.bazel_arg),
+        broker_host=_non_empty("--broker-host", namespace.broker_host),
     )

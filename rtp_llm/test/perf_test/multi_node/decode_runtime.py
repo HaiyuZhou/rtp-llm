@@ -86,16 +86,19 @@ def execute_master_decode(
     server_log_path,
     profiler_directory,
     transport=None,
+    run_context=None,
 ):
     """Execute and finalize a run while the caller owns server lifetime."""
     root = Path(plan.result_directory)
-    run_id = os.environ.get("PERF_TEST_RUN_ID", root.name)
+    run_context = run_context or {}
+    run_id = run_context.get("run_id", root.name)
     initialize_run_directory(
         root,
         source_config=source_config,
         plan=plan,
         run_id=run_id,
         code_version=os.environ.get("BUILD_SCM_REVISION", "unknown"),
+        repository_revisions=run_context.get("repository_revisions", {}),
     )
     store = RunStore(root)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))

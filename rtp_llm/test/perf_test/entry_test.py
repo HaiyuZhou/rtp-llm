@@ -30,6 +30,7 @@ from rtp_llm.test.perf_test.test_support import (
     fixture_execution,
     fixture_model,
     fixture_workload,
+    run_context_path,
 )
 
 entry_ROOT = Path(__file__).resolve().parents[3]
@@ -757,11 +758,13 @@ class RepositoryProvenanceTest(unittest.TestCase):
                 request = parse_cli(
                     ["--mode=prefill", "--action=run", f"--config={path}"]
                 )
-                with patch.dict(
-                    "os.environ", {"PERF_TEST_REPOSITORY_REVISIONS": value}
-                ):
-                    with self.assertRaises((PlanningError, ValueError)):
-                        run_request(request)
+                context_path = root / "run_context.json"
+                context_path.write_text(
+                    '{"schema_version":1,"repository_revisions":' + value + "}"
+                )
+                request = replace(request, run_context=str(context_path))
+                with self.assertRaises((PlanningError, ValueError)):
+                    run_request(request)
                 self.assertFalse((root / "results").exists())
 
     def test_revisions_survive_success_and_executor_failure(self):
@@ -784,10 +787,13 @@ class RepositoryProvenanceTest(unittest.TestCase):
                         raise OSError("execution failed")
                     return 0
 
+                request = replace(
+                    request,
+                    run_context=run_context_path(root, repository_revisions=revisions),
+                )
                 with patch.dict(
                     "os.environ",
                     {
-                        "PERF_TEST_REPOSITORY_REVISIONS": json.dumps(revisions),
                         "BUILD_SCM_REVISION": revisions["public"],
                     },
                 ):

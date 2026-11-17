@@ -241,22 +241,27 @@ class AOneSingleTest(unittest.TestCase):
                         (output / "shard_result.json").write_text(json.dumps(payload))
                 return process
 
-            integration = BazelAOneIntegration(
-                workspace_root=workspace,
-                resource="daily",
-                gpu_type="H20",
-                max_parallel=2,
-                run_command=run,
-                popen_command=popen,
-            )
-            with patch(
+            def integration_factory(**kwargs):
+                return BazelAOneIntegration(
+                    **kwargs, run_command=run, popen_command=popen
+                )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "PERF_TEST_BAZEL_BUILD_JOBS": "obsolete",
+                    "PERF_TEST_BAZEL_TESTLOGS": "/obsolete/testlogs",
+                },
+            ), patch(
                 "rtp_llm.test.perf_test.execution.aone_bazel._workspace_root",
                 return_value=workspace,
             ), patch(
                 "rtp_llm.test.perf_test.execution.aone_bazel.BazelAOneIntegration",
-                return_value=integration,
+                side_effect=integration_factory,
             ):
-                outcome = create_default_aone_executor(plan)
+                outcome = create_default_aone_executor(
+                    plan, startup_args=("--batch",), common_args=("--announce_rc",)
+                )
             self.assertEqual(RunState.COMPLETED, outcome.state)
             self.assertEqual(0, outcome.exit_code)
             self.assertEqual("formal", outcome.report["report_kind"])
@@ -264,6 +269,8 @@ class AOneSingleTest(unittest.TestCase):
             self.assertEqual(2, len(commands))
             self.assertIn("build", commands[0])
             for command in commands:
+                self.assertEqual(["bazelisk", "--batch"], command[:2])
+                self.assertIn("--announce_rc", command)
                 self.assertIn("//runs/normal/workload/aone_package:shard_0000", command)
                 self.assertIn("//runs/normal/workload/aone_package:shard_0001", command)
             self.assertIn("--jobs=2", commands[1])

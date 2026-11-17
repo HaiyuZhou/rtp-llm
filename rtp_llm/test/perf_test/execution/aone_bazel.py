@@ -6,7 +6,6 @@ import copy
 import json
 import os
 import re
-import shlex
 import stat
 import subprocess
 import zipfile
@@ -90,7 +89,6 @@ class BazelAOneIntegration:
         resource: str,
         gpu_type: str,
         max_parallel: int,
-        bazel: str = "bazelisk",
         build_jobs: Optional[int] = None,
         startup_args: Sequence[str] = (),
         common_args: Sequence[str] = (),
@@ -117,7 +115,7 @@ class BazelAOneIntegration:
         self._resource = resource
         self._platform = AONE_GPU_PLATFORMS[gpu_type]
         self._max_parallel = _positive_integer("max_parallel", max_parallel)
-        self._bazel = bazel
+        self._bazel = "bazelisk"
         self._startup_args = tuple(startup_args)
         self._build_jobs = _positive_integer(
             "build_jobs", build_jobs if build_jobs is not None else os.cpu_count() or 1
@@ -341,13 +339,17 @@ class BazelAOneIntegration:
 
 
 def _workspace_root() -> Path:
-    configured = os.environ.get("PERF_TEST_WORKSPACE_ROOT") or os.environ.get(
-        "BUILD_WORKSPACE_DIRECTORY"
-    )
+    configured = os.environ.get("BUILD_WORKSPACE_DIRECTORY")
     return Path(configured).resolve() if configured else Path.cwd().resolve()
 
 
-def create_default_aone_executor(plan: ExecutionPlan):
+def create_default_aone_executor(
+    plan: ExecutionPlan,
+    *,
+    startup_args: Sequence[str] = (),
+    common_args: Sequence[str] = (),
+    broker_host: Optional[str] = None,
+):
     resource = plan.resource_plan
     if not isinstance(resource, AOneResourcePlan):
         raise ValueError("AOne execution requires an AOne resource plan")
@@ -360,7 +362,12 @@ def create_default_aone_executor(plan: ExecutionPlan):
             create_default_gang_executor,
         )
 
-        return create_default_gang_executor(plan)
+        return create_default_gang_executor(
+            plan,
+            startup_args=startup_args,
+            common_args=common_args,
+            broker_host=broker_host,
+        )
     workspace_root = _workspace_root()
     integration: Optional[BazelAOneIntegration] = None
 
@@ -372,16 +379,8 @@ def create_default_aone_executor(plan: ExecutionPlan):
                 resource=resource.resource,
                 gpu_type=resource.gpu_type,
                 max_parallel=resource.max_parallel,
-                bazel=os.environ.get("PERF_TEST_BAZEL", "bazelisk"),
-                build_jobs=_positive_integer(
-                    "PERF_TEST_BAZEL_BUILD_JOBS",
-                    os.environ.get("PERF_TEST_BAZEL_BUILD_JOBS", os.cpu_count() or 1),
-                ),
-                startup_args=shlex.split(
-                    os.environ.get("PERF_TEST_BAZEL_STARTUP_ARGS", "")
-                ),
-                common_args=shlex.split(os.environ.get("PERF_TEST_BAZEL_ARGS", "")),
-                testlogs_root=os.environ.get("PERF_TEST_BAZEL_TESTLOGS"),
+                startup_args=startup_args,
+                common_args=common_args,
             )
         return integration
 

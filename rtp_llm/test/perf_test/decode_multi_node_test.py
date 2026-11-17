@@ -30,11 +30,13 @@ from rtp_llm.test.perf_test.multi_node.decode_runtime import (
     execute_master_decode,
     run_external_rank,
 )
+from rtp_llm.test.perf_test.run_context import read_run_context
 from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.test_support import (
     fixture_engine,
     fixture_execution,
     fixture_model,
+    run_context_path,
 )
 
 
@@ -112,19 +114,19 @@ def decode_multi_node_persist_run(plan, source, root, state, run_id):
             )
 
     plan = replace(plan, result_directory=str(root))
-    with patch.dict(os.environ, {"PERF_TEST_RUN_ID": run_id}):
-        with patch(
-            "rtp_llm.test.perf_test.multi_node.decode_runtime.DecodeHttpTransport",
-            return_value=Transport(),
-        ):
-            execute_master_decode(
-                plan,
-                source_config=source,
-                endpoint="http://test",
-                prompt_for_length=str,
-                server_log_path=None,
-                profiler_directory=root / "traces",
-            )
+    with patch(
+        "rtp_llm.test.perf_test.multi_node.decode_runtime.DecodeHttpTransport",
+        return_value=Transport(),
+    ):
+        execute_master_decode(
+            plan,
+            source_config=source,
+            endpoint="http://test",
+            prompt_for_length=str,
+            server_log_path=None,
+            profiler_directory=root / "traces",
+            run_context={"run_id": run_id},
+        )
 
 
 class DecodeMultiNodeTest(unittest.TestCase):
@@ -364,7 +366,11 @@ class DecodeMultiNodeTest(unittest.TestCase):
                         "PERF_TEST_DECODE_RESULT "
                         + json.dumps(
                             decode_multi_node_marker(
-                                plan, env["PERF_TEST_RUN_ID"], "completed"
+                                plan,
+                                read_run_context(args[args.index("--run-context") + 1])[
+                                    "run_id"
+                                ],
+                                "completed",
                             )
                         )
                         + "\n"
@@ -473,6 +479,9 @@ class DecodeMultiNodeTest(unittest.TestCase):
             )
             namespace = dict(
                 os=os,
+                argparse=__import__("argparse"),
+                sys=sys,
+                read_run_context=read_run_context,
                 pathlib=__import__("pathlib"),
                 time=__import__("time"),
                 PyEnvConfigs=object,
@@ -485,7 +494,17 @@ class DecodeMultiNodeTest(unittest.TestCase):
                 ),
                 build_external_decode_plan=build_external_decode_plan,
             )
-            with patch.dict(os.environ, {"PERF_TEST_CONFIG_PATH": str(path)}):
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "worker",
+                    "--run-context",
+                    run_context_path(
+                        root, config_path=str(path), mode="decode", run_id="preflight"
+                    ),
+                ],
+            ):
                 with self.assertRaisesRegex(PlanningError, "runtime topology"):
                     exec(compiled, namespace)
             self.assertEqual(["topology"], effects)
@@ -575,18 +594,30 @@ class DecodeMultiNodeTest(unittest.TestCase):
                     if action == "test":
                         path.write_text("{}")
                         (delivered_plan, delivered_source) = build_external_decode_plan(
-                            env["PERF_TEST_CONFIG_PATH"],
+                            read_run_context(args[args.index("--run-context") + 1])[
+                                "config_path"
+                            ],
                             "unused",
                             decode_multi_node_TOPOLOGY,
                         )
                         delivered.append(
-                            (delivered_plan, delivered_source, env["PERF_TEST_RUN_ID"])
+                            (
+                                delivered_plan,
+                                delivered_source,
+                                read_run_context(args[args.index("--run-context") + 1])[
+                                    "run_id"
+                                ],
+                            )
                         )
                         stdout.write(
                             "PERF_TEST_DECODE_RESULT "
                             + json.dumps(
                                 decode_multi_node_marker(
-                                    delivered_plan, env["PERF_TEST_RUN_ID"], state
+                                    delivered_plan,
+                                    read_run_context(
+                                        args[args.index("--run-context") + 1]
+                                    )["run_id"],
+                                    state,
                                 )
                             )
                             + "\n"
@@ -665,26 +696,29 @@ class DecodeMultiNodeTest(unittest.TestCase):
                 MODEL_TYPE="registered",
                 TOKENIZER_PATH="/m",
                 CHECKPOINT_PATH="/m",
-                PERF_TEST_CONFIG_PATH=str(config),
-                PERF_TEST_RUN_ID="delivery_test",
                 FAKE_CALLS=str(calls),
+            )
+            context_path = run_context_path(
+                root, config_path=str(config), mode="decode", run_id="delivery_test"
             )
             script = Path(__file__).parent / "multi_node/multi_runner.sh"
             completed = subprocess.run(
-                ["bash", str(script)], env=env, capture_output=True, text=True
+                ["bash", str(script), "--run-context", context_path],
+                env=env,
+                capture_output=True,
+                text=True,
             )
             self.assertEqual(0, completed.returncode, completed.stderr)
             recorded = [json.loads(line) for line in calls.read_text().splitlines()]
             copies = [
                 args
                 for (tool, args) in recorded
-                if tool == "scp" and str(config) in args
+                if tool == "scp" and str(root) + "/." in args
             ]
             self.assertEqual(2, len(copies))
             for args in copies:
-                self.assertTrue(
-                    args[-1].endswith(":/tmp/rtp_llm_perf_delivery_test/config.json")
-                )
+                self.assertTrue(args[-1].endswith(":/tmp/rtp_llm_perf_delivery_test/"))
+                self.assertIn("-r", args)
             environments = [
                 shlex.split(args[-1])
                 for (tool, args) in recorded
@@ -693,7 +727,7 @@ class DecodeMultiNodeTest(unittest.TestCase):
             self.assertEqual(2, len(environments))
             for remote_command in environments:
                 self.assertIn(
-                    "PERF_TEST_CONFIG_PATH=/tmp/rtp_llm_perf_delivery_test/config.json",
+                    "/tmp/rtp_llm_perf_delivery_test/run_context.json",
                     remote_command,
                 )
                 self.assertIn(
@@ -701,7 +735,7 @@ class DecodeMultiNodeTest(unittest.TestCase):
                     remote_command,
                 )
             completed = subprocess.run(
-                ["bash", str(script)],
+                ["bash", str(script), "--run-context", context_path],
                 env={**env, "FAKE_FAIL": "1"},
                 capture_output=True,
                 text=True,

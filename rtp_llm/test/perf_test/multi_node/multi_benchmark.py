@@ -33,6 +33,7 @@ from rtp_llm.test.perf_test.multi_node.prefill_runtime import (
 )
 from rtp_llm.test.perf_test.plan import thaw
 from rtp_llm.test.perf_test.results import parse_result_envelope
+from rtp_llm.test.perf_test.run_context import read_run_context, write_run_context
 
 # Global variables
 logger = None
@@ -53,6 +54,7 @@ def get_args():
         type=str,
         help="Path to the configuration file",
     )
+    parser.add_argument("--run-context", help="Path to run metadata/provenance JSON")
     args = parser.parse_args()
     return args
 
@@ -180,14 +182,14 @@ def convert_to_env(benchmark_config: Dict[str, Any]) -> Dict[str, str]:
     validate_launcher_config(benchmark_config)
     env = {}
     for key, value in benchmark_config.items():
+        if key in {"perf_test_config", "resolved_workload_path", "run_context"}:
+            continue
         if not isinstance(value, (int, float, str, bool)):
             continue
         if isinstance(value, bool):
             env[key.upper()] = "1" if value else "0"
         else:
             env[key.upper()] = str(value)
-    if "perf_test_config" in benchmark_config:
-        env["PERF_TEST_CONFIG_PATH"] = str(benchmark_config["perf_test_config"])
     return env
 
 
@@ -401,9 +403,9 @@ def execute_task(
     log_stage(f"Task Variable Dict: {variable_dict}", stage="TASK")
     # Convert task config to environment variables
     multi_runner_env = convert_to_env(task_config)
-    multi_runner_env["PERF_TEST_MODE"] = plan.mode
     config_dir = Path(task_output_dir) / "config"
     config_dir.mkdir()
+    resolved_workload_path = None
     if plan.mode == "prefill":
         # Freeze traffic distributions on the launcher; remote hosts do not
         # need the original external distribution file.
@@ -418,9 +420,6 @@ def execute_task(
         resolved_workload_path.write_text(
             json.dumps(thaw(plan.resolved_config["workload"])), encoding="utf-8"
         )
-        multi_runner_env["PERF_TEST_RESOLVED_WORKLOAD_PATH"] = str(
-            resolved_workload_path
-        )
     if source["workload"]["kind"] == "distribution":
         # Keep the delivered config self-contained; relative distributions must
         # not point back to the launcher's filesystem on a remote rank.
@@ -430,28 +429,44 @@ def execute_task(
             encoding="utf-8",
         )
         source["workload"]["distribution_file"] = "distribution.json"
-        multi_runner_env["PERF_TEST_DISTRIBUTION_PATH"] = str(distribution_path)
     config_path = config_dir / "config.json"
     config_path.write_text(json.dumps(source), encoding="utf-8")
     plan, source = validate_benchmark(
         {
             **task_config,
             "perf_test_config": str(config_path),
-            "resolved_workload_path": multi_runner_env.get(
-                "PERF_TEST_RESOLVED_WORKLOAD_PATH"
+            "resolved_workload_path": (
+                str(resolved_workload_path) if resolved_workload_path else None
             ),
         }
     )
-    multi_runner_env["PERF_TEST_CONFIG_PATH"] = str(config_path)
+    context_path = config_dir / "run_context.json"
+    repository_revisions = read_run_context(task_config.get("run_context")).get(
+        "repository_revisions", {}
+    )
     log_stage(f"Task Config: {multi_runner_env}", stage="TASK")
     multi_runner_args = [
         "bash",
         str(SCRIPT_DIRECTORY / "multi_runner.sh"),
+        "--run-context",
+        str(context_path),
     ]
     # Retry test
     terminal_state = None
     for i in range(num_retry_times + 1):
-        multi_runner_env["PERF_TEST_RUN_ID"] = uuid.uuid4().hex
+        run_id = uuid.uuid4().hex
+        write_run_context(
+            context_path,
+            mode=plan.mode,
+            run_id=run_id,
+            config_path="config.json",
+            repository_revisions=repository_revisions,
+            **(
+                {"resolved_workload_path": "resolved_workload.json"}
+                if resolved_workload_path
+                else {}
+            ),
+        )
         # Run subprocess and redirect both stdout and stderr to file
         with open(task_test_output_path, "a", encoding="utf-8") as f:
             f.write(f"=== OUTPUT {i} ===\n")
@@ -482,7 +497,7 @@ def execute_task(
         state = extract_run_state(
             task_test_output_path,
             plan=plan,
-            run_id=multi_runner_env["PERF_TEST_RUN_ID"],
+            run_id=run_id,
         )
         if state:
             multi_copy_script(
@@ -493,7 +508,7 @@ def execute_task(
                     "ft_work_dir": task_config.get("ft_work_dir"),
                     "ft_sub_dir": task_config["ft_sub_dir"],
                     "task_output_dir": task_output_dir,
-                    "perf_test_run_id": multi_runner_env["PERF_TEST_RUN_ID"],
+                    "run_context": str(context_path),
                     "local_world_size": task_config.get("local_world_size", 8),
                     "collect_diagnostics": (
                         copy_test_result or state == "partial" or result.returncode != 0
@@ -504,7 +519,7 @@ def execute_task(
             verify_collected_run(
                 Path(task_output_dir) / "run",
                 plan=plan,
-                run_id=multi_runner_env["PERF_TEST_RUN_ID"],
+                run_id=run_id,
                 state=state,
             )
             log_stage(f"{plan.mode} run finalized: {state}", stage="TASK")
@@ -522,11 +537,9 @@ def execute_task(
                         "ft_work_dir": task_config.get("ft_work_dir"),
                         "ft_sub_dir": task_config["ft_sub_dir"],
                         "task_output_dir": str(
-                            Path(task_output_dir)
-                            / "failed_attempts"
-                            / multi_runner_env["PERF_TEST_RUN_ID"]
+                            Path(task_output_dir) / "failed_attempts" / run_id
                         ),
-                        "perf_test_run_id": multi_runner_env["PERF_TEST_RUN_ID"],
+                        "run_context": str(context_path),
                         "local_world_size": task_config.get("local_world_size", 8),
                         "collect_diagnostics": True,
                         "diagnostics_only": True,
@@ -789,6 +802,10 @@ def multi_copy_script(copy_copy_config: Dict[str, Any], copy_log_path: str) -> N
     # Convert clean config to environment variables
     multi_runner_env = convert_to_env(copy_copy_config)
     multi_runner_args = ["bash", str(SCRIPT_DIRECTORY / "multi_runner.sh")]
+    if copy_copy_config.get("run_context"):
+        multi_runner_args.extend(
+            ["--run-context", str(copy_copy_config["run_context"])]
+        )
     # Log copy test results information
     log_stage(f"Copy test results | Log: {copy_log_path}", stage="COPY")
     # Run copy test results command and redirect both stdout and stderr to file
@@ -1031,6 +1048,8 @@ def main():
         fixed_config.update(build_config)
         fixed_config.update(common_config)
         fixed_config.update(benchmark_fixed)
+        if args.run_context:
+            fixed_config["run_context"] = args.run_context
         fixed_config["sub_cmd"] = "test"
         fixed_config["build_from_scratch"] = 0
         fixed_config["benchmark_name"] = benchmark_name

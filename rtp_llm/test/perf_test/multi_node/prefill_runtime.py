@@ -177,17 +177,20 @@ def execute_master_prefill(
     tokenizer_path,
     server_log_path,
     profiler_directory,
+    run_context=None,
 ):
     """Run the shared prefill measurement against a caller-owned rank group."""
     del server_log_path, profiler_directory
     root = Path(plan.result_directory)
-    run_id = os.environ.get("PERF_TEST_RUN_ID", root.name)
+    run_context = run_context or {}
+    run_id = run_context.get("run_id", root.name)
     initialize_run_directory(
         root,
         source_config=source_config,
         plan=plan,
         run_id=run_id,
         code_version=os.environ.get("BUILD_SCM_REVISION", "unknown"),
+        repository_revisions=run_context.get("repository_revisions", {}),
     )
     store = RunStore(root)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))

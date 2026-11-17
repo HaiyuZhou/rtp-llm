@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -11,14 +9,13 @@ from rtp_llm.test.perf_test.config_schema import (
     DEFAULT_PREFILL_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_PREFILL_TRANSPORT,
 )
+from rtp_llm.test.perf_test.execution.distributed.member import begin_master_run
 from rtp_llm.test.perf_test.execution.engine_session import EngineDiagnostics
 from rtp_llm.test.perf_test.execution.runtime import HttpPrefillClient
 from rtp_llm.test.perf_test.modes import ModeExecutionContext, create_prefill_adapter
 from rtp_llm.test.perf_test.plan import thaw
 from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
-from rtp_llm.test.perf_test.run_directory import initialize_run_directory
-from rtp_llm.test.perf_test.storage import RunStore
 
 
 class ExternalPrefillSession:
@@ -93,20 +90,9 @@ def execute_master_prefill(
     """Run the shared prefill measurement against a caller-owned rank group."""
     del server_log_path, profiler_directory
     root = Path(plan.result_directory)
-    run_context = run_context or {}
-    run_id = run_context.get("run_id", root.name)
-    initialize_run_directory(
-        root,
-        source_config=source_config,
-        plan=plan,
-        run_id=run_id,
-        code_version=os.environ.get("BUILD_SCM_REVISION", "unknown"),
-        repository_revisions=run_context.get("repository_revisions", {}),
+    run_id, store, manifest = begin_master_run(
+        root, plan, source_config=source_config, run_context=run_context
     )
-    store = RunStore(root)
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    manifest["state"] = "running"
-    store.write_manifest(manifest)
     config = thaw(plan.resolved_config)
     workload = config["workload"]
     model = config["model"]

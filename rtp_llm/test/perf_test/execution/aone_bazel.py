@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Union
 
 from rtp_llm.test.perf_test.aone.package import GeneratedAOnePackage
 from rtp_llm.test.perf_test.aone.plan import AONE_GPU_PLATFORMS, AONE_RESOURCES
-from rtp_llm.test.perf_test.execution.aone import AOneExecutor
+from rtp_llm.test.perf_test.execution.aone import AOneExecutor, bazel_argv
 from rtp_llm.test.perf_test.plan import AOneResourcePlan, ExecutionPlan
 
 _TARGET = re.compile(r"//(?P<package>[A-Za-z0-9_.\-/]+):(?P<name>[A-Za-z0-9_.-]+)\Z")
@@ -154,19 +154,20 @@ class BazelAOneIntegration:
             raise ValueError("AOne package has no shard targets")
         for target in package.targets:
             _target_parts(target)
-        command = [
+        command = bazel_argv(
             self._bazel,
-            *self._startup_args,
+            self._startup_args,
             "build",
-            *package.targets,
-            f"--config={self._platform}",
-            "--config=cicd",
-            f"--config={self._resource}_aone_bazel_cache",
-            f"--jobs={self._build_jobs}",
-            "--remote_download_outputs=minimal",
-            "--keep_going",
-            *self._common_args,
-        ]
+            package.targets,
+            self._platform,
+            self._common_args,
+            (
+                f"--config={self._resource}_aone_bazel_cache",
+                f"--jobs={self._build_jobs}",
+                "--remote_download_outputs=minimal",
+                "--keep_going",
+            ),
+        )
         completed = self._run_command(
             command,
             cwd=self._workspace_root,
@@ -179,23 +180,24 @@ class BazelAOneIntegration:
 
     def _start_test(self) -> None:
         assert self._package is not None
-        command = [
+        command = bazel_argv(
             self._bazel,
-            *self._startup_args,
+            self._startup_args,
             "test",
-            *self._package.targets,
-            f"--config={self._platform}",
-            "--config=cicd",
-            f"--config={self._resource}_aone_bazel_remote",
-            "--strategy=TestRunner=remote",
-            f"--jobs={self._max_parallel}",
-            f"--test_timeout={AONE_TEST_TIMEOUT_S}",
-            "--test_output=errors",
-            "--keep_going",
-            "--remote_download_outputs=all",
-            "--nocache_test_results",
-            *self._common_args,
-        ]
+            self._package.targets,
+            self._platform,
+            self._common_args,
+            (
+                f"--config={self._resource}_aone_bazel_remote",
+                "--strategy=TestRunner=remote",
+                f"--jobs={self._max_parallel}",
+                f"--test_timeout={AONE_TEST_TIMEOUT_S}",
+                "--test_output=errors",
+                "--keep_going",
+                "--remote_download_outputs=all",
+                "--nocache_test_results",
+            ),
+        )
         self._process = self._popen_command(
             command,
             cwd=self._workspace_root,

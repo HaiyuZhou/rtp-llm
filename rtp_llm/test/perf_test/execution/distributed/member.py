@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -11,6 +12,27 @@ from types import SimpleNamespace
 
 from rtp_llm.test.perf_test.execution.devices import resolve_allocated_devices
 from rtp_llm.test.perf_test.plan import bind_member_plan
+from rtp_llm.test.perf_test.run_directory import initialize_run_directory
+from rtp_llm.test.perf_test.storage import RunStore
+
+
+def begin_master_run(root, plan, *, source_config, run_context=None):
+    """Initialize a master run directory and flip its manifest into running state."""
+    run_context = run_context or {}
+    run_id = run_context.get("run_id", root.name)
+    initialize_run_directory(
+        root,
+        source_config=source_config,
+        plan=plan,
+        run_id=run_id,
+        code_version=os.environ.get("BUILD_SCM_REVISION", "unknown"),
+        repository_revisions=run_context.get("repository_revisions", {}),
+    )
+    store = RunStore(root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest["state"] = "running"
+    store.write_manifest(manifest)
+    return run_id, store, manifest
 
 
 class CompletionGroup:

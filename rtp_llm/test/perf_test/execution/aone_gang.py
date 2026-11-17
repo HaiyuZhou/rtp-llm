@@ -49,7 +49,7 @@ from rtp_llm.test.perf_test.errors import (
     PostExecutionError,
     ReportError,
 )
-from rtp_llm.test.perf_test.execution.aone import AOneExecutionOutcome
+from rtp_llm.test.perf_test.execution.aone import AOneExecutionOutcome, bazel_argv
 from rtp_llm.test.perf_test.execution.aone_bazel import (
     _MAX_ARCHIVE_MEMBERS,
     AONE_TEST_TIMEOUT_S,
@@ -640,16 +640,15 @@ class GangAOneExecutor:
     def _bazel_command(
         self, verb: str, targets: Sequence[str], *extra: str
     ) -> List[str]:
-        return [
+        return bazel_argv(
             self._bazel,
-            *self._startup_args,
+            self._startup_args,
             verb,
-            *targets,
-            f"--config={self._platform}",
-            "--config=cicd",
-            *extra,
-            *self._common_args,
-        ]
+            targets,
+            self._platform,
+            self._common_args,
+            extra,
+        )
 
     def _default_reporter(self, mode: str) -> Callable[[Path], Mapping[str, Any]]:
         if mode == "prefill":

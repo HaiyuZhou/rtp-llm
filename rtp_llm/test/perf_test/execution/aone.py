@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Union
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Union
 
 from rtp_llm.test.perf_test.aone.collector import (
     CollectionOutcome,
@@ -24,6 +24,28 @@ from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock, inspect_run_directory
 from rtp_llm.test.perf_test.state import RunOutcome, RunState
 from rtp_llm.test.perf_test.storage import RunStore, atomic_write_json
+
+
+def bazel_argv(
+    bazel: str,
+    startup_args: Sequence[str],
+    verb: str,
+    targets: Sequence[str],
+    platform: str,
+    common_args: Sequence[str],
+    extra: Sequence[str] = (),
+) -> list:
+    """Shared Bazel invocation skeleton for the AOne executors."""
+    return [
+        bazel,
+        *startup_args,
+        verb,
+        *targets,
+        f"--config={platform}",
+        "--config=cicd",
+        *extra,
+        *common_args,
+    ]
 
 
 @dataclass(frozen=True)

@@ -86,7 +86,7 @@ For example, create a decode JSON config based on
 `rtp_llm/test/perf_test/examples/decode_grid_local.json`, set its model and
 tokenizer paths to files available on each host, and declare the topology and
 devices for the distributed service. A two-worker DP config can be referenced
-by a launcher benchmark like this:
+by a launcher benchmark using one DP worker on each host:
 
 ```yaml
 benchmarks:
@@ -100,7 +100,7 @@ benchmarks:
       dp_size: 2
       pp_size: 1
       ep_size: 2
-      local_world_size: 2
+      local_world_size: 1
 ```
 
 Supply the machine, build and common service sections from the launcher reference
@@ -186,8 +186,8 @@ test_output/
 `run/results/result.json` is the schema-v2 common envelope, containing run
 identity, fingerprints, metadata, summary and ordered cases.
 `run/reports/decode_report.json` contains flat observations and input-by-output
-matrices grouped by exact batch or TPOT strategy. Profile manifests record
-profile status, full input shape, requested output length, selected batch and
+matrices grouped by fixed batch size. Profile manifests record
+profile status, full input shape, requested output length, configured batch and
 listed artifacts. Profiling must be enabled in the workload to produce them.
 The collector always copies standard run artifacts and also preserves available
 diagnostics for partial runs; optional process logs/traces depend on diagnostic
@@ -203,7 +203,7 @@ python -m rtp_llm.test.perf_test.multi_node.analyzer.merge_decode_results \
 The merger also accepts standard run artifacts directly beneath `Task_*`.
 It validates data with the shared result schema, diagnoses invalid files/cases,
 and avoids counting the same run/case twice if direct and nested copies coexist.
-CSV rows retain input/output lengths, strategy, global/selected batch, success
+CSV rows retain input/output lengths, strategy, global batch size, success
 rate, latency, TPOT, throughput and status.
 
 Analyze collected traces with:

@@ -10,7 +10,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
-from rtp_llm.test.perf_test.config_schema import DEFAULT_PREFILL_TRANSPORT, EngineConfig
+from rtp_llm.test.perf_test.config_schema import EngineConfig
 from rtp_llm.test.perf_test.decode.executor import (
     DecodeBatchExecutor,
     DecodeCaseExecutor,
@@ -36,19 +36,15 @@ from rtp_llm.test.perf_test.modes import (
     PrefillAdapter,
 )
 from rtp_llm.test.perf_test.plan import ExecutionPlan, thaw
+from rtp_llm.test.perf_test.prefill.adapter import create_prefill_adapter
 from rtp_llm.test.perf_test.prefill.checkpoint import (
     PrefillResume,
     ResumeSelection,
     validate_prefill_resume,
 )
 from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
-from rtp_llm.test.perf_test.prefill.probe import (
-    probe_cache_block,
-    resolve_probe_block_size,
-)
 from rtp_llm.test.perf_test.prefill.profile import PrefillProfiler
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
-from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
 from rtp_llm.test.perf_test.prefill.trace import ProfiledRunner
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock, inspect_run_directory
 from rtp_llm.test.perf_test.state import RunOutcome, RunState
@@ -204,28 +200,8 @@ class UnifiedLocalExecutor:
         self._selected_case_ids = tuple(selected_case_ids)
 
     def _prefill_adapter(self, plan: ExecutionPlan) -> PrefillAdapter:
-        tokenizer = self._tokenizer_loader(plan)
-        config = thaw(plan.resolved_config)
-        commit_tail = int(config["workload"]["commit_tail_tokens"])
-        return PrefillAdapter(
-            lambda context: PrefillRunner(
-                context.session.client,
-                tokenizer,
-                commit_tail_tokens=commit_tail,
-                max_batch_tokens=config["engine"]["max_batch_tokens"],
-                workspace_tokens=config["workload"].get("workspace_tokens"),
-                input_ids_only=config["workload"].get(
-                    "transport", DEFAULT_PREFILL_TRANSPORT
-                )
-                == "dashsc_input_ids",
-                cache_block_size=resolve_probe_block_size(config),
-            ),
-            probe=lambda context: probe_cache_block(
-                context.session.client,
-                tokenizer,
-                resolve_probe_block_size(config),
-                commit_tail,
-            ),
+        return create_prefill_adapter(
+            thaw(plan.resolved_config), self._tokenizer_loader(plan)
         )
 
     def _decode_adapter(self, plan: ExecutionPlan) -> DecodeAdapter:

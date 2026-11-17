@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, FrozenSet, Optional
+from typing import Optional
 
 from rtp_llm.test.perf_test.errors import PerfTestError
 
@@ -30,85 +30,6 @@ class CaseState(str, Enum):
     INVALID_REUSE = "invalid_reuse"
     INVALID_TIMING = "invalid_timing"
     TARGET_TPOT_NOT_MET = "target_tpot_not_met"
-
-
-class StateTransitionError(ValueError):
-    """Raised when persisted state attempts an undeclared transition."""
-
-
-_RUN_TRANSITIONS: Dict[RunState, FrozenSet[RunState]] = {
-    RunState.CREATED: frozenset(
-        {RunState.PLANNED, RunState.FAILED, RunState.INTERRUPTED}
-    ),
-    RunState.PLANNED: frozenset(
-        {RunState.RUNNING, RunState.REPORTING, RunState.FAILED, RunState.INTERRUPTED}
-    ),
-    RunState.RUNNING: frozenset(
-        {
-            RunState.COLLECTING,
-            RunState.REPORTING,
-            RunState.COMPLETED,
-            RunState.PARTIAL,
-            RunState.FAILED,
-            RunState.INTERRUPTED,
-        }
-    ),
-    RunState.COLLECTING: frozenset(
-        {
-            RunState.REPORTING,
-            RunState.COMPLETED,
-            RunState.PARTIAL,
-            RunState.FAILED,
-            RunState.INTERRUPTED,
-        }
-    ),
-    RunState.REPORTING: frozenset(
-        {
-            RunState.COMPLETED,
-            RunState.PARTIAL,
-            RunState.FAILED,
-            RunState.INTERRUPTED,
-        }
-    ),
-    RunState.COMPLETED: frozenset(),
-    RunState.PARTIAL: frozenset(),
-    RunState.FAILED: frozenset(),
-    RunState.INTERRUPTED: frozenset(),
-}
-
-_CASE_TRANSITIONS: Dict[CaseState, FrozenSet[CaseState]] = {
-    CaseState.PLANNED: frozenset({CaseState.RUNNING}),
-    CaseState.RUNNING: frozenset(
-        {
-            CaseState.OK,
-            CaseState.REQUEST_FAILED,
-            CaseState.INVALID_SHAPE,
-            CaseState.INVALID_REUSE,
-            CaseState.INVALID_TIMING,
-        }
-    ),
-    CaseState.OK: frozenset(),
-    CaseState.REQUEST_FAILED: frozenset({CaseState.RUNNING}),
-    CaseState.INVALID_SHAPE: frozenset({CaseState.RUNNING}),
-    CaseState.INVALID_REUSE: frozenset({CaseState.RUNNING}),
-    CaseState.INVALID_TIMING: frozenset({CaseState.RUNNING}),
-}
-
-
-def transition_run(current: RunState, target: RunState) -> RunState:
-    if target not in _RUN_TRANSITIONS[current]:
-        raise StateTransitionError(
-            f"invalid run state transition: {current.value} -> {target.value}"
-        )
-    return target
-
-
-def transition_case(current: CaseState, target: CaseState) -> CaseState:
-    if target not in _CASE_TRANSITIONS[current]:
-        raise StateTransitionError(
-            f"invalid case state transition: {current.value} -> {target.value}"
-        )
-    return target
 
 
 @dataclass(frozen=True)

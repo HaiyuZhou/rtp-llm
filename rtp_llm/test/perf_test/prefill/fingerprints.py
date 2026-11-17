@@ -45,36 +45,56 @@ _SOURCE_SUFFIXES = {
 _FILE_DIGESTS: Dict[Path, tuple] = {}
 
 
-def _file_digest(path: Path) -> str:
-    path = path.resolve(strict=True)
-    before = path.stat()
-    signature = (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
+def _file_signature(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.stat()
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
     )
-    cached = _FILE_DIGESTS.get(path)
-    if cached is not None and cached[0] == signature:
-        return cached[1]
+
+
+def _read_file_digest(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
-    after = path.stat()
-    if signature != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    ):
+    return digest.hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    path = path.resolve(strict=True)
+    signature = _file_signature(path)
+    cached = _FILE_DIGESTS.get(path)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    value = _read_file_digest(path)
+    after = _file_signature(path)
+    if signature[:-1] != after[:-1]:
         raise PlanningError(
             "engine identity changed while reading it; retry with a stable build"
         )
-    value = digest.hexdigest()
-    _FILE_DIGESTS[path] = signature, value
+    if signature[-1] != after[-1]:
+        # Remote actions may hard-link the same CAS binary concurrently. Link
+        # count changes update ctime without changing its content. Verify the
+        # bytes again instead of treating metadata churn as an engine rebuild.
+        verified_value = _read_file_digest(path)
+        verified_signature = _file_signature(path)
+        if after[:-1] != verified_signature[:-1] or value != verified_value:
+            raise PlanningError(
+                "engine identity changed while reading it; retry with a stable build"
+            )
+        if after != verified_signature:
+            # The bytes matched twice, but the last stat may already describe
+            # a change after the second read. Return that content snapshot
+            # without binding it to metadata whose bytes we have not read.
+            return value
+        after = verified_signature
+    # Keep ctime in the cache key: same-size writes with restored mtime must
+    # still invalidate a previously computed digest.
+    _FILE_DIGESTS[path] = after, value
     return value
 
 

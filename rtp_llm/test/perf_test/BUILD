@@ -89,6 +89,7 @@ py_library(
         "multi_node/gang_config.py",
         "multi_node/local_server_runner.py",
         "multi_node/prefill_runtime.py",
+        "prefill/adapter.py",
         "prefill/checkpoint.py",
         "prefill/chart.py",
         "prefill/finalize.py",
@@ -116,10 +117,39 @@ py_library(
 )
 
 exports_files([
+    "BUILD",
     "aone/gang_worker.py",
     "aone/worker.py",
     "aone_defs.bzl",
     "decode_remote_test.py",
+    "examples/decode_aone_gang.json",
+    "examples/decode_distribution_local.json",
+    "examples/decode_distribution_requests.json",
+    "examples/decode_grid_local.json",
+    "examples/decode_tpot_local.json",
+    "examples/prefill_aone.json",
+    "examples/prefill_aone_ci.json",
+    "examples/prefill_aone_gang.json",
+    "examples/prefill_deepseek_v4_flash_daily.json",
+    "examples/prefill_deepseek_v4_pro_daily.json",
+    "examples/prefill_grouped_local.json",
+    "examples/prefill_local.json",
+    "examples/prefill_multi_grid_local.json",
+    "examples/prefill_random_batch_local.json",
+    "examples/prefill_traffic_distribution_local.json",
+    "examples/qwen35_prefill_test.json",
+    "examples/req_distribution.json",
+    "main.py",
+    "multi_node/analyzer/configs/module_base.py",
+    "multi_node/analyzer/configs/module_conf.py",
+    "multi_node/analyzer/configs/qwen_480b_decode-fp8.py",
+    "multi_node/analyzer/configs/qwen_480b_prefill_fp8.py",
+    "multi_node/gang_config.py",
+    "multi_node/local_server_runner.py",
+    "multi_node/multi_benchmark_config.yaml",
+    "multi_node/multi_local_executor.sh",
+    "multi_node/multi_runner.sh",
+    "testdata/historical_aone_plan.json",
 ])
 
 py_library(
@@ -162,13 +192,6 @@ py_library(
     deps = [":perf_test_entry_lib"],
 )
 
-py_library(
-    name = "perf_test_regression_test_support",
-    testonly = True,
-    srcs = ["regression/test_support.py"],
-    deps = [":perf_test_regression_lib"],
-)
-
 py_binary(
     name = "generate_perf_test_golden",
     srcs = ["generate_perf_test_golden.py"],
@@ -181,90 +204,26 @@ py_binary(
     deps = [":perf_test_regression_lib"],
 )
 
+# Compatibility aggregate for offline callers and CI helpers.
 py_library(
     name = "perf_test_lib",
     srcs = [
-        "multi_node/decode_runtime.py",
-        "multi_node/decode_sync.py",
-        "multi_node/gang_config.py",
-        "multi_node/local_server_runner.py",
-        "multi_node/prefill_runtime.py",
-        "aone/__init__.py",
-        "aone/config_schema.py",
-        "aone/plan.py",
-        "aone/sharding.py",
-        "capabilities.py",
-        "cli.py",
-        "config_resolver.py",
-        "config_schema.py",
         "dataset.py",
-        "decode/executor.py",
-        "decode/profiling.py",
-        "decode/report.py",
-        "decode/strategy.py",
-        "decode/transport.py",
-        "decode/distribution.py",
-        "decode/finalize.py",
-        "decode/planner.py",
-        "decode/metrics.py",
-        "decode/model.py",
-        "decode/scheduler.py",
-        "entry.py",
-        "case_planning.py",
-        "errors.py",
-        "execution/devices.py",
-        "execution/engine_session.py",
-        "execution/launch_boundary.py",
-        "execution/local.py",
-        "execution/runtime.py",
-        "execution/scheduler.py",
         "engine_paths.py",
-        "hub_download.py",
         "offline_bench_test.py",
         "offline_runner.py",
-        "plan.py",
-        "prefill/block_size.py",
-        "prefill/case_store.py",
-        "prefill/fingerprints.py",
-        "prefill/measurement.py",
-        "prefill/planner.py",
-        "prefill/random_batch.py",
-        "prefill/traffic_batch.py",
-        "prefill/traffic_distribution.py",
-        "prefill/generate_traffic_batch_grid.py",
-        "prefill/generate_random_batch_grid.py",
-        "prefill/checkpoint.py",
-        "prefill/chart.py",
-        "prefill/finalize.py",
-        "prefill/dashsc_transport.py",
-        "prefill/formula.py",
-        "prefill/profile.py",
-        "prefill/probe.py",
-        "prefill/report.py",
-        "prefill/restricted_symbolic.py",
-        "prefill/runner.py",
-        "prefill/trace.py",
         "server.py",
-        "run_context.py",
-        "run_directory.py",
-        "storage.py",
-        "state.py",
-        "modes.py",
-        "test_util.py",
     ],
-    data = glob(["examples/*.json"]),
+    data = [":perf_test_examples"],
     deps = [
         ":aone_lib",
+        ":perf_test_entry_lib",
+        ":perf_test_runtime_lib",
         ":perf_test_results_lib",
         "//rtp_llm:testlib",
         "//rtp_llm/test/utils:maga_server_manager",
         "//rtp_llm/test/utils:device_resource",
-    ] + select({
-        "@rtp_llm//:using_cuda13_x86": [requirement_cuda13("plotly")],
-        "@rtp_llm//:using_cuda13_arm": [requirement_cuda13_arm("plotly")],
-        "//conditions:default": [],
-    }),
-    visibility = ["//visibility:public"],
+    ],
 )
 
 # Site-CI adapters: deliver pipeline parameters onto a strict config and
@@ -295,15 +254,6 @@ py_binary(
     name = "ci_prefill_verify",
     srcs = ["ci_prefill_verify.py"],
     deps = [":ci_helpers"],
-)
-
-py_test(
-    name = "ci_test",
-    srcs = ["ci_test.py"],
-    deps = [
-        ":perf_test_lib",
-        ":ci_helpers",
-    ],
 )
 
 py_binary(
@@ -358,166 +308,6 @@ py_binary(
     deps = [":perf_test_entry_lib"],
 )
 
-py_library(
-    name = "perf_test_support",
-    testonly = True,
-    srcs = [
-        "test_support.py",
-        "multi_node/analyzer/batch_analyze.py",
-        "multi_node/analyzer/merge_decode_results.py",
-        "multi_node/analyzer/trace_analyze.py",
-    ],
-    deps = [":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "decode_executor_test",
-    srcs = ["decode_executor_test.py"],
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "decode_multi_node_test",
-    srcs = ["decode_multi_node_test.py"],
-    data = [
-        "multi_node/multi_benchmark_config.yaml",
-        "multi_node/gang_config.py",
-        "multi_node/local_server_runner.py",
-        "multi_node/multi_local_executor.sh",
-        "multi_node/multi_runner.sh",
-    ] + glob(["multi_node/analyzer/configs/*.py"]),
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "engine_session_test",
-    srcs = ["engine_session_test.py"],
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "entry_test",
-    srcs = ["entry_test.py", "main.py"],
-    data = [
-        "//tools:perf_test_script",
-        "examples/prefill_local.json",
-        "examples/decode_grid_local.json",
-        "testdata/historical_aone_plan.json",
-        "BUILD",
-    ] + glob(["**/*.py"]),
-    deps = [":perf_test_support", ":perf_test_entry_lib"],
-)
-
-py_test(
-    name = "offline_runner_test",
-    srcs = ["offline_runner_test.py"],
-    deps = [":perf_test_lib"],
-)
-
-py_test(
-    name = "plan_test",
-    srcs = ["plan_test.py"],
-    data = [
-        "testdata/historical_aone_plan.json",
-        "examples/prefill_local.json",
-        "examples/decode_grid_local.json",
-    ],
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "prefill_profile_test",
-    srcs = ["prefill_profile_test.py"],
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "prefill_report_test",
-    srcs = ["prefill_report_test.py"],
-    data = glob(["multi_node/analyzer/configs/*.py"]),
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "prefill_resume_test",
-    srcs = ["prefill_resume_test.py"],
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "prefill_runner_test",
-    srcs = ["prefill_runner_test.py"],
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "result_envelope_test",
-    srcs = ["result_envelope_test.py"],
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "runtime_adapter_test",
-    srcs = ["runtime_adapter_test.py"],
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "ssh_prefill_test",
-    srcs = ["ssh_prefill_test.py"],
-    data = [
-        "multi_node/multi_benchmark_config.yaml",
-        "multi_node/gang_config.py",
-        "multi_node/local_server_runner.py",
-        "multi_node/multi_local_executor.sh",
-        "multi_node/multi_runner.sh",
-    ],
-    deps = [":perf_test_support", ":perf_test_lib"],
-)
-
-py_test(
-    name = "unified_config_test",
-    srcs = ["unified_config_test.py"],
-    deps = [":perf_test_support", ":perf_test_entry_lib"],
-)
-
-py_test(
-    name = "workload_test",
-    srcs = ["workload_test.py"],
-    data = [
-        "examples/prefill_random_batch_local.json",
-        "examples/req_distribution.json",
-    ],
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
-)
-
-py_test(
-    name = "aone_single_test",
-    srcs = ["aone_single_test.py"],
-    data = ["aone_defs.bzl"],
-    deps = [":aone_lib", ":perf_test_support"],
-)
-
-py_test(
-    name = "aone_worker_test",
-    srcs = ["aone_worker_test.py"],
-    deps = [":aone_lib", ":perf_test_support"],
-)
-
-py_test(
-    name = "aone_broker_test",
-    srcs = ["aone_broker_test.py"],
-    data = ["aone_defs.bzl"],
-    deps = [":aone_lib", ":perf_test_support"],
-)
-
-py_test(
-    name = "aone_gang_test",
-    srcs = ["aone_gang_test.py"],
-    data = ["aone_defs.bzl"] + glob(["examples/*.json"]),
-    deps = [":aone_lib", ":perf_test_support"],
-)
-
 # One test action runs the complete local-backend grid on a worker with two GPUs.
 # Adapt the example model/tokenizer paths to files readable on that worker.
 unified_decode_remote_test(
@@ -527,33 +317,190 @@ unified_decode_remote_test(
     gpu_count = 2,
 )
 
-py_test(
-    name = "decode_remote_test_test",
-    srcs = ["decode_remote_test_test.py", "decode_remote_test.py"],
-    data = ["aone_defs.bzl"],
-    deps = [":perf_test_support", ":perf_test_runtime_lib"],
+filegroup(
+    name = "perf_test_python_sources",
+    srcs = glob(["**/*.py"], exclude = ["tests/**"]),
 )
 
-py_test(
+py_library(
+    name = "perf_test_analyzer_lib",
+    srcs = [
+        "multi_node/analyzer/batch_analyze.py",
+        "multi_node/analyzer/merge_decode_results.py",
+        "multi_node/analyzer/trace_analyze.py",
+        "multi_node/analyzer/configs/module_base.py",
+        "multi_node/analyzer/configs/module_conf.py",
+        "multi_node/analyzer/configs/qwen_480b_decode-fp8.py",
+        "multi_node/analyzer/configs/qwen_480b_prefill_fp8.py",
+    ],
+    deps = [
+        ":perf_test_results_lib",
+    ],
+)
+
+# Preserve existing test labels as suites; aliases do not expand in tests().
+
+test_suite(
+    name = "aone_broker_test",
+    tests = ["//rtp_llm/test/perf_test/tests:aone_broker_test"],
+)
+
+test_suite(
     name = "aone_entry_test",
-    srcs = ["aone_entry_test.py"],
-    deps = [":aone_lib"],
+    tests = ["//rtp_llm/test/perf_test/tests:aone_entry_test"],
 )
 
-py_test(
+test_suite(
+    name = "aone_gang_test",
+    tests = ["//rtp_llm/test/perf_test/tests:aone_gang_test"],
+)
+
+test_suite(
+    name = "aone_single_test",
+    tests = ["//rtp_llm/test/perf_test/tests:aone_single_test"],
+)
+
+test_suite(
+    name = "aone_worker_test",
+    tests = ["//rtp_llm/test/perf_test/tests:aone_worker_test"],
+)
+
+test_suite(
+    name = "ci_test",
+    tests = ["//rtp_llm/test/perf_test/tests:ci_test"],
+)
+
+test_suite(
+    name = "decode_executor_test",
+    tests = ["//rtp_llm/test/perf_test/tests:decode_executor_test"],
+)
+
+test_suite(
+    name = "decode_multi_node_test",
+    tests = ["//rtp_llm/test/perf_test/tests:decode_multi_node_test"],
+)
+
+test_suite(
+    name = "decode_remote_test_test",
+    tests = ["//rtp_llm/test/perf_test/tests:decode_remote_test_test"],
+)
+
+test_suite(
+    name = "engine_session_test",
+    tests = ["//rtp_llm/test/perf_test/tests:engine_session_test"],
+)
+
+test_suite(
+    name = "entry_test",
+    tests = ["//rtp_llm/test/perf_test/tests:entry_test"],
+)
+
+test_suite(
+    name = "offline_runner_test",
+    tests = ["//rtp_llm/test/perf_test/tests:offline_runner_test"],
+)
+
+alias(
+    name = "perf_test_regression_test_support",
+    testonly = True,
+    actual = "//rtp_llm/test/perf_test/tests:perf_test_regression_test_support",
+)
+
+alias(
+    name = "perf_test_support",
+    testonly = True,
+    actual = "//rtp_llm/test/perf_test/tests:perf_test_support",
+)
+
+test_suite(
+    name = "plan_test",
+    tests = ["//rtp_llm/test/perf_test/tests:plan_test"],
+)
+
+test_suite(
     name = "policy_extraction_test",
-    srcs = ["policy_extraction_test.py"],
-    deps = [":perf_test_regression_lib", ":perf_test_publish_policy_lib"],
+    tests = ["//rtp_llm/test/perf_test/tests:policy_extraction_test"],
 )
 
-py_test(
-    name = "regression_test",
-    srcs = ["regression_test.py"],
-    deps = [":perf_test_regression_lib", ":perf_test_regression_test_support"],
+test_suite(
+    name = "prefill_profile_test",
+    tests = ["//rtp_llm/test/perf_test/tests:prefill_profile_test"],
 )
 
-py_test(
+test_suite(
+    name = "prefill_report_test",
+    tests = ["//rtp_llm/test/perf_test/tests:prefill_report_test"],
+)
+
+test_suite(
+    name = "prefill_resume_test",
+    tests = ["//rtp_llm/test/perf_test/tests:prefill_resume_test"],
+)
+
+test_suite(
+    name = "prefill_runner_test",
+    tests = ["//rtp_llm/test/perf_test/tests:prefill_runner_test"],
+)
+
+test_suite(
     name = "publication_policy_test",
-    srcs = ["publication_policy_test.py"],
-    deps = [":perf_test_publish_policy_lib"],
+    tests = ["//rtp_llm/test/perf_test/tests:publication_policy_test"],
+)
+
+test_suite(
+    name = "regression_test",
+    tests = ["//rtp_llm/test/perf_test/tests:regression_test"],
+)
+
+test_suite(
+    name = "result_envelope_test",
+    tests = ["//rtp_llm/test/perf_test/tests:result_envelope_test"],
+)
+
+test_suite(
+    name = "runtime_adapter_test",
+    tests = ["//rtp_llm/test/perf_test/tests:runtime_adapter_test"],
+)
+
+test_suite(
+    name = "ssh_prefill_test",
+    tests = ["//rtp_llm/test/perf_test/tests:ssh_prefill_test"],
+)
+
+test_suite(
+    name = "unified_config_test",
+    tests = ["//rtp_llm/test/perf_test/tests:unified_config_test"],
+)
+
+test_suite(
+    name = "unit_tests",
+    tests = ["//rtp_llm/test/perf_test/tests:unit_tests"],
+)
+
+test_suite(
+    name = "workload_test",
+    tests = ["//rtp_llm/test/perf_test/tests:workload_test"],
+)
+
+filegroup(
+    name = "perf_test_examples",
+    srcs = [
+        "examples/decode_aone_gang.json",
+        "examples/decode_distribution_local.json",
+        "examples/decode_distribution_requests.json",
+        "examples/decode_grid_local.json",
+        "examples/decode_tpot_local.json",
+        "examples/prefill_aone.json",
+        "examples/prefill_aone_ci.json",
+        "examples/prefill_aone_gang.json",
+        "examples/prefill_deepseek_v4_flash_daily.json",
+        "examples/prefill_deepseek_v4_pro_daily.json",
+        "examples/prefill_grouped_local.json",
+        "examples/prefill_local.json",
+        "examples/prefill_multi_grid_local.json",
+        "examples/prefill_random_batch_local.json",
+        "examples/prefill_traffic_distribution_local.json",
+        "examples/qwen35_prefill_test.json",
+        "examples/req_distribution.json",
+    ],
 )

@@ -163,12 +163,7 @@ def load_remote_inputs(
 
 def _default_executor(inputs: RemoteInputs):
     from rtp_llm.test.perf_test.execution.local import _default_session_factory
-    from rtp_llm.test.perf_test.modes import PrefillAdapter
-    from rtp_llm.test.perf_test.prefill.probe import (
-        probe_cache_block,
-        resolve_probe_block_size,
-    )
-    from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
+    from rtp_llm.test.perf_test.prefill.adapter import create_prefill_adapter
     from rtp_llm.test.perf_test.test_util import _load_tokenizer
 
     runtime_inputs = resolve_remote_runtime_inputs(inputs)
@@ -178,27 +173,7 @@ def _default_executor(inputs: RemoteInputs):
         checkpoint_path=model["checkpoint"],
         model_type=model["type"],
     )
-    commit_tail = int(inputs.config["workload"]["commit_tail_tokens"])
-    adapter = PrefillAdapter(
-        lambda context: PrefillRunner(
-            context.session.client,
-            tokenizer,
-            commit_tail_tokens=commit_tail,
-            max_batch_tokens=inputs.config["engine"]["max_batch_tokens"],
-            workspace_tokens=inputs.config["workload"].get("workspace_tokens"),
-            input_ids_only=inputs.config["workload"].get(
-                "transport", DEFAULT_PREFILL_TRANSPORT
-            )
-            == "dashsc_input_ids",
-            cache_block_size=resolve_probe_block_size(inputs.config),
-        ),
-        probe=lambda context: probe_cache_block(
-            context.session.client,
-            tokenizer,
-            resolve_probe_block_size(inputs.config),
-            commit_tail,
-        ),
-    )
+    adapter = create_prefill_adapter(inputs.config, tokenizer)
     executor = RemoteShardExecutor(
         session_factory=_default_session_factory, adapter=adapter
     )

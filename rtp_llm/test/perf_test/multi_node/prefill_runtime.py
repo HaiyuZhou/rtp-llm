@@ -8,7 +8,7 @@ import json
 import os
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from rtp_llm.test.perf_test.capabilities import validate_capability
 from rtp_llm.test.perf_test.config_resolver import canonical_json, load_resolved_config
@@ -22,16 +22,12 @@ from rtp_llm.test.perf_test.entry import _source_config
 from rtp_llm.test.perf_test.errors import ConfigurationError, PlanningError
 from rtp_llm.test.perf_test.execution.engine_session import EngineDiagnostics
 from rtp_llm.test.perf_test.execution.runtime import HttpPrefillClient
-from rtp_llm.test.perf_test.modes import ModeExecutionContext, PrefillAdapter
-from rtp_llm.test.perf_test.plan import build_execution_plan
+from rtp_llm.test.perf_test.modes import ModeExecutionContext
+from rtp_llm.test.perf_test.plan import build_execution_plan, thaw
+from rtp_llm.test.perf_test.prefill.adapter import create_prefill_adapter
 from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
 from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
-from rtp_llm.test.perf_test.prefill.probe import (
-    probe_cache_block,
-    resolve_probe_block_size,
-)
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
-from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
 from rtp_llm.test.perf_test.prefill.traffic_batch import materialize_traffic_source
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.storage import RunStore
@@ -178,6 +174,7 @@ def execute_master_prefill(
     server_log_path,
     profiler_directory,
     run_context=None,
+    model_paths: Optional[Mapping[str, Any]] = None,
 ):
     """Run the shared prefill measurement against a caller-owned rank group."""
     del server_log_path, profiler_directory
@@ -196,19 +193,19 @@ def execute_master_prefill(
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     manifest["state"] = "running"
     store.write_manifest(manifest)
-    workload = plan.resolved_config["workload"]
-    model = plan.resolved_config["model"]
+    config = thaw(plan.resolved_config)
+    workload = config["workload"]
+    model = config["model"]
+    tokenizer_model = model if model_paths is None else model_paths
     session = None
     try:
         from rtp_llm.test.perf_test.test_util import _load_tokenizer
 
         tokenizer = _load_tokenizer(
             tokenizer_path,
-            checkpoint_path=str(model["checkpoint"]),
-            model_type=str(model["type"]),
+            checkpoint_path=str(tokenizer_model["checkpoint"]),
+            model_type=str(tokenizer_model["type"]),
         )
-        commit_tail = int(workload["commit_tail_tokens"])
-        block_size = resolve_probe_block_size(source_config)
         session = ExternalPrefillSession(
             endpoint,
             topology=dict(model["topology"]),
@@ -217,21 +214,7 @@ def execute_master_prefill(
                 "request_timeout_seconds", DEFAULT_PREFILL_REQUEST_TIMEOUT_SECONDS
             ),
         )
-        adapter = PrefillAdapter(
-            lambda context: PrefillRunner(
-                context.session.client,
-                tokenizer,
-                commit_tail_tokens=commit_tail,
-                max_batch_tokens=plan.resolved_config["engine"]["max_batch_tokens"],
-                workspace_tokens=workload.get("workspace_tokens"),
-                input_ids_only=workload.get("transport", DEFAULT_PREFILL_TRANSPORT)
-                == "dashsc_input_ids",
-                cache_block_size=block_size,
-            ),
-            probe=lambda context: probe_cache_block(
-                context.session.client, tokenizer, block_size, commit_tail
-            ),
-        )
+        adapter = create_prefill_adapter(config, tokenizer)
         result = adapter(ModeExecutionContext(plan=plan, session=session, store=store))
         finalize_prefill_run(
             root,
@@ -240,7 +223,6 @@ def execute_master_prefill(
             case_results=result.case_results,
             terminal_state=result.state,
         )
-        generate_prefill_report(root, acquire_lock=False)
     except Exception:
         manifest["state"] = "failed"
         store.write_manifest(manifest)
@@ -248,6 +230,12 @@ def execute_master_prefill(
     finally:
         if session is not None:
             session.close()
+    try:
+        generate_prefill_report(root, acquire_lock=False)
+    except Exception:
+        manifest["state"] = "failed"
+        store.write_manifest(manifest)
+        raise
     manifest["state"] = result.state.value
     store.write_manifest(manifest)
     return result

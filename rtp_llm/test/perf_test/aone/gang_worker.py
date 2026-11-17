@@ -45,11 +45,7 @@ from rtp_llm.test.perf_test.aone.plan import plan_resources
 from rtp_llm.test.perf_test.capabilities import validate_aone_capability
 from rtp_llm.test.perf_test.case_planning import plan_cases
 from rtp_llm.test.perf_test.config_resolver import ResolvedConfig, canonical_json
-from rtp_llm.test.perf_test.config_schema import (
-    DEFAULT_PREFILL_REQUEST_TIMEOUT_SECONDS,
-    DEFAULT_PREFILL_TRANSPORT,
-    parse_config,
-)
+from rtp_llm.test.perf_test.config_schema import parse_config
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.execution.devices import (
     GPU_LOCKED_DEVICES_ENV,
@@ -1157,105 +1153,21 @@ def _default_master_executor(
 def _default_prefill_master_executor(
     handle: Any, *, context: GangWorkerContext, config_path: str, result_directory: str
 ) -> int:
-    """Execute and finalize the unified prefill plan on the master shard.
+    """Prepare gang inputs; the shared executor owns measurement and artifacts."""
+    from rtp_llm.test.perf_test.multi_node.prefill_runtime import execute_master_prefill
 
-    The prefill runner drives the gang's own distributed server through the
-    external session: the session owns no lifecycle, the worker does.
-    """
-    from rtp_llm.test.perf_test.modes import ModeExecutionContext, PrefillAdapter
-    from rtp_llm.test.perf_test.multi_node import prefill_runtime
-    from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
-    from rtp_llm.test.perf_test.prefill.probe import (
-        probe_cache_block,
-        resolve_probe_block_size,
-    )
-    from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
-    from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
-    from rtp_llm.test.perf_test.run_directory import initialize_run_directory
-    from rtp_llm.test.perf_test.storage import RunStore
-    from rtp_llm.test.perf_test.test_util import _load_tokenizer
-
-    topology = context.gang_plan["topology"]
-    merged = json.loads(Path(config_path).read_text(encoding="utf-8"))
     plan, source = _build_gang_execution_plan(config_path, context, result_directory)
-    root = Path(result_directory)
-    run_context = context.gang_plan
-    run_id = run_context.get("run_id", root.name)
-    initialize_run_directory(
-        root,
+    model = _resolve_model_paths(config_path, context.gang_plan)
+    result = execute_master_prefill(
+        plan,
         source_config=source,
-        plan=plan,
-        run_id=run_id,
-        code_version=os.environ.get("BUILD_SCM_REVISION", "unknown"),
-        repository_revisions=run_context.get("repository_revisions", {}),
+        endpoint=f"http://127.0.0.1:{int(context.gang_plan['port_range']['start'])}",
+        tokenizer_path=model["tokenizer"],
+        model_paths=model,
+        server_log_path=handle.log_file_path,
+        profiler_directory=Path(handle.log_dir),
+        run_context=context.gang_plan,
     )
-    store = RunStore(root)
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    manifest["state"] = "running"
-    store.write_manifest(manifest)
-    resolved_model = _resolve_model_paths(config_path, context.gang_plan)
-    tokenizer = _load_tokenizer(
-        resolved_model["tokenizer"],
-        checkpoint_path=str(resolved_model.get("checkpoint", "")),
-        model_type=str(resolved_model.get("type", "")),
-    )
-    commit_tail = int(merged["workload"]["commit_tail_tokens"])
-    endpoint = f"http://127.0.0.1:{int(context.gang_plan['port_range']['start'])}"
-    session = None
-    try:
-        session = prefill_runtime.ExternalPrefillSession(
-            endpoint,
-            topology=topology,
-            transport=merged["workload"].get("transport", DEFAULT_PREFILL_TRANSPORT),
-            timeout_seconds=merged["workload"].get(
-                "request_timeout_seconds", DEFAULT_PREFILL_REQUEST_TIMEOUT_SECONDS
-            ),
-        )
-        adapter = PrefillAdapter(
-            lambda executor_context: PrefillRunner(
-                executor_context.session.client,
-                tokenizer,
-                commit_tail_tokens=commit_tail,
-                max_batch_tokens=merged["engine"]["max_batch_tokens"],
-                workspace_tokens=merged["workload"].get("workspace_tokens"),
-                input_ids_only=merged["workload"].get(
-                    "transport", DEFAULT_PREFILL_TRANSPORT
-                )
-                == "dashsc_input_ids",
-                cache_block_size=resolve_probe_block_size(merged),
-            ),
-            probe=lambda executor_context: probe_cache_block(
-                executor_context.session.client,
-                tokenizer,
-                resolve_probe_block_size(merged),
-                commit_tail,
-            ),
-        )
-        result = adapter(ModeExecutionContext(plan=plan, session=session, store=store))
-        finalize_prefill_run(
-            root,
-            plan=plan,
-            run_id=run_id,
-            case_results=result.case_results,
-            terminal_state=result.state,
-        )
-    except Exception:
-        manifest["state"] = "failed"
-        store.write_manifest(manifest)
-        raise
-    finally:
-        if session is not None:
-            session.close()
-    try:
-        generate_prefill_report(root, acquire_lock=False)
-    except Exception:
-        # A report failure must not leave the manifest claiming running
-        # while the exception propagates to the failure vote.
-        manifest["state"] = "failed"
-        store.write_manifest(manifest)
-        raise
-    manifest["state"] = result.state.value
-    store.write_manifest(manifest)
     return EXIT_SUCCESS if result.state.value == "completed" else 1
 
 

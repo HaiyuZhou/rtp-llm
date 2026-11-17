@@ -56,20 +56,20 @@ class ModeExecutionResult:
             raise ValueError("mode execution result requires a terminal state")
 
 
+def _request_failure(case: Dict[str, Any], error: Exception) -> Dict[str, Any]:
+    return {
+        "case_id": case["case_id"],
+        "identity": {key: value for key, value in case.items() if key != "case_id"},
+        "status": "request_failed",
+        "runs": int(case.get("measure_runs", 0)),
+        "errors": [{"code": "request_failed", "message": str(error)}],
+        "metrics": None,
+    }
+
+
 class DecodeAdapter:
     def __init__(self, runner_factory: Callable[[ModeExecutionContext], Any]):
         self._runner_factory = runner_factory
-
-    @staticmethod
-    def _request_failure(case: Dict[str, Any], error: Exception) -> Dict[str, Any]:
-        return {
-            "case_id": case["case_id"],
-            "identity": {key: value for key, value in case.items() if key != "case_id"},
-            "status": "request_failed",
-            "runs": int(case.get("measure_runs", 0)),
-            "errors": [{"code": "request_failed", "message": str(error)}],
-            "metrics": None,
-        }
 
     def __call__(self, context: ModeExecutionContext) -> ModeExecutionResult:
         if context.plan.mode != "decode":
@@ -94,7 +94,7 @@ class DecodeAdapter:
                 raise
             except Exception as error:
                 _assert_engine_healthy(context.session)
-                result = self._request_failure(case, error)
+                result = _request_failure(case, error)
             session_reusable = (
                 session_reusable
                 and getattr(executor, "session_reusable", True) is not False
@@ -136,17 +136,6 @@ class PrefillAdapter:
     ):
         self._runner_factory = runner_factory
         self._probe = probe
-
-    @staticmethod
-    def _request_failure(case: Dict[str, Any], error: Exception) -> Dict[str, Any]:
-        return {
-            "case_id": case["case_id"],
-            "identity": {key: value for key, value in case.items() if key != "case_id"},
-            "status": "request_failed",
-            "runs": int(case.get("measure_runs", 0)),
-            "errors": [{"code": "request_failed", "message": str(error)}],
-            "metrics": None,
-        }
 
     def run(
         self,
@@ -203,7 +192,7 @@ class PrefillAdapter:
                 raise
             except Exception as error:
                 _assert_engine_healthy(context.session)
-                result = self._request_failure(case, error)
+                result = _request_failure(case, error)
             context.store.write_prefill_case(planned_case.case_id, result)
             results.append(result)
         failed = [result for result in results if result["status"] != "ok"]

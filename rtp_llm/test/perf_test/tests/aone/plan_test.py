@@ -1,9 +1,10 @@
 """Tests for aone plan_test."""
 
+import hashlib
 import unittest
 
 from rtp_llm.test.perf_test.case_planning import plan_cases
-from rtp_llm.test.perf_test.config_resolver import resolve_config
+from rtp_llm.test.perf_test.config_resolver import canonical_json, resolve_config
 from rtp_llm.test.perf_test.config_schema import ConfigError
 from rtp_llm.test.perf_test.errors import PlanningError, ResourceError
 from rtp_llm.test.perf_test.plan import ExecutionPlan, build_execution_plan, case_id
@@ -108,6 +109,14 @@ class AOnePlanningTest(unittest.TestCase):
                 payload["resource_plan"].update(
                     gpus_per_machine=1, machine_count=2, local_world_size=1
                 )
+                config_fields = {
+                    key: section
+                    for key, section in payload["resolved_config"].items()
+                    if key != "workload"
+                }
+                payload["config_fingerprint"] = hashlib.sha256(
+                    canonical_json(config_fields).encode()
+                ).hexdigest()
                 with self.assertRaises(ResourceError):
                     ExecutionPlan.from_dict(payload)
 

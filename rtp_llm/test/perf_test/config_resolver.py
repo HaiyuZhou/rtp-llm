@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import asdict, dataclass
@@ -46,10 +47,15 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _load_external_json(path: Path, max_bytes: int) -> Any:
+def _load_external_json(
+    path: Path, max_bytes: int, cache: Optional[dict] = None
+) -> Any:
     field = "workload.distribution_file"
     if type(max_bytes) is not int or max_bytes <= 0:
         raise ConfigResolutionError("max_external_bytes must be a positive integer")
+    cache_key = str(path.resolve())
+    if cache is not None and cache_key in cache:
+        return copy.deepcopy(cache[cache_key])
     try:
         size = path.stat().st_size
     except OSError as error:
@@ -59,7 +65,10 @@ def _load_external_json(path: Path, max_bytes: int) -> Any:
             f"{field}: {path} is too large ({size} bytes; limit {max_bytes})"
         )
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if cache is not None:
+            cache[cache_key] = copy.deepcopy(value)
+        return value
     except UnicodeDecodeError as error:
         raise ConfigResolutionError(f"{field}: {path} is not UTF-8") from error
     except json.JSONDecodeError as error:
@@ -75,6 +84,7 @@ def _materialize_workload(
     normalized: Dict[str, Any],
     source_dir: Path,
     max_external_bytes: int,
+    external_inputs: Optional[dict] = None,
 ) -> None:
     source_workload = source["workload"]
     if source_workload.get("kind") != "distribution":
@@ -85,11 +95,13 @@ def _materialize_workload(
     normalized_workload = normalized["workload"]
     normalized_workload.pop("distribution_file", None)
     normalized_workload["distribution"] = _load_external_json(
-        source_path, max_external_bytes
+        source_path, max_external_bytes, external_inputs
     )
 
 
-def _materialize_traffic(parsed, normalized, source_dir, max_external_bytes):
+def _materialize_traffic(
+    parsed, normalized, source_dir, max_external_bytes, external_inputs=None
+):
     from rtp_llm.test.perf_test.prefill.traffic_batch import sample_traffic_batches
     from rtp_llm.test.perf_test.prefill.traffic_distribution import (
         parse_length_distribution,
@@ -102,7 +114,7 @@ def _materialize_traffic(parsed, normalized, source_dir, max_external_bytes):
         path = Path(spec.distribution_file)
         if not path.is_absolute():
             path = source_dir / path
-        payload = _load_external_json(path, max_external_bytes)
+        payload = _load_external_json(path, max_external_bytes, external_inputs)
         try:
             distribution = parse_length_distribution(payload)
         except ValueError as error:
@@ -146,6 +158,7 @@ def resolve_config(
     source_dir: Optional[Union[str, Path]] = None,
     max_external_bytes: int = DEFAULT_MAX_EXTERNAL_BYTES,
     execution_parser: Optional[ExecutionParser] = None,
+    external_inputs: Optional[dict] = None,
 ) -> ResolvedConfig:
     """Validate, normalize, materialize, and fingerprint a decoded config."""
     parsed = parse_config(value, execution_parser=execution_parser)
@@ -160,8 +173,18 @@ def resolve_config(
                 if batch["sample_index"] is None:
                     batch.pop("sample_index")
     base_dir = Path.cwd() if source_dir is None else Path(source_dir)
-    _materialize_workload(value, normalized, base_dir, max_external_bytes)
-    _materialize_traffic(parsed, normalized, base_dir, max_external_bytes)
+    _materialize_workload(
+        value, normalized, base_dir, max_external_bytes, external_inputs
+    )
+    _materialize_traffic(
+        parsed, normalized, base_dir, max_external_bytes, external_inputs
+    )
+    if normalized["execution"]["backend"] == "ssh":
+        from rtp_llm.test.perf_test.ssh.source import resolve_source
+
+        normalized["execution"]["source"] = resolve_source(
+            normalized["execution"]["source"], source_dir=base_dir
+        )
 
     config_fields = {
         name: section for name, section in normalized.items() if name != "workload"
@@ -178,6 +201,7 @@ def load_resolved_config(
     *,
     max_external_bytes: int = DEFAULT_MAX_EXTERNAL_BYTES,
     execution_parser: Optional[ExecutionParser] = None,
+    external_inputs: Optional[dict] = None,
 ) -> ResolvedConfig:
     """Load a source JSON config and resolve relative workload inputs."""
     config_path = Path(path)
@@ -198,4 +222,5 @@ def load_resolved_config(
         source_dir=config_path.parent,
         max_external_bytes=max_external_bytes,
         execution_parser=execution_parser,
+        external_inputs=external_inputs,
     )

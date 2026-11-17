@@ -1020,7 +1020,15 @@ def _parse_execution(value: Any) -> ExecutionConfig:
                 allow_empty=True,
             ),
         )
-    raise ConfigError("execution.backend: expected local")
+    if backend == "ssh":
+        from rtp_llm.test.perf_test.ssh.config_schema import parse_execution
+
+        return parse_execution(raw)
+    if backend == "aone":
+        from rtp_llm.test.perf_test.aone.config_schema import parse_execution
+
+        return parse_execution(raw)
+    raise ConfigError("execution.backend: expected local, aone, or ssh")
 
 
 def _parse_output(value: Any) -> OutputConfig:

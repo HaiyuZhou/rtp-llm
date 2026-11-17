@@ -160,3 +160,43 @@ class ExtensionSeamsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LatestPlanContractTest(unittest.TestCase):
+    def test_only_latest_plan_schema_is_accepted(self):
+        from rtp_llm.test.perf_test.errors import PlanningError
+
+        plan = build_execution_plan(
+            mode="prefill",
+            action="run",
+            resolved=resolve_config(plan_config()),
+            cases=plan_cases(),
+            result_directory="runs/latest",
+        )
+        self.assertEqual(2, plan.schema_version)
+        raw = plan.to_dict()
+        raw["schema_version"] = 1
+        with self.assertRaisesRegex(PlanningError, "schema_version"):
+            ExecutionPlan.from_dict(raw)
+
+
+class FrozenPlanIntegrityTest(unittest.TestCase):
+    def test_changed_resolved_fields_cannot_keep_original_fingerprint(self):
+        from rtp_llm.test.perf_test.errors import PlanningError
+
+        plan = build_execution_plan(
+            mode="prefill",
+            action="run",
+            resolved=resolve_config(plan_config()),
+            cases=plan_cases(),
+            result_directory="runs/latest",
+        )
+        for section, field, value in (
+            ("engine", "max_seq_len", 9999),
+            ("workload", "seed", 999),
+        ):
+            with self.subTest(section=section):
+                raw = plan.to_dict()
+                raw["resolved_config"][section][field] = value
+                with self.assertRaisesRegex(PlanningError, "fingerprint"):
+                    ExecutionPlan.from_dict(raw)

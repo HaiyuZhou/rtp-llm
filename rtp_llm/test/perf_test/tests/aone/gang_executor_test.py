@@ -271,7 +271,7 @@ class GangExecutorTest(unittest.TestCase):
                     Path(directory), status=status, remote_exit=3
                 )
                 self.assertEqual(
-                    RunState.PARTIAL if status == "partial" else RunState.FAILED,
+                    RunState.FAILED,
                     outcome.state,
                 )
                 self.assertNotEqual(0, outcome.exit_code)

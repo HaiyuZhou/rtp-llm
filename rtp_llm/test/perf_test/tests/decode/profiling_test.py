@@ -58,9 +58,7 @@ class DecodeProfilingTest(unittest.TestCase):
             self.assertEqual("completed", manifest["status"])
             self.assertEqual([128] * 8, manifest["input_lengths"])
             self.assertEqual(8, manifest["batch_size"])
-            self.assertEqual(
-                [str(Path(directory) / "traces/trace.json")], manifest["artifacts"]
-            )
+            self.assertEqual(["traces/trace.json"], manifest["artifacts"])
             self.assertIn("decode_in128_out16_bs8_", manifest["trace_name"])
             self.assertEqual(
                 manifest,

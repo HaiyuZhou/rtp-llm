@@ -123,7 +123,7 @@ class DecodeProfiler:
             retained = self._run_root / "traces" / path.name
             retained.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_json(retained, trace)
-            artifacts.append(str(retained.resolve()))
+            artifacts.append(str(retained.relative_to(self._run_root)))
         return tuple(sorted(artifacts))
 
     def profile(self, case: DecodeCaseSpec, batch_size: int) -> Dict[str, Any]:

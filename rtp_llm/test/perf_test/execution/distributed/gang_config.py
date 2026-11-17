@@ -1,8 +1,7 @@
 """Gang config string construction for multi-host perf-test runs.
 
-The builder lives here (not in ``local_server_runner``) so Bazel targets
-can import it without pulling the server startup stack and the
-internal-source environment machinery along.
+Keep member encoding independent of engine startup so planning and workers
+can share it without importing the model runtime.
 """
 
 from __future__ import annotations

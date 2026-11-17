@@ -63,8 +63,12 @@ class GangWorkerTest(unittest.TestCase):
         self.assertNotIn(secret, (self.root / "outputs/gang_worker.json").read_text())
 
     def test_decode_worker_resolves_its_own_tokenizer(self):
-        self._example("decode")
-        handle = Mock(tokenizer_path=None)
+        source = self._example("decode")
+        source["model"]["topology"] = {"tp": 1, "dp": 2, "pp": 1, "ep": 2}
+        source["workload"]["batch"]["sizes"] = [2]
+        self.gang["topology"] = source["model"]["topology"]
+        self._freeze_source(source)
+        handle = Mock(tokenizer_path=None, log_dir=str(self.root / "worker-logs"))
         with patch(
             "rtp_llm.test.perf_test.aone.gang_worker._resolve_model_paths",
             return_value={"tokenizer": "/local/tokenizer"},
@@ -72,7 +76,7 @@ class GangWorkerTest(unittest.TestCase):
             "rtp_llm.test.perf_test.test_util.create_query",
             return_value={8: "prompt"},
         ) as create, patch(
-            "rtp_llm.test.perf_test.multi_node.decode_sync.serve_decode_worker"
+            "rtp_llm.test.perf_test.execution.distributed.decode_sync.serve_decode_worker"
         ) as serve:
             _default_decode_worker(
                 handle,
@@ -131,6 +135,27 @@ class GangWorkerTest(unittest.TestCase):
             ],
         )
 
+    def _freeze_source(self, source):
+        from rtp_llm.test.perf_test.entry import plan_from_source
+        from rtp_llm.test.perf_test.plan import thaw
+
+        plan, _ = plan_from_source(
+            source,
+            source_dir=self.root,
+            result_directory=str(self.root / "controller-run"),
+        )
+        self.config_path.write_text(json.dumps(source))
+        self.config_path.with_suffix(".frozen.json").write_text(
+            json.dumps(thaw(plan.resolved_config["workload"]))
+        )
+        self.gang.update(
+            execution_plan=plan.to_dict(),
+            config_fingerprint=plan.config_fingerprint,
+            workload_fingerprint=plan.workload_fingerprint,
+            topology=source["model"]["topology"],
+        )
+        self.plan_path.write_text(json.dumps(self.gang))
+
     def _example(self, mode):
         source = _gang_source()
         source["model"]["topology"] = {"tp": 2, "dp": 1, "pp": 1, "ep": 1}
@@ -165,7 +190,7 @@ class GangWorkerTest(unittest.TestCase):
                 measure_runs=1,
                 profiling={"enabled": False},
             )
-        self.config_path.write_text(json.dumps(source))
+        self._freeze_source(source)
         return source
 
     def test_model_startup_propagates_args_rank_layout_and_disables_cross_host_all_reduce(
@@ -186,7 +211,7 @@ class GangWorkerTest(unittest.TestCase):
                 "RTP_LLM_GPU_LOCKED_DEVICES": "4,5,6,7,0,1,2,3",
             },
         ), patch(
-            "rtp_llm.test.perf_test.aone.gang_worker._load_local_server_runner",
+            "rtp_llm.test.perf_test.aone.gang_worker._load_rank_group",
             return_value=runner,
         ), patch(
             "rtp_llm.test.perf_test.aone.gang_worker._resolve_model_paths",
@@ -245,7 +270,7 @@ class GangWorkerTest(unittest.TestCase):
             "rtp_llm.test.perf_test.test_util._load_tokenizer",
             return_value=SimpleNamespace(encode=lambda text: text.split()),
         ), patch(
-            "rtp_llm.test.perf_test.multi_node.prefill_runtime.ExternalPrefillSession",
+            "rtp_llm.test.perf_test.execution.distributed.prefill.ExternalPrefillSession",
             return_value=session,
         ):
             code = _default_prefill_master_executor(
@@ -307,7 +332,7 @@ class GangWorkerTest(unittest.TestCase):
         with patch(
             "rtp_llm.test.perf_test.test_util.create_query", return_value={8: "prompt"}
         ), patch(
-            "rtp_llm.test.perf_test.multi_node.decode_runtime.DecodeHttpTransport",
+            "rtp_llm.test.perf_test.execution.distributed.decode.DecodeHttpTransport",
             return_value=transport,
         ) as factory:
             code = _default_master_executor(
@@ -359,18 +384,21 @@ class GangWorkerTest(unittest.TestCase):
         self.config_path.write_text(json.dumps(source))
         self.gang["topology"] = source["model"]["topology"]
         context = build_worker_context(self.gang, self.members, 0)
-        plan = SimpleNamespace(cases=[SimpleNamespace(identity={"input_lengths": [8]})])
+        plan = SimpleNamespace(
+            cases=[SimpleNamespace(identity={"input_lengths": [8]})],
+            resolved_config=source,
+        )
         cluster = Mock()
         with patch(
-            "rtp_llm.test.perf_test.multi_node.decode_runtime.build_external_decode_plan",
+            "rtp_llm.test.perf_test.aone.gang_worker._build_gang_execution_plan",
             return_value=(plan, source),
         ), patch(
             "rtp_llm.test.perf_test.test_util.create_query", return_value={8: "prompt"}
         ), patch(
-            "rtp_llm.test.perf_test.multi_node.decode_sync.ClusterDecodeTransport",
+            "rtp_llm.test.perf_test.execution.distributed.decode_sync.ClusterDecodeTransport",
             return_value=cluster,
         ), patch(
-            "rtp_llm.test.perf_test.multi_node.decode_runtime.execute_master_decode",
+            "rtp_llm.test.perf_test.execution.distributed.decode.execute_master_decode",
             return_value=SimpleNamespace(state=RunState.COMPLETED),
         ) as execute:
             code = _default_master_executor(
@@ -561,10 +589,14 @@ class FrozenGangInputsTest(unittest.TestCase):
                                 "rtp_llm.test.perf_test.test_util.create_query",
                                 return_value={},
                             ) as queries, patch(
-                                "rtp_llm.test.perf_test.multi_node.decode_sync.serve_decode_worker"
+                                "rtp_llm.test.perf_test.execution.distributed.decode_sync.serve_decode_worker"
                             ) as serve:
                                 gang_worker._default_decode_worker(
-                                    SimpleNamespace(tokenizer_path="/tokenizer"),
+                                    SimpleNamespace(
+                                        tokenizer_path="/tokenizer",
+                                        log_file_path=None,
+                                        log_dir=str(outputs),
+                                    ),
                                     context=worker_context,
                                     config_path=str(config_path),
                                 )

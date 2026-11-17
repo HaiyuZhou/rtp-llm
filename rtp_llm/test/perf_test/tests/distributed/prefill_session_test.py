@@ -5,11 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from rtp_llm.test.perf_test.entry import plan_from_source
 from rtp_llm.test.perf_test.errors import CaseExecutionError
-from rtp_llm.test.perf_test.multi_node.prefill_runtime import (
-    ExternalPrefillSession,
-    build_external_prefill_plan,
-)
+from rtp_llm.test.perf_test.execution.distributed.prefill import ExternalPrefillSession
 from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.tests.support.fixtures import (
     prefill_external_aux,
@@ -30,8 +28,10 @@ class ExternalPrefillSessionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = prefill_external_write_prefill_config(root)
-            (plan, _source) = build_external_prefill_plan(
-                path, str(root / "run"), prefill_external_TOPOLOGY
+            (plan, _source) = plan_from_source(
+                json.loads(Path(path).read_text()),
+                source_dir=Path(path).parent,
+                result_directory=str(str(root / "run")),
             )
             with prefill_external_FakeModelServer(
                 [
@@ -93,8 +93,10 @@ class ExternalPrefillSessionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = prefill_external_write_prefill_config(root)
-            (plan, _source) = build_external_prefill_plan(
-                path, str(root / "run"), prefill_external_TOPOLOGY
+            (plan, _source) = plan_from_source(
+                json.loads(Path(path).read_text()),
+                source_dir=Path(path).parent,
+                result_directory=str(str(root / "run")),
             )
             with prefill_external_FakeModelServer(
                 [

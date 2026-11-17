@@ -2,109 +2,24 @@
 
 from __future__ import annotations
 
-import copy
-import hashlib
 import json
 import os
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-from rtp_llm.test.perf_test.capabilities import validate_capability
-from rtp_llm.test.perf_test.config_resolver import canonical_json, load_resolved_config
 from rtp_llm.test.perf_test.config_schema import (
     DEFAULT_PREFILL_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_PREFILL_TRANSPORT,
-    PrefillWorkloadConfig,
-    parse_config,
 )
-from rtp_llm.test.perf_test.entry import _source_config
-from rtp_llm.test.perf_test.errors import ConfigurationError, PlanningError
 from rtp_llm.test.perf_test.execution.engine_session import EngineDiagnostics
 from rtp_llm.test.perf_test.execution.runtime import HttpPrefillClient
 from rtp_llm.test.perf_test.modes import ModeExecutionContext
-from rtp_llm.test.perf_test.plan import build_execution_plan, thaw
+from rtp_llm.test.perf_test.plan import thaw
 from rtp_llm.test.perf_test.prefill.adapter import create_prefill_adapter
 from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
-from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
-from rtp_llm.test.perf_test.prefill.traffic_batch import materialize_traffic_source
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.storage import RunStore
-
-
-def build_external_prefill_plan(
-    config_path,
-    result_directory,
-    actual_topology,
-    *,
-    resolved_workload_path=None,
-    execution_parser=None,
-    resource_planner=None,
-    capability_validator=validate_capability,
-):
-    """Build the local prefill case identities without creating run artifacts.
-
-    Mirrors ``build_external_decode_plan``: the configured topology must
-    match the topology the running service was started with, and the
-    returned plan is fully frozen (with standard case IDs and fingerprints)
-    before any run directory is initialized.
-    """
-    source = _source_config(str(config_path))
-    resolved = load_resolved_config(config_path, execution_parser=execution_parser)
-    if resolved_workload_path:
-        delivered = json.loads(Path(resolved_workload_path).read_text(encoding="utf-8"))
-
-        def without_sampling(workload):
-            workload = copy.deepcopy(workload)
-            workload.pop("traffic_sampling", None)
-            for grid in workload.get("grids", ()):
-                grid["workload"] = without_sampling(grid["workload"])
-            return workload
-
-        if canonical_json(without_sampling(delivered)) != canonical_json(
-            without_sampling(resolved.resolved_config["workload"])
-        ):
-            raise PlanningError(
-                "delivered resolved workload does not match frozen config"
-            )
-        normalized = {**resolved.resolved_config, "workload": delivered}
-        resolved = replace(
-            resolved,
-            resolved_config=normalized,
-            workload_fingerprint=hashlib.sha256(
-                canonical_json(delivered).encode("utf-8")
-            ).hexdigest(),
-        )
-    planned_source = materialize_traffic_source(
-        source, resolved.resolved_config["workload"]
-    )
-    config = parse_config(planned_source, execution_parser=execution_parser)
-    if not isinstance(config.workload, PrefillWorkloadConfig):
-        raise ConfigurationError("external prefill requires workload.kind=cache_grid")
-    configured = config.model.topology.as_tuple()
-    actual = tuple(actual_topology.get(name) for name in ("tp", "dp", "pp", "ep"))
-    if any(type(value) is not int or value <= 0 for value in actual):
-        raise PlanningError(
-            "runtime topology must supply positive integer TP, DP, PP, and EP sizes"
-        )
-    if configured != actual:
-        raise PlanningError(
-            f"runtime topology {actual} does not match configured topology {configured}"
-        )
-    cases = plan_prefill_cases(
-        config.workload, config.engine, dp_size=config.model.topology.dp
-    )
-    plan = build_execution_plan(
-        resource_planner=resource_planner,
-        capability_validator=capability_validator,
-        mode="prefill",
-        action="run",
-        resolved=resolved,
-        cases=cases,
-        result_directory=str(result_directory),
-    )
-    return plan, source
 
 
 class ExternalPrefillSession:

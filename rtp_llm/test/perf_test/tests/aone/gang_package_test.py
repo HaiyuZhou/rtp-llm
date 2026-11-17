@@ -54,6 +54,7 @@ class GangPackageTest(unittest.TestCase):
             self.assertIn(BROKER_TOKEN_ENV, action["env_inherit"])
             self.assertNotIn(BROKER_TOKEN_ENV, " ".join(action["args"]))
             payload = load_gang_plan(package.shard_plan)
+            self.assertEqual(plan.to_dict(), payload["execution_plan"])
             self.assertEqual(
                 (16, 4, 4, 8),
                 tuple(

@@ -509,14 +509,20 @@ class PublicBoundaryTest(unittest.TestCase):
                         ),
                     )
 
-    def test_historical_plan_roundtrip_is_read_only(self):
-        payload = json.loads(
-            (public_boundary_ROOT / "testdata/historical_aone_plan.json").read_text()
+    def test_historical_plan_is_rejected(self):
+        plan, _ = build_request_plan(
+            parse_cli(
+                [
+                    "--config="
+                    + str(public_boundary_ROOT / "examples/prefill_local.json"),
+                    "--dry-run",
+                ]
+            )
         )
-        plan = ExecutionPlan.from_dict(payload)
-        self.assertEqual(payload, plan.to_dict())
-        with self.assertRaises(PlanningError):
-            create_preview(plan)
+        payload = plan.to_dict()
+        payload["schema_version"] = 1
+        with self.assertRaisesRegex(PlanningError, "schema_version"):
+            ExecutionPlan.from_dict(payload)
 
     def test_decode_follow_up_actions_rejected_before_output_or_executor(self):
         for action in ("resume", "profile", "report"):
@@ -674,3 +680,94 @@ class RepositoryProvenanceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InferredCliTest(unittest.TestCase):
+
+    def test_invalid_workload_shape_is_a_configuration_error(self):
+        from rtp_llm.test.perf_test.entry import plan_from_source
+
+        for workload in (None, [], "grid"):
+            with self.subTest(workload=workload), self.assertRaises(ConfigurationError):
+                plan_from_source({"workload": workload}, source_dir=Path.cwd())
+
+    def test_single_config_defaults_to_run_and_infers_mode(self):
+        request = parse_cli(["--config=" + str(entry_LOCAL), "--dry-run"])
+        self.assertEqual("run", request.action)
+        self.assertIsNone(request.mode)
+        plan, _ = build_request_plan(request)
+        self.assertEqual("prefill", plan.mode)
+
+    def test_explicit_mode_is_assertion(self):
+        request = parse_cli(["--mode=decode", "--config=" + str(entry_LOCAL)])
+        with self.assertRaises(ConfigurationError):
+            build_request_plan(request)
+
+    def test_maintenance_only_accepts_existing_run(self):
+        request = parse_cli(["--run-dir=/tmp/existing-run", "--maintenance=status"])
+        self.assertEqual("status", request.maintenance)
+        for argv in (
+            ["--maintenance=cancel"],
+            ["--run-dir=x", "--maintenance=clean", "--action=run"],
+        ):
+            with self.assertRaises(ConfigurationError):
+                parse_cli(argv)
+
+
+class SshEntryContractTest(unittest.TestCase):
+    def test_one_config_freezes_git_and_roundtrips_without_original_worktree(self):
+        import shutil
+
+        from rtp_llm.test.perf_test.entry import plan_from_source
+        from rtp_llm.test.perf_test.run_directory import inspect_run_directory
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "public source"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / "source.py").write_text("print('source')\n")
+            subprocess.run(["git", "-C", str(repo), "add", "source.py"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "-c",
+                    "user.name=Perf Test",
+                    "-c",
+                    "user.email=perf@example.invalid",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+                check=True,
+            )
+            source = json.loads(entry_LOCAL.read_text())
+            source["execution"] = {
+                "backend": "ssh",
+                "hosts": [
+                    {"ssh_target": "gpu-via-jump", "advertise_host": "192.0.2.11"}
+                ],
+                "gpus_per_machine": 1,
+                "source": {"build_policy": "reuse", "worktree": repo.name},
+            }
+            plan, frozen_source = plan_from_source(
+                source, source_dir=root, result_directory=str(root / "run")
+            )
+            self.assertEqual(
+                40, len(plan.resolved_config["execution"]["source"]["ref"])
+            )
+            self.assertEqual(1, plan.resource_plan.machine_count)
+            self.assertEqual(plan, ExecutionPlan.from_dict(plan.to_dict()))
+            initialize_run_directory(
+                root / "run",
+                source_config=frozen_source,
+                plan=plan,
+                run_id="run",
+                code_version="test",
+            )
+            shutil.rmtree(repo)
+            self.assertEqual(plan, inspect_run_directory(root / "run").execution_plan)
+            with self.assertRaises(TypeError):
+                plan.resource_plan.hosts[0]["ssh_target"] = "changed"

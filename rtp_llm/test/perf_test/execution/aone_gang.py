@@ -35,6 +35,7 @@ from rtp_llm.test.perf_test.aone.collector import CollectionOutcome
 from rtp_llm.test.perf_test.aone.package import (
     GeneratedAOnePackage,
     generate_gang_package,
+    package_location,
 )
 from rtp_llm.test.perf_test.aone.plan import (
     AONE_GPU_HOSTS,
@@ -44,12 +45,11 @@ from rtp_llm.test.perf_test.aone.plan import (
 from rtp_llm.test.perf_test.errors import (
     CaseExecutionError,
     CollectionError,
-    PartialRunError,
     PerfTestError,
     PostExecutionError,
     ReportError,
 )
-from rtp_llm.test.perf_test.execution.aone import AOneExecutionOutcome, AOneExecutor
+from rtp_llm.test.perf_test.execution.aone import AOneExecutionOutcome
 from rtp_llm.test.perf_test.execution.aone_bazel import (
     _MAX_ARCHIVE_MEMBERS,
     AONE_TEST_TIMEOUT_S,
@@ -57,30 +57,21 @@ from rtp_llm.test.perf_test.execution.aone_bazel import (
     _safe_zip_member,
     _workspace_root,
 )
-from rtp_llm.test.perf_test.plan import AOneResourcePlan, ExecutionPlan, thaw
-from rtp_llm.test.perf_test.results import parse_result_envelope
+from rtp_llm.test.perf_test.execution.artifacts import (
+    collect_master_artifacts,
+    copy_member_traces,
+)
+from rtp_llm.test.perf_test.execution.gang import (
+    reconcile_terminal_state,
+    record_stage,
+    write_manifest,
+)
+from rtp_llm.test.perf_test.plan import AOneResourcePlan, ExecutionPlan
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock, inspect_run_directory
 from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.storage import RunStore, atomic_write_json
 
 BROKER_TOKEN_ENV = "PERF_TEST_BROKER_TOKEN"
-
-# The subtrees of the master's run directory that hold result artifacts.
-# Planning snapshots (execution plan, configs, manifest) stay submit-side.
-_MASTER_ARTIFACT_TREES = ("results", "reports", "traces", "profiles", "checkpoints")
-
-# Stage execution order. Persisted manifests are key-sorted JSON, so the
-# order is recorded explicitly inside every stage entry.
-_STAGE_ORDER = {"rendezvous": 0, "build": 1, "submit": 2, "collect": 3, "report": 4}
-
-
-def _forbidden_stage_seam(stage: str) -> Callable[..., Any]:
-    def _raise(*_args: Any, **_kwargs: Any) -> Any:
-        raise RuntimeError(  # pragma: no cover - guard against misuse
-            f"GangAOneExecutor drives the {stage} stage itself"
-        )
-
-    return _raise
 
 
 def _redact(text: str, secret: str) -> str:
@@ -98,7 +89,7 @@ def _package_path(target: str) -> Path:
     return Path(package) / name
 
 
-class GangAOneExecutor(AOneExecutor):
+class GangAOneExecutor:
     """Execute one multi-machine AOne plan through a broker-coordinated gang."""
 
     def __init__(
@@ -129,13 +120,7 @@ class GangAOneExecutor(AOneExecutor):
                 f"unsupported gang GPU type {gpu_type!r}; gang shards request "
                 f"full hosts, supported GPU types: {supported}"
             )
-        super().__init__(
-            workspace_root=workspace_root,
-            builder=_forbidden_stage_seam("build"),
-            submitter=_forbidden_stage_seam("submit"),
-            result_collector=_forbidden_stage_seam("collect"),
-            reporter=reporter,
-        )
+        self._workspace_root = Path(workspace_root).resolve()
         self._resource = resource
         self._platform = AONE_GPU_PLATFORMS[gpu_type]
         self._max_parallel = _positive_integer("max_parallel", max_parallel)
@@ -153,6 +138,11 @@ class GangAOneExecutor(AOneExecutor):
         self._broker_host = broker_host
         self._reporter_override = reporter
 
+    _write_manifest = staticmethod(write_manifest)
+
+    def _package_location(self, root: Path) -> tuple[Path, str]:
+        return package_location(self._workspace_root, root)
+
     # Public entry ---------------------------------------------------------
 
     def _write_stage(
@@ -165,17 +155,8 @@ class GangAOneExecutor(AOneExecutor):
         state: Optional[RunState] = None,
         details: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        """Persist one stage transition with its explicit execution order."""
-        payload: Dict[str, Any] = {"stage_index": _STAGE_ORDER[stage]}
-        if details:
-            payload.update(dict(details))
-        self._write_manifest(
-            store,
-            manifest,
-            state=state,
-            stage=stage,
-            status=status,
-            details=payload,
+        record_stage(
+            store, manifest, stage=stage, status=status, state=state, details=details
         )
 
     def _stage_failure(
@@ -485,9 +466,9 @@ class GangAOneExecutor(AOneExecutor):
             status="running",
         )
         if collection is not None:
-            final_state = collection.state
-            final_failure = collection.failure
-            if test_failure is not None and final_state == RunState.COMPLETED:
+            final_state = reconcile_terminal_state(collection.state, test_failure)
+            final_failure = test_failure or collection.failure
+            if test_failure is not None and collection.state == RunState.COMPLETED:
                 # A completed envelope contradicts the observed nonzero bazel
                 # exit; the test failure is authoritative.
                 final_state = RunState.FAILED
@@ -639,93 +620,19 @@ class GangAOneExecutor(AOneExecutor):
 
     @staticmethod
     def _copy_worker_traces(outputs: Path, trace_root: Path, shard_index: int) -> None:
-        """Retain complete decode traces emitted by a non-master rank group."""
-        destination = trace_root / f"shard_{shard_index + 1}"
         for engine_dir in sorted(outputs.glob("TEST_OUTPUT_*")):
-            for source in sorted(engine_dir.rglob("decode_*.json")):
-                if not source.is_file():
-                    continue
-                try:
-                    trace = json.loads(source.read_text(encoding="utf-8"))
-                except (OSError, UnicodeError, ValueError):
-                    continue
-                if not isinstance(trace, dict) or not isinstance(
-                    trace.get("traceEvents"), list
-                ):
-                    continue
-                destination.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination / source.name)
+            copy_member_traces(engine_dir, trace_root, f"shard_{shard_index + 1}")
 
     def _collect_master_tree(self, root: Path, outputs: Path) -> CollectionOutcome:
-        run_tree = outputs / "run"
-        envelope_path = run_tree / "results" / "result.json"
-        if not envelope_path.is_file():
-            raise CollectionError(
-                f"gang master run tree is missing its result envelope: {envelope_path}"
-            )
-        try:
-            envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            raise CollectionError(
-                f"gang master result envelope is unreadable: {error}"
-            ) from error
-        parsed = parse_result_envelope(envelope)
         snapshot = inspect_run_directory(root)
-        plan = snapshot.execution_plan
-        expected = {
-            "run_id": snapshot.manifest["run_id"],
-            "mode": plan.mode,
-            "backend": "aone",
-            "config_fingerprint": plan.config_fingerprint,
-            "workload_fingerprint": plan.workload_fingerprint,
-        }
-        for field, value in expected.items():
-            if envelope.get(field) != value:
-                raise CollectionError(
-                    f"gang master result {field} does not match the plan"
-                )
-        planned = {case.case_id: thaw(case.identity) for case in plan.cases}
-        if {case.case_id for case in parsed.cases} != set(planned) or len(
-            parsed.cases
-        ) != len(planned):
-            raise CollectionError(
-                "gang master results must cover every planned case exactly once"
-            )
-        for case in parsed.cases:
-            if case.identity != planned[case.case_id]:
-                raise CollectionError(
-                    f"gang master case identity does not match: {case.case_id}"
-                )
-        for name in _MASTER_ARTIFACT_TREES:
-            source = run_tree / name
-            if not source.is_dir():
-                continue
-            destination = root / name
-            destination.mkdir(parents=True, exist_ok=True)
-            for path in sorted(source.rglob("*")):
-                if path.is_file():
-                    target = destination / path.relative_to(source)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(path, target)
-        cases = tuple(dict(case) for case in envelope.get("cases", []))
-        if parsed.status == RunState.COMPLETED:
-            return CollectionOutcome(RunState.COMPLETED, cases)
-        if parsed.status == RunState.PARTIAL:
-            return CollectionOutcome(
-                RunState.PARTIAL,
-                cases,
-                failure=PartialRunError("remote gang run completed part of the plan"),
-            )
-        if parsed.status == RunState.INTERRUPTED:
-            return CollectionOutcome(
-                RunState.PARTIAL,
-                cases,
-                failure=PartialRunError("remote gang run was interrupted"),
-            )
+        collected = collect_master_artifacts(
+            root,
+            outputs / "run",
+            plan=snapshot.execution_plan,
+            run_id=snapshot.manifest["run_id"],
+        )
         return CollectionOutcome(
-            RunState.FAILED,
-            cases,
-            failure=CaseExecutionError("remote gang run failed"),
+            collected.state, collected.cases, failure=collected.failure
         )
 
     # Helpers --------------------------------------------------------------

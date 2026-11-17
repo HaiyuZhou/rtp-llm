@@ -16,7 +16,7 @@ from rtp_llm.test.perf_test.capabilities import (
 )
 from rtp_llm.test.perf_test.case_planning import plan_cases as _planned_cases
 from rtp_llm.test.perf_test.cli import CliRequest, parse_cli
-from rtp_llm.test.perf_test.config_resolver import load_resolved_config
+from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.decode.planner import validate_decode_frontend_lengths
 from rtp_llm.test.perf_test.errors import (
     CaseExecutionError,
@@ -28,6 +28,7 @@ from rtp_llm.test.perf_test.plan import (
     AOneResourcePlan,
     ExecutionPlan,
     LocalResourcePlan,
+    SshResourcePlan,
     build_execution_plan,
 )
 from rtp_llm.test.perf_test.prefill.planner import require_concurrent_prefill_plan
@@ -88,7 +89,7 @@ def create_preview(
 
 
 def backend_preview(plan: ExecutionPlan) -> Dict[str, Any]:
-    """Render local execution; historical remote plans remain read-only."""
+    """Render local execution; other backends provide placement renderers."""
     if plan.backend != "local":
         raise PlanningError("non-local preview requires an explicit renderer")
     plan_path = str(PurePath(plan.result_directory) / "execution_plan.json")
@@ -139,74 +140,119 @@ def _source_config(path: str) -> Dict[str, Any]:
     return value
 
 
-def _new_plan(request: CliRequest) -> tuple[ExecutionPlan, Dict[str, Any]]:
-    assert request.config is not None
-    source = _source_config(request.config)
-    raw_execution = source.get("execution")
-    is_aone = (
-        isinstance(raw_execution, Mapping) and raw_execution.get("backend") == "aone"
+def infer_mode(source: Mapping[str, Any], assertion: Optional[str] = None) -> str:
+    workload = source.get("workload")
+    if not isinstance(workload, Mapping):
+        raise ConfigurationError("workload: expected an object")
+    kind = workload.get("kind")
+    mode = {"cache_grid": "prefill", "grid": "decode", "distribution": "decode"}.get(
+        kind
     )
+    if mode is None:
+        raise ConfigurationError(f"unsupported workload.kind: {kind!r}")
+    if assertion is not None and assertion != mode:
+        raise ConfigurationError(
+            f"--mode={assertion} conflicts with workload.kind={kind!r}"
+        )
+    return mode
+
+
+def plan_from_source(
+    source: Mapping[str, Any],
+    *,
+    source_dir: Path,
+    result_directory: Optional[str] = None,
+    mode: Optional[str] = None,
+    action: str = "run",
+    external_inputs: Optional[dict] = None,
+) -> tuple[ExecutionPlan, Dict[str, Any]]:
+    """Plan in memory once; callers may freeze every experiment task before run."""
+    mode = infer_mode(source, mode)
+    execution = source.get("execution")
+    if not isinstance(execution, Mapping):
+        raise ConfigurationError("execution: expected an object")
+    backend = execution.get("backend")
     parser = None
     planner = None
     validator = validate_capability
-    if is_aone:
+    if backend == "aone":
         from rtp_llm.test.perf_test.aone.config_schema import parse_execution
         from rtp_llm.test.perf_test.aone.plan import plan_resources
 
-        parser = parse_execution
-        planner = plan_resources
-        validator = validate_aone_capability
-    resolved = load_resolved_config(request.config, execution_parser=parser)
-    cases = _planned_cases(request.mode, source, resolved, execution_parser=parser)
+        parser, planner, validator = (
+            parse_execution,
+            plan_resources,
+            validate_aone_capability,
+        )
+    elif backend == "ssh":
+        from rtp_llm.test.perf_test.ssh.config_schema import parse_execution
+        from rtp_llm.test.perf_test.ssh.plan import plan_resources
+
+        parser, planner = parse_execution, plan_resources
+    resolved = resolve_config(
+        source,
+        source_dir=source_dir,
+        execution_parser=parser,
+        external_inputs=external_inputs,
+    )
+    cases = _planned_cases(mode, source, resolved, execution_parser=parser)
     root = Path(resolved.resolved_config["output"]["result_root"]).resolve()
-    result_directory = str(root / _run_id(request.mode))
     plan = build_execution_plan(
-        mode=request.mode,
-        action=request.action,
+        mode=mode,
+        action=action,
         resolved=resolved,
         cases=cases,
-        result_directory=result_directory,
+        result_directory=result_directory or str(root / _run_id(mode)),
         resource_planner=planner,
         capability_validator=validator,
     )
-    if request.mode == "decode":
+    if mode == "decode":
         topology = resolved.resolved_config["model"]["topology"]
-        if isinstance(plan.resource_plan, LocalResourcePlan):
-            local_dp_size = topology["dp"]
-        elif isinstance(plan.resource_plan, AOneResourcePlan):
-            local_dp_size = plan.resource_plan.local_world_size // topology["tp"]
-        else:
-            raise PlanningError("decode planning requires a known frontend layout")
-        validate_decode_frontend_lengths(
-            cases, dp_size=topology["dp"], local_dp_size=local_dp_size
+        local_dp = (
+            topology["dp"]
+            if isinstance(plan.resource_plan, LocalResourcePlan)
+            else max(1, plan.resource_plan.local_world_size // topology["tp"])
         )
-    return plan, source
+        validate_decode_frontend_lengths(
+            cases, dp_size=topology["dp"], local_dp_size=local_dp
+        )
+    return plan, dict(source)
+
+
+def _new_plan(request: CliRequest) -> tuple[ExecutionPlan, Dict[str, Any]]:
+    assert request.config is not None
+    return plan_from_source(
+        _source_config(request.config),
+        source_dir=Path(request.config).resolve().parent,
+        mode=request.mode,
+        action=request.action,
+    )
 
 
 def _persisted_plan(request: CliRequest) -> tuple[ExecutionPlan, Dict[str, Any]]:
     assert request.run_dir is not None
     snapshot = inspect_run_directory(request.run_dir)
     plan = snapshot.execution_plan
-    if request.mode != plan.mode:
+    if request.mode is not None and request.mode != plan.mode:
         raise ConfigurationError(
             f"--mode={request.mode} does not match persisted mode {plan.mode}"
         )
+    if request.skip_test and plan.mode != "prefill":
+        raise ConfigurationError("--skip-test requires a prefill run")
     validator = (
         validate_aone_capability if plan.backend == "aone" else validate_capability
     )
-    validator(request.mode, request.action, plan.backend)
-    if request.mode == "prefill" and request.action in ("resume", "profile"):
+    validator(plan.mode, request.action, plan.backend)
+    if plan.mode == "prefill" and request.action in ("resume", "profile"):
         require_concurrent_prefill_plan(plan)
     if request.cases:
-        known = {item.case_id for item in plan.cases}
-        unknown = sorted(set(request.cases) - known)
+        unknown = sorted(set(request.cases) - {item.case_id for item in plan.cases})
         if unknown:
             raise ConfigurationError(f"unknown --cases value: {unknown[0]}")
     return replace(plan, action=request.action), snapshot.source_config
 
 
 def build_request_plan(request: CliRequest) -> tuple[ExecutionPlan, Dict[str, Any]]:
-    """Resolve a CLI request without mutating its result directory."""
     return _new_plan(request) if request.action == "run" else _persisted_plan(request)
 
 
@@ -228,6 +274,10 @@ def _default_executors(
                 broker_host=request.broker_host if request else None,
             )
         }
+    if backend == "ssh":
+        from rtp_llm.test.perf_test.execution.ssh import create_default_ssh_executor
+
+        return {"ssh": lambda plan: create_default_ssh_executor(plan)(plan)}
     from rtp_llm.test.perf_test.execution.local import create_default_local_executor
 
     selected = () if request is None else request.cases
@@ -236,23 +286,29 @@ def _default_executors(
     }
 
 
-def run_request(
-    request: CliRequest,
+def execute_plan(
+    plan: ExecutionPlan,
+    source: Mapping[str, Any],
+    request: Optional[CliRequest] = None,
     *,
     executor_factory: ExecutorFactory = _default_executors,
 ) -> Any:
-    """Plan first; keep dry-run outside every filesystem/execution side effect."""
-    plan, source = build_request_plan(request)
-    if plan.backend != "aone" and (
-        request.bazel_startup_args or request.bazel_args or request.broker_host
+    """Execute an already frozen plan; never re-resolve config or workload."""
+    if (
+        plan.backend != "aone"
+        and request is not None
+        and (request.bazel_startup_args or request.bazel_args or request.broker_host)
     ):
         raise ConfigurationError(
             "Bazel options and --broker-host require the AOne backend"
         )
-    if request.dry_run:
-        preview = create_preview(
-            plan, preview_renderer=aone_preview if plan.backend == "aone" else None
-        )
+    if request is not None and request.dry_run:
+        renderer = aone_preview if plan.backend == "aone" else None
+        if plan.backend == "ssh":
+            from rtp_llm.test.perf_test.ssh.plan import ssh_preview
+
+            renderer = ssh_preview
+        preview = create_preview(plan, preview_renderer=renderer)
         if request.cases:
             preview["selected_case_ids"] = list(request.cases)
         if plan.backend == "aone":
@@ -262,8 +318,8 @@ def run_request(
             if request.broker_host and "gang" in preview:
                 preview["gang"]["broker_host"] = request.broker_host
         return preview
-    if request.action == "run":
-        run_context = read_run_context(request.run_context)
+    if plan.action == "run":
+        run_context = read_run_context(request.run_context if request else None)
         initialize_run_directory(
             plan.result_directory,
             source_config=source,
@@ -277,8 +333,44 @@ def run_request(
         if executor_factory is _default_executors
         else executor_factory()
     )
-    orchestrator = Orchestrator(executors)
-    return orchestrator.execute(plan)
+    return Orchestrator(executors).execute(plan)
+
+
+def run_request(
+    request: CliRequest, *, executor_factory: ExecutorFactory = _default_executors
+) -> Any:
+    if request.maintenance is not None:
+        from rtp_llm.test.perf_test.ssh.maintenance import maintain
+
+        return maintain(request.run_dir, request.maintenance, dry_run=request.dry_run)
+    if request.config:
+        source = _source_config(request.config)
+        if "experiment_schema_version" in source:
+            if (
+                request.mode
+                or request.action != "run"
+                or request.cases
+                or request.bazel_args
+                or request.bazel_startup_args
+                or request.broker_host
+            ):
+                raise ConfigurationError(
+                    "experiment accepts --config, --dry-run and --run-context only"
+                )
+            from rtp_llm.test.perf_test.experiment import run_experiment
+
+            return run_experiment(
+                request.config, dry_run=request.dry_run, run_context=request.run_context
+            )
+        plan, source = plan_from_source(
+            source,
+            source_dir=Path(request.config).resolve().parent,
+            mode=request.mode,
+            action=request.action,
+        )
+    else:
+        plan, source = build_request_plan(request)
+    return execute_plan(plan, source, request, executor_factory=executor_factory)
 
 
 def main(
@@ -297,7 +389,11 @@ def main(
             output.write(json.dumps(result, sort_keys=True, indent=2) + "\n")
             if request.action == "profile" and result.get("status") == "failed":
                 return CaseExecutionError.exit_code
-        exit_code = getattr(result, "exit_code", 0)
+        exit_code = (
+            result.get("exit_code", 0)
+            if isinstance(result, Mapping)
+            else getattr(result, "exit_code", 0)
+        )
         return int(exit_code)
     except PerfTestError as error:
         errors.write(f"perf_test: {error}\n")

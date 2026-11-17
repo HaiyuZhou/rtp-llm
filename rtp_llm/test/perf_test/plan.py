@@ -11,7 +11,7 @@ from rtp_llm.test.perf_test.capabilities import CapabilityValidator, validate_ca
 from rtp_llm.test.perf_test.config_resolver import ResolvedConfig, canonical_json
 from rtp_llm.test.perf_test.errors import PlanningError, ResourceError
 
-PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -121,7 +121,25 @@ class AOneResourcePlan:
         }
 
 
-ResourcePlan = Union[LocalResourcePlan, AOneResourcePlan]
+@dataclass(frozen=True)
+class SshResourcePlan:
+    backend: str
+    world_size: int
+    machine_count: int
+    local_world_size: int
+    hosts: Tuple[FrozenMap, ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "world_size": self.world_size,
+            "machine_count": self.machine_count,
+            "local_world_size": self.local_world_size,
+            "hosts": [thaw(host) for host in self.hosts],
+        }
+
+
+ResourcePlan = Union[LocalResourcePlan, AOneResourcePlan, SshResourcePlan]
 
 
 class ResourcePlanner(Protocol):
@@ -186,16 +204,36 @@ class ExecutionPlan:
             raise PlanningError(
                 f"unsupported execution plan schema_version: {schema_version!r}"
             )
-        # Historical remote plans are data, not authorization for new execution.
         if backend == "aone":
-            if (mode, action) not in {
-                ("prefill", "run"),
-                ("prefill", "report"),
-                ("decode", "run"),
-            }:
-                raise PlanningError("invalid historical remote plan capability")
+            from rtp_llm.test.perf_test.capabilities import validate_aone_capability
+
+            validate_aone_capability(mode, action, backend)
         else:
             validate_capability(mode, action, backend)
+        if (
+            not isinstance(raw_config, Mapping)
+            or raw_config.get("execution", {}).get("backend") != backend
+        ):
+            raise PlanningError("execution plan backend does not match resolved config")
+        fields = {
+            name: section for name, section in raw_config.items() if name != "workload"
+        }
+        if (
+            hashlib.sha256(canonical_json(fields).encode("utf-8")).hexdigest()
+            != config_fingerprint
+        ):
+            raise PlanningError(
+                "execution plan config fingerprint does not match resolved config"
+            )
+        if (
+            hashlib.sha256(
+                canonical_json(raw_config.get("workload")).encode("utf-8")
+            ).hexdigest()
+            != workload_fingerprint
+        ):
+            raise PlanningError(
+                "execution plan workload fingerprint does not match resolved config"
+            )
         if not isinstance(raw_cases, list):
             raise PlanningError("execution plan cases must be an array")
         cases = []
@@ -267,9 +305,17 @@ def _resource_from_dict(value: Any) -> ResourcePlan:
                 gpus_per_shard=gpus_per_shard,
                 shard_count=value["shard_count"],
                 max_parallel=value["max_parallel"],
-                gpus_per_machine=value.get("gpus_per_machine", gpus_per_shard),
-                machine_count=value.get("machine_count", 1),
-                local_world_size=value.get("local_world_size", gpus_per_shard),
+                gpus_per_machine=value["gpus_per_machine"],
+                machine_count=value["machine_count"],
+                local_world_size=value["local_world_size"],
+            )
+        if backend == "ssh":
+            return SshResourcePlan(
+                backend="ssh",
+                world_size=value["world_size"],
+                machine_count=value["machine_count"],
+                local_world_size=value["local_world_size"],
+                hosts=tuple(freeze(host) for host in value["hosts"]),
             )
     except KeyError as error:
         raise PlanningError(f"invalid resource plan: missing {error}") from error
@@ -302,6 +348,19 @@ def _validate_persisted_resource_plan(
                 "resource plan world_size does not match model topology"
             )
         expected = _local_resource_plan(resolved_config, world_size)
+    elif isinstance(resource_plan, SshResourcePlan):
+        from rtp_llm.test.perf_test.ssh.plan import plan_resources
+
+        expected = plan_resources(
+            mode=(
+                "decode"
+                if resolved_config["workload"]["kind"] in ("grid", "distribution")
+                else "prefill"
+            ),
+            resolved_config=resolved_config,
+            world_size=world_size,
+            case_count=case_count,
+        )
     else:
         execution = resolved_config["execution"]
         per_machine = execution.get("gpus_per_machine")
@@ -309,8 +368,7 @@ def _validate_persisted_resource_plan(
             per_machine = world_size
         if type(per_machine) is not int or per_machine <= 0:
             raise ResourceError("persisted resource topology is invalid")
-        # Match the planner's single-machine normalization, including historical
-        # configurations that requested more per-machine GPUs than model ranks.
+        # Resource planners normalize a per-machine upper bound to model width.
         per_machine = min(per_machine, world_size)
         if world_size % per_machine:
             raise ResourceError("persisted resource topology is invalid")

@@ -10,19 +10,19 @@ from unittest.mock import patch
 
 from rtp_llm.test.perf_test import entry
 from rtp_llm.test.perf_test.aone.config_schema import parse_execution
-from rtp_llm.test.perf_test.aone.plan import (
-    GangTopology,
-    derive_gang_topology,
-    plan_resources,
-)
+from rtp_llm.test.perf_test.aone.plan import plan_resources
 from rtp_llm.test.perf_test.capabilities import validate_aone_capability
 from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.errors import PlanningError
-from rtp_llm.test.perf_test.multi_node import decode_runtime, prefill_runtime
+from rtp_llm.test.perf_test.execution.gang_layout import (
+    GangTopology,
+    derive_gang_topology,
+)
 from rtp_llm.test.perf_test.plan import (
     AOneResourcePlan,
     ExecutionPlan,
     build_execution_plan,
+    thaw,
 )
 
 
@@ -196,10 +196,10 @@ class GangConfigTest(unittest.TestCase):
 
 class GangPolicyTest(unittest.TestCase):
 
-    def test_rank_plan_preserves_identity_without_local_policy(self):
+    def test_worker_consumes_frozen_plan_without_replanning_or_source_resolution(self):
         from rtp_llm.test.perf_test.aone.gang_worker import _build_rank_group_plan
 
-        for mode, runtime in (("prefill", prefill_runtime), ("decode", decode_runtime)):
+        for mode in ("prefill", "decode"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "config.json"
                 topology = {"tp": 8, "dp": 2, "pp": 1, "ep": 16}
@@ -208,26 +208,32 @@ class GangPolicyTest(unittest.TestCase):
                         _gang_config(_execution(gpus_per_machine=8), topology, mode)
                     )
                 )
-                builder = getattr(runtime, f"build_external_{mode}_plan")
-                expected, source = builder(
-                    path,
-                    str(Path(directory) / "run"),
-                    topology,
-                    execution_parser=parse_execution,
-                    resource_planner=plan_resources,
-                    capability_validator=validate_aone_capability,
+                from rtp_llm.test.perf_test.entry import plan_from_source
+
+                expected, source = plan_from_source(
+                    json.loads(path.read_text()),
+                    source_dir=path.parent,
+                    result_directory=str(Path(directory) / "run"),
                 )
-                context = SimpleNamespace(gang_plan={"topology": topology})
+                from rtp_llm.test.perf_test.aone.package import build_gang_plan_payload
+
+                path.with_suffix(".frozen.json").write_text(
+                    json.dumps(thaw(expected.resolved_config["workload"]))
+                )
+                context = SimpleNamespace(
+                    gang_plan=build_gang_plan_payload(expected, "policy")
+                )
                 with ExitStack() as stack:
                     for target in (
-                        "config_schema._parse_execution",
-                        "plan._aone_resource_plan",
+                        "config_resolver.load_resolved_config",
+                        "aone.plan.plan_resources",
                     ):
                         stack.enter_context(
                             patch(
                                 "rtp_llm.test.perf_test." + target,
-                                side_effect=AssertionError("public policy forbidden"),
-                                create=True,
+                                side_effect=AssertionError(
+                                    "worker must consume its frozen plan"
+                                ),
                             )
                         )
                     actual, actual_source = _build_rank_group_plan(
@@ -235,6 +241,24 @@ class GangPolicyTest(unittest.TestCase):
                     )
                 self.assertEqual(expected.to_dict(), actual.to_dict())
                 self.assertEqual(source, actual_source)
+
+    def test_source_only_gang_config_is_rejected_without_replanning(self):
+        from rtp_llm.test.perf_test.aone.gang_worker import _build_rank_group_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = SimpleNamespace(
+                gang_plan={"topology": {"tp": 2, "dp": 1, "pp": 1, "ep": 1}}
+            )
+            with patch(
+                "rtp_llm.test.perf_test.config_resolver.load_resolved_config",
+                side_effect=AssertionError("worker must not resolve source"),
+            ):
+                with self.assertRaisesRegex(
+                    PlanningError, "complete frozen execution plan"
+                ):
+                    _build_rank_group_plan(
+                        str(Path(directory) / "source.json"), context, Path(directory)
+                    )
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ py_library(
         "aone/plan.py",
         "aone/sharding.py",
         "capabilities.py",
+        "case_planning.py",
         "cli.py",
         "config_resolver.py",
         "config_schema.py",
@@ -38,23 +39,28 @@ py_library(
         "decode/planner.py",
         "decode/scheduler.py",
         "entry.py",
-        "case_planning.py",
         "errors.py",
+        "execution/gang_layout.py",
+        "experiment.py",
         "plan.py",
         "prefill/__init__.py",
         "prefill/block_size.py",
         "prefill/case_store.py",
         "prefill/fingerprints.py",
+        "prefill/generate_random_batch_grid.py",
+        "prefill/generate_traffic_batch_grid.py",
         "prefill/measurement.py",
         "prefill/planner.py",
         "prefill/prompts.py",
         "prefill/random_batch.py",
         "prefill/traffic_batch.py",
         "prefill/traffic_distribution.py",
-        "prefill/generate_traffic_batch_grid.py",
-        "prefill/generate_random_batch_grid.py",
         "run_context.py",
         "run_directory.py",
+        "ssh/__init__.py",
+        "ssh/config_schema.py",
+        "ssh/plan.py",
+        "ssh/source.py",
         "state.py",
         "storage.py",
     ],
@@ -75,27 +81,31 @@ py_library(
         "decode/profiling.py",
         "decode/report.py",
         "decode/transport.py",
+        "execution/artifacts.py",
         "execution/devices.py",
+        "execution/distributed/__init__.py",
+        "execution/distributed/decode.py",
+        "execution/distributed/decode_sync.py",
+        "execution/distributed/gang_config.py",
+        "execution/distributed/member.py",
+        "execution/distributed/plan.py",
+        "execution/distributed/prefill.py",
+        "execution/distributed/rank_group.py",
         "execution/engine_session.py",
+        "execution/gang.py",
         "execution/launch_boundary.py",
         "execution/local.py",
         "execution/runtime.py",
         "execution/scheduler.py",
         "modes.py",
-        "multi_node/decode_runtime.py",
-        "multi_node/decode_sync.py",
-        "multi_node/multi_benchmark.py",
-        "multi_node/gang_config.py",
-        "multi_node/local_server_runner.py",
-        "multi_node/prefill_runtime.py",
         "prefill/adapter.py",
-        "prefill/checkpoint.py",
         "prefill/chart.py",
-        "prefill/finalize.py",
+        "prefill/checkpoint.py",
         "prefill/dashsc_transport.py",
+        "prefill/finalize.py",
         "prefill/formula.py",
-        "prefill/profile.py",
         "prefill/probe.py",
+        "prefill/profile.py",
         "prefill/report.py",
         "prefill/restricted_symbolic.py",
         "prefill/runner.py",
@@ -142,12 +152,6 @@ exports_files([
     "multi_node/analyzer/configs/module_conf.py",
     "multi_node/analyzer/configs/qwen_480b_decode-fp8.py",
     "multi_node/analyzer/configs/qwen_480b_prefill_fp8.py",
-    "multi_node/gang_config.py",
-    "multi_node/local_server_runner.py",
-    "multi_node/multi_benchmark_config.yaml",
-    "multi_node/multi_local_executor.sh",
-    "multi_node/multi_runner.sh",
-    "testdata/historical_aone_plan.json",
 ])
 
 py_library(
@@ -202,7 +206,18 @@ py_binary(
     deps = [":perf_test_regression_lib"],
 )
 
-# Compatibility aggregate for offline callers and CI helpers.
+# Aggregate for standalone offline callers and CI helpers.
+py_library(
+    name = "perf_test_ssh_lib",
+    srcs = [
+        "execution/ssh.py",
+        "ssh/maintenance.py",
+        "ssh/remote.py",
+        "ssh/worker.py",
+    ],
+    deps = [":perf_test_entry_lib", ":perf_test_runtime_lib", ":perf_test_results_lib"],
+)
+
 py_library(
     name = "perf_test_lib",
     srcs = [
@@ -214,6 +229,7 @@ py_library(
     ],
     data = [":perf_test_examples"],
     deps = [
+        ":perf_test_ssh_lib",
         ":aone_lib",
         ":perf_test_entry_lib",
         ":perf_test_runtime_lib",
@@ -373,10 +389,7 @@ test_suite(
     tests = ["//rtp_llm/test/perf_test/tests:decode_executor_test"],
 )
 
-test_suite(
-    name = "decode_multi_node_test",
-    tests = ["//rtp_llm/test/perf_test/tests:decode_multi_node_test"],
-)
+
 
 test_suite(
     name = "decode_remote_test_test",
@@ -460,10 +473,7 @@ test_suite(
     tests = ["//rtp_llm/test/perf_test/tests:runtime_adapter_test"],
 )
 
-test_suite(
-    name = "ssh_prefill_test",
-    tests = ["//rtp_llm/test/perf_test/tests:ssh_prefill_test"],
-)
+
 
 test_suite(
     name = "unified_config_test",
@@ -483,6 +493,10 @@ test_suite(
 filegroup(
     name = "perf_test_examples",
     srcs = [
+        "examples/decode_ssh_gang.json",
+        "examples/prefill_ssh_gang.json",
+        "examples/prefill_ssh_single.json",
+        "examples/decode_ssh_experiment.json",
         "examples/decode_aone_gang.json",
         "examples/decode_distribution_local.json",
         "examples/decode_distribution_requests.json",

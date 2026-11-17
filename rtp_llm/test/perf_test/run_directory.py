@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Union
 
 from rtp_llm.test.perf_test.errors import PlanningError, ResourceError
-from rtp_llm.test.perf_test.plan import ExecutionPlan
+from rtp_llm.test.perf_test.plan import ExecutionPlan, thaw
 from rtp_llm.test.perf_test.storage import atomic_write_json
 
 RUN_MANIFEST_SCHEMA_VERSION = 1
@@ -198,6 +198,19 @@ def inspect_run_directory(root: Union[str, Path]) -> RunDirectorySnapshot:
     ):
         if not isinstance(value, dict):
             raise PlanningError(f"run {name} must be a JSON object")
+    if resolved_config != thaw(execution_plan.resolved_config):
+        raise PlanningError("resolved config does not match persisted execution plan")
+    for name, expected in (
+        ("config_fingerprint", execution_plan.config_fingerprint),
+        ("workload_fingerprint", execution_plan.workload_fingerprint),
+        ("backend", execution_plan.backend),
+        ("mode", execution_plan.mode),
+        ("case_ids", [case.case_id for case in execution_plan.cases]),
+    ):
+        if manifest.get(name) != expected:
+            raise PlanningError(
+                f"run manifest {name} does not match persisted execution plan"
+            )
     return RunDirectorySnapshot(
         paths=paths,
         source_config=source_config,

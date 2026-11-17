@@ -18,9 +18,7 @@ or persisted artifacts.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
-import io
 import json
 import logging
 import os
@@ -41,23 +39,22 @@ from rtp_llm.test.perf_test.aone.broker import (
 )
 from rtp_llm.test.perf_test.aone.config_schema import parse_execution
 from rtp_llm.test.perf_test.aone.package import GANG_PLAN_SCHEMA_VERSION
-from rtp_llm.test.perf_test.aone.plan import plan_resources
-from rtp_llm.test.perf_test.capabilities import validate_aone_capability
-from rtp_llm.test.perf_test.case_planning import plan_cases
-from rtp_llm.test.perf_test.config_resolver import ResolvedConfig, canonical_json
+from rtp_llm.test.perf_test.config_resolver import canonical_json
 from rtp_llm.test.perf_test.config_schema import parse_config
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.execution.devices import (
     GPU_LOCKED_DEVICES_ENV,
     resolve_allocated_devices,
 )
-from rtp_llm.test.perf_test.multi_node.gang_config import build_gang_config_string
-from rtp_llm.test.perf_test.plan import build_execution_plan
+from rtp_llm.test.perf_test.execution.distributed.gang_config import (
+    build_gang_config_string,
+)
+from rtp_llm.test.perf_test.plan import ExecutionPlan
 from rtp_llm.test.perf_test.run_context import read_run_context, write_run_context
 from rtp_llm.test.perf_test.storage import atomic_write_json
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, heavy at runtime
-    from rtp_llm.test.perf_test.multi_node.local_server_runner import ServerHandle
+    from rtp_llm.test.perf_test.execution.distributed.rank_group import ServerHandle
 
 BROKER_TOKEN_ENV = "PERF_TEST_BROKER_TOKEN"
 
@@ -341,8 +338,8 @@ class GangWorkerContext:
 
 
 @dataclass(frozen=True)
-class _LegacyMember:
-    """Adapter to the legacy ``name/ip/port`` member records."""
+class _EngineMember:
+    """Engine-facing ``name/ip/port`` member identity."""
 
     name: str
     ip: str
@@ -443,15 +440,15 @@ def build_worker_context(
 ) -> GangWorkerContext:
     """Freeze the rank layout: world rank, gang config, and GPU visibility."""
     local_world_size = int(gang_plan["local_world_size"])
-    legacy_members = tuple(
-        _LegacyMember(
+    engine_members = tuple(
+        _EngineMember(
             name=f"gang_part{member.shard_index}",
             ip=member.hostname,
             server_port=int(member.port),
         )
         for member in sorted(members, key=lambda member: member.shard_index)
     )
-    gang_config_string = build_gang_config_string(legacy_members, local_world_size)
+    gang_config_string = build_gang_config_string(engine_members, local_world_size)
     return GangWorkerContext(
         gang_plan=gang_plan,
         members=tuple(members),
@@ -619,7 +616,7 @@ def _run_worker(
             context = build_worker_context(gang_plan, members, shard_index)
             record["context"] = context
             if _is_distributed_decode(resolved_config_path, context):
-                from rtp_llm.test.perf_test.multi_node.decode_sync import (
+                from rtp_llm.test.perf_test.execution.distributed.decode_sync import (
                     validate_decode_layout,
                 )
 
@@ -796,23 +793,10 @@ def _write_worker_summary(
         _LOG.warning("cannot write worker summary: %s", error)
 
 
-def _load_local_server_runner():
-    """Import the legacy rank-group module without leaking the environment.
+def _load_rank_group():
+    from rtp_llm.test.perf_test.execution.distributed import rank_group
 
-    ``multi_node.local_server_runner`` prints the whole process environment
-    at import time (a legacy debugging aid). Gang workers import it lazily
-    with stdout redirected and the broker token masked so neither worker
-    logs nor test output can capture the token.
-    """
-    token = os.environ.pop(BROKER_TOKEN_ENV, None)
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            from rtp_llm.test.perf_test.multi_node import local_server_runner
-
-            return local_server_runner
-    finally:
-        if token is not None:
-            os.environ[BROKER_TOKEN_ENV] = token
+    return rank_group
 
 
 def _build_rank_group_plan(
@@ -823,67 +807,38 @@ def _build_rank_group_plan(
 
 
 def _build_gang_execution_plan(config_path, context, result_directory):
-    """Consume frozen runfiles without reloading submit-host distributions.
+    """Consume the controller's v2 plan; never replan cases on a worker."""
+    from rtp_llm.test.perf_test.execution.distributed.plan import bind_member_plan
 
-    Source-shaped fields serve strict parsing and case planning only. The
-    frozen workload remains authoritative for fingerprints and metadata.
-    Source-config callers retain the existing external-runtime path.
-    """
-    from rtp_llm.test.perf_test.multi_node import decode_runtime, prefill_runtime
-
-    topology = context.gang_plan["topology"]
-    frozen_path = Path(config_path).with_suffix(".frozen.json")
-    if frozen_path.is_file():
+    try:
+        plan = ExecutionPlan.from_dict(context.gang_plan["execution_plan"])
         source = json.loads(Path(config_path).read_text(encoding="utf-8"))
-        workload = json.loads(frozen_path.read_text(encoding="utf-8"))
-        parsed = parse_config(source, execution_parser=parse_execution)
-        if parsed.model.topology.as_tuple() != tuple(
-            topology[name] for name in ("tp", "dp", "pp", "ep")
-        ):
-            raise PlanningError("runtime topology does not match frozen config")
-        config = asdict(parsed)
-        config.pop("workload")
+        workload = json.loads(
+            Path(config_path).with_suffix(".frozen.json").read_text(encoding="utf-8")
+        )
+    except (KeyError, OSError, ValueError) as error:
+        raise PlanningError(
+            f"gang requires a complete frozen execution plan: {error}"
+        ) from error
+    if plan.backend != "aone":
+        raise PlanningError("gang execution plan requires backend=aone")
+    topology = plan.resolved_config["model"]["topology"]
+    if dict(topology) != context.gang_plan["topology"]:
+        raise PlanningError("runtime topology does not match frozen config")
+    parsed = asdict(parse_config(source, execution_parser=parse_execution))
+    parsed.pop("workload")
 
-        def fingerprint(value):
-            return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+    def fingerprint(value):
+        return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
-        resolved = ResolvedConfig(
-            {**config, "workload": workload}, fingerprint(config), fingerprint(workload)
-        )
-        for name in ("config_fingerprint", "workload_fingerprint"):
-            if getattr(resolved, name) != context.gang_plan[name]:
-                raise PlanningError(f"gang frozen {name} mismatch")
-        mode = merged_config_mode(config_path)
-        cases = plan_cases(mode, source, resolved, execution_parser=parse_execution)
-        return (
-            build_execution_plan(
-                mode=mode,
-                action="run",
-                resolved=resolved,
-                cases=cases,
-                result_directory=str(result_directory),
-                resource_planner=plan_resources,
-                capability_validator=validate_aone_capability,
-            ),
-            source,
-        )
-    if merged_config_mode(config_path) == "prefill":
-        return prefill_runtime.build_external_prefill_plan(
-            config_path,
-            result_directory=result_directory,
-            actual_topology=topology,
-            execution_parser=parse_execution,
-            resource_planner=plan_resources,
-            capability_validator=validate_aone_capability,
-        )
-    return decode_runtime.build_external_decode_plan(
-        config_path,
-        result_directory=result_directory,
-        actual_topology=topology,
-        execution_parser=parse_execution,
-        resource_planner=plan_resources,
-        capability_validator=validate_aone_capability,
-    )
+    if fingerprint(parsed) != plan.config_fingerprint:
+        raise PlanningError("gang frozen config_fingerprint mismatch")
+    if fingerprint(workload) != plan.workload_fingerprint:
+        raise PlanningError("gang frozen workload_fingerprint mismatch")
+    for name in ("config_fingerprint", "workload_fingerprint"):
+        if getattr(plan, name) != context.gang_plan[name]:
+            raise PlanningError(f"gang frozen {name} mismatch")
+    return bind_member_plan(plan, result_directory=str(result_directory)), source
 
 
 def _default_server_runner(context: GangWorkerContext, *, config_path: str):
@@ -891,7 +846,7 @@ def _default_server_runner(context: GangWorkerContext, *, config_path: str):
     from rtp_llm.config.server_config_setup import set_parallelism_config
     from rtp_llm.server.server_args.server_args import setup_args
 
-    runner = _load_local_server_runner()
+    runner = _load_rank_group()
     plan = context.gang_plan
     topology = plan["topology"]
     engine_environment = {
@@ -1046,6 +1001,34 @@ def _decode_control_port(context: GangWorkerContext) -> int:
     return port
 
 
+def _decode_member(handle, *, context, config_path, result_directory, check_cancelled):
+    from rtp_llm.test.perf_test.execution.distributed.decode import (
+        execute_decode_member,
+    )
+
+    plan, source = _build_gang_execution_plan(config_path, context, result_directory)
+    tokenizer_path = (
+        handle.tokenizer_path
+        or _resolve_model_paths(config_path, context.gang_plan)["tokenizer"]
+    )
+    if not tokenizer_path:
+        raise WorkerConfigError("decode member tokenizer path is missing")
+    return execute_decode_member(
+        plan,
+        source_config=source,
+        endpoint=f"http://127.0.0.1:{int(context.gang_plan['port_range']['start'])}",
+        tokenizer_path=tokenizer_path,
+        server_log_path=handle.log_file_path,
+        profiler_directory=Path(handle.log_dir),
+        world_rank=context.world_rank,
+        local_world_size=context.local_world_size,
+        member_hosts=tuple(member.hostname for member in context.members),
+        control_port=_decode_control_port(context),
+        run_context=context.gang_plan,
+        check_cancelled=check_cancelled,
+    )
+
+
 def _default_decode_worker(
     handle: Any,
     *,
@@ -1053,36 +1036,11 @@ def _default_decode_worker(
     config_path: str,
     check_cancelled: Callable[[], None] = lambda: None,
 ) -> None:
-    from rtp_llm.test.perf_test.decode.transport import DecodeHttpTransport
-    from rtp_llm.test.perf_test.multi_node.decode_sync import serve_decode_worker
-    from rtp_llm.test.perf_test.test_util import create_query
-
-    plan, _source = _build_gang_execution_plan(config_path, context, "unused")
-    input_lengths = sorted(
-        {length for case in plan.cases for length in case.identity["input_lengths"]}
-    )
-    tokenizer_path = handle.tokenizer_path
-    if not tokenizer_path:
-        tokenizer_path = _resolve_model_paths(config_path, context.gang_plan)[
-            "tokenizer"
-        ]
-    if not tokenizer_path:
-        raise WorkerConfigError("decode worker tokenizer path is missing")
-    queries = create_query(tokenizer_path=tokenizer_path, input_len_list=input_lengths)
-    topology = context.gang_plan["topology"]
-    transport = DecodeHttpTransport(
-        endpoint=f"http://127.0.0.1:{int(context.gang_plan['port_range']['start'])}",
-        prompt_for_length=lambda length: queries[length],
-    )
-    master = next(member for member in context.members if member.shard_index == 0)
-    serve_decode_worker(
-        master.hostname,
-        _decode_control_port(context),
-        world_rank=context.world_rank,
-        local_world_size=context.local_world_size,
-        tp_size=int(topology["tp"]),
-        dp_size=int(topology["dp"]),
-        local_transport=transport,
+    _decode_member(
+        handle,
+        context=context,
+        config_path=config_path,
+        result_directory=str(Path(handle.log_dir) / "unused-run"),
         check_cancelled=check_cancelled,
     )
 
@@ -1095,57 +1053,13 @@ def _default_master_executor(
     result_directory: str,
     check_cancelled: Callable[[], None] = lambda: None,
 ) -> int:
-    """Execute and finalize the unified decode plan on the master shard."""
-    from rtp_llm.test.perf_test.multi_node import decode_runtime
-    from rtp_llm.test.perf_test.test_util import create_query
-
-    plan, source = _build_gang_execution_plan(config_path, context, result_directory)
-    input_lengths = sorted(
-        {length for case in plan.cases for length in case.identity["input_lengths"]}
+    result = _decode_member(
+        handle,
+        context=context,
+        config_path=config_path,
+        result_directory=result_directory,
+        check_cancelled=check_cancelled,
     )
-    queries = create_query(
-        tokenizer_path=handle.tokenizer_path, input_len_list=input_lengths
-    )
-    endpoint = f"http://127.0.0.1:{int(context.gang_plan['port_range']['start'])}"
-    cluster = None
-    if _is_distributed_decode(Path(config_path), context):
-        from rtp_llm.test.perf_test.decode.transport import DecodeHttpTransport
-        from rtp_llm.test.perf_test.multi_node.decode_sync import ClusterDecodeTransport
-
-        topology = context.gang_plan["topology"]
-        cluster = ClusterDecodeTransport(
-            DecodeHttpTransport(
-                endpoint=endpoint, prompt_for_length=lambda length: queries[length]
-            ),
-            bind_host="0.0.0.0",
-            control_port=_decode_control_port(context),
-            local_world_size=context.local_world_size,
-            tp_size=int(topology["tp"]),
-            dp_size=int(topology["dp"]),
-            member_world_ranks=tuple(
-                index * context.local_world_size
-                for index in range(len(context.members))
-            ),
-            check_cancelled=check_cancelled,
-        )
-    try:
-        if cluster is not None:
-            cluster.connect_workers()
-        result = decode_runtime.execute_master_decode(
-            plan,
-            source_config=source,
-            endpoint=endpoint,
-            prompt_for_length=lambda length: queries[length],
-            server_log_path=handle.log_file_path,
-            # The engine writes raw chrome traces to TORCH_CUDA_PROFILER_DIR,
-            # which the rank-group startup points at the member's log dir.
-            profiler_directory=Path(handle.log_dir),
-            transport=cluster,
-            run_context=context.gang_plan,
-        )
-    finally:
-        if cluster is not None:
-            cluster.close()
     state = getattr(result, "state", None)
     return EXIT_SUCCESS if getattr(state, "value", None) == "completed" else 1
 
@@ -1154,7 +1068,9 @@ def _default_prefill_master_executor(
     handle: Any, *, context: GangWorkerContext, config_path: str, result_directory: str
 ) -> int:
     """Prepare gang inputs; the shared executor owns measurement and artifacts."""
-    from rtp_llm.test.perf_test.multi_node.prefill_runtime import execute_master_prefill
+    from rtp_llm.test.perf_test.execution.distributed.prefill import (
+        execute_master_prefill,
+    )
 
     plan, source = _build_gang_execution_plan(config_path, context, result_directory)
     model = _resolve_model_paths(config_path, context.gang_plan)

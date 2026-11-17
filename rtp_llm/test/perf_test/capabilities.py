@@ -9,7 +9,7 @@ from rtp_llm.test.perf_test.errors import CapabilityError
 
 MODES: FrozenSet[str] = frozenset({"prefill", "decode"})
 ACTIONS: FrozenSet[str] = frozenset({"run", "resume", "profile", "report"})
-BACKENDS: FrozenSet[str] = frozenset({"local"})
+BACKENDS: FrozenSet[str] = frozenset({"local", "ssh"})
 
 _SUPPORTED: FrozenSet[Tuple[str, str, str]] = frozenset(
     {
@@ -18,6 +18,9 @@ _SUPPORTED: FrozenSet[Tuple[str, str, str]] = frozenset(
         ("prefill", "local", "profile"),
         ("prefill", "local", "report"),
         ("decode", "local", "run"),
+        ("prefill", "ssh", "run"),
+        ("prefill", "ssh", "report"),
+        ("decode", "ssh", "run"),
     }
 )
 
@@ -65,7 +68,7 @@ def validate_capability(
         mode=mode,
         backend=backend,
         action=action,
-        offline_only=False,
+        offline_only=backend == "ssh" and action == "report",
     )
 
 

@@ -171,14 +171,6 @@ py_test(
     ],
 )
 
-test_suite(
-    name = "aone_gang_test",
-    tests = [
-        ":unit_aone_gang_executor_test",
-        ":unit_aone_gang_worker_test",
-        ":unit_aone_gang_package_test",
-    ],
-)
 
 py_test(
     name = "aone_single_test",
@@ -229,38 +221,7 @@ py_test(
     ],
 )
 
-py_test(
-    name = "decode_multi_node_test",
-    srcs = ["multi_node/decode_test.py"],
-    main = "multi_node/decode_test.py",
-    data = [
-        "//rtp_llm/test/perf_test:multi_node/multi_benchmark_config.yaml",
-        "//rtp_llm/test/perf_test:multi_node/gang_config.py",
-        "//rtp_llm/test/perf_test:multi_node/local_server_runner.py",
-        "//rtp_llm/test/perf_test:multi_node/multi_local_executor.sh",
-        "//rtp_llm/test/perf_test:multi_node/multi_runner.sh",
-        "//rtp_llm/test/perf_test:multi_node/analyzer/configs/module_base.py",
-        "//rtp_llm/test/perf_test:multi_node/analyzer/configs/module_conf.py",
-        "//rtp_llm/test/perf_test:multi_node/analyzer/configs/qwen_480b_decode-fp8.py",
-        "//rtp_llm/test/perf_test:multi_node/analyzer/configs/qwen_480b_prefill_fp8.py",
-    ],
-    deps = [
-        "//rtp_llm/test/perf_test:perf_test_entry_lib",
-        "//rtp_llm/test/perf_test:perf_test_runtime_lib",
-        ":perf_test_support",
-    ],
-)
 
-py_test(
-    name = "decode_remote_test_test",
-    srcs = ["decode/remote_entry_test.py", "//rtp_llm/test/perf_test:decode_remote_test.py"],
-    main = "decode/remote_entry_test.py",
-    data = ["//rtp_llm/test/perf_test:aone_defs.bzl"],
-    deps = [
-        ":perf_test_support",
-        "//rtp_llm/test/perf_test:perf_test_runtime_lib",
-    ],
-)
 
 py_test(
     name = "unit_execution_engine_session_test",
@@ -295,48 +256,9 @@ py_test(
     ],
 )
 
-test_suite(
-    name = "engine_session_test",
-    tests = [
-        ":unit_execution_engine_session_test",
-        ":unit_execution_local_test",
-        ":unit_prefill_backend_integration_test",
-    ],
-)
 
-py_test(
-    name = "unit_core_entry_test",
-    srcs = ["core/entry_test.py", "//rtp_llm/test/perf_test:main.py"],
-    main = "core/entry_test.py",
-    data = [
-        "//tools:perf_test_script",
-        "//rtp_llm/test/perf_test:examples/prefill_local.json",
-        "//rtp_llm/test/perf_test:examples/decode_grid_local.json",
-        "//rtp_llm/test/perf_test:testdata/historical_aone_plan.json",
-    ],
-    deps = [
-        "//rtp_llm/test/perf_test:perf_test_entry_lib",
-        ":perf_test_entry_test_support",
-        "//rtp_llm/test/perf_test:perf_test_runtime_lib",
-        ":perf_test_support",
-    ],
-)
 
-py_test(
-    name = "unit_core_build_closure_test",
-    srcs = ["core/build_closure_test.py", "//rtp_llm/test/perf_test:main.py"],
-    main = "core/build_closure_test.py",
-    data = [
-        "//rtp_llm/test/perf_test:BUILD",
-        "//rtp_llm/test/perf_test:perf_test_python_sources",
-    ],
-    deps = [":perf_test_entry_test_support", ":perf_test_support"],
-)
 
-test_suite(
-    name = "entry_test",
-    tests = [":unit_core_entry_test", ":unit_core_build_closure_test"],
-)
 
 py_test(
     name = "offline_runner_test",
@@ -350,7 +272,6 @@ py_test(
     srcs = ["core/plan_test.py"],
     main = "core/plan_test.py",
     data = [
-        "//rtp_llm/test/perf_test:testdata/historical_aone_plan.json",
         "//rtp_llm/test/perf_test:examples/prefill_local.json",
         "//rtp_llm/test/perf_test:examples/decode_grid_local.json",
     ],
@@ -362,35 +283,18 @@ py_test(
     srcs = ["aone/plan_test.py"],
     main = "aone/plan_test.py",
     data = [
-        "//rtp_llm/test/perf_test:testdata/historical_aone_plan.json",
         "//rtp_llm/test/perf_test:examples/prefill_local.json",
         "//rtp_llm/test/perf_test:examples/decode_grid_local.json",
     ],
     deps = ["//rtp_llm/test/perf_test:perf_test_entry_lib", ":perf_test_plan_test_support"],
 )
 
-py_test(
-    name = "unit_multi_node_plan_test",
-    srcs = ["multi_node/plan_test.py"],
-    main = "multi_node/plan_test.py",
-    data = [
-        "//rtp_llm/test/perf_test:testdata/historical_aone_plan.json",
-        "//rtp_llm/test/perf_test:examples/prefill_local.json",
-        "//rtp_llm/test/perf_test:examples/decode_grid_local.json",
-    ],
-    deps = [
-        "//rtp_llm/test/perf_test:perf_test_entry_lib",
-        "//rtp_llm/test/perf_test:perf_test_runtime_lib",
-        ":perf_test_support",
-    ],
-)
 
 py_test(
     name = "unit_prefill_planner_test",
     srcs = ["prefill/planner_test.py"],
     main = "prefill/planner_test.py",
     data = [
-        "//rtp_llm/test/perf_test:testdata/historical_aone_plan.json",
         "//rtp_llm/test/perf_test:examples/prefill_local.json",
         "//rtp_llm/test/perf_test:examples/decode_grid_local.json",
     ],
@@ -402,23 +306,12 @@ py_test(
     srcs = ["decode/planner_test.py"],
     main = "decode/planner_test.py",
     data = [
-        "//rtp_llm/test/perf_test:testdata/historical_aone_plan.json",
         "//rtp_llm/test/perf_test:examples/prefill_local.json",
         "//rtp_llm/test/perf_test:examples/decode_grid_local.json",
     ],
     deps = ["//rtp_llm/test/perf_test:perf_test_entry_lib", ":perf_test_plan_test_support"],
 )
 
-test_suite(
-    name = "plan_test",
-    tests = [
-        ":unit_core_plan_test",
-        ":unit_aone_plan_test",
-        ":unit_multi_node_plan_test",
-        ":unit_prefill_planner_test",
-        ":unit_decode_planner_test",
-    ],
-)
 
 py_test(
     name = "policy_extraction_test",
@@ -459,14 +352,6 @@ py_test(
     ],
 )
 
-test_suite(
-    name = "prefill_profile_test",
-    tests = [
-        ":unit_prefill_profile_test",
-        ":unit_execution_profiling_launch_test",
-        ":unit_decode_profiling_test",
-    ],
-)
 
 py_test(
     name = "unit_prefill_report_test",
@@ -516,14 +401,6 @@ py_test(
     ],
 )
 
-test_suite(
-    name = "prefill_report_test",
-    tests = [
-        ":unit_prefill_report_test",
-        ":unit_decode_report_test",
-        ":unit_multi_node_analyzer_test",
-    ],
-)
 
 py_test(
     name = "unit_prefill_resume_test",
@@ -554,14 +431,6 @@ py_test(
     ],
 )
 
-test_suite(
-    name = "prefill_resume_test",
-    tests = [
-        ":unit_prefill_resume_test",
-        ":unit_core_storage_test",
-        ":unit_core_run_directory_test",
-    ],
-)
 
 py_test(
     name = "unit_prefill_runner_test",
@@ -575,22 +444,7 @@ py_test(
     ],
 )
 
-py_test(
-    name = "unit_multi_node_prefill_session_test",
-    srcs = ["multi_node/prefill_session_test.py"],
-    main = "multi_node/prefill_session_test.py",
-    deps = [
-        "//rtp_llm/test/perf_test:perf_test_entry_lib",
-        ":perf_test_prefill_test_support",
-        "//rtp_llm/test/perf_test:perf_test_runtime_lib",
-        ":perf_test_support",
-    ],
-)
 
-test_suite(
-    name = "prefill_runner_test",
-    tests = [":unit_prefill_runner_test", ":unit_multi_node_prefill_session_test"],
-)
 
 py_test(
     name = "publication_policy_test",
@@ -647,14 +501,6 @@ py_test(
     ],
 )
 
-test_suite(
-    name = "result_envelope_test",
-    tests = [
-        ":unit_core_results_test",
-        ":unit_decode_metrics_test",
-        ":unit_prefill_finalize_test",
-    ],
-)
 
 py_test(
     name = "unit_execution_runtime_adapter_test",
@@ -684,33 +530,7 @@ py_test(
     ],
 )
 
-test_suite(
-    name = "runtime_adapter_test",
-    tests = [
-        ":unit_execution_runtime_adapter_test",
-        ":unit_prefill_dashsc_transport_test",
-        ":unit_decode_http_transport_test",
-    ],
-)
 
-py_test(
-    name = "ssh_prefill_test",
-    srcs = ["multi_node/ssh_prefill_test.py"],
-    main = "multi_node/ssh_prefill_test.py",
-    data = [
-        "//rtp_llm/test/perf_test:multi_node/multi_benchmark_config.yaml",
-        "//rtp_llm/test/perf_test:multi_node/gang_config.py",
-        "//rtp_llm/test/perf_test:multi_node/local_server_runner.py",
-        "//rtp_llm/test/perf_test:multi_node/multi_local_executor.sh",
-        "//rtp_llm/test/perf_test:multi_node/multi_runner.sh",
-        "//rtp_llm/test/perf_test:perf_test_examples",
-    ],
-    deps = [
-        "//rtp_llm/test/perf_test:perf_test_entry_lib",
-        "//rtp_llm/test/perf_test:perf_test_runtime_lib",
-        ":perf_test_support",
-    ],
-)
 
 py_test(
     name = "unified_config_test",
@@ -745,67 +565,360 @@ py_test(
     deps = ["//rtp_llm/test/perf_test:perf_test_entry_lib", ":perf_test_workload_test_support"],
 )
 
-test_suite(
-    name = "workload_test",
-    tests = [":unit_prefill_workload_test", ":unit_decode_distribution_test"],
-)
 
-test_suite(
-    name = "unit_tests",
-    tests = [
-        ":aone_broker_test",
-        ":aone_entry_test",
-        ":unit_aone_gang_executor_test",
-        ":unit_aone_gang_worker_test",
-        ":unit_aone_gang_package_test",
-        ":aone_single_test",
-        ":aone_worker_test",
-        ":ci_test",
-        ":decode_executor_test",
-        ":decode_multi_node_test",
-        ":decode_remote_test_test",
-        ":unit_execution_engine_session_test",
-        ":unit_execution_local_test",
-        ":unit_prefill_backend_integration_test",
-        ":unit_core_entry_test",
-        ":unit_core_build_closure_test",
-        ":offline_runner_test",
-        ":unit_core_plan_test",
-        ":unit_aone_plan_test",
-        ":unit_multi_node_plan_test",
-        ":unit_prefill_planner_test",
-        ":unit_decode_planner_test",
-        ":policy_extraction_test",
-        ":unit_prefill_profile_test",
-        ":unit_execution_profiling_launch_test",
-        ":unit_decode_profiling_test",
-        ":unit_prefill_report_test",
-        ":unit_decode_report_test",
-        ":unit_multi_node_analyzer_test",
-        ":unit_prefill_resume_test",
-        ":unit_core_storage_test",
-        ":unit_core_run_directory_test",
-        ":unit_prefill_runner_test",
-        ":unit_multi_node_prefill_session_test",
-        ":publication_policy_test",
-        ":regression_test",
-        ":unit_core_results_test",
-        ":unit_decode_metrics_test",
-        ":unit_prefill_finalize_test",
-        ":unit_execution_runtime_adapter_test",
-        ":unit_prefill_dashsc_transport_test",
-        ":unit_decode_http_transport_test",
-        ":ssh_prefill_test",
-        ":unified_config_test",
-        ":unit_prefill_workload_test",
-        ":unit_decode_distribution_test",
-        ":unit_prefill_fingerprints_test",
-    ],
-)
 
 py_test(
     name = "unit_prefill_fingerprints_test",
     srcs = ["prefill/fingerprints_test.py"],
     main = "prefill/fingerprints_test.py",
     deps = ["//rtp_llm/test/perf_test:perf_test_entry_lib"],
+)
+
+py_test(
+    name = "unit_ssh_executor_test",
+    srcs = ["ssh/executor_test.py"],
+    main = "ssh/executor_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_ssh_maintenance_test",
+    srcs = ["ssh/maintenance_test.py", "ssh/executor_test.py"],
+    main = "ssh/maintenance_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_ssh_remote_test",
+    srcs = ["ssh/remote_test.py"],
+    main = "ssh/remote_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_ssh_source_test",
+    srcs = ["ssh/source_test.py"],
+    main = "ssh/source_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_ssh_worker_test",
+    srcs = ["ssh/worker_test.py"],
+    main = "ssh/worker_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_distributed_artifacts_test",
+    srcs = ["distributed/artifacts_test.py"],
+    main = "distributed/artifacts_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_distributed_binding_test",
+    srcs = ["distributed/binding_test.py"],
+    main = "distributed/binding_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_distributed_completion_test",
+    srcs = ["distributed/completion_test.py"],
+    main = "distributed/completion_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_distributed_decode_sync_test",
+    srcs = ["distributed/decode_sync_test.py"],
+    main = "distributed/decode_sync_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_distributed_gang_test",
+    srcs = ["distributed/gang_test.py"],
+    main = "distributed/gang_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+
+py_test(
+    name = "unit_distributed_prefill_runtime_test",
+    srcs = ["distributed/prefill_runtime_test.py"],
+    main = "distributed/prefill_runtime_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_distributed_prefill_session_test",
+    srcs = ["distributed/prefill_session_test.py"],
+    main = "distributed/prefill_session_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        ":perf_test_prefill_test_support",
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_experiments_experiment_test",
+    srcs = ["experiments/experiment_test.py"],
+    main = "experiments/experiment_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_ssh_lib",
+        "//rtp_llm/test/perf_test:aone_lib",
+        ":perf_test_support",
+        ":perf_test_gang_test_support",
+        ":perf_test_results_test_support",
+    ],
+)
+
+test_suite(
+    name = "unit_tests",
+    tests = [
+        ":unit_core_build_closure_test",
+        ":unit_core_entry_test",
+        ":decode_remote_test_test",
+        ":unit_distributed_member_test",
+        ":aone_broker_test",
+        ":aone_entry_test",
+        ":aone_single_test",
+        ":aone_worker_test",
+        ":ci_test",
+        ":decode_executor_test",
+        ":offline_runner_test",
+        ":policy_extraction_test",
+        ":publication_policy_test",
+        ":regression_test",
+        ":unified_config_test",
+        ":unit_aone_gang_executor_test",
+        ":unit_aone_gang_package_test",
+        ":unit_aone_gang_worker_test",
+        ":unit_aone_plan_test",
+        ":unit_core_plan_test",
+        ":unit_core_results_test",
+        ":unit_core_run_directory_test",
+        ":unit_core_storage_test",
+        ":unit_decode_distribution_test",
+        ":unit_decode_http_transport_test",
+        ":unit_decode_metrics_test",
+        ":unit_decode_planner_test",
+        ":unit_decode_profiling_test",
+        ":unit_decode_report_test",
+        ":unit_distributed_artifacts_test",
+        ":unit_distributed_binding_test",
+        ":unit_distributed_completion_test",
+        ":unit_distributed_decode_sync_test",
+        ":unit_distributed_gang_test",
+        ":unit_distributed_prefill_runtime_test",
+        ":unit_distributed_prefill_session_test",
+        ":unit_execution_engine_session_test",
+        ":unit_execution_local_test",
+        ":unit_execution_profiling_launch_test",
+        ":unit_execution_runtime_adapter_test",
+        ":unit_experiments_experiment_test",
+        ":unit_multi_node_analyzer_test",
+        ":unit_prefill_backend_integration_test",
+        ":unit_prefill_dashsc_transport_test",
+        ":unit_prefill_finalize_test",
+        ":unit_prefill_fingerprints_test",
+        ":unit_prefill_planner_test",
+        ":unit_prefill_profile_test",
+        ":unit_prefill_report_test",
+        ":unit_prefill_resume_test",
+        ":unit_prefill_runner_test",
+        ":unit_prefill_workload_test",
+        ":unit_ssh_executor_test",
+        ":unit_ssh_maintenance_test",
+        ":unit_ssh_remote_test",
+        ":unit_ssh_source_test",
+        ":unit_ssh_worker_test",
+    ],
+)
+
+test_suite(
+    name = "aone_gang_test",
+    tests = [":unit_aone_gang_executor_test", ":unit_aone_gang_worker_test", ":unit_aone_gang_package_test"],
+)
+
+py_test(
+    name = "unit_distributed_member_test",
+    srcs = ["distributed/member_test.py"],
+    main = "distributed/member_test.py",
+    data = ["//rtp_llm/test/perf_test:perf_test_examples"],
+    deps = ["//rtp_llm/test/perf_test:perf_test_runtime_lib", ":perf_test_support"],
+)
+
+test_suite(
+    name = "engine_session_test",
+    tests = [":unit_execution_engine_session_test", ":unit_execution_local_test", ":unit_prefill_backend_integration_test"],
+)
+
+test_suite(
+    name = "plan_test",
+    tests = [":unit_core_plan_test", ":unit_aone_plan_test", ":unit_distributed_binding_test", ":unit_prefill_planner_test", ":unit_decode_planner_test"],
+)
+
+test_suite(
+    name = "prefill_profile_test",
+    tests = [":unit_prefill_profile_test", ":unit_execution_profiling_launch_test", ":unit_decode_profiling_test"],
+)
+
+test_suite(
+    name = "prefill_report_test",
+    tests = [":unit_prefill_report_test", ":unit_decode_report_test", ":unit_multi_node_analyzer_test"],
+)
+
+test_suite(
+    name = "prefill_resume_test",
+    tests = [":unit_prefill_resume_test", ":unit_core_storage_test", ":unit_core_run_directory_test"],
+)
+
+test_suite(
+    name = "prefill_runner_test",
+    tests = [":unit_prefill_runner_test", ":unit_distributed_prefill_session_test"],
+)
+
+test_suite(
+    name = "result_envelope_test",
+    tests = [":unit_core_results_test", ":unit_decode_metrics_test", ":unit_prefill_finalize_test"],
+)
+
+test_suite(
+    name = "runtime_adapter_test",
+    tests = [":unit_execution_runtime_adapter_test", ":unit_prefill_dashsc_transport_test", ":unit_decode_http_transport_test"],
+)
+
+test_suite(
+    name = "workload_test",
+    tests = [":unit_prefill_workload_test", ":unit_decode_distribution_test"],
+)
+
+py_test(
+    name = "decode_remote_test_test",
+    srcs = ["decode/remote_entry_test.py", "//rtp_llm/test/perf_test:decode_remote_test.py"],
+    main = "decode/remote_entry_test.py",
+    data = ["//rtp_llm/test/perf_test:aone_defs.bzl"],
+    deps = [
+        ":perf_test_support",
+        "//rtp_llm/test/perf_test:perf_test_runtime_lib",
+    ],
+)
+
+py_test(
+    name = "unit_core_entry_test",
+    srcs = ["core/entry_test.py", "//rtp_llm/test/perf_test:main.py"],
+    main = "core/entry_test.py",
+    data = [
+        "//tools:perf_test_script",
+        "//rtp_llm/test/perf_test:examples/prefill_local.json",
+        "//rtp_llm/test/perf_test:examples/decode_grid_local.json",
+    ],
+    deps = [
+        "//rtp_llm/test/perf_test:perf_test_entry_lib",
+        ":perf_test_entry_test_support",
+        "//rtp_llm/test/perf_test:perf_test_runtime_lib",
+        ":perf_test_support",
+    ],
+)
+
+py_test(
+    name = "unit_core_build_closure_test",
+    srcs = ["core/build_closure_test.py", "//rtp_llm/test/perf_test:main.py"],
+    main = "core/build_closure_test.py",
+    data = [
+        "//rtp_llm/test/perf_test:BUILD",
+        "//rtp_llm/test/perf_test:perf_test_python_sources",
+    ],
+    deps = [":perf_test_entry_test_support", ":perf_test_support"],
+)
+
+test_suite(
+    name = "entry_test",
+    tests = [":unit_core_entry_test", ":unit_core_build_closure_test"],
 )

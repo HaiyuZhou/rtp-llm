@@ -16,6 +16,14 @@ from rtp_llm.test.perf_test.tests.support.results import (
 
 class ResultEnvelopeTest(unittest.TestCase):
 
+    def test_ssh_result_uses_the_common_envelope(self):
+        for value in (
+            result_envelope_prefill_result(),
+            result_envelope_decode_result(),
+        ):
+            value["backend"] = "ssh"
+            self.assertEqual("ssh", parse_result_envelope(value).to_dict()["backend"])
+
     def test_prefill_result_preserves_server_ttft_and_wait(self):
         value = result_envelope_prefill_result()
         metrics = value["cases"][0]["metrics"]

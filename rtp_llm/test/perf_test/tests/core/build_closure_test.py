@@ -85,6 +85,7 @@ class RuntimeBuildClosureTest(unittest.TestCase):
             + libraries["perf_test_entry_lib"]
             + libraries["aone_lib"]
             + libraries["perf_test_results_lib"]
+            + libraries["perf_test_ssh_lib"]
         )
         prefix = "rtp_llm.test.perf_test."
         missing = set()
@@ -116,7 +117,7 @@ class RuntimeBuildClosureTest(unittest.TestCase):
                     sys.executable,
                     "-I",
                     "-c",
-                    "import sys, types; sys.path.insert(0, sys.argv[1]); sys.modules['yaml'] = types.ModuleType('yaml'); tokenizers = types.ModuleType('transformers'); tokenizers.AutoTokenizer = object; sys.modules['transformers'] = tokenizers; fuser = types.ModuleType('rtp_llm.utils.fuser'); fuser.fetch_remote_file_to_local = lambda path: path; sys.modules['rtp_llm.utils.fuser'] = fuser; from rtp_llm.test.perf_test.multi_node import multi_benchmark; assert callable(multi_benchmark.validate_benchmark)",
+                    "import sys, types; sys.path.insert(0, sys.argv[1]); sys.modules['yaml'] = types.ModuleType('yaml'); tokenizers = types.ModuleType('transformers'); tokenizers.AutoTokenizer = object; sys.modules['transformers'] = tokenizers; fuser = types.ModuleType('rtp_llm.utils.fuser'); fuser.fetch_remote_file_to_local = lambda path: path; sys.modules['rtp_llm.utils.fuser'] = fuser; from rtp_llm.test.perf_test.entry import plan_from_source; from rtp_llm.test.perf_test.ssh.source import resolve_source; assert callable(plan_from_source) and callable(resolve_source)",
                     str(isolated),
                 ],
                 cwd=directory,

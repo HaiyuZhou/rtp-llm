@@ -30,6 +30,7 @@ from rtp_llm.test.perf_test.plan import (
     AOneResourcePlan,
     ExecutionPlan,
     LocalResourcePlan,
+    SshResourcePlan,
     thaw,
 )
 
@@ -60,6 +61,8 @@ def build_engine_launch_spec(plan: ExecutionPlan) -> EngineLaunchSpec:
         device_ids = plan.resource_plan.devices
     elif isinstance(plan.resource_plan, AOneResourcePlan):
         device_ids = tuple(range(plan.resource_plan.gpus_per_shard))
+    elif isinstance(plan.resource_plan, SshResourcePlan):
+        device_ids = tuple(range(plan.resource_plan.local_world_size))
     else:
         raise PlanningError("engine launch requires an executable resource plan")
     config = thaw(plan.resolved_config)

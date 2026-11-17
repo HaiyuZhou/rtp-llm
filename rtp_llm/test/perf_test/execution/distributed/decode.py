@@ -4,77 +4,18 @@ import json
 import os
 from pathlib import Path
 
-from rtp_llm.test.perf_test.capabilities import validate_capability
-from rtp_llm.test.perf_test.config_resolver import load_resolved_config
-from rtp_llm.test.perf_test.config_schema import EngineConfig, parse_config
+from rtp_llm.test.perf_test.config_schema import EngineConfig
 from rtp_llm.test.perf_test.decode.executor import (
     DecodeBatchExecutor,
     DecodeCaseExecutor,
 )
 from rtp_llm.test.perf_test.decode.finalize import finalize_decode_run
-from rtp_llm.test.perf_test.decode.planner import plan_decode_cases
 from rtp_llm.test.perf_test.decode.profiling import DecodeProfiler
 from rtp_llm.test.perf_test.decode.transport import DecodeHttpTransport
-from rtp_llm.test.perf_test.entry import _source_config
-from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.modes import DecodeAdapter, ModeExecutionContext
-from rtp_llm.test.perf_test.plan import build_execution_plan, thaw
+from rtp_llm.test.perf_test.plan import thaw
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.storage import RunStore
-
-
-def build_external_decode_plan(
-    config_path,
-    result_directory,
-    actual_topology,
-    *,
-    execution_parser=None,
-    resource_planner=None,
-    capability_validator=validate_capability,
-):
-    """Build the local decode case identities without creating run artifacts."""
-    source = _source_config(str(config_path))
-    resolved = load_resolved_config(config_path, execution_parser=execution_parser)
-    config = parse_config(source, execution_parser=execution_parser)
-    configured = config.model.topology.as_tuple()
-    actual = tuple(actual_topology.get(name) for name in ("tp", "dp", "pp", "ep"))
-    if any(type(value) is not int or value <= 0 for value in actual):
-        raise PlanningError(
-            "runtime topology must supply positive integer TP, DP, PP, and EP sizes"
-        )
-    if configured != actual:
-        raise PlanningError(
-            f"runtime topology {actual} does not match configured topology {configured}"
-        )
-    cases = plan_decode_cases(
-        config.workload,
-        config.engine,
-        dp_size=config.model.topology.dp,
-        resolved_workload=resolved.resolved_config["workload"],
-    )
-    plan = build_execution_plan(
-        resource_planner=resource_planner,
-        capability_validator=capability_validator,
-        mode="decode",
-        action="run",
-        resolved=resolved,
-        cases=cases,
-        result_directory=str(result_directory),
-    )
-    return plan, source
-
-
-def run_external_rank(
-    *, world_rank, wait_for_master, execute_master, execute_worker=None
-):
-    """Only rank zero writes results; workers may drive synchronized local load."""
-    if world_rank == 0:
-        return execute_master()
-    if execute_worker is None:
-        wait_for_master()
-    else:
-        execute_worker()
-    return None
 
 
 def execute_master_decode(
@@ -138,3 +79,81 @@ def execute_master_decode(
     manifest["state"] = result.state.value
     store.write_manifest(manifest)
     return result
+
+
+def execute_decode_member(
+    plan,
+    *,
+    source_config,
+    endpoint,
+    tokenizer_path,
+    server_log_path,
+    profiler_directory,
+    world_rank,
+    local_world_size,
+    member_hosts,
+    control_port,
+    run_context=None,
+    check_cancelled=lambda: None,
+):
+    """Run the shared per-member decode load, independent of its scheduler."""
+    from rtp_llm.test.perf_test.decode.scheduler import requires_distributed_decode
+    from rtp_llm.test.perf_test.execution.distributed.decode_sync import (
+        ClusterDecodeTransport,
+        serve_decode_worker,
+    )
+    from rtp_llm.test.perf_test.test_util import create_query
+
+    topology = plan.resolved_config["model"]["topology"]
+    distributed = requires_distributed_decode(topology, local_world_size)
+    if world_rank and not distributed:
+        return None
+    lengths = sorted(
+        {length for case in plan.cases for length in case.identity["input_lengths"]}
+    )
+    queries = create_query(tokenizer_path=tokenizer_path, input_len_list=lengths)
+    local = DecodeHttpTransport(
+        endpoint=endpoint, prompt_for_length=lambda length: queries[length]
+    )
+    if world_rank:
+        serve_decode_worker(
+            member_hosts[0],
+            control_port,
+            world_rank=world_rank,
+            local_world_size=local_world_size,
+            tp_size=int(topology["tp"]),
+            dp_size=int(topology["dp"]),
+            local_transport=local,
+            check_cancelled=check_cancelled,
+        )
+        return None
+    cluster = None
+    try:
+        check_cancelled()
+        if distributed:
+            cluster = ClusterDecodeTransport(
+                local,
+                bind_host="0.0.0.0",
+                control_port=control_port,
+                local_world_size=local_world_size,
+                tp_size=int(topology["tp"]),
+                dp_size=int(topology["dp"]),
+                member_world_ranks=tuple(
+                    index * local_world_size for index in range(len(member_hosts))
+                ),
+                check_cancelled=check_cancelled,
+            )
+            cluster.connect_workers()
+        return execute_master_decode(
+            plan,
+            source_config=source_config,
+            endpoint=endpoint,
+            prompt_for_length=lambda length: queries[length],
+            server_log_path=server_log_path,
+            profiler_directory=profiler_directory,
+            transport=cluster,
+            run_context=run_context,
+        )
+    finally:
+        if cluster is not None:
+            cluster.close()

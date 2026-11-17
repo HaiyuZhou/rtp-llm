@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Union
 
@@ -15,19 +13,17 @@ from rtp_llm.test.perf_test.aone.collector import (
 from rtp_llm.test.perf_test.aone.package import (
     GeneratedAOnePackage,
     generate_aone_package,
+    package_location,
 )
 from rtp_llm.test.perf_test.aone.sharding import plan_shards
 from rtp_llm.test.perf_test.errors import PerfTestError, PostExecutionError, ReportError
+from rtp_llm.test.perf_test.execution.gang import write_manifest
 from rtp_llm.test.perf_test.plan import AOneResourcePlan, ExecutionPlan
 from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock, inspect_run_directory
 from rtp_llm.test.perf_test.state import RunOutcome, RunState
 from rtp_llm.test.perf_test.storage import RunStore, atomic_write_json
-
-
-def _timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -61,26 +57,7 @@ class AOneExecutor:
             lambda root: generate_prefill_report(root, acquire_lock=False)
         )
 
-    @staticmethod
-    def _write_manifest(
-        store: RunStore,
-        manifest: Dict[str, Any],
-        *,
-        state: Optional[RunState] = None,
-        stage: Optional[str] = None,
-        status: Optional[str] = None,
-        details: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        if state is not None:
-            manifest["state"] = state.value
-        if stage is not None:
-            stages = manifest.setdefault("stages", {})
-            stage_value = {"status": status, "updated_at": _timestamp()}
-            if details:
-                stage_value.update(copy.deepcopy(dict(details)))
-            stages[stage] = stage_value
-        manifest["updated_at"] = _timestamp()
-        store.write_manifest(manifest)
+    _write_manifest = staticmethod(write_manifest)
 
     @staticmethod
     def _write_collection_diagnostics(
@@ -112,14 +89,7 @@ class AOneExecutor:
             )
 
     def _package_location(self, root: Path) -> tuple[Path, str]:
-        package_root = root / "workload" / "aone_package"
-        try:
-            relative = package_root.resolve().relative_to(self._workspace_root)
-        except ValueError as error:
-            raise PostExecutionError(
-                f"AOne run directory must be inside workspace {self._workspace_root}"
-            ) from error
-        return package_root, relative.as_posix()
+        return package_location(self._workspace_root, root)
 
     def _stage_failure(
         self,

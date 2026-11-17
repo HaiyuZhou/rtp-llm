@@ -10,13 +10,25 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from rtp_llm.test.perf_test.aone.plan import AONE_GPU_HOSTS
-from rtp_llm.test.perf_test.errors import PlanningError
+from rtp_llm.test.perf_test.errors import PlanningError, PostExecutionError
 from rtp_llm.test.perf_test.plan import AOneResourcePlan, ExecutionPlan, thaw
 from rtp_llm.test.perf_test.storage import atomic_write_json
 
 PACKAGE_SCHEMA_VERSION = 1
 
 _PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*")
+
+
+def package_location(workspace_root: Path, root: Path) -> tuple[Path, str]:
+    """Locate an AOne-generated package within the Bazel workspace."""
+    package_root = root / "workload" / "aone_package"
+    try:
+        relative = package_root.resolve().relative_to(workspace_root)
+    except ValueError as error:
+        raise PostExecutionError(
+            f"AOne run directory must be inside workspace {workspace_root}"
+        ) from error
+    return package_root, relative.as_posix()
 
 
 def _validated_package_name(package_name: object) -> str:
@@ -246,6 +258,7 @@ def build_gang_plan_payload(plan: ExecutionPlan, run_id: str) -> Dict[str, Any]:
     return {
         "schema_version": GANG_PLAN_SCHEMA_VERSION,
         "run_id": run_id,
+        "execution_plan": plan.to_dict(),
         "config_fingerprint": plan.config_fingerprint,
         "workload_fingerprint": plan.workload_fingerprint,
         "world_size": resource.machine_count * resource.local_world_size,

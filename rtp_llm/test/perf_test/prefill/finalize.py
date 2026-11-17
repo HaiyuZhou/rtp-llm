@@ -25,7 +25,7 @@ def finalize_prefill_run(
     if (
         plan.mode != "prefill"
         or plan.action not in {"run", "resume"}
-        or plan.backend not in {"local", "aone"}
+        or plan.backend not in {"local", "aone", "ssh"}
     ):
         raise PlanningError("prefill finalization requires a prefill run plan")
     if not isinstance(run_id, str) or not run_id:

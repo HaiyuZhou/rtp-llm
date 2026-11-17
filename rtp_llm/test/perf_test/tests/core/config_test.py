@@ -290,3 +290,71 @@ class CapabilitiesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SshConfigurationTest(unittest.TestCase):
+    def execution(self):
+        return {
+            "backend": "ssh",
+            "hosts": [{"ssh_target": "gpu-alias", "advertise_host": "192.0.2.11"}],
+            "gpus_per_machine": 1,
+            "source": {"build_policy": "reuse"},
+        }
+
+    def test_single_config_accepts_ssh_alias_and_independent_advertised_address(self):
+        source = unified_config_base_config()
+        source["execution"] = self.execution()
+        execution = parse_config(source).execution
+        self.assertEqual("gpu-alias", execution.hosts[0].ssh_target)
+        self.assertEqual("192.0.2.11", execution.hosts[0].advertise_host)
+        self.assertIsNone(execution.run_user)
+        self.assertIsNone(execution.ssh_port)
+
+    def test_build_requires_explicit_driver_and_rejects_credential_fields(self):
+        from rtp_llm.test.perf_test.ssh.config_schema import parse_execution
+
+        execution = self.execution()
+        execution["source"]["build_policy"] = "build"
+        with self.assertRaisesRegex(ConfigError, "build_driver"):
+            parse_execution(execution)
+        execution["source"]["build_policy"] = "reuse"
+        execution["password"] = "secret"
+        with self.assertRaises(ConfigError):
+            parse_execution(execution)
+
+    def test_unknown_host_options_and_duplicate_members_are_rejected(self):
+        from rtp_llm.test.perf_test.ssh.config_schema import parse_execution
+
+        execution = self.execution()
+        execution["hosts"] *= 2
+        with self.assertRaisesRegex(ConfigError, "duplicate"):
+            parse_execution(execution)
+        execution = self.execution()
+        execution["hosts"][0]["ssh_options"] = "-F none"
+        with self.assertRaises(ConfigError):
+            parse_execution(execution)
+
+
+class ExternalInputSnapshotTest(unittest.TestCase):
+    def test_experiment_input_snapshot_survives_file_mutation_and_is_not_aliased(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = [[128, 1]]
+            path = root / "distribution.json"
+            path.write_text(json.dumps(payload))
+            source = unified_config_base_config()
+            source["workload"] = {
+                "kind": "distribution",
+                "distribution_file": path.name,
+                "output_length": 8,
+                "batch": {"strategy": "fixed", "sizes": [1]},
+            }
+            cache = {}
+            first = resolve_config(source, source_dir=root, external_inputs=cache)
+            path.write_text("corrupt now")
+            second = resolve_config(source, source_dir=root, external_inputs=cache)
+            self.assertEqual(first.workload_fingerprint, second.workload_fingerprint)
+            first.resolved_config["workload"]["distribution"].append([256, 1])
+            self.assertEqual(
+                payload, second.resolved_config["workload"]["distribution"]
+            )

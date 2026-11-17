@@ -2,14 +2,32 @@
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
 from rtp_llm.test.perf_test.results import parse_result_envelope
+from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.tests.support.results import prefill_adapter_finalize_plan
 
 
 class PrefillFinalizeTest(unittest.TestCase):
+
+    def test_ssh_missing_measurements_remain_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "results").mkdir()
+            plan = replace(prefill_adapter_finalize_plan(root), backend="ssh")
+            envelope = finalize_prefill_run(
+                root,
+                plan=plan,
+                run_id="ssh-run",
+                case_results=[],
+                terminal_state=RunState.FAILED,
+            )
+            parsed = parse_result_envelope(envelope)
+            self.assertEqual("ssh", parsed.backend)
+            self.assertEqual("failed", parsed.status.value)
 
     def test_writes_valid_common_envelope_and_summary(self):
         with tempfile.TemporaryDirectory() as directory:

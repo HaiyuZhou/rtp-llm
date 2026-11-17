@@ -1,4 +1,4 @@
-"""Freeze unified random prefill workloads as explicit request batches."""
+"""Export random or traffic prefill sampling into explicit request batches."""
 
 import argparse
 import copy
@@ -8,10 +8,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional, Sequence
 
+from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.config_schema import PrefillWorkloadConfig, parse_config
 from rtp_llm.test.perf_test.errors import ConfigurationError, PerfTestError
 from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
 from rtp_llm.test.perf_test.prefill.random_batch import sample_random_request_batches
+from rtp_llm.test.perf_test.prefill.traffic_batch import materialize_traffic_source
 
 
 def _freeze_workload(raw, workload: PrefillWorkloadConfig, engine) -> bool:
@@ -33,15 +35,24 @@ def _freeze_workload(raw, workload: PrefillWorkloadConfig, engine) -> bool:
     return True
 
 
-def _freeze_config(source):
-    frozen = copy.deepcopy(source)
+def _freeze_config(source, *, source_dir):
     config = parse_config(source)
-    if not isinstance(config.workload, PrefillWorkloadConfig) or not _freeze_workload(
-        frozen["workload"], config.workload, config.engine
-    ):
-        raise ConfigurationError("export requires a random_request_batches workload")
+    if not isinstance(config.workload, PrefillWorkloadConfig):
+        raise ConfigurationError("export requires a prefill workload")
+    frozen = copy.deepcopy(source)
+    changed = _freeze_workload(frozen["workload"], config.workload, config.engine)
+    raw = source["workload"]
+    if any("traffic_request_batches" in item for item in [raw, *raw.get("grids", ())]):
+        resolved = resolve_config(source, source_dir=source_dir)
+        frozen = materialize_traffic_source(
+            frozen, resolved.resolved_config["workload"]
+        )
+        changed = True
+    if not changed:
+        raise ConfigurationError(
+            "export requires random_request_batches or traffic_request_batches"
+        )
     parsed = parse_config(frozen)
-    # The ordinary grouped planner remains the final admission authority.
     plan_prefill_cases(parsed.workload, parsed.engine, dp_size=parsed.model.topology.dp)
     return frozen
 
@@ -56,7 +67,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         source = json.loads(args.config.read_text(encoding="utf-8"))
         if args.output is not None:
-            outputs = [(args.output, _freeze_config(source))]
+            outputs = [
+                (args.output, _freeze_config(source, source_dir=args.config.parent))
+            ]
         else:
             config = parse_config(source)
             workload = config.workload
@@ -81,7 +94,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     }
                 per_batch["workload"]["seed"] = workload.seed + size
                 outputs.append(
-                    (args.output_dir / f"batch_{size}.json", _freeze_config(per_batch))
+                    (
+                        args.output_dir / f"batch_{size}.json",
+                        _freeze_config(per_batch, source_dir=args.config.parent),
+                    )
                 )
         # Preflight the complete set before creating directories or writing a file.
         for path, _ in outputs:

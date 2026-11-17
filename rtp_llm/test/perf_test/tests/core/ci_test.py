@@ -1,3 +1,5 @@
+"""Performance framework behavior and failure regressions."""
+
 import importlib.util
 import json
 import tempfile
@@ -5,10 +7,11 @@ import unittest
 from pathlib import Path
 
 from rtp_llm.test.perf_test.ci_delivery import deliver_config
-from rtp_llm.test.perf_test.tests.support.paths import PERF_TEST_ROOT
+from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
 
 
 class CiDeliveryTest(unittest.TestCase):
+
     def setUp(self):
         self.checkout = PERF_TEST_ROOT.parents[2]
         self.temp = tempfile.TemporaryDirectory()
@@ -16,12 +19,7 @@ class CiDeliveryTest(unittest.TestCase):
         self.destination = Path(self.temp.name) / "delivered.json"
 
     def deliver(self, *, MODE="decode", CONFIG="auto"):
-        return deliver_config(
-            MODE,
-            CONFIG,
-            self.checkout,
-            self.destination,
-        )
+        return deliver_config(MODE, CONFIG, self.checkout, self.destination)
 
     def test_missing_ep_is_resolved_by_planner(self):
         base = self.deliver(MODE="prefill")
@@ -39,10 +37,7 @@ class CiDeliveryTest(unittest.TestCase):
         base["model"]["checkpoint"] = "/configured/model"
         base["model"]["tokenizer"] = "/configured/tokenizer"
         base["execution"]["backend"] = "local"
-        config = self.deliver(
-            MODE="prefill",
-            CONFIG=json.dumps(base),
-        )
+        config = self.deliver(MODE="prefill", CONFIG=json.dumps(base))
         self.assertEqual(config["model"], base["model"])
         self.assertEqual(
             config["execution"],
@@ -129,7 +124,6 @@ class CiDeliveryTest(unittest.TestCase):
                     source,
                     execution_parser=parse_execution if mode == "prefill" else None,
                 ).resolved_config["workload"]
-                # Use a valid AOne execution section so path resolution is isolated.
                 base = json.loads(source.read_text())
                 base["execution"] = dict(
                     backend="aone",
@@ -141,8 +135,8 @@ class CiDeliveryTest(unittest.TestCase):
                 source_copy = Path(self.temp.name) / "source" / name
                 source_copy.parent.mkdir(exist_ok=True)
                 source_copy.write_text(json.dumps(base))
-                distribution = (
-                    base["workload"].get("traffic_request_batches", base["workload"])
+                distribution = base["workload"].get(
+                    "traffic_request_batches", base["workload"]
                 )["distribution_file"]
                 (source_copy.parent / distribution).write_bytes(
                     (examples / distribution).read_bytes()
@@ -177,6 +171,7 @@ class CiDeliveryTest(unittest.TestCase):
 
 
 class PrefillVerificationTest(unittest.TestCase):
+
     def setUp(self):
         self.assertIsNotNone(
             importlib.util.find_spec("rtp_llm.test.perf_test.ci_prefill_verify"),
@@ -185,8 +180,6 @@ class PrefillVerificationTest(unittest.TestCase):
         from rtp_llm.test.perf_test.ci_prefill_verify import verify_prefill_run
 
         self.verify = verify_prefill_run
-        # Platform targets without plotly render the static chart fallback;
-        # relax only the interactive-chart assertions there, not the CI gate.
         from rtp_llm.test.perf_test.prefill.chart import plotly_available
 
         self.require_interactive_charts = plotly_available()
@@ -226,7 +219,7 @@ class PrefillVerificationTest(unittest.TestCase):
                     round_elapsed_ms=20.0,
                     measurement_contract=identity["measurement_contract"],
                 )
-                for j, (n, c) in enumerate(
+                for (j, (n, c)) in enumerate(
                     [(length, 64)] * (self.batch_size - 1) + [(length + 64, 0)]
                 )
             ]
@@ -359,29 +352,14 @@ class PrefillVerificationTest(unittest.TestCase):
                     require_interactive_charts=self.require_interactive_charts,
                 )
 
-    SVG_FALLBACK_CHART = (
-        "<!doctype html><html><body><h1>Prefill 3D chart</h1>"
-        "<p>Plotly unavailable; showing static chart.</p><svg></svg>"
-        "</body></html>"
-    )
-    EMBEDDED_PLOTLY_CHART = (
-        '<!doctype html><html><body><div id="chart"></div>'
-        "<script>/* plotly.js v1.2.3 */ window.Plotly = {}; "
-        "window.Plotly.newPlot = function () {}; "
-        "window.Plotly.react = function () {}; "
-        "window.Plotly.relayout = function () {};</script>"
-        "<script>const layout = {updatemenus: []}; "
-        "Plotly.newPlot('chart', [], layout);</script>"
-        "</body></html>"
-    )
+    SVG_FALLBACK_CHART = "<!doctype html><html><body><h1>Prefill 3D chart</h1><p>Plotly unavailable; showing static chart.</p><svg></svg></body></html>"
+    EMBEDDED_PLOTLY_CHART = "<!doctype html><html><body><div id=\"chart\"></div><script>/* plotly.js v1.2.3 */ window.Plotly = {}; window.Plotly.newPlot = function () {}; window.Plotly.react = function () {}; window.Plotly.relayout = function () {};</script><script>const layout = {updatemenus: []}; Plotly.newPlot('chart', [], layout);</script></body></html>"
 
     def write_interactive_charts(self, content):
         for chart in ("latency", "tpm"):
             self.write_text(f"reports/{chart}.interactive.html", content)
 
     def test_relaxed_chart_check_accepts_static_fallback(self):
-        # Platform targets without plotly render the static fallback; every
-        # other artifact must still be verified in that environment.
         self.write_interactive_charts(self.SVG_FALLBACK_CHART)
         summary = self.verify(self.root, require_interactive_charts=False)
         self.assertEqual(summary["valid_geometries"], 30)

@@ -76,8 +76,41 @@
             ]
           }
         ]
+      },
+      {
+        "name": "random",
+        "random_request_batches": {
+          "num_cases": 12,
+          "batch_sizes": [
+            2,
+            4
+          ],
+          "min_input_tokens": 512,
+          "max_input_tokens": 8192,
+          "input_alignment": 256,
+          "cold_probability": 0.2,
+          "kv_budget_tokens": 32768,
+          "batch_input_limits": {
+            "4": 6144
+          }
+        }
+      },
+      {
+        "name": "traffic",
+        "traffic_request_batches": {
+          "distribution_file": "req_distribution.json",
+          "num_cases": 12,
+          "batch_sizes": [
+            1,
+            4
+          ],
+          "min_input_tokens": 512,
+          "max_input_tokens": 8192,
+          "kv_budget_tokens": 32768
+        }
       }
-    ]
+    ],
+    "seed": 20261009
   },
   "execution": {
     "backend": "local",

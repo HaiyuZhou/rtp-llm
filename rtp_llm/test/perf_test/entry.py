@@ -38,18 +38,6 @@ from rtp_llm.test.perf_test.run_directory import (
     inspect_run_directory,
 )
 
-
-class Orchestrator:
-    def __init__(self, executors: Mapping[str, Callable[[ExecutionPlan], Any]]):
-        self._executors = dict(executors)
-
-    def execute(self, plan: ExecutionPlan) -> Any:
-        executor = self._executors.get(plan.backend)
-        if executor is None:
-            raise PlanningError(f"no executor registered for backend {plan.backend!r}")
-        return executor(plan)
-
-
 # Renderers return backend-specific commands and optional placement details.
 # Shared identity/configuration fields cannot be replaced by an adapter.
 PreviewRenderer = Callable[[ExecutionPlan], Dict[str, Any]]
@@ -98,19 +86,6 @@ def backend_preview(plan: ExecutionPlan) -> Dict[str, Any]:
             {"stage": "local-run", "argv": ["perf_test_worker", "--plan", plan_path]}
         ]
     }
-
-
-def dispatch_plan(
-    plan: ExecutionPlan,
-    *,
-    dry_run: bool,
-    execute: Callable[[ExecutionPlan], Any],
-    preview_renderer: Optional[PreviewRenderer] = None,
-) -> Any:
-    """Keep dry-run on a branch that cannot invoke the execution callback."""
-    if dry_run:
-        return create_preview(plan, preview_renderer=preview_renderer)
-    return execute(plan)
 
 
 ExecutorFactory = Callable[[], Mapping[str, Callable[[ExecutionPlan], Any]]]
@@ -333,7 +308,10 @@ def execute_plan(
         if executor_factory is _default_executors
         else executor_factory()
     )
-    return Orchestrator(executors).execute(plan)
+    executor = executors.get(plan.backend)
+    if executor is None:
+        raise PlanningError(f"no executor registered for backend {plan.backend!r}")
+    return executor(plan)
 
 
 def run_request(

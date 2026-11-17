@@ -1,13 +1,26 @@
 """Resolve model and tokenizer engine arguments for standalone benchmarks."""
 
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-from rtp_llm.test.perf_test.dataset import extract_arg
 from rtp_llm.test.perf_test.hub_download import (
     needs_perf_hub_resolve,
     resolve_checkpoint_or_tokenizer_for_perf,
 )
+
+
+def extract_arg(
+    args_list: List[str], key: str, default: Optional[str] = None
+) -> Optional[str]:
+    """Extract --key value from a CLI args list (without removing it)."""
+    flag = f"--{key}"
+    prefix = f"--{key}="
+    for i, arg in enumerate(args_list):
+        if arg == flag and i + 1 < len(args_list):
+            return args_list[i + 1]
+        if arg.startswith(prefix):
+            return arg[len(prefix) :]
+    return default
 
 
 def _replace_cli_value(argv: List[str], key: str, new_value: str) -> None:

@@ -34,18 +34,17 @@ from rtp_llm.test.perf_test.modes import (
     ModeExecutionContext,
     ModeExecutionResult,
     PrefillAdapter,
+    create_prefill_adapter,
 )
 from rtp_llm.test.perf_test.plan import ExecutionPlan, thaw
-from rtp_llm.test.perf_test.prefill.adapter import create_prefill_adapter
 from rtp_llm.test.perf_test.prefill.checkpoint import (
     PrefillResume,
     ResumeSelection,
     validate_prefill_resume,
 )
 from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
-from rtp_llm.test.perf_test.prefill.profile import PrefillProfiler
+from rtp_llm.test.perf_test.prefill.profile import PrefillProfiler, ProfiledRunner
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
-from rtp_llm.test.perf_test.prefill.trace import ProfiledRunner
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock, inspect_run_directory
 from rtp_llm.test.perf_test.state import RunOutcome, RunState
 from rtp_llm.test.perf_test.storage import RunStore

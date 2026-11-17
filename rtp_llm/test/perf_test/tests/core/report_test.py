@@ -1,5 +1,8 @@
-"""Tests for prefill report_test."""
+"""Performance framework behavior and failure regressions."""
 
+import copy
+import csv
+import json
 import tempfile
 import types
 import unittest
@@ -7,10 +10,14 @@ from pathlib import Path
 from unittest.mock import patch
 from xml.etree import ElementTree
 
+from rtp_llm.test.perf_test.decode.report import generate_decode_report
 from rtp_llm.test.perf_test.execution.engine_session import EngineSession
+from rtp_llm.test.perf_test.multi_node.analyzer import merge_decode_results as merge
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
 from rtp_llm.test.perf_test.tests.support.reports import (
     _setup_prefill_report_run,
+    decode_multi_node_analyzer_write_collected_run,
+    decode_report_exact_cases,
     prefill_report_case_bytes,
 )
 
@@ -73,10 +80,7 @@ class PrefillChartTest(unittest.TestCase):
         offline.get_plotlyjs = lambda: ""
         package = types.ModuleType("plotly")
         package.offline = offline
-        with patch.dict(
-            "sys.modules",
-            {"plotly": package, "plotly.offline": offline},
-        ):
+        with patch.dict("sys.modules", {"plotly": package, "plotly.offline": offline}):
             self.assertTrue(plotly_available())
 
     def test_standalone_charts_and_static_fallback(self):
@@ -105,6 +109,90 @@ class PrefillChartTest(unittest.TestCase):
                 document = (root / "reports" / f"{metric}.interactive.html").read_text()
                 self.assertIn("<svg", document)
                 self.assertIn("request_index", document)
+
+
+class DecodeReportTest(unittest.TestCase):
+
+    def test_exact_report_groups_input_output_matrix_by_batch(self):
+        cases = decode_report_exact_cases((128, 512), (16, 64), (1, 4))
+        before = copy.deepcopy(cases)
+        report = generate_decode_report(cases)
+        self.assertEqual(2, report["schema_version"])
+        self.assertEqual("formal", report["report_kind"])
+        self.assertEqual({"planned": 8, "valid": 8, "excluded": 0}, report["counts"])
+        self.assertEqual(
+            [1, 4], [matrix["batch_size"] for matrix in report["matrices"]]
+        )
+        first = report["matrices"][0]
+        self.assertEqual([128, 512], first["input_lengths"])
+        self.assertEqual([16, 64], first["output_lengths"])
+        self.assertEqual(4, len(first["cells"]))
+        self.assertEqual(1.0, first["cells"][0]["tpot_ms"])
+        self.assertEqual(100.0, first["cells"][0]["throughput_tokens_per_second"])
+        self.assertEqual(17.0, first["cells"][0]["total_latency_ms"])
+        self.assertEqual(1.0, first["cells"][0]["success_rate"])
+        self.assertEqual(
+            [item["case_id"] for item in cases],
+            [item["case_id"] for item in report["observations"]],
+        )
+        for row in report["observations"]:
+            self.assertNotIn("search", row)
+        for matrix in report["matrices"]:
+            for cell in matrix["cells"]:
+                self.assertNotIn("search", cell)
+        self.assertEqual(before, cases)
+        first["cells"][0]["errors"].append({"message": "changed"})
+        self.assertEqual([], cases[0]["errors"])
+
+
+class DecodeMultiNodeAnalyzerTest(unittest.TestCase):
+
+    def test_merger_exports_fixed_batch_metrics_to_csv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            decode_multi_node_analyzer_write_collected_run(root)
+            rows = merge.merge_all_results(merge.scan_result_files(directory))
+            output = root / "decode.csv"
+            merge.save_merged_csv(rows, str(output))
+            with output.open(newline="") as stream:
+                actual = list(csv.DictReader(stream))
+            self.assertEqual(
+                [
+                    {
+                        "dp_size": "2",
+                        "input_length": "128",
+                        "output_length": "64",
+                        "batch_strategy": "fixed",
+                        "global_batch_size": "8",
+                        "success_rate": "1.0",
+                        "wait_ms": "1.0",
+                        "prefill_ms": "2.0",
+                        "decode_ms": "8.0",
+                        "tpot_ms": "1.0",
+                        "total_ms": "11.0",
+                        "throughput_tokens_per_second": "1000.0",
+                        "status": "ok",
+                    }
+                ],
+                actual,
+            )
+
+    def test_merger_deduplicates_copied_run_identity_but_keeps_distinct_runs(self):
+        for same_run in (False, True):
+            with self.subTest(
+                same_run=same_run
+            ), tempfile.TemporaryDirectory() as directory:
+                path = decode_multi_node_analyzer_write_collected_run(Path(directory))
+                envelope = json.loads(path.read_text())
+                if not same_run:
+                    envelope["run_id"] = "another-run"
+                nested = path.parents[1] / "run" / "results" / "result.json"
+                nested.parent.mkdir(parents=True)
+                nested.write_text(json.dumps(envelope))
+                rows = merge.merge_all_results(merge.scan_result_files(directory))
+                self.assertEqual(
+                    1 if same_run else 2, sum((len(metrics) for (_, metrics) in rows))
+                )
 
 
 if __name__ == "__main__":

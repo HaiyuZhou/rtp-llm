@@ -1,4 +1,5 @@
-import copy
+"""Performance framework behavior and failure regressions."""
+
 import json
 import tempfile
 import unittest
@@ -9,10 +10,11 @@ from unittest.mock import patch
 from rtp_llm.test.perf_test.errors import ConfigurationError
 from rtp_llm.test.perf_test.experiment import expand_experiment, run_experiment
 from rtp_llm.test.perf_test.state import RunState
-from rtp_llm.test.perf_test.tests.support.fixtures import prefill_resume_config
+from rtp_llm.test.perf_test.tests.support.prefill import prefill_resume_config
 
 
 class ExperimentTest(unittest.TestCase):
+
     def document(self):
         return {
             "experiment_schema_version": 1,

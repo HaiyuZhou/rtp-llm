@@ -1,4 +1,4 @@
-"""Core performance behavior contracts."""
+"""Performance framework behavior and failure regressions."""
 
 import asyncio
 import json

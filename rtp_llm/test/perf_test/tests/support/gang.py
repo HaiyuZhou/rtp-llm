@@ -1,4 +1,4 @@
-"""Fixtures shared by tests split from aone_gang_test."""
+"""Performance framework behavior and failure regressions."""
 
 import json
 
@@ -185,9 +185,98 @@ def _write_testlogs_tree(base, plan, *, status="completed", master=True):
 
 
 TOPOLOGY = {"tp": 8, "dp": 2, "pp": 1, "ep": 16}
-
 MACHINE_COUNT = 2
-
 LOCAL_WORLD_SIZE = 8
-
 RUN_ID = "run-gang"
+
+
+def prefill_source(
+    *, model=None, engine=None, workload=None, execution=None, output=None
+):
+    """Fresh minimal remote prefill config; section overrides are explicit per case."""
+    source = {
+        "schema_version": 1,
+        "model": {"label": "test", "type": "registered", "checkpoint": "/m"},
+        "engine": {
+            "max_seq_len": 4096,
+            "max_batch_tokens": 8192,
+            "concurrency_limit": 2,
+        },
+        "workload": {
+            "kind": "cache_grid",
+            "max_input_len": 2048,
+            "cache_alignment": 64,
+            "commit_tail_tokens": 64,
+            "compute_steps": [256],
+            "batch_sizes": [1],
+        },
+        "execution": {
+            "backend": "aone",
+            "resource": "daily",
+            "gpu_type": "H20",
+            "max_parallel": 2,
+            "shard_count": 2,
+        },
+        "output": {},
+        "regression": {},
+        "publish": {},
+    }
+    for section, overrides in (
+        ("model", model),
+        ("engine", engine),
+        ("workload", workload),
+        ("execution", execution),
+        ("output", output),
+    ):
+        if overrides is not None:
+            source[section].update(overrides)
+    return source
+
+
+def aone_execution(**fields):
+    execution = {
+        "backend": "aone",
+        "resource": "daily",
+        "gpu_type": "H20",
+        "max_parallel": 2,
+    }
+    execution.update(fields)
+    return execution
+
+
+def aone_gang_config(execution, topology=None, mode="prefill"):
+    if mode == "decode":
+        workload = {
+            "kind": "grid",
+            "input_lengths": [128],
+            "output_lengths": [16],
+            "batch": {"strategy": "fixed", "sizes": [2]},
+        }
+    else:
+        workload = {
+            "kind": "cache_grid",
+            "max_input_len": 2048,
+            "cache_alignment": 64,
+            "commit_tail_tokens": 64,
+            "compute_steps": [128],
+            "batch_sizes": [1],
+        }
+    return {
+        "schema_version": 1,
+        "model": {
+            "label": "test-model",
+            "type": "registered_model",
+            "checkpoint": "/models/test",
+            "topology": topology or {"tp": 2, "dp": 1, "pp": 1, "ep": 1},
+        },
+        "engine": {
+            "max_seq_len": 4096,
+            "max_batch_tokens": 8192,
+            "concurrency_limit": 8,
+        },
+        "workload": workload,
+        "execution": execution,
+        "output": {},
+        "regression": {},
+        "publish": {},
+    }

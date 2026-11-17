@@ -14,46 +14,8 @@ from rtp_llm.test.perf_test.config_schema import (
     ConfigError,
     validate_engine_argument_names,
 )
-from rtp_llm.test.perf_test.errors import ConfigurationError, PlanningError
+from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.execution.devices import GPU_LOCKED_DEVICES_ENV
-
-LAUNCHER_CONFIG_FIELDS = frozenset(
-    {
-        "ip_lists",
-        "run_user",
-        "ssh_port",
-        "git_repo_url",
-        "git_checkout_ref",
-        "open_source_url",
-        "open_source_ref",
-        "ft_sub_dir",
-        "ft_work_dir",
-        "bazel_build_args",
-        "bazel_targets",
-        "patch_commands",
-        "perf_test_config",
-        "resolved_workload_path",
-        "checkpoint_path",
-        "tokenizer_path",
-        "model_type",
-        "tp_size",
-        "dp_size",
-        "pp_size",
-        "ep_size",
-        "world_size",
-        "local_world_size",
-        "start_port",
-        "upload_oss_path",
-        "cuda_asan",
-        "sub_cmd",
-        "build_from_scratch",
-        "benchmark_name",
-        "task_output_dir",
-        "run_context",
-        "collect_diagnostics",
-        "diagnostics_only",
-    }
-)
 
 RUNTIME_ENVIRONMENT_KEYS = frozenset(
     {
@@ -75,23 +37,10 @@ RUNTIME_ENVIRONMENT_KEYS = frozenset(
         "MAGA_SERVER_WORK_DIR",
     }
 )
-HOST_MODEL_ENVIRONMENT_KEYS = frozenset(
-    {"CHECKPOINT_PATH", "TOKENIZER_PATH", "MODEL_TYPE"}
-)
 FORCED_ENGINE_ENVIRONMENT = {
     "USE_BATCH_DECODE_SCHEDULER": "1",
     "FAKE_BALANCE_EXPERT": "1",
 }
-
-
-def validate_launcher_config(config: Mapping[str, Any]) -> None:
-    unknown = sorted(set(config) - LAUNCHER_CONFIG_FIELDS)
-    if unknown:
-        raise ConfigurationError(
-            f"launcher YAML field {unknown[0]!r} is not a launcher setting; "
-            "move engine settings to engine.args/engine.env in perf_test_config JSON "
-            "so they are included in the config fingerprint"
-        )
 
 
 @lru_cache(maxsize=1)

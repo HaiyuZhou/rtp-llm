@@ -1,4 +1,4 @@
-"""Tests for prefill dashsc_transport_test."""
+"""Performance framework behavior and failure regressions."""
 
 import struct
 import unittest

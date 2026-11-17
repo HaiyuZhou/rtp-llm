@@ -1,4 +1,4 @@
-"""Ordinary Bazel decode keeps one complete local execution plan."""
+"""Performance framework behavior and failure regressions."""
 
 import contextlib
 import importlib
@@ -13,14 +13,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from rtp_llm.test.perf_test.tests.support.fixtures import (
+    PERF_TEST_ROOT,
     fixture_engine,
     fixture_execution,
     fixture_model,
 )
-from rtp_llm.test.perf_test.tests.support.paths import PERF_TEST_ROOT
 
 
 class DecodeRemoteTest(unittest.TestCase):
+
     def setUp(self):
         module_name = "rtp_llm.test.perf_test.decode_remote_test"
         self.assertIsNotNone(
@@ -60,16 +61,13 @@ class DecodeRemoteTest(unittest.TestCase):
     def invoke(self, source=None, outputs=None):
         self.config.write_text(json.dumps(self.source if source is None else source))
         self.errors = io.StringIO()
-        with (
-            patch.dict(
-                os.environ,
-                {"TEST_UNDECLARED_OUTPUTS_DIR": str(outputs or self.outputs)},
-            ),
-            patch(
-                "rtp_llm.test.perf_test.execution.local.create_default_local_executor",
-                return_value=self.execute,
-            ),
-            contextlib.redirect_stderr(self.errors),
+        with patch.dict(
+            os.environ, {"TEST_UNDECLARED_OUTPUTS_DIR": str(outputs or self.outputs)}
+        ), patch(
+            "rtp_llm.test.perf_test.execution.local.create_default_local_executor",
+            return_value=self.execute,
+        ), contextlib.redirect_stderr(
+            self.errors
         ):
             return self.wrapper.main([f"--config={self.config}"])
 
@@ -119,10 +117,9 @@ class DecodeRemoteTest(unittest.TestCase):
 
     def test_missing_config_fails_clearly(self):
         errors = io.StringIO()
-        with (
-            patch.dict(os.environ, {"TEST_UNDECLARED_OUTPUTS_DIR": str(self.outputs)}),
-            contextlib.redirect_stderr(errors),
-        ):
+        with patch.dict(
+            os.environ, {"TEST_UNDECLARED_OUTPUTS_DIR": str(self.outputs)}
+        ), contextlib.redirect_stderr(errors):
             self.assertNotEqual(0, self.wrapper.main([f"--config={self.config}"]))
         self.assertIn("config", errors.getvalue())
         self.assertFalse(self.outputs.exists())
@@ -143,6 +140,7 @@ class DecodeRemoteTest(unittest.TestCase):
 
 
 class DecodeRemoteMacroTest(unittest.TestCase):
+
     def test_macro_declares_one_unsharded_gpu_action_with_config_runfile(self):
         declarations = []
         namespace = {

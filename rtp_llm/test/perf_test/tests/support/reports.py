@@ -23,7 +23,6 @@ from rtp_llm.test.perf_test.tests.support.fixtures import (
 )
 
 decode_report_TOPOLOGY = {"tp": 1, "dp": 1, "pp": 1, "ep": 1}
-
 decode_report_DISABLED = {"status": "disabled", "manifest_path": None, "error": None}
 
 
@@ -213,12 +212,7 @@ def decode_multi_node_analyzer_decode_envelope_v2():
 
 
 def decode_multi_node_analyzer_write_collected_run(
-    root,
-    *,
-    input_length=128,
-    output_length=64,
-    batch_size=8,
-    nested=False,
+    root, *, input_length=128, output_length=64, batch_size=8, nested=False
 ):
     task = root / "Task_dp_size-2"
     run = task / "run" if nested else task

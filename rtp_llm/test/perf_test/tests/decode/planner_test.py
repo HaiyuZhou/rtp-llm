@@ -1,27 +1,26 @@
-"""Tests for decode planner_test."""
+"""Performance framework behavior and failure regressions."""
 
+import json
+import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
+from rtp_llm.test.perf_test.config_resolver import load_resolved_config
 from rtp_llm.test.perf_test.config_schema import parse_config
 from rtp_llm.test.perf_test.decode.model import DecodeCaseSpec
 from rtp_llm.test.perf_test.decode.planner import plan_decode_cases
 from rtp_llm.test.perf_test.errors import PlanningError
-from rtp_llm.test.perf_test.tests.support.plan import (
-    decode_planner_payload,
-    decode_planner_resolved_distribution,
-    decode_planner_resolved_grid,
-)
 
 
 class DecodePlannerTest(unittest.TestCase):
 
     def test_fixed_batches_reject_uneven_active_dp_workers(self):
         for size in (1, 3):
-            grid, _ = decode_planner_resolved_grid(
+            (grid, _) = decode_planner_resolved_grid(
                 inputs=[128], outputs=[16], sizes=[size]
             )
-            distribution, resolved = decode_planner_resolved_distribution(
+            (distribution, resolved) = decode_planner_resolved_distribution(
                 distribution=[64, 96, 128], sizes=[size]
             )
             for config, workload in (
@@ -125,6 +124,114 @@ class DecodePlannerTest(unittest.TestCase):
                 )
                 self.assertEqual({"source_kind": source_kind}, cases[0]["distribution"])
                 self.assertTrue(all((case["output_length"] == 16 for case in cases)))
+
+
+class DecodeDistributionTest(unittest.TestCase):
+
+    def test_materialized_sequence_lengths_generate_deterministic_actual_cases(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "requests.json").write_text(
+                json.dumps({"sequence_lengths": [64, 128, 256, 512]}), encoding="utf-8"
+            )
+            config_path = root / "perf.json"
+            config_path.write_text(
+                json.dumps(decode_distribution_source()), encoding="utf-8"
+            )
+            resolved = load_resolved_config(config_path)
+            parsed = parse_config(decode_distribution_source())
+            first = plan_decode_cases(
+                parsed.workload,
+                parsed.engine,
+                dp_size=1,
+                resolved_workload=resolved.resolved_config["workload"],
+            )
+            second = plan_decode_cases(
+                parsed.workload,
+                parsed.engine,
+                dp_size=1,
+                resolved_workload=resolved.resolved_config["workload"],
+            )
+            self.assertEqual(first, second)
+            self.assertEqual(
+                [[64, 128], [64, 128, 256]], [case["input_lengths"] for case in first]
+            )
+            self.assertEqual([2, 3], [case["batch_policy"]["size"] for case in first])
+            self.assertEqual({32}, {case["output_length"] for case in first})
+
+
+import json
+import tempfile
+from pathlib import Path
+
+from rtp_llm.test.perf_test.config_resolver import resolve_config
+from rtp_llm.test.perf_test.config_schema import parse_config
+from rtp_llm.test.perf_test.tests.support.fixtures import (
+    fixture_engine,
+    fixture_execution,
+    fixture_model,
+)
+
+
+def decode_planner_payload(workload):
+    return {
+        "schema_version": 1,
+        "model": fixture_model(label="test-model"),
+        "engine": fixture_engine(),
+        "workload": workload,
+        "execution": {"backend": "local"},
+        "output": {},
+        "regression": {},
+        "publish": {},
+    }
+
+
+def decode_planner_resolved_grid(*, inputs, outputs, sizes):
+    payload = decode_planner_payload(
+        {
+            "kind": "grid",
+            "input_lengths": inputs,
+            "output_lengths": outputs,
+            "batch": {"strategy": "fixed", "sizes": sizes},
+        }
+    )
+    return (parse_config(payload), resolve_config(payload))
+
+
+def decode_planner_resolved_distribution(*, distribution, sizes):
+    batch = {"strategy": "fixed", "sizes": sizes}
+    payload = decode_planner_payload(
+        {
+            "kind": "distribution",
+            "distribution_file": "requests.json",
+            "output_length": 16,
+            "batch": batch,
+        }
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        Path(directory, "requests.json").write_text(json.dumps(distribution))
+        return (parse_config(payload), resolve_config(payload, source_dir=directory))
+
+
+def decode_distribution_source(distribution_file="requests.json"):
+    return {
+        "schema_version": 1,
+        "model": fixture_model(),
+        "engine": fixture_engine(),
+        "workload": {
+            "kind": "distribution",
+            "distribution_file": distribution_file,
+            "output_length": 32,
+            "batch": {"strategy": "fixed", "sizes": [2, 3]},
+            "measure_runs": 2,
+            "warmup_runs": 1,
+            "generate_config": {"top_k": 1},
+        },
+        "execution": fixture_execution(),
+        "output": {},
+        "regression": {},
+        "publish": {},
+    }
 
 
 if __name__ == "__main__":

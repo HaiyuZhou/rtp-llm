@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from rtp_llm.test.perf_test.execution.devices import resolve_allocated_devices
-from rtp_llm.test.perf_test.execution.distributed.plan import bind_member_plan
+from rtp_llm.test.perf_test.plan import bind_member_plan
 
 
 class CompletionGroup:
@@ -165,14 +165,12 @@ def run_member(plan, *, source_config, descriptor, check_cancelled=lambda: None)
     from rtp_llm.test.perf_test.execution.distributed.decode import (
         execute_decode_member,
     )
-    from rtp_llm.test.perf_test.execution.distributed.gang_config import (
-        build_gang_config_string,
-    )
     from rtp_llm.test.perf_test.execution.distributed.prefill import (
         execute_master_prefill,
     )
     from rtp_llm.test.perf_test.execution.distributed.rank_group import (
         LocalRankGroupContext,
+        build_gang_config_string,
         start_local_rank_group,
     )
     from rtp_llm.test.perf_test.execution.launch_boundary import (

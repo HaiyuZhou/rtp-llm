@@ -1,4 +1,5 @@
-import copy
+"""Performance framework behavior and failure regressions."""
+
 import json
 import os
 import shutil
@@ -9,13 +10,15 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from rtp_llm.test.perf_test.entry import plan_from_source
 from rtp_llm.test.perf_test.execution.ssh import SshExecutor
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
+from rtp_llm.test.perf_test.ssh.maintenance import maintain, read_deployment
 from rtp_llm.test.perf_test.ssh.worker import verify_bundle
 from rtp_llm.test.perf_test.state import RunState
-from rtp_llm.test.perf_test.tests.support.paths import PERF_TEST_ROOT
+from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
 from rtp_llm.test.perf_test.tests.support.results import result_envelope_decode_result
 
 
@@ -98,6 +101,7 @@ class LocalTransport:
 
 
 class SshExecutorTest(unittest.TestCase):
+
     def setup_plan(self, temporary):
         root = Path(temporary)
         source_root = root / "public"
@@ -141,7 +145,7 @@ class SshExecutorTest(unittest.TestCase):
                 "build_policy": "reuse",
             },
         }
-        plan, source = plan_from_source(
+        (plan, source) = plan_from_source(
             config, source_dir=root, result_directory=str(root / "run")
         )
         initialize_run_directory(
@@ -186,7 +190,9 @@ class SshExecutorTest(unittest.TestCase):
             self.assertEqual(manifest["stages"]["collect"]["status"], "completed")
 
     def test_ctrl_c_mid_start_joins_inflight_launch_before_remote_cancel(self):
+
         class InterruptingStart(LocalTransport):
+
             def __init__(self, plan):
                 super().__init__(plan)
                 self.released = threading.Event()
@@ -225,6 +231,68 @@ class SshExecutorTest(unittest.TestCase):
             self.assertTrue(transport.cancelled)
             self.assertTrue(transport.remote_cancelled)
             self.assertFalse(transport.pending)
+
+
+class MaintenanceTest(unittest.TestCase):
+
+    def test_relocated_deployment_supports_dry_run_without_rewriting_original_manifest(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = SshExecutorTest().setup_plan(directory)
+            transport = LocalTransport(plan)
+            self.assertEqual(
+                SshExecutor(host_factory=lambda *args: transport)(plan).exit_code, 0
+            )
+            original = Path(plan.result_directory)
+            original_bytes = (original / "manifest.json").read_bytes()
+            relocated = Path(directory) / "relocated"
+            shutil.copytree(original, relocated)
+            with patch(
+                "rtp_llm.test.perf_test.ssh.maintenance.RemoteHost.run",
+                side_effect=AssertionError("no remote contact"),
+            ):
+                result = maintain(relocated, "cancel", dry_run=True)
+            self.assertEqual(result["exit_code"], 0)
+            self.assertIn("0", result["members"])
+            self.assertEqual((original / "manifest.json").read_bytes(), original_bytes)
+
+    def test_modified_host_is_rejected_before_any_network_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = SshExecutorTest().setup_plan(directory)
+            transport = LocalTransport(plan)
+            self.assertEqual(
+                SshExecutor(host_factory=lambda *args: transport)(plan).exit_code, 0
+            )
+            path = Path(plan.result_directory) / "execution/ssh/members.json"
+            deployment = json.loads(path.read_text())
+            deployment["members"][0]["ssh_target"] = "unexpected-machine"
+            path.write_text(json.dumps(deployment))
+            with self.assertRaisesRegex(ValueError, "host differs"):
+                read_deployment(plan.result_directory)
+
+    def test_invalid_member_indices_and_bound_paths_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = SshExecutorTest().setup_plan(directory)
+            transport = LocalTransport(plan)
+            self.assertEqual(
+                SshExecutor(host_factory=lambda *args: transport)(plan).exit_code, 0
+            )
+            path = Path(plan.result_directory) / "execution/ssh/members.json"
+            baseline = json.loads(path.read_text())
+            for field, value in [
+                ("member_index", -1),
+                ("member_index", True),
+                ("member_id", "1"),
+                ("worker_path", "/different/worker.py"),
+                ("descriptor_path", "/different/descriptor.json"),
+            ]:
+                with self.subTest(field=field, value=value):
+                    modified = json.loads(json.dumps(baseline))
+                    modified["members"][0][field] = value
+                    path.write_text(json.dumps(modified))
+                    with self.assertRaises(ValueError):
+                        read_deployment(plan.result_directory)
 
 
 if __name__ == "__main__":

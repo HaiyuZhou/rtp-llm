@@ -46,7 +46,7 @@ from rtp_llm.test.perf_test.execution.devices import (
     GPU_LOCKED_DEVICES_ENV,
     resolve_allocated_devices,
 )
-from rtp_llm.test.perf_test.execution.distributed.gang_config import (
+from rtp_llm.test.perf_test.execution.distributed.rank_group import (
     build_gang_config_string,
 )
 from rtp_llm.test.perf_test.plan import ExecutionPlan
@@ -808,7 +808,7 @@ def _build_rank_group_plan(
 
 def _build_gang_execution_plan(config_path, context, result_directory):
     """Consume the controller's v2 plan; never replan cases on a worker."""
-    from rtp_llm.test.perf_test.execution.distributed.plan import bind_member_plan
+    from rtp_llm.test.perf_test.plan import bind_member_plan
 
     try:
         plan = ExecutionPlan.from_dict(context.gang_plan["execution_plan"])

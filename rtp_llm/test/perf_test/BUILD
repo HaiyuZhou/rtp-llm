@@ -40,15 +40,12 @@ py_library(
         "decode/scheduler.py",
         "entry.py",
         "errors.py",
-        "execution/gang_layout.py",
         "experiment.py",
         "plan.py",
         "prefill/__init__.py",
         "prefill/block_size.py",
-        "prefill/case_store.py",
+        "prefill/export.py",
         "prefill/fingerprints.py",
-        "prefill/generate_random_batch_grid.py",
-        "prefill/generate_traffic_batch_grid.py",
         "prefill/measurement.py",
         "prefill/planner.py",
         "prefill/prompts.py",
@@ -86,9 +83,7 @@ py_library(
         "execution/distributed/__init__.py",
         "execution/distributed/decode.py",
         "execution/distributed/decode_sync.py",
-        "execution/distributed/gang_config.py",
         "execution/distributed/member.py",
-        "execution/distributed/plan.py",
         "execution/distributed/prefill.py",
         "execution/distributed/rank_group.py",
         "execution/engine_session.py",
@@ -96,9 +91,7 @@ py_library(
         "execution/launch_boundary.py",
         "execution/local.py",
         "execution/runtime.py",
-        "execution/scheduler.py",
         "modes.py",
-        "prefill/adapter.py",
         "prefill/chart.py",
         "prefill/checkpoint.py",
         "prefill/dashsc_transport.py",
@@ -109,7 +102,6 @@ py_library(
         "prefill/report.py",
         "prefill/restricted_symbolic.py",
         "prefill/runner.py",
-        "prefill/trace.py",
         "test_util.py",
     ],
     deps = [
@@ -137,14 +129,10 @@ exports_files([
     "examples/decode_grid_local.json",
     "examples/prefill_aone.json",
     "examples/prefill_aone_ci.json",
-    "examples/prefill_aone_gang.json",
     "examples/prefill_deepseek_v4_flash_daily.json",
     "examples/prefill_deepseek_v4_pro_daily.json",
-    "examples/prefill_grouped_local.json",
     "examples/prefill_local.json",
     "examples/prefill_multi_grid_local.json",
-    "examples/prefill_random_batch_local.json",
-    "examples/prefill_traffic_distribution_local.json",
     "examples/qwen35_prefill_test.json",
     "examples/req_distribution.json",
     "main.py",
@@ -195,14 +183,9 @@ py_library(
 )
 
 py_binary(
-    name = "generate_perf_test_golden",
-    srcs = ["generate_perf_test_golden.py"],
-    deps = [":perf_test_regression_lib"],
-)
-
-py_binary(
-    name = "validate_perf_test_golden",
-    srcs = ["validate_perf_test_golden.py"],
+    name = "perf_test_golden",
+    main = "regression/golden.py",
+    srcs = ["regression/golden.py"],
     deps = [":perf_test_regression_lib"],
 )
 
@@ -221,7 +204,6 @@ py_library(
 py_library(
     name = "perf_test_lib",
     srcs = [
-        "dataset.py",
         "engine_paths.py",
         "offline_bench_test.py",
         "offline_runner.py",
@@ -309,16 +291,9 @@ py_test(
 )
 
 py_binary(
-    name = "generate_random_batch_grid",
-    main = "prefill/generate_random_batch_grid.py",
-    srcs = ["prefill/generate_random_batch_grid.py"],
-    deps = [":perf_test_entry_lib"],
-)
-
-py_binary(
-    name = "generate_traffic_batch_grid",
-    main = "prefill/generate_traffic_batch_grid.py",
-    srcs = ["prefill/generate_traffic_batch_grid.py"],
+    name = "export_prefill_batches",
+    main = "prefill/export.py",
+    srcs = ["prefill/export.py"],
     deps = [":perf_test_entry_lib"],
 )
 
@@ -352,165 +327,26 @@ py_library(
     ],
 )
 
-# Preserve existing test labels as suites; aliases do not expand in tests().
-
-test_suite(
-    name = "aone_broker_test",
-    tests = ["//rtp_llm/test/perf_test/tests:aone_broker_test"],
-)
-
-test_suite(
-    name = "aone_entry_test",
-    tests = ["//rtp_llm/test/perf_test/tests:aone_entry_test"],
-)
-
-test_suite(
-    name = "aone_gang_test",
-    tests = ["//rtp_llm/test/perf_test/tests:aone_gang_test"],
-)
-
-test_suite(
-    name = "aone_single_test",
-    tests = ["//rtp_llm/test/perf_test/tests:aone_single_test"],
-)
-
-test_suite(
-    name = "aone_worker_test",
-    tests = ["//rtp_llm/test/perf_test/tests:aone_worker_test"],
-)
-
-test_suite(
-    name = "ci_test",
-    tests = ["//rtp_llm/test/perf_test/tests:ci_test"],
-)
-
-test_suite(
-    name = "decode_executor_test",
-    tests = ["//rtp_llm/test/perf_test/tests:decode_executor_test"],
-)
-
-
-
-test_suite(
-    name = "decode_remote_test_test",
-    tests = ["//rtp_llm/test/perf_test/tests:decode_remote_test_test"],
-)
-
-test_suite(
-    name = "engine_session_test",
-    tests = ["//rtp_llm/test/perf_test/tests:engine_session_test"],
-)
-
-test_suite(
-    name = "entry_test",
-    tests = ["//rtp_llm/test/perf_test/tests:entry_test"],
-)
-
-test_suite(
-    name = "offline_runner_test",
-    tests = ["//rtp_llm/test/perf_test/tests:offline_runner_test"],
-)
-
-alias(
-    name = "perf_test_regression_test_support",
-    testonly = True,
-    actual = "//rtp_llm/test/perf_test/tests:perf_test_regression_test_support",
-)
-
-alias(
-    name = "perf_test_support",
-    testonly = True,
-    actual = "//rtp_llm/test/perf_test/tests:perf_test_support",
-)
-
-test_suite(
-    name = "plan_test",
-    tests = ["//rtp_llm/test/perf_test/tests:plan_test"],
-)
-
-test_suite(
-    name = "policy_extraction_test",
-    tests = ["//rtp_llm/test/perf_test/tests:policy_extraction_test"],
-)
-
-test_suite(
-    name = "prefill_profile_test",
-    tests = ["//rtp_llm/test/perf_test/tests:prefill_profile_test"],
-)
-
-test_suite(
-    name = "prefill_report_test",
-    tests = ["//rtp_llm/test/perf_test/tests:prefill_report_test"],
-)
-
-test_suite(
-    name = "prefill_resume_test",
-    tests = ["//rtp_llm/test/perf_test/tests:prefill_resume_test"],
-)
-
-test_suite(
-    name = "prefill_runner_test",
-    tests = ["//rtp_llm/test/perf_test/tests:prefill_runner_test"],
-)
-
-test_suite(
-    name = "publication_policy_test",
-    tests = ["//rtp_llm/test/perf_test/tests:publication_policy_test"],
-)
-
-test_suite(
-    name = "regression_test",
-    tests = ["//rtp_llm/test/perf_test/tests:regression_test"],
-)
-
-test_suite(
-    name = "result_envelope_test",
-    tests = ["//rtp_llm/test/perf_test/tests:result_envelope_test"],
-)
-
-test_suite(
-    name = "runtime_adapter_test",
-    tests = ["//rtp_llm/test/perf_test/tests:runtime_adapter_test"],
-)
-
-
-
-test_suite(
-    name = "unified_config_test",
-    tests = ["//rtp_llm/test/perf_test/tests:unified_config_test"],
-)
-
 test_suite(
     name = "unit_tests",
     tests = ["//rtp_llm/test/perf_test/tests:unit_tests"],
 )
 
-test_suite(
-    name = "workload_test",
-    tests = ["//rtp_llm/test/perf_test/tests:workload_test"],
-)
-
 filegroup(
     name = "perf_test_examples",
     srcs = [
-        "examples/decode_ssh_gang.json",
-        "examples/prefill_ssh_gang.json",
-        "examples/prefill_ssh_single.json",
-        "examples/decode_ssh_experiment.json",
         "examples/decode_aone_gang.json",
         "examples/decode_distribution_local.json",
         "examples/decode_distribution_requests.json",
         "examples/decode_grid_local.json",
+        "examples/decode_ssh_experiment.json",
+        "examples/decode_ssh_gang.json",
         "examples/prefill_aone.json",
         "examples/prefill_aone_ci.json",
-        "examples/prefill_aone_gang.json",
         "examples/prefill_deepseek_v4_flash_daily.json",
         "examples/prefill_deepseek_v4_pro_daily.json",
-        "examples/prefill_grouped_local.json",
         "examples/prefill_local.json",
         "examples/prefill_multi_grid_local.json",
-        "examples/prefill_random_batch_local.json",
-        "examples/prefill_traffic_distribution_local.json",
         "examples/qwen35_prefill_test.json",
         "examples/req_distribution.json",
     ],

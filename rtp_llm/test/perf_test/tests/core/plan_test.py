@@ -1,22 +1,27 @@
-"""Tests for core plan_test."""
+"""Performance framework behavior and failure regressions."""
 
 import dataclasses
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from rtp_llm.test.perf_test.case_planning import plan_cases
+from rtp_llm.test.perf_test.cli import parse_cli
 from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.config_schema import _parse_execution, parse_config
+from rtp_llm.test.perf_test.entry import _new_plan
 from rtp_llm.test.perf_test.errors import ResourceError
 from rtp_llm.test.perf_test.plan import (
     AOneResourcePlan,
     ExecutionPlan,
     LocalResourcePlan,
+    bind_member_plan,
     build_execution_plan,
     case_id,
 )
+from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
 from rtp_llm.test.perf_test.tests.support.plan import plan_cases, plan_config
 
 
@@ -158,11 +163,8 @@ class ExtensionSeamsTest(unittest.TestCase):
             ExecutionPlan.from_dict(damaged)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LatestPlanContractTest(unittest.TestCase):
+
     def test_only_latest_plan_schema_is_accepted(self):
         from rtp_llm.test.perf_test.errors import PlanningError
 
@@ -181,6 +183,7 @@ class LatestPlanContractTest(unittest.TestCase):
 
 
 class FrozenPlanIntegrityTest(unittest.TestCase):
+
     def test_changed_resolved_fields_cannot_keep_original_fingerprint(self):
         from rtp_llm.test.perf_test.errors import PlanningError
 
@@ -200,3 +203,34 @@ class FrozenPlanIntegrityTest(unittest.TestCase):
                 raw["resolved_config"][section][field] = value
                 with self.assertRaisesRegex(PlanningError, "fingerprint"):
                     ExecutionPlan.from_dict(raw)
+
+
+class FrozenBindingTest(unittest.TestCase):
+
+    def test_only_result_path_is_bound(self):
+        request = parse_cli(
+            [
+                "--mode=decode",
+                "--action=run",
+                "--config=" + str(PERF_TEST_ROOT / "examples/decode_grid_local.json"),
+            ]
+        )
+        (plan, _) = _new_plan(request)
+        with patch(
+            "rtp_llm.test.perf_test.config_resolver.load_resolved_config",
+            side_effect=AssertionError("must not reload source"),
+        ):
+            bound = bind_member_plan(plan, result_directory="/remote/run")
+        expected = dataclasses.replace(plan, result_directory="/remote/run")
+        self.assertEqual(expected, bound)
+        self.assertEqual(plan.config_fingerprint, bound.config_fingerprint)
+        self.assertEqual(plan.workload_fingerprint, bound.workload_fingerprint)
+        self.assertEqual(plan.cases, bound.cases)
+
+    def test_relative_binding_is_rejected(self):
+        with self.assertRaises(ValueError):
+            bind_member_plan(None, result_directory="relative")
+
+
+if __name__ == "__main__":
+    unittest.main()

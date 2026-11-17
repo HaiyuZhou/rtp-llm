@@ -6,8 +6,7 @@ from typing import Any, Mapping
 
 from rtp_llm.test.perf_test.decode.scheduler import requires_distributed_decode
 from rtp_llm.test.perf_test.errors import PlanningError
-from rtp_llm.test.perf_test.execution.gang_layout import derive_gang_topology
-from rtp_llm.test.perf_test.plan import SshResourcePlan, freeze
+from rtp_llm.test.perf_test.plan import SshResourcePlan, derive_gang_topology, freeze
 
 
 def plan_resources(

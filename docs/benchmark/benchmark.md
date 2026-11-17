@@ -11,7 +11,7 @@ is `run` for a config and `report` for an existing run directory. Explicit
 ```bash
 ./tools/perf_test --config=rtp_llm/test/perf_test/examples/prefill_local.json --dry-run
 ./tools/perf_test --config=rtp_llm/test/perf_test/examples/decode_ssh_gang.json --dry-run
-./tools/perf_test --config=rtp_llm/test/perf_test/examples/prefill_aone_gang.json --dry-run
+./tools/perf_test --config=rtp_llm/test/perf_test/examples/prefill_aone_ci.json --dry-run
 ```
 
 Remove `--dry-run` to execute. Preview validates the complete plan without
@@ -28,11 +28,31 @@ creating a run directory, contacting hosts, building or starting a model.
 uses fixed global batches divisible by DP. Current model-level measurements
 require PP=1. Profiling restrictions are checked during planning.
 
+## Prefill batches
+
+`examples/prefill_multi_grid_local.json` contains named cold, explicit mixed,
+random and traffic grids in one engine session. Freeze its sampled batches
+before sharing a config:
+
+```bash
+python -m rtp_llm.test.perf_test.prefill.export \
+  --config rtp_llm/test/perf_test/examples/prefill_multi_grid_local.json \
+  --output /tmp/prefill-batches-frozen.json
+```
+
+The exporter detects random and traffic sources, including named grids.
+`--output-dir DIR` instead exports one file per batch size for a single
+top-level random workload. Existing destinations are rejected. The corresponding
+Bazel binary is `//rtp_llm/test/perf_test:export_prefill_batches`.
+
 ## SSH machines
 
-Start with `examples/prefill_ssh_single.json`, `prefill_ssh_gang.json` or
-`decode_ssh_gang.json` under `rtp_llm/test/perf_test/`. There is no launcher
-YAML or referenced benchmark JSON to maintain.
+Start with `examples/decode_ssh_gang.json` under `rtp_llm/test/perf_test/` for
+SSH execution settings. For prefill, combine its `execution` object with the
+model, engine and workload from `examples/prefill_local.json` in one JSON.
+Set topology, `gpus_per_machine` and host count together; the local prefill
+example needs one host. There is no launcher YAML or referenced benchmark JSON
+to maintain.
 
 Each host has a `ssh_target` for the submitting machine's SSH connection and
 an `advertise_host` reachable by the other model workers. System SSH config,
@@ -111,3 +131,19 @@ frozen run and do not accept config overrides.
 The historical `multi_node/analyzer/` tools remain available for existing result
 analysis. The manual `offline_bench_test` is a separate microbenchmark. Public
 runs do not automatically publish results or replace regression baselines.
+
+## Result goldens
+
+Generate a candidate from a completed result, review the differences, then
+validate the accepted file explicitly:
+
+```bash
+python -m rtp_llm.test.perf_test.regression.golden generate \
+  --result /path/to/run/results/result.json --output /tmp/result.candidate.json
+python -m rtp_llm.test.perf_test.regression.golden validate \
+  --result /path/to/run/results/result.json --golden /path/to/accepted.golden.json
+```
+
+`generate` atomically replaces its output; use a candidate path before promotion.
+`validate` reads the golden without changing it. The corresponding Bazel binary
+is `//rtp_llm/test/perf_test:perf_test_golden`.

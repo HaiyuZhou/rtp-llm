@@ -1,4 +1,4 @@
-"""Backend-neutral distributed runtime regression tests."""
+"""Performance framework behavior and failure regressions."""
 
 import copy
 import json
@@ -73,8 +73,8 @@ class DistributedRuntimeTest(unittest.TestCase):
             member_world_ranks=(0, 1, 2),
             timeout_seconds=0.1,
         )
-        silent_master, silent_peer = socket.socketpair()
-        failed_master, failed_peer = socket.socketpair()
+        (silent_master, silent_peer) = socket.socketpair()
+        (failed_master, failed_peer) = socket.socketpair()
         for sock in (silent_master, failed_master):
             sock.settimeout(0.1)
         cluster._peers = {
@@ -133,6 +133,7 @@ class DistributedRuntimeTest(unittest.TestCase):
         )
 
         class LocalTransport:
+
             def __init__(self):
                 self.configured = []
                 self.rounds = []
@@ -143,20 +144,22 @@ class DistributedRuntimeTest(unittest.TestCase):
             def run_round(self, *, input_lengths, output_length, generate_config):
                 self.rounds.append(tuple(input_lengths))
                 return tuple(
-                    {
-                        "request_index": index,
-                        "success": True,
-                        "input_length": length,
-                        "output_length": output_length,
-                        "latency_ms": {
-                            "wait": 0.0,
-                            "prefill": 1.0,
-                            "decode": 4.0,
-                            "tpot": 1.0,
-                            "total": 5.0,
-                        },
-                    }
-                    for index, length in enumerate(input_lengths)
+                    (
+                        {
+                            "request_index": index,
+                            "success": True,
+                            "input_length": length,
+                            "output_length": output_length,
+                            "latency_ms": {
+                                "wait": 0.0,
+                                "prefill": 1.0,
+                                "decode": 4.0,
+                                "tpot": 1.0,
+                                "total": 5.0,
+                            },
+                        }
+                        for (index, length) in enumerate(input_lengths)
+                    )
                 )
 
         master_local = LocalTransport()
@@ -199,9 +202,7 @@ class DistributedRuntimeTest(unittest.TestCase):
                 ]
                 cluster.configure_scheduler(allocations)
                 outcomes = cluster.run_round(
-                    input_lengths=(10, 11, 12, 13),
-                    output_length=8,
-                    generate_config={},
+                    input_lengths=(10, 11, 12, 13), output_length=8, generate_config={}
                 )
                 self.assertEqual([0, 1, 2, 3], [r["request_index"] for r in outcomes])
                 self.assertEqual([(10, 11)], master_local.rounds)
@@ -212,8 +213,6 @@ class DistributedRuntimeTest(unittest.TestCase):
                 self.assertEqual(
                     2, len(worker_local.configured[0][0]["request_indices"])
                 )
-                # Every DP rank must execute a nonempty batch. Reject idle
-                # allocations before sending configure commands to members.
                 from rtp_llm.test.perf_test.decode.scheduler import (
                     schedule_decode_requests,
                 )
@@ -221,7 +220,7 @@ class DistributedRuntimeTest(unittest.TestCase):
                 small = schedule_decode_requests((17,), dp_size=2)
                 with self.assertRaisesRegex(PlanningError, "positive"):
                     cluster.configure_scheduler(
-                        tuple(w.to_dict() for w in small.workers)
+                        tuple((w.to_dict() for w in small.workers))
                     )
                 with self.assertRaisesRegex(PlanningError, "profiling requires DP=1"):
                     cluster.start_profile(
@@ -341,3 +340,7 @@ class DistributedRuntimeTest(unittest.TestCase):
                     )
                 )
             )
+
+
+if __name__ == "__main__":
+    unittest.main()

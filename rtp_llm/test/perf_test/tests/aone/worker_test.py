@@ -1,3 +1,5 @@
+"""Performance framework behavior and failure regressions."""
+
 import json
 import tempfile
 import unittest
@@ -16,7 +18,7 @@ from rtp_llm.test.perf_test.execution.engine_session import EngineDiagnostics
 from rtp_llm.test.perf_test.modes import PrefillAdapter
 from rtp_llm.test.perf_test.plan import build_execution_plan
 from rtp_llm.test.perf_test.state import RunState
-from rtp_llm.test.perf_test.tests.support.aone import prefill_source
+from rtp_llm.test.perf_test.tests.support.gang import prefill_source
 
 
 def _worker_plan(root):
@@ -277,6 +279,7 @@ class AOneWorkerTest(unittest.TestCase):
             calls = []
 
             class Runner:
+
                 def run_case(self, case):
                     calls.append(case["case_id"])
                     if len(calls) == 2:

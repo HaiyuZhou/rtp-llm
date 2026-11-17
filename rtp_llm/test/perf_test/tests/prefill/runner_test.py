@@ -1,4 +1,4 @@
-"""Tests for prefill runner_test."""
+"""Performance framework behavior and failure regressions."""
 
 import array
 import copy
@@ -22,12 +22,10 @@ from rtp_llm.test.perf_test.prefill.prompts import (
 from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.storage import RunStore
-from rtp_llm.test.perf_test.tests.support.fixtures import (
-    prefill_resume_config,
-    prefill_resume_plan,
-)
 from rtp_llm.test.perf_test.tests.support.prefill import (
     SeedBatchClient,
+    prefill_resume_config,
+    prefill_resume_plan,
     prefill_runner_case,
     prefill_runner_Client,
     prefill_runner_grouped_case,
@@ -37,6 +35,7 @@ from rtp_llm.test.perf_test.tests.support.prefill import (
 
 
 class ShortColdPromptTest(unittest.TestCase):
+
     def test_short_cold_runs_have_distinct_exact_length_inputs(self):
         tokenizer = SimpleNamespace(encode=list)
         prompts = PrefixPromptFactory(tokenizer).build_case_prompts(
@@ -47,7 +46,9 @@ class ShortColdPromptTest(unittest.TestCase):
 
 
 class PreflightReuseTest(unittest.TestCase):
+
     class Tokenizer(prefill_runner_Tokenizer):
+
         def __init__(self, *, collide=False):
             self.long_encodes = 0
             self.reject_long = False
@@ -86,7 +87,7 @@ class PreflightReuseTest(unittest.TestCase):
                 commit_tail_tokens=4,
                 max_batch_tokens=4096,
                 cache_block_size=4,
-                **kwargs,
+                **kwargs
             ),
             client,
         )
@@ -94,7 +95,7 @@ class PreflightReuseTest(unittest.TestCase):
     def test_successful_global_preflight_is_reused_without_long_reencoding(self):
         case = self.case()
         tokenizer = self.Tokenizer()
-        runner, client = self.runner(tokenizer, case)
+        (runner, client) = self.runner(tokenizer, case)
         runner.preflight([case])
         tokenizer.reject_long = True
         result = runner.run_case(copy.deepcopy(case))
@@ -105,7 +106,7 @@ class PreflightReuseTest(unittest.TestCase):
     def test_changed_case_with_same_id_is_validated_again(self):
         case = self.case()
         tokenizer = self.Tokenizer()
-        runner, client = self.runner(tokenizer, case)
+        (runner, client) = self.runner(tokenizer, case)
         runner.preflight([case])
         tokenizer.reject_long = True
         result = runner.run_case(dict(case, measure_runs=3))
@@ -115,7 +116,7 @@ class PreflightReuseTest(unittest.TestCase):
     def test_standalone_run_validates_before_dispatch(self):
         case = self.case(cache_len=0)
         tokenizer = self.Tokenizer()
-        runner, client = self.runner(tokenizer, case)
+        (runner, client) = self.runner(tokenizer, case)
         tokenizer.reject_long = True
         result = runner.run_case(case)
         self.assertEqual("request_failed", result["status"])
@@ -125,7 +126,7 @@ class PreflightReuseTest(unittest.TestCase):
         case = self.case(batch_size=1)
         other = self.case(case_id="other", batch_size=1)
         tokenizer = self.Tokenizer(collide=True)
-        runner, client = self.runner(tokenizer, case)
+        (runner, client) = self.runner(tokenizer, case)
         with self.assertRaisesRegex(ValueError, "not independent"):
             runner.preflight([case, other])
         tokenizer.reject_long = True
@@ -136,7 +137,7 @@ class PreflightReuseTest(unittest.TestCase):
     def test_id_transport_only_full_encodes_initial_verified_shapes(self):
         case = self.case(batch_size=16)
         tokenizer = self.Tokenizer()
-        runner, _ = self.runner(tokenizer, case, input_ids_only=True)
+        (runner, _) = self.runner(tokenizer, case, input_ids_only=True)
         runner.preflight([case])
         self.assertEqual(5, tokenizer.long_encodes)
 
@@ -144,7 +145,7 @@ class PreflightReuseTest(unittest.TestCase):
         for input_ids_only in (False, True):
             with self.subTest(input_ids_only=input_ids_only):
                 case = self.case()
-                runner, _ = self.runner(
+                (runner, _) = self.runner(
                     self.Tokenizer(), case, input_ids_only=input_ids_only
                 )
 
@@ -169,7 +170,7 @@ class PreflightReuseTest(unittest.TestCase):
         for corruption in ("prefix", "duplicate", "short_texts"):
             with self.subTest(corruption=corruption):
                 case = self.case()
-                runner, client = self.runner(
+                (runner, client) = self.runner(
                     self.Tokenizer(), case, input_ids_only=True
                 )
 
@@ -194,6 +195,7 @@ class PreflightReuseTest(unittest.TestCase):
 
 
 class TokenDigestTest(unittest.TestCase):
+
     def test_digest_matches_little_endian_int32_boundary_bytes(self):
         ids = [0, 1, -1, -(2**31), 2**31 - 1]
         payload = bytes.fromhex("00000000 01000000 ffffffff 00000080 ffffff7f")
@@ -220,6 +222,7 @@ class TokenDigestTest(unittest.TestCase):
                     prefill_runner_module._token_digest([token])
 
     def test_big_endian_native_array_is_normalized(self):
+
         def big_endian_array(typecode, values):
             packed = array.array(typecode, values)
             if sys.byteorder == "little":
@@ -242,7 +245,7 @@ class TokenDigestTest(unittest.TestCase):
             compute_len=68,
             request_groups=[{"count": 1, "input_len": 132, "cache_len": 64}],
         )
-        runner, client = setup.runner(
+        (runner, client) = setup.runner(
             setup.Tokenizer(collide=True), first, input_ids_only=True
         )
         with self.assertRaisesRegex(ValueError, "cache blocks are not independent"):
@@ -252,7 +255,7 @@ class TokenDigestTest(unittest.TestCase):
     def test_preflight_rejects_extra_reuse_with_distinct_complete_sequences(self):
         setup = PreflightReuseTest()
         case = setup.case()
-        runner, client = setup.runner(setup.Tokenizer(), case, input_ids_only=True)
+        (runner, client) = setup.runner(setup.Tokenizer(), case, input_ids_only=True)
 
         def corrupt_round(*args):
             members = build_grouped_prompts(*args)
@@ -270,6 +273,7 @@ class TokenDigestTest(unittest.TestCase):
 
 
 class SeedBatchTest(unittest.TestCase):
+
     def run_seeds(
         self,
         cache_lengths,
@@ -277,7 +281,7 @@ class SeedBatchTest(unittest.TestCase):
         max_batch_tokens=4096,
         workspace_tokens=None,
         cache_block_size=4,
-        client=None,
+        client=None
     ):
         client = client or SeedBatchClient(cache_lengths)
         case = dict(
@@ -298,41 +302,38 @@ class SeedBatchTest(unittest.TestCase):
             max_batch_tokens=max_batch_tokens,
             workspace_tokens=workspace_tokens,
         ).run_case(case)
-        return client, result
+        return (client, result)
 
     def test_seeds_overlap_in_batches_of_eight_with_short_tail(self):
-        client, result = self.run_seeds([8] * 10)
+        (client, result) = self.run_seeds([8] * 10)
         self.assertEqual("ok", result["status"])
         self.assertEqual([8, 2, 20], [len(b["requests"]) for b in client.batches])
         self.assertEqual(10, len(result["metrics"]["measurements"]))
 
     def test_token_budget_includes_output_and_skips_cold_members(self):
-        for budget, expected in (
-            (30, [[0, 2], [3, 4]]),
-            (29, [[0], [2, 3], [4]]),
-        ):
+        for budget, expected in ((30, [[0, 2], [3, 4]]), (29, [[0], [2, 3], [4]])):
             with self.subTest(budget=budget):
-                client, result = self.run_seeds(
+                (client, result) = self.run_seeds(
                     [8, 0, 12, 4, 8], max_batch_tokens=budget
                 )
                 self.assertEqual("ok", result["status"])
                 self.assertEqual(
                     expected,
                     [
-                        sorted(r["request_index"] for r in b["requests"])
+                        sorted((r["request_index"] for r in b["requests"]))
                         for b in client.batches[:-1]
                     ],
                 )
 
     def test_workspace_budget_counts_block_padding(self):
-        client, result = self.run_seeds(
+        (client, result) = self.run_seeds(
             [8, 0, 12, 4, 8], workspace_tokens=32, cache_block_size=8
         )
         self.assertEqual("ok", result["status"])
         self.assertEqual(
             [[0], [2], [3, 4]],
             [
-                sorted(r["request_index"] for r in b["requests"])
+                sorted((r["request_index"] for r in b["requests"]))
                 for b in client.batches[:-1]
             ],
         )
@@ -340,7 +341,7 @@ class SeedBatchTest(unittest.TestCase):
     def test_oversized_seed_fails_before_any_dispatch(self):
         for limits in ({"max_batch_tokens": 24}, {"workspace_tokens": 27}):
             with self.subTest(limits=limits):
-                client, result = self.run_seeds([8, 20], **limits)
+                (client, result) = self.run_seeds([8, 20], **limits)
                 self.assertEqual("request_failed", result["status"])
                 self.assertIsNone(result["metrics"])
                 self.assertEqual([], client.batches)
@@ -349,7 +350,7 @@ class SeedBatchTest(unittest.TestCase):
         for failure in ("failed_member", "raised_member"):
             with self.subTest(failure=failure):
                 client = SeedBatchClient([8] * 10, **{failure: 0})
-                _, result = self.run_seeds([8] * 10, client=client)
+                (_, result) = self.run_seeds([8] * 10, client=client)
                 self.assertEqual("request_failed", result["status"])
                 self.assertIsNone(result["metrics"])
                 self.assertEqual(1, len(client.batches))
@@ -359,6 +360,7 @@ class SeedBatchTest(unittest.TestCase):
         submitted = []
 
         class Executor(ThreadPoolExecutor):
+
             def submit(self, fn, *args, **kwargs):
                 if submitted:
                     raise RuntimeError("submission failed")
@@ -369,24 +371,27 @@ class SeedBatchTest(unittest.TestCase):
         with patch(
             "rtp_llm.test.perf_test.prefill.runner.ThreadPoolExecutor", Executor
         ):
-            client, result = self.run_seeds([8] * 4)
+            (client, result) = self.run_seeds([8] * 4)
         self.assertEqual("request_failed", result["status"])
         self.assertEqual([], client.batches[0]["requests"])
         self.assertEqual(1, len(submitted))
         self.assertTrue(submitted[0].done())
 
     def test_scheduler_failure_stops_before_seed_dispatch(self):
+
         class Client(SeedBatchClient):
+
             def configure_scheduler(self, batch_size, mode="prefill"):
                 raise RuntimeError("scheduler unavailable")
 
         client = Client([8] * 4)
-        _, result = self.run_seeds([8] * 4, client=client)
+        (_, result) = self.run_seeds([8] * 4, client=client)
         self.assertEqual("request_failed", result["status"])
         self.assertEqual([], client.batches)
 
 
 class PrefillWarmupTest(unittest.TestCase):
+
     def test_warmup_is_concurrent_independent_and_excluded_from_metrics(self):
         for cache_len in (0, 8):
             with self.subTest(cache_len=cache_len):
@@ -396,6 +401,7 @@ class PrefillWarmupTest(unittest.TestCase):
                 lock = threading.Lock()
 
                 class Client:
+
                     def configure_scheduler(self, batch_size, mode="prefill"):
                         assert batch_size == 2
 
@@ -414,9 +420,9 @@ class PrefillWarmupTest(unittest.TestCase):
                             prefill_runner_response(
                                 len(request["input_ids"]),
                                 0 if phase == "seed" else cache_len,
-                                latency=(10000 if phase == "warmup" else 10),
+                                latency=10000 if phase == "warmup" else 10,
                             ),
-                            wait_time_ms=(9999 if phase == "warmup" else 2),
+                            wait_time_ms=9999 if phase == "warmup" else 2,
                         )
 
                 result = PrefillRunner(
@@ -443,7 +449,9 @@ class PrefillWarmupTest(unittest.TestCase):
                         3, len({tuple(tokens[: cache_len + 4]) for tokens in ids})
                     )
                     self.assertTrue(
-                        all(tokens[:cache_len] == ids[0][:cache_len] for tokens in ids)
+                        all(
+                            (tokens[:cache_len] == ids[0][:cache_len] for tokens in ids)
+                        )
                     )
                 metrics = result["metrics"]
                 self.assertEqual(2, result["runs"])
@@ -462,6 +470,7 @@ class PrefillWarmupTest(unittest.TestCase):
                 barrier = threading.Barrier(2, timeout=2)
 
                 class Client:
+
                     def configure_scheduler(self, batch_size, mode="prefill"):
                         pass
 
@@ -476,7 +485,7 @@ class PrefillWarmupTest(unittest.TestCase):
                             ):
                                 if failure == "exception":
                                     raise RuntimeError("warmup transport failed")
-                                field, value = {
+                                (field, value) = {
                                     "request": ("success", False),
                                     "shape": ("input_len", 15),
                                     "reuse": ("reuse_len", 4),
@@ -647,8 +656,7 @@ class PrefillRunnerTest(unittest.TestCase):
         self.assertEqual(4, len(client.requests))
         self.assertEqual("seed", client.requests[0]["phase"])
         self.assertEqual(
-            ["warmup", "measure", "measure"],
-            [r["phase"] for r in client.requests[1:]],
+            ["warmup", "measure", "measure"], [r["phase"] for r in client.requests[1:]]
         )
         self.assertEqual(12.0, result["metrics"]["latency_ms"])
         self.assertEqual(12.0, result["metrics"]["ttft_ms"])
@@ -671,8 +679,7 @@ class PrefillRunnerTest(unittest.TestCase):
         ).run_case(prefill_runner_case(cache_len=0))
         self.assertEqual("ok", result["status"])
         self.assertEqual(
-            ["warmup", "measure", "measure"],
-            [r["phase"] for r in client.requests],
+            ["warmup", "measure", "measure"], [r["phase"] for r in client.requests]
         )
 
 

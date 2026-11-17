@@ -1,4 +1,4 @@
-"""Tests for core build_closure_test."""
+"""Performance framework behavior and failure regressions."""
 
 import ast
 import shutil
@@ -8,8 +8,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from rtp_llm.test.perf_test.tests.support.entry import public_boundary_ROOT
-from rtp_llm.test.perf_test.tests.support.paths import PERF_TEST_ROOT
+from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
+from rtp_llm.test.perf_test.tests.support.fixtures import (
+    PERF_TEST_ROOT as public_boundary_ROOT,
+)
 
 
 class RuntimeBuildClosureTest(unittest.TestCase):

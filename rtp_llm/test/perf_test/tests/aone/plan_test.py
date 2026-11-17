@@ -1,17 +1,29 @@
-"""Tests for aone plan_test."""
+"""Performance framework behavior and failure regressions."""
 
 import hashlib
 import unittest
 
+from rtp_llm.test.perf_test.aone.config_schema import parse_execution
+from rtp_llm.test.perf_test.aone.plan import plan_resources
+from rtp_llm.test.perf_test.capabilities import validate_aone_capability
 from rtp_llm.test.perf_test.case_planning import plan_cases
 from rtp_llm.test.perf_test.config_resolver import canonical_json, resolve_config
 from rtp_llm.test.perf_test.config_schema import ConfigError
 from rtp_llm.test.perf_test.errors import PlanningError, ResourceError
-from rtp_llm.test.perf_test.plan import ExecutionPlan, build_execution_plan, case_id
+from rtp_llm.test.perf_test.plan import (
+    ExecutionPlan,
+    GangTopology,
+    build_execution_plan,
+    case_id,
+    derive_gang_topology,
+)
+from rtp_llm.test.perf_test.tests.support.gang import aone_execution as _execution
+from rtp_llm.test.perf_test.tests.support.gang import aone_gang_config as _gang_config
 from rtp_llm.test.perf_test.tests.support.plan import plan_cases, plan_config
 
 
 class AOnePlanningTest(unittest.TestCase):
+
     def test_cross_host_dp_layout_is_validated_before_submission(self):
         from rtp_llm.test.perf_test.aone.config_schema import parse_execution
         from rtp_llm.test.perf_test.aone.plan import plan_resources
@@ -71,6 +83,8 @@ class AOnePlanningTest(unittest.TestCase):
                 self.assertEqual(2 if gang else 1, plan.resource_plan.machine_count)
                 self.assertEqual(8 if gang else 2, plan.resource_plan.local_world_size)
                 self.assertEqual(plan, ExecutionPlan.from_dict(plan.to_dict()))
+                self.assertEqual(8 if gang else 2, plan.resource_plan.gpus_per_machine)
+                self.assertEqual(None if gang else 2, plan.resource_plan.shard_count)
 
     def test_invalid_resources_and_case_gang_combinations_rejected(self):
         invalid = [
@@ -111,7 +125,7 @@ class AOnePlanningTest(unittest.TestCase):
                 )
                 config_fields = {
                     key: section
-                    for key, section in payload["resolved_config"].items()
+                    for (key, section) in payload["resolved_config"].items()
                     if key != "workload"
                 }
                 payload["config_fingerprint"] = hashlib.sha256(
@@ -126,11 +140,11 @@ class AOnePlanningTest(unittest.TestCase):
         shard_plan = plan_shards(self._plan())
         self.assertEqual(
             (524288, 262144),
-            tuple(shard.estimated_cost for shard in shard_plan.shards),
+            tuple((shard.estimated_cost for shard in shard_plan.shards)),
         )
         self.assertEqual(786432, shard_plan.total_estimated_cost)
         self.assertEqual(
-            (1, 1), tuple(len(shard.case_ids) for shard in shard_plan.shards)
+            (1, 1), tuple((len(shard.case_ids) for shard in shard_plan.shards))
         )
         self.assertEqual(
             {case_id("prefill", case) for case in plan_cases()},
@@ -151,7 +165,7 @@ class AOnePlanningTest(unittest.TestCase):
         forward = plan_shards(self._plan(cases=cases))
         reverse = plan_shards(self._plan(cases=list(reversed(cases))))
         self.assertEqual(forward, reverse)
-        self.assertEqual((101, 145), tuple(s.estimated_cost for s in forward.shards))
+        self.assertEqual((101, 145), tuple((s.estimated_cost for s in forward.shards)))
         self.assertEqual(
             {case_id("prefill", cases[0]), case_id("prefill", cases[3])},
             set(forward.shards[0].case_ids),
@@ -173,11 +187,7 @@ class AOnePlanningTest(unittest.TestCase):
         )
         with self.assertRaises(PlanningError):
             case_weight(
-                {
-                    "request_groups": [
-                        {"count": 0, "input_len": 10, "cache_len": 6},
-                    ]
-                }
+                {"request_groups": [{"count": 0, "input_len": 10, "cache_len": 6}]}
             )
 
     def test_gang_has_no_case_ownership_shards(self):
@@ -202,6 +212,48 @@ class AOnePlanningTest(unittest.TestCase):
         ):
             with self.subTest(changes=changes), self.assertRaises(ConfigError):
                 parse_execution({**plan_config("aone")["execution"], **changes})
+
+
+def _build(execution, topology=None, mode="prefill"):
+    return build_execution_plan(
+        mode=mode,
+        action="run",
+        resolved=resolve_config(
+            _gang_config(execution, topology, mode), execution_parser=parse_execution
+        ),
+        cases=[
+            {"input_len": 1024, "cache_len": 512, "batch_size": 1},
+            {"input_len": 512, "cache_len": 0, "batch_size": 1},
+        ],
+        result_directory="runs/example",
+        resource_planner=plan_resources,
+        capability_validator=validate_aone_capability,
+    )
+
+
+class GangConfigTest(unittest.TestCase):
+
+    def test_gang_derivation(self):
+        self.assertEqual(
+            GangTopology(
+                world_size=16, gpus_per_machine=8, machine_count=2, local_world_size=8
+            ),
+            derive_gang_topology(16, 8),
+        )
+        plan = _build(
+            _execution(gpus_per_machine=8),
+            topology={"tp": 8, "dp": 2, "pp": 1, "ep": 16},
+        )
+        resource = plan.resource_plan
+        self.assertEqual(2, resource.machine_count)
+        self.assertEqual(8, resource.gpus_per_machine)
+        self.assertEqual(8, resource.local_world_size)
+        self.assertIsNone(resource.shard_count)
+
+    def test_non_divisible_world_size_rejected(self):
+        topology = {"tp": 5, "dp": 2, "pp": 1, "ep": 10}
+        with self.assertRaisesRegex(PlanningError, "world_size 10.*machine_count 3"):
+            _build(_execution(gpus_per_machine=4), topology)
 
 
 if __name__ == "__main__":

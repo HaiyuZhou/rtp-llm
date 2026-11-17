@@ -1,4 +1,4 @@
-"""Tests for prefill planner_test."""
+"""Performance framework behavior and failure regressions."""
 
 import json
 import tempfile
@@ -8,10 +8,6 @@ from pathlib import Path
 from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
-from rtp_llm.test.perf_test.tests.support.plan import (
-    prefill_planner_parsed,
-    prefill_planner_payload,
-)
 
 
 class PrefillPlannerTest(unittest.TestCase):
@@ -87,7 +83,7 @@ class PrefillPlannerTest(unittest.TestCase):
                             cache_alignment=128,
                             commit_tail_tokens=tail,
                             workspace_tokens=8192,
-                            **spec,
+                            **spec
                         )
                         resolved = resolve_config(source, source_dir=directory)
                         cases = plan_workload("prefill", source, resolved)
@@ -101,17 +97,17 @@ class PrefillPlannerTest(unittest.TestCase):
         payload = prefill_planner_payload()
         payload["engine"]["args"] = {"seq_size_per_block": 256}
         payload["workload"].update(commit_tail_tokens=256, cache_lengths=[64])
-        workload, engine = prefill_planner_parsed(payload)
+        (workload, engine) = prefill_planner_parsed(payload)
         with self.assertRaisesRegex(PlanningError, "cache length 64.*aligned"):
             plan_prefill_cases(workload, engine)
 
     def test_generated_commit_tail_can_be_shorter_than_a_physical_block(self):
         payload = prefill_planner_payload()
         payload["engine"]["args"] = {"seq_size_per_block": 256}
-        workload, engine = prefill_planner_parsed(payload)
+        (workload, engine) = prefill_planner_parsed(payload)
         cases = plan_prefill_cases(workload, engine)
         self.assertEqual({0, 512}, {case["cache_len"] for case in cases})
-        self.assertTrue(all(case["cache_len"] % 256 == 0 for case in cases))
+        self.assertTrue(all((case["cache_len"] % 256 == 0 for case in cases)))
 
     def test_generated_random_cache_lengths_use_physical_block_stride(self):
         payload = prefill_planner_payload()
@@ -119,10 +115,10 @@ class PrefillPlannerTest(unittest.TestCase):
         payload["workload"].update(
             commit_tail_tokens=256, cache_lengths=[], random_cache_count=6
         )
-        workload, engine = prefill_planner_parsed(payload)
+        (workload, engine) = prefill_planner_parsed(payload)
         cases = plan_prefill_cases(workload, engine)
         self.assertTrue(cases)
-        self.assertTrue(all(case["cache_len"] % 256 == 0 for case in cases))
+        self.assertTrue(all((case["cache_len"] % 256 == 0 for case in cases)))
 
     def test_random_batches_are_deterministic_unique_and_admitted(self):
         payload = prefill_planner_payload()
@@ -232,6 +228,69 @@ class PrefillPlannerTest(unittest.TestCase):
             self.assertLessEqual(case["input_len"], 2048)
             self.assertEqual(3, case["measure_runs"])
             self.assertEqual(17, case["seed"])
+
+    def test_named_sampled_grids_preserve_top_level_case_geometry(self):
+        from rtp_llm.test.perf_test.case_planning import plan_cases
+
+        examples = Path(__file__).resolve().parents[2] / "examples"
+        source = json.loads((examples / "prefill_multi_grid_local.json").read_text())
+        for grid in source["workload"]["grids"]:
+            keys = set(grid) & {"random_request_batches", "traffic_request_batches"}
+            if not keys:
+                continue
+            key = keys.pop()
+            with self.subTest(source=key):
+                common = {k: v for (k, v) in source["workload"].items() if k != "grids"}
+                top = dict(source, workload=dict(common, **{key: grid[key]}))
+                named = dict(source, workload=dict(common, grids=[grid]))
+                left = resolve_config(top, source_dir=examples)
+                right = resolve_config(named, source_dir=examples)
+                left_cases = plan_cases("prefill", top, left)
+                right_cases = plan_cases("prefill", named, right)
+                self.assertEqual(len(left_cases), len(right_cases))
+                for a, b in zip(left_cases, right_cases):
+                    self.assertEqual(a["request_groups"], b["request_groups"])
+
+
+import json
+import tempfile
+from pathlib import Path
+
+from rtp_llm.test.perf_test.config_resolver import resolve_config
+from rtp_llm.test.perf_test.config_schema import parse_config
+from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
+from rtp_llm.test.perf_test.tests.support.fixtures import (
+    fixture_engine,
+    fixture_model,
+    fixture_workload,
+)
+
+
+def prefill_planner_payload():
+    return {
+        "schema_version": 1,
+        "model": fixture_model(),
+        "engine": fixture_engine(max_seq_len=4097, concurrency_limit=2),
+        "workload": fixture_workload(
+            commit_tail_tokens=128,
+            compute_steps=[512, 256],
+            min_compute_len=256,
+            cache_lengths=[0, 512],
+            batch_sizes=[1, 2],
+            measure_runs=3,
+            seed=17,
+            max_cases=100,
+        ),
+        "execution": {"backend": "local"},
+        "output": {},
+        "regression": {},
+        "publish": {},
+    }
+
+
+def prefill_planner_parsed(payload=None):
+    config = parse_config(payload or prefill_planner_payload())
+    return (config.workload, config.engine)
 
 
 if __name__ == "__main__":

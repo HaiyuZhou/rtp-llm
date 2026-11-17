@@ -1,3 +1,5 @@
+"""Performance framework behavior and failure regressions."""
+
 import json
 import tempfile
 import unittest
@@ -27,8 +29,8 @@ from rtp_llm.test.perf_test.run_directory import (
     inspect_run_directory,
 )
 from rtp_llm.test.perf_test.state import RunState
-from rtp_llm.test.perf_test.tests.support.aone import prefill_source
-from rtp_llm.test.perf_test.tests.support.paths import PERF_TEST_ROOT
+from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
+from rtp_llm.test.perf_test.tests.support.gang import prefill_source
 
 
 def _source_config(shard_count):
@@ -294,7 +296,6 @@ class AOneSingleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             plan = _setup(Path(directory) / "run", 2)
             assignments = plan_shards(plan)
-            # Costs are 1024*512 and 512*512: the larger case goes first.
             by_length = {
                 thaw(case.identity)["input_len"]: case.case_id for case in plan.cases
             }
@@ -302,7 +303,7 @@ class AOneSingleTest(unittest.TestCase):
                 ((by_length[1024],), (by_length[512],)), assignments.ownership
             )
             self.assertEqual(
-                (524288, 262144), tuple(s.estimated_cost for s in assignments.shards)
+                (524288, 262144), tuple((s.estimated_cost for s in assignments.shards))
             )
             self.assertEqual(
                 assignments,
@@ -333,11 +334,10 @@ class AOneSingleTest(unittest.TestCase):
                 )
                 self.assertEqual("remote", loaded.run_id)
                 self.assertEqual(1, len(loaded.owned_case_ids))
-
-            # Evaluate the generated BUILD and its public rule, recording actions.
             declarations = []
 
             class Native:
+
                 def py_test(self, **kwargs):
                     declarations.append(kwargs)
 
@@ -386,7 +386,7 @@ class AOneSingleTest(unittest.TestCase):
             plan = _setup(Path(directory) / "run", 2)
 
             def mutate(kind, results):
-                first, second = results
+                (first, second) = results
                 if kind == "duplicate-shard":
                     results.append(copy.deepcopy(first))
                 elif kind == "unknown-shard":
@@ -457,7 +457,7 @@ class AOneSingleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             plan = _setup(root / "run", 2)
-            first, second = (case.case_id for case in plan.cases)
+            (first, second) = (case.case_id for case in plan.cases)
             invalid = (
                 ((first,),),
                 ((first,), (first,)),
@@ -511,7 +511,7 @@ class AOneSingleTest(unittest.TestCase):
             self.assertEqual(5, outcome.exit_code)
             self.assertEqual(2, len(outcome.collection.cases))
             self.assertTrue(
-                all(case["status"] == "ok" for case in outcome.collection.cases)
+                all((case["status"] == "ok" for case in outcome.collection.cases))
             )
             manifest = inspect_run_directory(root).manifest
             self.assertIn(
@@ -617,7 +617,7 @@ class AOneSingleTest(unittest.TestCase):
                     json.loads((root / "results/result.json").read_text())
                 )
                 self.assertEqual(RunState.FAILED, final.status)
-                self.assertTrue(all(case.status != "ok" for case in final.cases))
+                self.assertTrue(all((case.status != "ok" for case in final.cases)))
 
     def test_collector_replaces_nonfinite_engine_diagnostics_with_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -628,10 +628,7 @@ class AOneSingleTest(unittest.TestCase):
             )
             results[1]["config_fingerprint"] = "invalid"
             outcome = collect_aone_results(
-                plan,
-                run_id="run-aone",
-                shard_plan=plan_shards(plan),
-                results=results,
+                plan, run_id="run-aone", shard_plan=plan_shards(plan), results=results
             )
             self.assertEqual(RunState.FAILED, outcome.state)
             self.assertEqual(results[0]["cases"], list(outcome.diagnostic_cases))

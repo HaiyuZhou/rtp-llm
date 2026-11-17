@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Any, Dict, Mapping, Union
@@ -50,3 +51,25 @@ def load_result(path: Union[str, Path]) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"invalid result {source}: expected an object")
     return value
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="action", required=True)
+    generate = commands.add_parser("generate")
+    generate.add_argument("--result", required=True)
+    generate.add_argument("--output", required=True)
+    validate = commands.add_parser("validate")
+    validate.add_argument("--result", required=True)
+    validate.add_argument("--golden", required=True)
+    args = parser.parse_args(argv)
+    result = load_result(args.result)
+    if args.action == "generate":
+        write_golden(result, args.output)
+    else:
+        validate_golden(result, args.golden)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

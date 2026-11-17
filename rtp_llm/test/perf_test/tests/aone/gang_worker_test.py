@@ -1,9 +1,10 @@
-"""Tests for aone gang_worker_test."""
+"""Performance framework behavior and failure regressions."""
 
 import json
 import tempfile
 import threading
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -19,11 +20,15 @@ from rtp_llm.test.perf_test.aone.gang_worker import (
     build_worker_context,
     run_gang_worker,
 )
+from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.execution.aone_gang import BROKER_TOKEN_ENV
+from rtp_llm.test.perf_test.plan import thaw
 from rtp_llm.test.perf_test.results import parse_result_envelope
 from rtp_llm.test.perf_test.state import RunState
+from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
 from rtp_llm.test.perf_test.tests.support.gang import _gang_source
-from rtp_llm.test.perf_test.tests.support.paths import PERF_TEST_ROOT
+from rtp_llm.test.perf_test.tests.support.gang import aone_execution as _execution
+from rtp_llm.test.perf_test.tests.support.gang import aone_gang_config as _gang_config
 
 
 class GangWorkerTest(unittest.TestCase):
@@ -73,8 +78,7 @@ class GangWorkerTest(unittest.TestCase):
             "rtp_llm.test.perf_test.aone.gang_worker._resolve_model_paths",
             return_value={"tokenizer": "/local/tokenizer"},
         ) as resolve, patch(
-            "rtp_llm.test.perf_test.test_util.create_query",
-            return_value={8: "prompt"},
+            "rtp_llm.test.perf_test.test_util.create_query", return_value={8: "prompt"}
         ) as create, patch(
             "rtp_llm.test.perf_test.execution.distributed.decode_sync.serve_decode_worker"
         ) as serve:
@@ -139,7 +143,7 @@ class GangWorkerTest(unittest.TestCase):
         from rtp_llm.test.perf_test.entry import plan_from_source
         from rtp_llm.test.perf_test.plan import thaw
 
-        plan, _ = plan_from_source(
+        (plan, _) = plan_from_source(
             source,
             source_dir=self.root,
             result_directory=str(self.root / "controller-run"),
@@ -352,17 +356,13 @@ class GangWorkerTest(unittest.TestCase):
         self.assertEqual("http://127.0.0.1:18000", factory.call_args.kwargs["endpoint"])
         transport.configure_scheduler.assert_called()
 
-    def test_rank_batch_decode_master_uses_cluster_transport(self):
-        self._check_decode_master_cluster(
+    def test_decode_master_uses_cluster_transport(self):
+        for workload in (
             {
                 "kind": "grid",
                 "input_lengths": [8],
                 "batch": {"strategy": "fixed", "sizes": [1], "unit": "per_dp_rank"},
-            }
-        )
-
-    def test_global_grid_and_distribution_master_use_cluster_transport(self):
-        for workload in (
+            },
             {
                 "kind": "grid",
                 "input_lengths": [8],
@@ -454,36 +454,33 @@ class GangWorkerTest(unittest.TestCase):
         self.handle.start_server.assert_called_once()
         self.handle.stop_server.assert_called_once()
 
-    def test_rank_batch_decode_worker_measures_before_completion_vote(self):
-        self._check_decode_worker_dispatch("per_dp_rank")
-
-    def test_global_decode_worker_measures_before_completion_vote(self):
-        self._check_decode_worker_dispatch("global")
-
     def _check_decode_worker_dispatch(self, unit):
         source = self._example("decode")
         source["model"]["topology"] = {"tp": 1, "dp": 2, "pp": 1, "ep": 2}
-        source["workload"]["batch"] = {
-            "strategy": "fixed",
-            "sizes": [1],
-            "unit": unit,
-        }
+        source["workload"]["batch"] = {"strategy": "fixed", "sizes": [1], "unit": unit}
         self.config_path.write_text(json.dumps(source))
         self.gang["topology"] = source["model"]["topology"]
         self.plan_path.write_text(json.dumps(self.gang))
         with patch(
             "rtp_llm.test.perf_test.aone.gang_worker._default_decode_worker"
         ) as measure, patch(
-            "rtp_llm.test.perf_test.aone.gang_worker._run_waiter",
-            return_value=0,
+            "rtp_llm.test.perf_test.aone.gang_worker._run_waiter", return_value=0
         ) as waiter:
             self.assertEqual(0, self._run(1))
         measure.assert_called_once()
         waiter.assert_called_once()
 
+    def test_decode_worker_measures_before_completion_vote(self):
+        for unit in ("per_dp_rank", "global"):
+            with self.subTest(unit=unit):
+                self.broker.reset_mock()
+                self.handle.reset_mock()
+                self._check_decode_worker_dispatch(unit)
+
 
 class FrozenGangInputsTest(unittest.TestCase):
-    def test_accepted_workloads_reach_worker_startup_with_identical_plans(self):
+
+    def test_prefill_and_decode_workers_consume_frozen_package(self):
         from rtp_llm.test.perf_test.aone import gang_worker
         from rtp_llm.test.perf_test.aone.package import generate_gang_package
         from rtp_llm.test.perf_test.cli import parse_cli
@@ -492,162 +489,224 @@ class FrozenGangInputsTest(unittest.TestCase):
         examples = PERF_TEST_ROOT / "examples"
         shapes = (
             ("decode_distribution_local.json", "decode", 2),
-            ("prefill_random_batch_local.json", "prefill", 12),
-            ("prefill_traffic_distribution_local.json", "prefill", 12),
             ("prefill_local.json", "prefill", None),
         )
         for example, mode, count in shapes:
-            for named in (
-                (False, True)
-                if "batch" in example or "traffic" in example
-                else (False,)
-            ):
-                with self.subTest(
-                    example=example, named=named
-                ), tempfile.TemporaryDirectory() as directory:
-                    root = Path(directory)
-                    source = json.loads((examples / example).read_text())
-                    source["model"]["topology"].update(
-                        tp=8,
-                        dp=2 if mode == "decode" else 1,
-                        ep=16 if mode == "decode" else 1,
+            with self.subTest(
+                example=example
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = json.loads((examples / example).read_text())
+                source["model"]["topology"].update(
+                    tp=8,
+                    dp=2 if mode == "decode" else 1,
+                    ep=16 if mode == "decode" else 1,
+                )
+                source["execution"] = dict(
+                    backend="aone",
+                    resource="daily",
+                    gpu_type="H20",
+                    gpus_per_machine=8 if mode == "decode" else 4,
+                    max_parallel=4,
+                )
+                workload = source["workload"]
+                spec = (
+                    workload
+                    if mode == "decode"
+                    else workload.get("traffic_request_batches", {})
+                )
+                if "distribution_file" in spec:
+                    external = root / "external.json"
+                    external.write_text(
+                        (examples / spec["distribution_file"]).read_text()
                     )
-                    source["execution"] = dict(
-                        backend="aone",
-                        resource="daily",
-                        gpu_type="H20",
-                        gpus_per_machine=8 if mode == "decode" else 4,
-                        max_parallel=4,
+                    spec["distribution_file"] = str(external)
+                source_path = root / "source.json"
+                source_path.write_text(json.dumps(source))
+                (original, _) = build_request_plan(
+                    parse_cli(
+                        [f"--mode={mode}", "--action=run", f"--config={source_path}"]
                     )
-                    workload = source["workload"]
-                    spec = (
-                        workload
-                        if mode == "decode"
-                        else workload.get("traffic_request_batches", {})
-                    )
-                    if "distribution_file" in spec:
-                        external = root / "external.json"
-                        external.write_text(
-                            (examples / spec["distribution_file"]).read_text()
-                        )
-                        spec["distribution_file"] = str(external)
-                    if named:
-                        key = (
-                            "traffic_request_batches"
-                            if "traffic" in example
-                            else "random_request_batches"
-                        )
-                        workload["grids"] = [
-                            dict(name="sampled", **{key: workload.pop(key)})
-                        ]
-                    source_path = root / "source.json"
-                    source_path.write_text(json.dumps(source))
-                    original, _ = build_request_plan(
-                        parse_cli(
-                            [
-                                f"--mode={mode}",
-                                "--action=run",
-                                f"--config={source_path}",
-                            ]
-                        )
-                    )
-                    if count is not None:
-                        self.assertEqual(count, len(original.cases))
-                    package = generate_gang_package(
-                        root / "package", original, run_id="frozen"
-                    )
-                    source_path.unlink()
-                    (root / "external.json").unlink(missing_ok=True)
-                    outputs = root / "outputs"
-                    context = SimpleNamespace(
-                        gang_plan=json.loads(package.shard_plan.read_text())
-                    )
-                    seen = []
+                )
+                if count is not None:
+                    self.assertEqual(count, len(original.cases))
+                package = generate_gang_package(
+                    root / "package", original, run_id="frozen"
+                )
+                source_path.unlink()
+                (root / "external.json").unlink(missing_ok=True)
+                outputs = root / "outputs"
+                context = SimpleNamespace(
+                    gang_plan=json.loads(package.shard_plan.read_text())
+                )
+                seen = []
 
-                    def startup(config_path, *_args, **_kwargs):
-                        plan, _ = gang_worker._build_rank_group_plan(
-                            str(config_path), context, outputs
+                def startup(config_path, *_args, **_kwargs):
+                    (plan, _) = gang_worker._build_rank_group_plan(
+                        str(config_path), context, outputs
+                    )
+                    self.assertEqual(
+                        original.config_fingerprint, plan.config_fingerprint
+                    )
+                    self.assertEqual(
+                        original.workload_fingerprint, plan.workload_fingerprint
+                    )
+                    self.assertEqual(original.cases, plan.cases)
+                    self.assertEqual(original.resolved_config, plan.resolved_config)
+                    if mode == "decode":
+                        worker_context = SimpleNamespace(
+                            gang_plan=context.gang_plan,
+                            local_world_size=original.resource_plan.local_world_size,
+                            world_rank=original.resource_plan.local_world_size,
+                            members=[SimpleNamespace(shard_index=0, hostname="master")],
                         )
-                        self.assertEqual(
-                            original.config_fingerprint, plan.config_fingerprint
-                        )
-                        self.assertEqual(
-                            original.workload_fingerprint, plan.workload_fingerprint
-                        )
-                        self.assertEqual(original.cases, plan.cases)
-                        self.assertEqual(original.resolved_config, plan.resolved_config)
-                        if mode == "decode":
-                            worker_context = SimpleNamespace(
-                                gang_plan=context.gang_plan,
-                                local_world_size=original.resource_plan.local_world_size,
-                                world_rank=original.resource_plan.local_world_size,
-                                members=[
-                                    SimpleNamespace(shard_index=0, hostname="master")
-                                ],
-                            )
-                            with patch(
-                                "rtp_llm.test.perf_test.test_util.create_query",
-                                return_value={},
-                            ) as queries, patch(
-                                "rtp_llm.test.perf_test.execution.distributed.decode_sync.serve_decode_worker"
-                            ) as serve:
-                                gang_worker._default_decode_worker(
-                                    SimpleNamespace(
-                                        tokenizer_path="/tokenizer",
-                                        log_file_path=None,
-                                        log_dir=str(outputs),
-                                    ),
-                                    context=worker_context,
-                                    config_path=str(config_path),
-                                )
-                            self.assertEqual(
-                                sorted(
-                                    {
-                                        n
-                                        for case in plan.cases
-                                        for n in case.identity["input_lengths"]
-                                    }
+                        with patch(
+                            "rtp_llm.test.perf_test.test_util.create_query",
+                            return_value={},
+                        ) as queries, patch(
+                            "rtp_llm.test.perf_test.execution.distributed.decode_sync.serve_decode_worker"
+                        ) as serve:
+                            gang_worker._default_decode_worker(
+                                SimpleNamespace(
+                                    tokenizer_path="/tokenizer",
+                                    log_file_path=None,
+                                    log_dir=str(outputs),
                                 ),
-                                queries.call_args.kwargs["input_len_list"],
+                                context=worker_context,
+                                config_path=str(config_path),
                             )
-                            serve.assert_called_once()
-                        for field in ("config_fingerprint", "workload_fingerprint"):
-                            expected = context.gang_plan[field]
-                            context.gang_plan[field] = "0" * 64
-                            with self.assertRaisesRegex(Exception, field + " mismatch"):
-                                gang_worker._build_rank_group_plan(
-                                    str(config_path), context, outputs
-                                )
-                            context.gang_plan[field] = expected
-                        seen.append(plan)
-                        return 0
-
-                    gang_payload = json.loads(package.shard_plan.read_text())
-                    gang_payload["broker_run_id"] = "frozen"
-                    gang_payload["broker_url"] = "http://localhost:1234"
-                    package.shard_plan.write_text(json.dumps(gang_payload))
-                    with patch.dict(
-                        "os.environ",
-                        {
-                            "TEST_UNDECLARED_OUTPUTS_DIR": str(outputs),
-                            "PERF_TEST_BROKER_TOKEN": "test",
-                        },
-                    ), patch.object(
-                        gang_worker, "run_gang_worker", side_effect=startup
-                    ):
-                        code = gang_worker.main(
-                            [
-                                "--resolved-config",
-                                str(package.resolved_config),
-                                "--resolved-workload",
-                                str(package.resolved_workload),
-                                "--gang-plan",
-                                str(package.shard_plan),
-                            ],
-                            broker_factory=Mock(),
+                        self.assertEqual(
+                            sorted(
+                                {
+                                    n
+                                    for case in plan.cases
+                                    for n in case.identity["input_lengths"]
+                                }
+                            ),
+                            queries.call_args.kwargs["input_len_list"],
                         )
-                    self.assertEqual(0, code)
-                    self.assertEqual(1, len(seen))
+                        serve.assert_called_once()
+                    seen.append(plan)
+                    return 0
+
+                gang_payload = json.loads(package.shard_plan.read_text())
+                gang_payload["broker_run_id"] = "frozen"
+                gang_payload["broker_url"] = "http://localhost:1234"
+                package.shard_plan.write_text(json.dumps(gang_payload))
+                with patch.dict(
+                    "os.environ",
+                    {
+                        "TEST_UNDECLARED_OUTPUTS_DIR": str(outputs),
+                        "PERF_TEST_BROKER_TOKEN": "test",
+                    },
+                ), patch.object(gang_worker, "run_gang_worker", side_effect=startup):
+                    code = gang_worker.main(
+                        [
+                            "--resolved-config",
+                            str(package.resolved_config),
+                            "--resolved-workload",
+                            str(package.resolved_workload),
+                            "--gang-plan",
+                            str(package.shard_plan),
+                        ],
+                        broker_factory=Mock(),
+                    )
+                self.assertEqual(0, code)
+                self.assertEqual(1, len(seen))
+
+    def test_worker_rejects_each_frozen_fingerprint_mismatch(self):
+        from rtp_llm.test.perf_test.aone import gang_worker
+        from rtp_llm.test.perf_test.aone.package import generate_gang_package
+        from rtp_llm.test.perf_test.entry import plan_from_source
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (plan, _) = plan_from_source(
+                _gang_source(), source_dir=root, result_directory=str(root / "run")
+            )
+            package = generate_gang_package(root / "package", plan, run_id="frozen")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(_gang_source()))
+            config_path.with_suffix(".frozen.json").write_text(
+                Path(package.resolved_workload).read_text()
+            )
+            original = json.loads(package.shard_plan.read_text())
+            for field in ("config_fingerprint", "workload_fingerprint"):
+                with self.subTest(field=field):
+                    context = SimpleNamespace(
+                        gang_plan=dict(original, **{field: "0" * 64})
+                    )
+                    with self.assertRaisesRegex(Exception, field + " mismatch"):
+                        gang_worker._build_rank_group_plan(
+                            str(config_path), context, root / "outputs"
+                        )
+
+
+class GangPolicyTest(unittest.TestCase):
+
+    def test_worker_consumes_frozen_plan_without_replanning_or_source_resolution(self):
+        from rtp_llm.test.perf_test.aone.gang_worker import _build_rank_group_plan
+
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.json"
+                topology = {"tp": 8, "dp": 2, "pp": 1, "ep": 16}
+                path.write_text(
+                    json.dumps(
+                        _gang_config(_execution(gpus_per_machine=8), topology, mode)
+                    )
+                )
+                from rtp_llm.test.perf_test.entry import plan_from_source
+
+                (expected, source) = plan_from_source(
+                    json.loads(path.read_text()),
+                    source_dir=path.parent,
+                    result_directory=str(Path(directory) / "run"),
+                )
+                from rtp_llm.test.perf_test.aone.package import build_gang_plan_payload
+
+                path.with_suffix(".frozen.json").write_text(
+                    json.dumps(thaw(expected.resolved_config["workload"]))
+                )
+                context = SimpleNamespace(
+                    gang_plan=build_gang_plan_payload(expected, "policy")
+                )
+                with ExitStack() as stack:
+                    for target in (
+                        "config_resolver.load_resolved_config",
+                        "aone.plan.plan_resources",
+                    ):
+                        stack.enter_context(
+                            patch(
+                                "rtp_llm.test.perf_test." + target,
+                                side_effect=AssertionError(
+                                    "worker must consume its frozen plan"
+                                ),
+                            )
+                        )
+                    (actual, actual_source) = _build_rank_group_plan(
+                        str(path), context, Path(directory)
+                    )
+                self.assertEqual(expected.to_dict(), actual.to_dict())
+                self.assertEqual(source, actual_source)
+
+    def test_source_only_gang_config_is_rejected_without_replanning(self):
+        from rtp_llm.test.perf_test.aone.gang_worker import _build_rank_group_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = SimpleNamespace(
+                gang_plan={"topology": {"tp": 2, "dp": 1, "pp": 1, "ep": 1}}
+            )
+            with patch(
+                "rtp_llm.test.perf_test.config_resolver.load_resolved_config",
+                side_effect=AssertionError("worker must not resolve source"),
+            ):
+                with self.assertRaisesRegex(
+                    PlanningError, "complete frozen execution plan"
+                ):
+                    _build_rank_group_plan(
+                        str(Path(directory) / "source.json"), context, Path(directory)
+                    )
 
 
 if __name__ == "__main__":

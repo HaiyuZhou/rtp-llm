@@ -1,5 +1,6 @@
-"""Core performance behavior contracts."""
+from rtp_llm.test.perf_test.tests.support.fixtures import config_resolution_base_config
 
+"Performance framework behavior and failure regressions."
 import copy
 import json
 import tempfile
@@ -29,7 +30,6 @@ from rtp_llm.test.perf_test.errors import (
     ResourceError,
 )
 from rtp_llm.test.perf_test.tests.support.fixtures import (
-    config_resolution_base_config,
     fixture_engine,
     fixture_model,
     fixture_workload,
@@ -288,11 +288,8 @@ class CapabilitiesTest(unittest.TestCase):
                 self.assertEqual("failure", str(error))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SshConfigurationTest(unittest.TestCase):
+
     def execution(self):
         return {
             "backend": "ssh",
@@ -336,6 +333,7 @@ class SshConfigurationTest(unittest.TestCase):
 
 
 class ExternalInputSnapshotTest(unittest.TestCase):
+
     def test_experiment_input_snapshot_survives_file_mutation_and_is_not_aliased(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -358,3 +356,7 @@ class ExternalInputSnapshotTest(unittest.TestCase):
             self.assertEqual(
                 payload, second.resolved_config["workload"]["distribution"]
             )
+
+
+if __name__ == "__main__":
+    unittest.main()

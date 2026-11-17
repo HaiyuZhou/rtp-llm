@@ -1,4 +1,4 @@
-"""Engine digest checks distinguish content changes from hard-link metadata."""
+"""Performance framework behavior and failure regressions."""
 
 import hashlib
 import os
@@ -14,6 +14,7 @@ from rtp_llm.test.perf_test.prefill.fingerprints import _FILE_DIGESTS, _file_dig
 
 
 class EngineFileDigestTest(unittest.TestCase):
+
     def setUp(self):
         _FILE_DIGESTS.clear()
         self.addCleanup(_FILE_DIGESTS.clear)
@@ -28,7 +29,6 @@ class EngineFileDigestTest(unittest.TestCase):
 
         def open_with_link_churn(path, *args, **kwargs):
             if path == self.path:
-                # Linux filesystem timestamps use a coarse clock tick.
                 time.sleep(0.01)
                 if link.exists():
                     link.unlink()

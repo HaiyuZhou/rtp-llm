@@ -13,9 +13,8 @@ from rtp_llm.test.perf_test.config_schema import (
 )
 from rtp_llm.test.perf_test.execution.engine_session import EngineDiagnostics
 from rtp_llm.test.perf_test.execution.runtime import HttpPrefillClient
-from rtp_llm.test.perf_test.modes import ModeExecutionContext
+from rtp_llm.test.perf_test.modes import ModeExecutionContext, create_prefill_adapter
 from rtp_llm.test.perf_test.plan import thaw
-from rtp_llm.test.perf_test.prefill.adapter import create_prefill_adapter
 from rtp_llm.test.perf_test.prefill.finalize import finalize_prefill_run
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory

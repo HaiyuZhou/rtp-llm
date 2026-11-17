@@ -3,42 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Optional
 
-from rtp_llm.test.perf_test.config_schema import ConfigError
-
-
-def _object(path: str, value: Any) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ConfigError(f"{path}: expected an object")
-    return value
-
-
-def _reject_unknown(path: str, value: Mapping[str, Any], allowed: set[str]) -> None:
-    unknown = sorted(set(value) - allowed)
-    if unknown:
-        field_path = unknown[0] if not path else f"{path}.{unknown[0]}"
-        expected = ", ".join(sorted(allowed))
-        raise ConfigError(f"{field_path}: unknown field; expected one of: {expected}")
-
-
-def _required(path: str, value: Mapping[str, Any], name: str) -> Any:
-    if name not in value:
-        field_path = name if not path else f"{path}.{name}"
-        raise ConfigError(f"{field_path}: required field is missing")
-    return value[name]
-
-
-def _non_empty_string(path: str, value: Any) -> str:
-    if not isinstance(value, str) or not value:
-        raise ConfigError(f"{path}: expected a non-empty string")
-    return value
-
-
-def _positive_int(path: str, value: Any) -> int:
-    if type(value) is not int or value <= 0:
-        raise ConfigError(f"{path}: expected a positive integer")
-    return value
+from rtp_llm.test.perf_test.config_schema import (
+    ConfigError,
+    _non_empty_string,
+    _object,
+    _positive_int,
+    _reject_unknown,
+    _required,
+)
 
 
 @dataclass(frozen=True)

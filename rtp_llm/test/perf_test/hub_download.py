@@ -199,41 +199,6 @@ def download_model_repo(repo_id: str, timeout: int = 600) -> str:
     )
 
 
-def download_dataset_repo_file(
-    repo_id: str,
-    filename: str,
-    *,
-    repo_type: str = "dataset",
-    label: str = "",
-    timeout: int = 300,
-) -> str:
-    tag = label or repo_id
-
-    def _ms():
-        from modelscope import snapshot_download as ms_download
-
-        local_dir = ms_download(repo_id, repo_type=repo_type)
-        path = os.path.join(local_dir, filename)
-        if not os.path.isfile(path):
-            raise FileNotFoundError(
-                f"{filename} not found in downloaded repo at {local_dir}"
-            )
-        return path
-
-    def _hf():
-        from huggingface_hub import hf_hub_download
-
-        return hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type)
-
-    return _download_with_fallback(
-        _ms,
-        _hf,
-        f"dataset '{tag}'",
-        timeout,
-        fallback_hint="use --dataset_path with a local file",
-    )
-
-
 def resolve_checkpoint_or_tokenizer_for_perf(path: str, timeout: int = 600) -> str:
     """将 perf 的 checkpoint/tokenizer 参数转为本地目录路径。"""
     if not path or not str(path).strip():

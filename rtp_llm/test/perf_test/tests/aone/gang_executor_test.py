@@ -1,4 +1,4 @@
-"""Tests for aone gang_executor_test."""
+"""Performance framework behavior and failure regressions."""
 
 import json
 import tempfile
@@ -18,9 +18,12 @@ from rtp_llm.test.perf_test.execution.aone_gang import (
 from rtp_llm.test.perf_test.results import parse_result_envelope
 from rtp_llm.test.perf_test.run_directory import inspect_run_directory
 from rtp_llm.test.perf_test.state import RunState
+from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
 from rtp_llm.test.perf_test.tests.support.gang import (
+    RUN_ID,
     _case_result,
     _envelope,
+    _gang_source,
     _setup_run,
     _write_master_run_tree,
     _write_testlogs_tree,
@@ -28,6 +31,7 @@ from rtp_llm.test.perf_test.tests.support.gang import (
 
 
 class BrokerProxyTest(unittest.TestCase):
+
     def test_token_bearing_requests_ignore_all_ambient_proxy_settings(self):
         import requests
 
@@ -61,7 +65,7 @@ class BrokerProxyTest(unittest.TestCase):
                         )
                         broker.heartbeat(0)
                     self.assertEqual(1, len(sent))
-                    request, settings = sent[0]
+                    (request, settings) = sent[0]
                     self.assertEqual({}, settings["proxies"])
                     self.assertEqual(
                         "Bearer test-secret", request.headers["Authorization"]
@@ -74,6 +78,7 @@ class BrokerProxyTest(unittest.TestCase):
 
 
 class GangExecutorTest(unittest.TestCase):
+
     def test_master_collection_rejects_results_from_another_run_or_plan(self):
         mutations = {
             "run_id": lambda result: result.update(run_id="other-run"),
@@ -201,7 +206,7 @@ class GangExecutorTest(unittest.TestCase):
 
     def test_failed_member_overrides_successful_bazel_and_master_result(self):
         with tempfile.TemporaryDirectory() as directory:
-            root, plan, outcome, _ = self._gang_flow(
+            (root, plan, outcome, _) = self._gang_flow(
                 Path(directory), member_failure=True
             )
             self.assertEqual(RunState.FAILED, outcome.state)
@@ -212,7 +217,7 @@ class GangExecutorTest(unittest.TestCase):
 
     def test_missing_master_still_collects_other_members_logs_and_traces(self):
         with tempfile.TemporaryDirectory() as directory:
-            root, plan, outcome, _ = self._gang_flow(
+            (root, plan, outcome, _) = self._gang_flow(
                 Path(directory), missing_master=True
             )
             self.assertEqual(RunState.FAILED, outcome.state)
@@ -270,10 +275,7 @@ class GangExecutorTest(unittest.TestCase):
                 (root, plan, outcome, _) = self._gang_flow(
                     Path(directory), status=status, remote_exit=3
                 )
-                self.assertEqual(
-                    RunState.FAILED,
-                    outcome.state,
-                )
+                self.assertEqual(RunState.FAILED, outcome.state)
                 self.assertNotEqual(0, outcome.exit_code)
                 self.assertEqual(
                     "failed",
@@ -287,6 +289,67 @@ class GangExecutorTest(unittest.TestCase):
                 self.assertEqual("ok", persisted.cases[0].status)
                 if status == "completed":
                     self.assertIn("Bazel gang test exited 3", str(outcome.failure))
+
+
+class GangPackageTest(unittest.TestCase):
+
+    def test_machine_shards_request_full_hosts_even_with_partial_gpu_use(self):
+        from rtp_llm.test.perf_test.aone.package import generate_gang_package
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _gang_source()
+            source["execution"]["gpus_per_machine"] = 4
+            source["execution"]["max_parallel"] = 4
+            plan = _setup_run(root / "run", source)
+            package = generate_gang_package(root / "generated", plan, run_id=RUN_ID)
+            actions = []
+            namespace = {
+                "native": SimpleNamespace(
+                    py_test=lambda **kwargs: actions.append(kwargs)
+                ),
+                "load": lambda *args: None,
+                "test_suite": lambda **kwargs: None,
+            }
+            exec((PERF_TEST_ROOT / "aone_defs.bzl").read_text(), namespace)
+            exec(package.build_file.read_text(), namespace)
+            self.assertEqual(("//generated:gang",), package.targets)
+            self.assertEqual(1, len(actions))
+            action = actions[0]
+            self.assertEqual(4, action["shard_count"])
+            self.assertEqual("8", action["env"]["GPU_COUNT"])
+            self.assertNotIn("WORLD_SIZE", action["env"])
+            self.assertEqual(
+                {"gpu": "H20", "gpu_count": "8"}, action["exec_properties"]
+            )
+            self.assertEqual(
+                "//rtp_llm/test/perf_test:aone/gang_worker.py", action["main"]
+            )
+            self.assertTrue(
+                {
+                    "resolved_config.json",
+                    "resolved_workload.json",
+                    "gang_plan.json",
+                }.issubset(action["data"])
+            )
+            self.assertIn(BROKER_TOKEN_ENV, action["env_inherit"])
+            self.assertNotIn(BROKER_TOKEN_ENV, " ".join(action["args"]))
+            payload = load_gang_plan(package.shard_plan)
+            self.assertEqual(plan.to_dict(), payload["execution_plan"])
+            self.assertEqual(
+                (16, 4, 4, 8),
+                tuple(
+                    (
+                        payload[key]
+                        for key in (
+                            "world_size",
+                            "machine_count",
+                            "local_world_size",
+                            "gpus_per_host",
+                        )
+                    )
+                ),
+            )
 
 
 if __name__ == "__main__":

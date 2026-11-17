@@ -1,4 +1,4 @@
-"""Tests for core entry_test."""
+"""Performance framework behavior and failure regressions."""
 
 import builtins
 import io
@@ -10,33 +10,27 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from rtp_llm.test.perf_test import entry
 from rtp_llm.test.perf_test.cli import parse_cli
 from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.entry import (
     build_request_plan,
-    create_preview,
-    dispatch_plan,
+    execute_plan,
     main,
     run_request,
 )
 from rtp_llm.test.perf_test.errors import ConfigurationError, PlanningError
 from rtp_llm.test.perf_test.plan import ExecutionPlan, build_execution_plan
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
-from rtp_llm.test.perf_test.tests.support.entry import (
-    dry_run_cases,
-    dry_run_config,
-    entry_LOCAL,
-    entry_ROOT,
-    entry_SCRIPT,
-    public_boundary_ROOT,
-)
 from rtp_llm.test.perf_test.tests.support.fixtures import (
+    PERF_TEST_ROOT,
     fixture_engine,
     fixture_execution,
     fixture_model,
     fixture_workload,
-    run_context_path,
 )
+from rtp_llm.test.perf_test.tests.support.gang import aone_execution as _execution
+from rtp_llm.test.perf_test.tests.support.gang import aone_gang_config as _gang_config
 
 
 class UnifiedEntryTest(unittest.TestCase):
@@ -61,11 +55,11 @@ class UnifiedEntryTest(unittest.TestCase):
             self.assertEqual(2, code)
             self.assertIn("model.topology.ep", errors.getvalue())
             factory.assert_not_called()
-            self.assertEqual(["config.json"], sorted(x.name for x in root.iterdir()))
+            self.assertEqual(["config.json"], sorted((x.name for x in root.iterdir())))
 
     def test_profile_cli_exit_code_matches_real_profile_outcome(self):
         from rtp_llm.test.perf_test.prefill.profile import PrefillProfiler
-        from rtp_llm.test.perf_test.tests.support.fixtures import prefill_profile_setup
+        from rtp_llm.test.perf_test.tests.support.prefill import prefill_profile_setup
 
         for fail in (False, True):
             with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
@@ -73,6 +67,7 @@ class UnifiedEntryTest(unittest.TestCase):
                 plan = prefill_profile_setup(root)
 
                 def factory(profile_dir):
+
                     def run_case(case):
                         if fail:
                             raise RuntimeError("trace collection failed")
@@ -228,19 +223,6 @@ class EntryExecutionTest(unittest.TestCase):
 class DryRunTest(unittest.TestCase):
 
     def _assert_side_effect_free_preview(self, backend):
-        create_run_directory = Mock()
-        build_target = Mock()
-        start_engine = Mock()
-        submit_job = Mock()
-        publisher = Mock()
-
-        def execute(_plan):
-            create_run_directory()
-            build_target()
-            start_engine()
-            submit_job()
-            publisher()
-
         with tempfile.TemporaryDirectory() as temp_dir:
             result_directory = Path(temp_dir) / "formal-run"
             plan = build_execution_plan(
@@ -250,7 +232,19 @@ class DryRunTest(unittest.TestCase):
                 cases=dry_run_cases(),
                 result_directory=str(result_directory),
             )
-            preview = dispatch_plan(plan, dry_run=True, execute=execute)
+            factory = Mock(
+                side_effect=AssertionError("dry run must not create executors")
+            )
+            with patch(
+                "rtp_llm.test.perf_test.entry.initialize_run_directory",
+                side_effect=AssertionError("dry run must not initialize artifacts"),
+            ) as initialize:
+                preview = execute_plan(
+                    plan,
+                    dry_run_config(backend),
+                    parse_cli(["--config=unused.json", "--dry-run"]),
+                    executor_factory=factory,
+                )
             self.assertFalse(result_directory.exists())
             self.assertTrue(preview["dry_run"])
             self.assertEqual(backend, preview["backend"])
@@ -262,12 +256,9 @@ class DryRunTest(unittest.TestCase):
                 [case.case_id for case in plan.cases], preview["cases"]["case_ids"]
             )
             self.assertEqual(plan.resource_plan.to_dict(), preview["resource_summary"])
-        create_run_directory.assert_not_called()
-        build_target.assert_not_called()
-        start_engine.assert_not_called()
-        submit_job.assert_not_called()
-        publisher.assert_not_called()
-        return preview
+            initialize.assert_not_called()
+            factory.assert_not_called()
+            return preview
 
     def test_local_dry_run_is_complete_and_side_effect_free(self):
         preview = self._assert_side_effect_free_preview("local")
@@ -392,7 +383,7 @@ class PublicBoundaryTest(unittest.TestCase):
                     self.assertCountEqual(preview["cases"]["case_ids"], owned)
                     self.assertEqual(len(owned), len(set(owned)))
                 self.assertEqual(
-                    ["config.json"], sorted(p.name for p in root.iterdir())
+                    ["config.json"], sorted((p.name for p in root.iterdir()))
                 )
 
     def test_aone_run_dispatches_injected_executor_after_persisting_plan(self):
@@ -455,7 +446,7 @@ class PublicBoundaryTest(unittest.TestCase):
                         ),
                     )
                 self.assertEqual(
-                    ["config.json"], sorted(p.name for p in root.iterdir())
+                    ["config.json"], sorted((p.name for p in root.iterdir()))
                 )
 
     def test_aone_report_is_offline_and_follow_up_execution_is_rejected(self):
@@ -472,7 +463,7 @@ class PublicBoundaryTest(unittest.TestCase):
             source["output"]["result_root"] = str(root / "results")
             config = root / "config.json"
             config.write_text(json.dumps(source))
-            plan, source = build_request_plan(
+            (plan, source) = build_request_plan(
                 parse_cli(["--mode=prefill", "--action=run", f"--config={config}"])
             )
             initialize_run_directory(
@@ -510,7 +501,7 @@ class PublicBoundaryTest(unittest.TestCase):
                     )
 
     def test_historical_plan_is_rejected(self):
-        plan, _ = build_request_plan(
+        (plan, _) = build_request_plan(
             parse_cli(
                 [
                     "--config="
@@ -612,6 +603,7 @@ class CliParsingTest(unittest.TestCase):
 
 
 class RepositoryProvenanceTest(unittest.TestCase):
+
     def test_invalid_revision_mapping_is_rejected_before_run_creation(self):
         for value in ('{"repo": "main"}', "[]", '"not a mapping"', "{invalid"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
@@ -657,10 +649,7 @@ class RepositoryProvenanceTest(unittest.TestCase):
                     run_context=run_context_path(root, repository_revisions=revisions),
                 )
                 with patch.dict(
-                    "os.environ",
-                    {
-                        "BUILD_SCM_REVISION": revisions["public"],
-                    },
+                    "os.environ", {"BUILD_SCM_REVISION": revisions["public"]}
                 ):
                     if failure:
                         with self.assertRaisesRegex(OSError, "execution failed"):
@@ -678,10 +667,6 @@ class RepositoryProvenanceTest(unittest.TestCase):
                 self.assertEqual(revisions["public"], manifest["code_version"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class InferredCliTest(unittest.TestCase):
 
     def test_invalid_workload_shape_is_a_configuration_error(self):
@@ -695,7 +680,7 @@ class InferredCliTest(unittest.TestCase):
         request = parse_cli(["--config=" + str(entry_LOCAL), "--dry-run"])
         self.assertEqual("run", request.action)
         self.assertIsNone(request.mode)
-        plan, _ = build_request_plan(request)
+        (plan, _) = build_request_plan(request)
         self.assertEqual("prefill", plan.mode)
 
     def test_explicit_mode_is_assertion(self):
@@ -715,6 +700,7 @@ class InferredCliTest(unittest.TestCase):
 
 
 class SshEntryContractTest(unittest.TestCase):
+
     def test_one_config_freezes_git_and_roundtrips_without_original_worktree(self):
         import shutil
 
@@ -752,7 +738,7 @@ class SshEntryContractTest(unittest.TestCase):
                 "gpus_per_machine": 1,
                 "source": {"build_policy": "reuse", "worktree": repo.name},
             }
-            plan, frozen_source = plan_from_source(
+            (plan, frozen_source) = plan_from_source(
                 source, source_dir=root, result_directory=str(root / "run")
             )
             self.assertEqual(
@@ -771,3 +757,86 @@ class SshEntryContractTest(unittest.TestCase):
             self.assertEqual(plan, inspect_run_directory(root / "run").execution_plan)
             with self.assertRaises(TypeError):
                 plan.resource_plan.hosts[0]["ssh_target"] = "changed"
+
+
+class AOneEntryTest(unittest.TestCase):
+
+    def test_cli_dry_run_and_invalid_resource_never_create_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = _gang_config(
+                _execution(gpus_per_machine=8),
+                topology={"tp": 8, "dp": 2, "pp": 1, "ep": 16},
+            )
+            source["output"]["result_root"] = str(Path(tmp) / "results")
+            config = Path(tmp) / "config.json"
+            config.write_text(json.dumps(source))
+            argv = [
+                "--mode=prefill",
+                "--action=run",
+                "--dry-run",
+                "--config",
+                str(config),
+            ]
+            (output, errors) = (io.StringIO(), io.StringIO())
+            self.assertEqual(
+                0,
+                entry.main(
+                    argv,
+                    stdout=output,
+                    stderr=errors,
+                    executor_factory=lambda: self.fail("executor"),
+                ),
+            )
+            self.assertEqual(2, json.loads(output.getvalue())["gang"]["machine_count"])
+            self.assertFalse((Path(tmp) / "results").exists())
+            source["execution"]["resource"] = "unknown"
+            config.write_text(json.dumps(source))
+            self.assertNotEqual(
+                0, entry.main(argv, stdout=io.StringIO(), stderr=errors)
+            )
+            self.assertIn("unsupported AOne resource", errors.getvalue())
+            self.assertFalse((Path(tmp) / "results").exists())
+
+
+entry_ROOT = PERF_TEST_ROOT.parents[2]
+entry_SCRIPT = entry_ROOT / "tools" / "perf_test"
+entry_LOCAL = (
+    entry_ROOT / "rtp_llm" / "test" / "perf_test" / "examples" / "prefill_local.json"
+)
+
+
+def dry_run_config(backend):
+    execution = {"backend": "local", "devices": [0]}
+    return {
+        "schema_version": 1,
+        "model": fixture_model(
+            label="test-model", type="registered_model", checkpoint="/models/test"
+        ),
+        "engine": fixture_engine(),
+        "workload": fixture_workload(),
+        "execution": execution,
+        "output": {},
+        "regression": {},
+        "publish": {},
+    }
+
+
+def dry_run_cases():
+    return [
+        {"input_len": 512, "cache_len": 0, "batch_size": 1},
+        {"input_len": 1024, "cache_len": 512, "batch_size": 1},
+    ]
+
+
+public_boundary_ROOT = PERF_TEST_ROOT
+
+
+def run_context_path(root, **fields):
+    """Create the file descriptor used by an existing launcher fixture."""
+    from rtp_llm.test.perf_test.run_context import write_run_context
+
+    return str(write_run_context(root / "run_context.json", **fields))
+
+
+if __name__ == "__main__":
+    unittest.main()

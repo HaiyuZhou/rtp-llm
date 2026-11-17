@@ -1,3 +1,5 @@
+"""Performance framework behavior and failure regressions."""
+
 import importlib.util
 import json
 import os
@@ -9,7 +11,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from rtp_llm.test.perf_test.tests.support.paths import PERF_TEST_ROOT
+from rtp_llm.test.perf_test.errors import ConfigurationError
+from rtp_llm.test.perf_test.ssh.source import build_identity, resolve_source
+from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
 
 
 def load_worker():
@@ -22,6 +26,7 @@ def load_worker():
 
 
 class WorkerTest(unittest.TestCase):
+
     def test_file_entry_describe_has_no_runtime_imports(self):
         result = subprocess.run(
             [
@@ -72,7 +77,7 @@ class WorkerTest(unittest.TestCase):
         worker = load_worker()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source_dir, build_dir, run_dir = (
+            (source_dir, build_dir, run_dir) = (
                 root / "source",
                 root / "build",
                 root / "run",
@@ -80,15 +85,7 @@ class WorkerTest(unittest.TestCase):
             source_dir.mkdir()
             run_dir.mkdir()
             driver = root / "driver.py"
-            program = """import hashlib,json,pathlib,sys
-p=json.loads(pathlib.Path(sys.argv[-1]).read_text())
-artifact=pathlib.Path(p['source_dir'])/'lib.so'; artifact.write_bytes(b'native')
-r={'schema_version':1,'status':'completed','bazel_exit_code':0,'source_sha':p['source_sha'],
-   'artifacts':{str(artifact):hashlib.sha256(artifact.read_bytes()).hexdigest()},
-   'driver_sha256':hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),
-   'toolchain':TOOLCHAIN}
-pathlib.Path(p['receipt_path']).write_text(json.dumps(r))
-""".replace(
+            program = "import hashlib,json,pathlib,sys\np=json.loads(pathlib.Path(sys.argv[-1]).read_text())\nartifact=pathlib.Path(p['source_dir'])/'lib.so'; artifact.write_bytes(b'native')\nr={'schema_version':1,'status':'completed','bazel_exit_code':0,'source_sha':p['source_sha'],\n   'artifacts':{str(artifact):hashlib.sha256(artifact.read_bytes()).hexdigest()},\n   'driver_sha256':hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),\n   'toolchain':TOOLCHAIN}\npathlib.Path(p['receipt_path']).write_text(json.dumps(r))\n".replace(
                 "TOOLCHAIN", repr(worker.toolchain_snapshot())
             )
             driver.write_text(program)
@@ -241,12 +238,12 @@ pathlib.Path(p['receipt_path']).write_text(json.dumps(r))
             "member_id": "0",
             "run_dir": str(root),
         }
-        return process, child, owner, descriptor
+        return (process, child, owner, descriptor)
 
     def test_cancel_kills_stubborn_group_child_after_leader_exits(self):
         worker = load_worker()
         with tempfile.TemporaryDirectory() as directory:
-            process, child, owner, descriptor = (
+            (process, child, owner, descriptor) = (
                 self.launch_owned_group_with_stubborn_child(worker, Path(directory))
             )
             with patch.object(worker, "CANCEL_GRACE_SECONDS", 0.05):
@@ -262,7 +259,7 @@ pathlib.Path(p['receipt_path']).write_text(json.dumps(r))
         worker = load_worker()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            process, child, owner, descriptor = (
+            (process, child, owner, descriptor) = (
                 self.launch_owned_group_with_stubborn_child(worker, root)
             )
             owner["members"] = {str(child): worker.process_identity(child)}
@@ -290,15 +287,10 @@ pathlib.Path(p['receipt_path']).write_text(json.dumps(r))
         worker = load_worker()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            first, second = root / "build-identity-a", root / "build-identity-b"
+            (first, second) = (root / "build-identity-a", root / "build-identity-b")
             first.mkdir()
             second.mkdir()
-            child_code = """import fcntl,os,runpy,sys
-ns=runpy.run_path(sys.argv[1]);os.write(1,b'R')
-with ns['environment_lock'](exclusive=sys.argv[3]=='exclusive'):
-    with open(sys.argv[2]+'/.lock','a') as build:
-        fcntl.flock(build,fcntl.LOCK_EX);os.write(1,b'A')
-"""
+            child_code = "import fcntl,os,runpy,sys\nns=runpy.run_path(sys.argv[1]);os.write(1,b'R')\nwith ns['environment_lock'](exclusive=sys.argv[3]=='exclusive'):\n    with open(sys.argv[2]+'/.lock','a') as build:\n        fcntl.flock(build,fcntl.LOCK_EX);os.write(1,b'A')\n"
             with patch.dict(os.environ, {"HOME": str(root)}):
                 with worker.environment_lock(exclusive=parent_exclusive):
                     with (first / ".lock").open("a") as build:
@@ -345,7 +337,7 @@ with ns['environment_lock'](exclusive=sys.argv[3]=='exclusive'):
                             selector.select(5), "environment lock was not released"
                         )
                         self.assertEqual(child.stdout.read(1), b"A")
-                _output, error = child.communicate(timeout=5)
+                (_output, error) = child.communicate(timeout=5)
                 self.assertEqual(child.returncode, 0, error.decode())
 
     def test_dependency_install_blocks_other_build_identity_measurement(self):
@@ -413,11 +405,7 @@ with ns['environment_lock'](exclusive=sys.argv[3]=='exclusive'):
                 "build_dir": str(build_dir),
             }
             observed = []
-            child_code = """import fcntl,sys
-with open(sys.argv[1],'a') as lock:
-    try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    except BlockingIOError: sys.exit(71)
-"""
+            child_code = "import fcntl,sys\nwith open(sys.argv[1],'a') as lock:\n    try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)\n    except BlockingIOError: sys.exit(71)\n"
 
             def check_source(_descriptor):
                 observed.append(
@@ -447,6 +435,52 @@ with open(sys.argv[1],'a') as lock:
                 [71],
                 "source checks happened before acquiring the native build lease",
             )
+
+
+class SourceTest(unittest.TestCase):
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.git("init")
+        self.git("config", "user.email", "test@example.invalid")
+        self.git("config", "user.name", "Test")
+        (self.root / "code.py").write_text("value = 1\n")
+        self.git("add", "code.py")
+        self.git("commit", "-m", "test")
+
+    def git(self, *args):
+        return subprocess.check_output(
+            ["git", "-C", str(self.root), *args], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+
+    def source(self):
+        return {
+            "worktree": str(self.root),
+            "ref": "auto",
+            "build_policy": "reuse",
+            "build_driver": None,
+            "bazel_config": "cuda13",
+            "bazel_targets": ["//:target"],
+            "bazel_args": [],
+        }
+
+    def test_auto_freezes_exact_public_commit_and_untracked_is_excluded(self):
+        (self.root / "personal.json").write_text("{}")
+        frozen = resolve_source(self.source(), source_dir=self.root)
+        self.assertEqual(frozen["ref"], self.git("rev-parse", "HEAD"))
+        self.assertEqual(frozen["worktree"], str(self.root))
+
+    def test_dirty_tracked_code_is_rejected(self):
+        (self.root / "code.py").write_text("value = 2\n")
+        with self.assertRaisesRegex(ConfigurationError, "uncommitted"):
+            resolve_source(self.source(), source_dir=self.root)
+
+    def test_build_identity_changes_with_flags(self):
+        source = resolve_source(self.source(), source_dir=self.root)
+        changed = {**source, "bazel_args": ["--jobs=2"]}
+        self.assertNotEqual(build_identity(source), build_identity(changed))
 
 
 if __name__ == "__main__":

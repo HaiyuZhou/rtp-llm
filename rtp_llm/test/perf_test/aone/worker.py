@@ -163,7 +163,7 @@ def load_remote_inputs(
 
 def _default_executor(inputs: RemoteInputs):
     from rtp_llm.test.perf_test.execution.local import _default_session_factory
-    from rtp_llm.test.perf_test.prefill.adapter import create_prefill_adapter
+    from rtp_llm.test.perf_test.modes import create_prefill_adapter
     from rtp_llm.test.perf_test.test_util import _load_tokenizer
 
     runtime_inputs = resolve_remote_runtime_inputs(inputs)

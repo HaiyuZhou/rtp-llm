@@ -1,3 +1,5 @@
+"""Performance framework behavior and failure regressions."""
+
 import subprocess
 import sys
 import threading
@@ -8,6 +10,7 @@ from rtp_llm.test.perf_test.ssh.remote import RemoteHost
 
 
 class RemoteTest(unittest.TestCase):
+
     def test_ssh_uses_config_and_quotes_remote_arguments_as_data(self):
         host = RemoteHost("jump-alias", python_bin=sys.executable)
         argv = host.command(["printf", "%s", "path with space;$(echo unsafe)'quote"])

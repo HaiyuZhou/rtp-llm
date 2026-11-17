@@ -1,4 +1,4 @@
-"""Portable publication outcome policy contracts."""
+"""Performance framework behavior and failure regressions."""
 
 import json
 import tempfile
@@ -10,13 +10,10 @@ from rtp_llm.test.perf_test.publish.policy import ConfiguredPublisher, run_publi
 
 
 class PublisherPolicyTest(unittest.TestCase):
+
     def _run_directory(self, root):
         (root / "results" / "cases").mkdir(parents=True)
-        manifest = {
-            "schema_version": 1,
-            "run_id": "run-001",
-            "state": "completed",
-        }
+        manifest = {"schema_version": 1, "run_id": "run-001", "state": "completed"}
         summary = {
             "schema_version": 1,
             "run_id": "run-001",
@@ -46,7 +43,6 @@ class PublisherPolicyTest(unittest.TestCase):
             root = Path(directory)
             self._run_directory(root)
             before = self._measurement_bytes(root)
-
             publication = run_publishers(
                 root,
                 [
@@ -62,7 +58,6 @@ class PublisherPolicyTest(unittest.TestCase):
                     ),
                 ],
             )
-
             self.assertEqual("failed_optional", publication["status"])
             self.assertFalse(publication["required_failure"])
             self.assertEqual(before, self._measurement_bytes(root))
@@ -78,7 +73,6 @@ class PublisherPolicyTest(unittest.TestCase):
             root = Path(directory)
             self._run_directory(root)
             before = self._measurement_bytes(root)
-
             with self.assertRaisesRegex(PublisherError, "required publisher") as raised:
                 run_publishers(
                     root,
@@ -92,7 +86,6 @@ class PublisherPolicyTest(unittest.TestCase):
                         )
                     ],
                 )
-
             self.assertEqual(6, raised.exception.exit_code)
             self.assertEqual(before, self._measurement_bytes(root))
             manifest = json.loads((root / "manifest.json").read_text())

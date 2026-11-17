@@ -9,8 +9,7 @@ Flow:
 import logging
 import os
 
-from rtp_llm.test.perf_test.dataset import extract_arg
-from rtp_llm.test.perf_test.engine_paths import resolve_engine_paths
+from rtp_llm.test.perf_test.engine_paths import extract_arg, resolve_engine_paths
 from rtp_llm.test.perf_test.offline_runner import OfflineBenchConfig, OfflineRunner
 from rtp_llm.test.perf_test.server import EngineServer
 from rtp_llm.test.utils.coredump_util import summarize_and_cleanup_coredumps

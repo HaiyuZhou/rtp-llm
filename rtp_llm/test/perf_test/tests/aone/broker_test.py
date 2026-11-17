@@ -1,3 +1,5 @@
+"""Performance framework behavior and failure regressions."""
+
 import json
 import threading
 import time
@@ -112,7 +114,7 @@ class GangBrokerTest(unittest.TestCase):
             with self.subTest(hostname=hostname):
                 broker = self._start_broker(machine_count=2)
                 self.assertEqual(200, _register(broker, 0, "host-a", 9000)[0])
-                status, body = _register(
+                (status, body) = _register(
                     broker, 1, hostname, 9001, source_address=source
                 )
                 self.assertEqual((409, "duplicate_host"), (status, body["error"]))
@@ -190,7 +192,7 @@ class GangBrokerTest(unittest.TestCase):
             )
             waiter.join(timeout=4)
             self.assertFalse(waiter.is_alive())
-            status, body = response[0]
+            (status, body) = response[0]
         finally:
             if waiter.is_alive():
                 broker.stop()
@@ -248,6 +250,5 @@ class GangBrokerTest(unittest.TestCase):
 
 _LOOPBACK = "127.0.0.1"
 _LOOPBACK_HOSTS = {_LOOPBACK: "host-a", "127.0.0.2": "host-b"}
-
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-"""Tests for prefill workload_test."""
+"""Performance framework behavior and failure regressions."""
 
 import json
 import subprocess
@@ -22,21 +22,11 @@ from rtp_llm.test.perf_test.prefill.traffic_batch import sample_traffic_batches
 from rtp_llm.test.perf_test.prefill.traffic_distribution import (
     parse_length_distribution,
 )
-from rtp_llm.test.perf_test.tests.support.fixtures import (
-    prefill_external_prefill_source,
-)
-from rtp_llm.test.perf_test.tests.support.workload import (
-    prefill_prompt_WhitespaceTokenizer,
-    random_batch_export_MODULE,
-    random_batch_export_planned,
-    random_batch_export_random_config,
-    traffic_batch_config,
-    traffic_batch_export_MODULE,
-    traffic_distribution_payload,
-)
+from rtp_llm.test.perf_test.tests.support.prefill import prefill_external_prefill_source
 
 
 class SeedPreparationTest(unittest.TestCase):
+
     def test_grouped_prompts_preserve_fast_construction_metadata(self):
         factory = PrefixPromptFactory(prefill_prompt_WhitespaceTokenizer())
         for policy in ("independent", "shared_by_group"):
@@ -60,7 +50,9 @@ class SeedPreparationTest(unittest.TestCase):
                     )
 
     def test_seed_fragments_match_exact_builder_without_repeated_long_encodes(self):
+
         class Tokenizer(prefill_prompt_WhitespaceTokenizer):
+
             def __init__(self):
                 self.long_encodes = 0
 
@@ -85,7 +77,9 @@ class SeedPreparationTest(unittest.TestCase):
         self.assertEqual(1, tokenizer.long_encodes)
 
     def test_seed_falls_back_when_commit_marker_changes_prefix_tokenization(self):
+
         class Tokenizer(prefill_prompt_WhitespaceTokenizer):
+
             def encode(self, text):
                 ids = super().encode(text)
                 for i, token in enumerate(ids):
@@ -102,7 +96,9 @@ class SeedPreparationTest(unittest.TestCase):
         self.assertEqual(prompt.prefix_ids, actual[1][:64])
 
     def test_seed_falls_back_when_commit_tail_cannot_fit_marker(self):
+
         class Tokenizer(prefill_prompt_WhitespaceTokenizer):
+
             def encode(self, text):
                 return text.replace("_", " ").split()
 
@@ -118,7 +114,9 @@ class SeedPreparationTest(unittest.TestCase):
         self.assertEqual(prompt.prefix_ids, actual[1][:64])
 
     def test_verified_long_seed_does_not_bypass_marker_only_prefix_fallback(self):
+
         class Tokenizer(prefill_prompt_WhitespaceTokenizer):
+
             def encode(self, text):
                 ids = super().encode(text)
                 for i, token in enumerate(ids):
@@ -141,7 +139,9 @@ class SeedPreparationTest(unittest.TestCase):
         self.assertEqual(short.prefix_ids, actual[1][:1])
 
     def test_verified_seed_with_fillers_does_not_bypass_eof_verification(self):
+
         class Tokenizer(prefill_prompt_WhitespaceTokenizer):
+
             def encode(self, text):
                 ids = super().encode(text)
                 if len(ids) >= 64 and ids[-1].startswith("__seed_commit_"):
@@ -455,6 +455,105 @@ class GroupedPrefillPlanningTest(unittest.TestCase):
         )
         self.assertEqual("independent", case["prefix_policy"])
         self.assertEqual(2, case["request_groups"][0]["count"])
+
+
+import json
+import tempfile
+from pathlib import Path
+
+from rtp_llm.test.perf_test.config_schema import parse_config
+from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
+from rtp_llm.test.perf_test.tests.support.fixtures import (
+    config_resolution_base_config,
+    fixture_engine,
+    fixture_execution,
+    fixture_model,
+)
+
+
+class prefill_prompt_WhitespaceTokenizer:
+
+    def encode(self, text):
+        return text.split()
+
+
+random_batch_export_MODULE = "rtp_llm.test.perf_test.prefill.export"
+
+
+def random_batch_export_random_config():
+    return {
+        "schema_version": 1,
+        "model": fixture_model(
+            label="random-test",
+            type="qwen_2",
+            checkpoint="/models/test",
+            tokenizer="/models/test",
+        ),
+        "engine": fixture_engine(
+            max_seq_len=4097, max_batch_tokens=16384, concurrency_limit=4
+        ),
+        "workload": {
+            "kind": "cache_grid",
+            "cache_alignment": 64,
+            "commit_tail_tokens": 64,
+            "measure_runs": 2,
+            "workspace_tokens": 16384,
+            "random_request_batches": {
+                "num_cases": 6,
+                "batch_sizes": [2, 4],
+                "min_input_tokens": 256,
+                "max_input_tokens": 2048,
+                "input_alignment": 256,
+                "batch_input_limits": {"4": 1024},
+            },
+        },
+        "execution": fixture_execution(),
+        "output": {"result_root": "perf_test_results"},
+        "regression": {},
+        "publish": {},
+    }
+
+
+def random_batch_export_planned(source):
+    config = parse_config(source)
+    return plan_prefill_cases(
+        config.workload, config.engine, dp_size=config.model.topology.dp
+    )
+
+
+traffic_batch_export_MODULE = "rtp_llm.test.perf_test.prefill.export"
+
+
+def traffic_batch_config():
+    raw = config_resolution_base_config()
+    raw["workload"] = {
+        "kind": "cache_grid",
+        "cache_alignment": 8,
+        "commit_tail_tokens": 8,
+        "workspace_tokens": 4096,
+        "traffic_request_batches": {
+            "distribution_file": "distribution.json",
+            "num_cases": 3,
+            "batch_sizes": [1, 2],
+            "min_input_tokens": 100,
+        },
+    }
+    return raw
+
+
+def traffic_distribution_payload():
+    return dict(
+        schema_version=1,
+        kind="conditional_request_lengths",
+        input_bucket_width=100,
+        reuse_ratio_bins=2,
+        source_rows=30,
+        incomplete_rows=0,
+        cells=[
+            dict(input_bucket=1, reuse_bin=b, count=10, input_min=100, input_max=199)
+            for b in (-1, 2, 1)
+        ],
+    )
 
 
 if __name__ == "__main__":

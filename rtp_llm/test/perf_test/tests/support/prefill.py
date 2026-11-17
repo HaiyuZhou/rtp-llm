@@ -204,7 +204,7 @@ def prefill_profile_formal_bytes(root):
         str(path.relative_to(root)): path.read_bytes()
         for path in root.rglob("*")
         if path.is_file()
-        and "profiles" not in path.parts
+        and not {"profiles", "traces"}.intersection(path.relative_to(root).parts)
         and (path.name != ".writer.lock")
     }
 

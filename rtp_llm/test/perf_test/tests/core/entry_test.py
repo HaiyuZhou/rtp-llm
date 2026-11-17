@@ -71,11 +71,13 @@ class UnifiedEntryTest(unittest.TestCase):
                     def run_case(case):
                         if fail:
                             raise RuntimeError("trace collection failed")
-                        (profile_dir / "trace.json").write_text("{}")
+                        case_dir = profile_dir / case["case_id"]
+                        case_dir.mkdir()
+                        (case_dir / "trace.json").write_text("{}")
                         return dict(
                             case_id=case["case_id"],
                             status="ok",
-                            trace_files=["trace.json"],
+                            trace_files=[case["case_id"] + "/trace.json"],
                         )
 
                     return Mock(run_case=run_case)

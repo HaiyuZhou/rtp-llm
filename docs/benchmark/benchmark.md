@@ -128,9 +128,66 @@ run and collected offline report. Decode supports run, including its automatic
 report; AOne decode requires a multi-machine gang. Follow-up actions read the
 frozen run and do not accept config overrides.
 
-The historical `multi_node/analyzer/` tools remain available for existing result
-analysis. The manual `offline_bench_test` is a separate microbenchmark. Public
-runs do not automatically publish results or replace regression baselines.
+The manual `offline_bench_test` is a separate microbenchmark. Public runs do not
+automatically publish results or replace regression baselines.
+
+## Trace analysis
+
+Prefill and decode store profile manifests in
+`profiles/<session_id>/manifest.json` and captured files in
+`traces/<session_id>/<case_id>/`. Schema 2 manifests list each case's capture
+status and run-relative artifact path, format, rank and phase (unknown values
+are null). Case dimensions and topology come from `execution_plan.json`.
+
+Analyze a captured run, an experiment, or a directory containing runs:
+
+```bash
+python -m rtp_llm.test.perf_test.multi_node.analyzer.batch_analyze /path/to/run
+```
+
+The command writes `reports/trace/analysis.json` and `kernels.csv` below its
+input directory; `--output-dir DIR` selects another destination. It does not
+launch an engine or change measurements. Missing, incomplete, invalid and
+unsupported artifacts are listed in `skipped`. An input with no analyzable
+trace exits nonzero. Copied collected runs are supported without rewriting
+the original plan.
+
+Only listed Kineto/Chrome Trace JSON files are analyzed. `.nsys-rep` captures
+remain available for Nsight Systems and are reported as unsupported by this
+JSON analyzer. Each trace retains its session/case/rank context. Kernel time is
+the sum of raw kernel durations; kernel span is the first-to-last kernel
+interval. Neither is end-to-end request latency. No duration outliers are
+silently removed. `--min-occurrences N` filters table rows only (default 1).
+
+For a single trace, use
+`python -m rtp_llm.test.perf_test.multi_node.analyzer.trace_analyze /path/to/trace.json`.
+Optional module analysis uses the restored configs with the same run input:
+
+```bash
+python -m rtp_llm.test.perf_test.multi_node.analyzer.batch_analyze /path/to/run \
+  --module-conf rtp_llm/test/perf_test/multi_node/analyzer/configs/qwen_480b_prefill_fp8.py
+```
+
+`module_conf.py` provides name matching only; the two `qwen_480b_*` presets also
+provide model-specific FLOPs/IO estimates. Select a preset matching the model
+and phase; the supplied formulas describe TP1. `modules.csv` and each trace's
+`statistics.modules` contain matched kernel names, actual invocation counts,
+summed durations and percentages of total kernel time. Rules match independently,
+so overlapping patterns can contribute to more than one module. Kernel row
+filtering does not remove events from module totals.
+
+FLOPs/IO describe one module invocation. Rates are computed only when the spec
+explicitly declares `formula_per_kernel=True`: estimated work per invocation
+is multiplied by the actual matching kernel-event count and divided by summed
+duration. QKV/O GEMM presets declare this; other presets leave rates null when
+logical module invocations cannot be inferred from kernel launches. Context comes from the frozen case and
+topology, with a per-DP batch and the case's input length. Heterogeneous or cached
+prefill shapes, unsupported TP/phase, invalid formulas and unknown capture steps
+produce null estimates and an `estimation_error`, while measured module times
+remain available. Decode rates require explicit decode phase metadata. These
+estimates are not measured hardware counters or end-to-end latency. Config files
+are Python files defining `module_config` with strings or `ModuleConf` values.
+The old Task-directory scanner and shell wrappers remain removed.
 
 ## Result goldens
 

@@ -16,6 +16,7 @@ from rtp_llm.test.perf_test.config_schema import DEFAULT_PREFILL_TRANSPORT
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.plan import ExecutionPlan, thaw
 from rtp_llm.test.perf_test.prefill.planner import require_concurrent_prefill_plan
+from rtp_llm.test.perf_test.profiling import new_profile_manifest, trace_artifact
 from rtp_llm.test.perf_test.run_directory import RunDirectoryLock
 from rtp_llm.test.perf_test.storage import atomic_write_json
 
@@ -76,24 +77,21 @@ class PrefillProfiler:
             cases_dir = profile_dir / "cases"
             cases_dir.mkdir()
             results = []
-            manifest = {
-                "schema_version": 1,
-                "session_id": session_id,
-                "diagnostic_only": True,
-                "case_ids": list(case_ids),
-                "profiling": thaw(plan.resolved_config)["workload"].get(
-                    "profiling", {}
-                ),
-                "status": "running",
-                "results": results,
-            }
-            manifest["capture_scope"] = capture_scope(
-                manifest["profiling"].get("backend", "kineto")
+            settings = thaw(plan.resolved_config)["workload"].get("profiling", {})
+            backend = settings.get("backend", "kineto")
+            manifest = new_profile_manifest(
+                "prefill",
+                session_id,
+                case_ids,
+                backend=backend,
+                capture_scope=capture_scope(backend),
             )
+            trace_dir = root / "traces" / session_id
             atomic_write_json(profile_dir / "manifest.json", manifest)
             try:
-                runner = self._runner_factory(profile_dir)
-                for case_id in case_ids:
+                trace_dir.mkdir(parents=True, exist_ok=False)
+                runner = self._runner_factory(trace_dir)
+                for case_id, profile_case in zip(case_ids, manifest["cases"]):
                     case = thaw(by_id[case_id].identity)
                     case["case_id"] = case_id
                     try:
@@ -109,16 +107,19 @@ class PrefillProfiler:
                                 raise RuntimeError(
                                     "profile produced no trace artifacts"
                                 )
-                            for artifact in artifacts:
-                                path = (profile_dir / artifact).resolve()
-                                if (
-                                    not path.is_relative_to(profile_dir.resolve())
-                                    or not path.is_file()
-                                    or path.stat().st_size == 0
-                                ):
-                                    raise RuntimeError(
-                                        f"invalid profile trace artifact: {artifact}"
-                                    )
+                            profile_case["artifacts"] = [
+                                trace_artifact(
+                                    root,
+                                    session_id,
+                                    case_id,
+                                    trace_dir / artifact,
+                                    backend=backend,
+                                )
+                                for artifact in artifacts
+                            ]
+                            result["trace_files"] = [
+                                item["path"] for item in profile_case["artifacts"]
+                            ]
                     except Exception as error:
                         result = {
                             "case_id": case_id,
@@ -128,7 +129,20 @@ class PrefillProfiler:
                                 {"code": "profile_failed", "message": str(error)}
                             ],
                         }
+                    profile_case.update(
+                        status=(
+                            "completed" if result.get("status") == "ok" else "failed"
+                        ),
+                        error=(
+                            None
+                            if result.get("status") == "ok"
+                            else str(result.get("errors", []))
+                        ),
+                    )
+                    if profile_case["status"] == "failed":
+                        profile_case["artifacts"] = []
                     atomic_write_json(cases_dir / f"{case_id}.json", result)
+                    atomic_write_json(profile_dir / "manifest.json", manifest)
                     results.append(result)
                 outcome = {
                     "schema_version": 1,
@@ -142,7 +156,7 @@ class PrefillProfiler:
                     ),
                     "results": results,
                 }
-                manifest.update(status=outcome["status"], results=results)
+                manifest["status"] = outcome["status"]
                 atomic_write_json(profile_dir / "manifest.json", manifest)
                 atomic_write_json(profile_dir / "profile_result.json", outcome)
                 return outcome
@@ -363,7 +377,13 @@ class ProfiledRunner:
                 cache_block_size=resolve_probe_block_size(self.config),
             ).run_case(diagnostic)
             if result["status"] == "ok":
-                result["trace_files"] = capture.finish()
+                files = capture.finish()
+                case_dir = self.directory / case["case_id"]
+                case_dir.mkdir(exist_ok=False)
+                result["trace_files"] = []
+                for name in files:
+                    (self.directory / name).rename(case_dir / name)
+                    result["trace_files"].append(case["case_id"] + "/" + name)
         except Exception as error:
             result = {
                 "case_id": case["case_id"],

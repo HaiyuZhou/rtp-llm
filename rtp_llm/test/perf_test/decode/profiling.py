@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from rtp_llm.test.perf_test.decode.model import DecodeCaseSpec
 from rtp_llm.test.perf_test.plan import case_id
+from rtp_llm.test.perf_test.profiling import new_profile_manifest, trace_artifact
 from rtp_llm.test.perf_test.storage import atomic_write_json
 
 
@@ -117,11 +119,15 @@ class DecodeProfiler:
                 traces[path] = trace
         return traces
 
-    def _retain_complete_traces(self, traces: Dict[Path, dict]) -> Tuple[str, ...]:
+    def _retain_complete_traces(
+        self, traces: Dict[Path, dict], directory: Path
+    ) -> Tuple[str, ...]:
         artifacts = []
         for path, trace in traces.items():
-            retained = self._run_root / "traces" / path.name
+            retained = directory / path.name
             retained.parent.mkdir(parents=True, exist_ok=True)
+            if retained.exists():
+                raise RuntimeError(f"ambiguous profile trace filename: {path.name}")
             atomic_write_json(retained, trace)
             artifacts.append(str(retained.relative_to(self._run_root)))
         return tuple(sorted(artifacts))
@@ -133,15 +139,17 @@ class DecodeProfiler:
             )
         identity = case.to_identity()
         case_id_value = case_id("decode", identity)
-        trace_name = (
-            f"decode_in{case.input_lengths[0]}_out{case.output_length}_bs{batch_size}_"
-            f"{case_id_value.rsplit('-', 1)[-1]}"
-        )
-        relative_manifest = Path("profiles") / case_id_value / "profile_manifest.json"
+        session_id = "profile-" + uuid.uuid4().hex
+        # The engine truncates prefixes at 64 characters. A unique short prefix
+        # lets collected ranks join the same session without counter assumptions.
+        trace_name = session_id
+        relative_manifest = Path("profiles") / session_id / "manifest.json"
+        trace_directory = self._run_root / "traces" / session_id / case_id_value
         manifest_path = self._run_root / relative_manifest
         status = "completed"
         error_message = None
         artifacts: Tuple[str, ...] = ()
+        artifact_records = []
         profile_invoked = False
         capture_completed = False
         try:
@@ -176,7 +184,17 @@ class DecodeProfiler:
                     # Stable source traces establish capture completion even if
                     # retaining diagnostic copies fails on the run filesystem.
                     capture_completed = True
-                    artifacts = self._retain_complete_traces(traces)
+                    artifacts = self._retain_complete_traces(traces, trace_directory)
+                    artifact_records = [
+                        trace_artifact(
+                            self._run_root,
+                            session_id,
+                            case_id_value,
+                            self._run_root / path,
+                            backend="kineto",
+                        )
+                        for path in artifacts
+                    ]
                     break
                 self._sleep(0.2)
             if not artifacts:
@@ -185,6 +203,7 @@ class DecodeProfiler:
             status = "failed"
             error_message = sanitize_error(error)
             artifacts = ()
+            artifact_records = []
         finally:
             # A lost start acknowledgement can still leave some ranks armed.
             # StartProfile has no cancellation API; only a completed capture
@@ -193,21 +212,21 @@ class DecodeProfiler:
             self._requires_session_restart = (
                 profile_invoked and attempted is not False and not capture_completed
             )
-        manifest = {
-            "schema_version": 1,
-            "status": status,
-            "case_id": case_id_value,
-            "batch_size": batch_size,
-            "input_lengths": list(case.input_lengths[:batch_size]),
-            "output_length": case.output_length,
-            "runs": case.profiling.runs,
-            "steps": case.profiling.steps,
-            "enable_all_ranks": case.profiling.enable_all_ranks,
-            "trace_name": trace_name,
-            "artifacts": list(artifacts),
-            "manifest_path": str(relative_manifest),
-            "error": error_message,
-        }
+        manifest = new_profile_manifest(
+            "decode",
+            session_id,
+            [case_id_value],
+            backend="kineto",
+            capture_scope=f"{case.profiling.steps} forward steps per capture; formal measurement excluded",
+        )
+        manifest["status"] = status
+        manifest["error"] = error_message
+        manifest["cases"][0].update(
+            trace_name=trace_name,
+            status=status,
+            error=error_message,
+            artifacts=artifact_records,
+        )
         try:
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_json(manifest_path, manifest)
@@ -215,15 +234,16 @@ class DecodeProfiler:
             # Profiling is diagnostic: persistence failures must not escape to
             # the case executor and discard the completed formal measurement.
             message = f"profile manifest persistence failed: {sanitize_error(error)}"
-            manifest.update(
-                status="failed",
-                artifacts=[],
-                error=sanitize_error(
-                    RuntimeError(
-                        f"{message}; capture error: {error_message}"
-                        if error_message
-                        else message
-                    )
-                ),
+            status = "failed"
+            error_message = sanitize_error(
+                RuntimeError(
+                    f"{message}; capture error: {error_message}"
+                    if error_message
+                    else message
+                )
             )
-        return manifest
+        return {
+            "status": status,
+            "manifest_path": str(relative_manifest),
+            "error": error_message,
+        }

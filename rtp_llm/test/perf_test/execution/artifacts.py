@@ -13,8 +13,10 @@ from rtp_llm.test.perf_test.errors import (
     PerfTestError,
 )
 from rtp_llm.test.perf_test.plan import thaw
+from rtp_llm.test.perf_test.profiling import parse_profile_manifest, trace_artifact
 from rtp_llm.test.perf_test.results import parse_result_envelope
 from rtp_llm.test.perf_test.state import RunState
+from rtp_llm.test.perf_test.storage import atomic_write_json
 
 MASTER_ARTIFACT_TREES = ("results", "reports", "traces", "profiles", "checkpoints")
 
@@ -120,6 +122,18 @@ def copy_member_traces(source_directory, trace_root, member_id):
         raise CollectionError("invalid trace member identity")
     if source_directory.is_symlink():
         raise CollectionError("trace source symlink is forbidden")
+    root = trace_root.parent
+    sessions = []
+    for path in sorted((root / "profiles").glob("*/manifest.json")):
+        manifest = parse_profile_manifest(json.loads(path.read_text()))
+        if (
+            manifest["status"] in ("completed", "failed")
+            and manifest["backend"] == "kineto"
+        ):
+            for case in manifest["cases"]:
+                if case["status"] == "completed":
+                    sessions.append((path, manifest, case))
+    changed = {}
     for source in sorted(source_directory.rglob("*.json")):
         if source.is_symlink() or not source.is_file():
             continue
@@ -131,8 +145,48 @@ def copy_member_traces(source_directory, trace_root, member_id):
             value.get("traceEvents"), list
         ):
             continue
-        target = trace_root / member_id / source.relative_to(source_directory)
+        matches = [
+            item
+            for item in sessions
+            if source.name.startswith(item[2]["trace_name"] + "_wr")
+            or source.name == item[2]["trace_name"] + ".json"
+        ]
+        if len(matches) > 1:
+            raise CollectionError(
+                f"ambiguous profile session for member trace: {source.name}"
+            )
+        if matches:
+            manifest_path, manifest, case = matches[0]
+            target = (
+                trace_root
+                / manifest["session_id"]
+                / case["case_id"]
+                / member_id
+                / source.relative_to(source_directory)
+            )
+        else:
+            # Failed/missing master captures still retain worker evidence, without
+            # presenting unassociated files as valid case measurements.
+            target = (
+                root
+                / "workload"
+                / "trace_diagnostics"
+                / member_id
+                / source.relative_to(source_directory)
+            )
         if any(path.is_symlink() for path in (target, *target.parents)):
             raise CollectionError("trace destination symlink is forbidden")
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+        if target.exists() and target.read_bytes() != source.read_bytes():
+            raise CollectionError(f"conflicting collected member trace: {target}")
+        if not target.exists():
+            shutil.copy2(source, target)
+        if matches:
+            artifact = trace_artifact(
+                root, manifest["session_id"], case["case_id"], target, backend="kineto"
+            )
+            if artifact not in case["artifacts"]:
+                case["artifacts"].append(artifact)
+                changed[manifest_path] = manifest
+    for path, manifest in changed.items():
+        atomic_write_json(path, manifest)

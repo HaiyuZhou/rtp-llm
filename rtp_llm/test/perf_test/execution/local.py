@@ -272,11 +272,11 @@ class UnifiedLocalExecutor:
             session_id = datetime.now(timezone.utc).strftime("profile-%Y%m%dT%H%M%S%fZ")
             with ExitStack() as stack:
 
-                def runner_factory(profile_dir):
+                def runner_factory(trace_dir):
                     options = {}
                     if self._session_factory is _default_session_factory:
                         options = {
-                            "profile_directory": profile_dir.resolve(),
+                            "profile_directory": trace_dir.resolve(),
                             "nsys_session": session_id,
                         }
                     session = stack.enter_context(
@@ -285,7 +285,7 @@ class UnifiedLocalExecutor:
                     return ProfiledRunner(
                         session.client,
                         tokenizer,
-                        profile_dir,
+                        trace_dir,
                         thaw(plan.resolved_config),
                         session_id,
                     )

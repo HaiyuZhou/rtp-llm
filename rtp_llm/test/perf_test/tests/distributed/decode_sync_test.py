@@ -310,9 +310,7 @@ class DistributedRuntimeTest(unittest.TestCase):
             envelope = json.loads((run / "results/result.json").read_text())
             self.assertEqual(4, envelope["summary"]["successful_cases"])
             self.assertEqual(4, len(list((run / "results/cases").glob("*.json"))))
-            self.assertEqual(
-                4, len(list((run / "profiles").glob("*/profile_manifest.json")))
-            )
+            self.assertEqual(4, len(list((run / "profiles").glob("*/manifest.json"))))
             self.assertEqual(
                 "formal",
                 json.loads((run / "reports/decode_report.json").read_text())[

@@ -19,6 +19,7 @@ from rtp_llm.test.perf_test.decode.profiling import DecodeProfiler
 from rtp_llm.test.perf_test.plan import case_id
 from rtp_llm.test.perf_test.prefill.profile import (
     PrefillProfiler,
+    ProfiledRunner,
     TraceCapture,
     TraceClient,
 )
@@ -44,12 +45,14 @@ class PrefillProfileTest(unittest.TestCase):
             }
 
             def factory(profile_dir):
-                (profile_dir / "trace.json").write_text(
+                case_dir = profile_dir / plan.cases[0].case_id
+                case_dir.mkdir()
+                (case_dir / "trace_wr0_1.json").write_text(
                     '{"traceEvents": [{"name": "kernel"}]}'
                 )
                 original = runner.run_case.side_effect
                 runner.run_case.side_effect = lambda case: dict(
-                    original(case), trace_files=["trace.json"]
+                    original(case), trace_files=[case["case_id"] + "/trace_wr0_1.json"]
                 )
                 return runner
 
@@ -64,6 +67,21 @@ class PrefillProfileTest(unittest.TestCase):
             self.assertTrue(
                 (root / "profiles" / "profile-001" / "profile_result.json").is_file()
             )
+            manifest = json.loads(
+                (root / "profiles/profile-001/manifest.json").read_text()
+            )
+            self.assertEqual(2, manifest["schema_version"])
+            self.assertEqual("prefill", manifest["mode"])
+            artifact = manifest["cases"][0]["artifacts"][0]
+            self.assertEqual(0, artifact["rank"])
+            self.assertEqual("chrome_trace", artifact["format"])
+            self.assertEqual(
+                f"traces/profile-001/{plan.cases[0].case_id}/trace_wr0_1.json",
+                artifact["path"],
+            )
+            self.assertTrue((root / artifact["path"]).is_file())
+            with self.assertRaisesRegex(Exception, "already exists"):
+                profiler.run(root, [plan.cases[0].case_id], session_id="profile-001")
             self.assertEqual(before, prefill_profile_formal_bytes(root))
 
     def test_failed_profile_keeps_formal_artifacts_unchanged(self):
@@ -106,6 +124,39 @@ class TraceTest(unittest.TestCase):
                     json.dumps({"traceEvents": [{"name": "kernel"}]})
                 )
             self.assertEqual(2, len(capture.finish()))
+
+    def test_prefill_runner_retains_completed_capture_under_its_case(self):
+        from rtp_llm.test.perf_test.plan import thaw
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = prefill_profile_setup(root / "run")
+            trace_dir = root / "run/traces/capture"
+            trace_dir.mkdir(parents=True)
+            case = dict(thaw(plan.cases[0].identity), case_id=plan.cases[0].case_id)
+            name = case["case_id"] + "_wr0_1.json"
+            payload = '{"traceEvents": [{"name": "kernel"}]}'
+            (trace_dir / name).write_text(payload)
+            capture = Mock(requires_session_restart=False, commands=[])
+            capture.finish.return_value = [name]
+            runner = Mock()
+            runner.run_case.return_value = {"case_id": case["case_id"], "status": "ok"}
+            with patch(
+                "rtp_llm.test.perf_test.prefill.profile.TraceCapture",
+                return_value=capture,
+            ), patch(
+                "rtp_llm.test.perf_test.prefill.runner.PrefillRunner",
+                return_value=runner,
+            ):
+                result = ProfiledRunner(
+                    Mock(), Mock(), trace_dir, thaw(plan.resolved_config), "capture"
+                ).run_case(case)
+            self.assertEqual([case["case_id"] + "/" + name], result["trace_files"])
+            self.assertEqual(
+                payload, (trace_dir / result["trace_files"][0]).read_text()
+            )
+            self.assertFalse((trace_dir / name).exists())
+            capture.abort.assert_called_once()
 
     def test_nsys_stop_exports_report(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -162,16 +213,21 @@ class DecodeProfilingTest(unittest.TestCase):
             )
             self.assertEqual([("measure", 8), ("profile", 8)], events)
             self.assertEqual("ok", result["status"])
-            manifest = result["metrics"]["profiling"]
-            self.assertEqual("completed", manifest["status"])
-            self.assertEqual([128] * 8, manifest["input_lengths"])
-            self.assertEqual(8, manifest["batch_size"])
-            self.assertEqual(["traces/trace.json"], manifest["artifacts"])
-            self.assertIn("decode_in128_out16_bs8_", manifest["trace_name"])
-            self.assertEqual(
-                manifest,
-                json.loads((Path(directory) / manifest["manifest_path"]).read_text()),
+            reference = result["metrics"]["profiling"]
+            self.assertEqual({"status", "manifest_path", "error"}, set(reference))
+            self.assertEqual("completed", reference["status"])
+            manifest = json.loads(
+                (Path(directory) / reference["manifest_path"]).read_text()
             )
+            self.assertEqual(2, manifest["schema_version"])
+            self.assertEqual("decode", manifest["mode"])
+            self.assertEqual("kineto", manifest["backend"])
+            artifact = manifest["cases"][0]["artifacts"][0]
+            self.assertTrue(
+                artifact["path"].startswith("traces/" + manifest["session_id"] + "/")
+            )
+            self.assertTrue((Path(directory) / artifact["path"]).is_file())
+            self.assertEqual(result["case_id"], manifest["cases"][0]["case_id"])
 
     def test_profile_failure_does_not_change_valid_performance_status(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -194,14 +250,14 @@ class DecodeProfilingTest(unittest.TestCase):
             self.assertEqual(4, result["metrics"]["global_batch_size"])
             manifest = result["metrics"]["profiling"]
             self.assertEqual("failed", manifest["status"])
-            self.assertEqual([], manifest["artifacts"])
             self.assertEqual(500, len(manifest["error"]))
             self.assertNotIn("\n", manifest["error"])
-            self.assertEqual(
-                manifest,
-                json.loads((Path(directory) / manifest["manifest_path"]).read_text()),
+            stored = json.loads(
+                (Path(directory) / manifest["manifest_path"]).read_text()
             )
-        for failure in ("copy", "mkdir"):
+            self.assertEqual("failed", stored["status"])
+            self.assertEqual([], stored["cases"][0]["artifacts"])
+        for failure in ("copy", "mkdir", "manifest"):
             with self.subTest(
                 failure=failure
             ), tempfile.TemporaryDirectory() as directory:
@@ -218,8 +274,10 @@ class DecodeProfilingTest(unittest.TestCase):
                     (root / "traces").write_text("occupied")
 
                 def persist(path, payload):
-                    if path.parent.name == "traces":
+                    if failure == "copy" and "traces" in path.parts:
                         raise OSError("trace copy disk full")
+                    if failure == "manifest" and path.name == "manifest.json":
+                        raise OSError("profile manifest disk full")
                     atomic_write_json(path, payload)
 
                 profiler = DecodeProfiler(
@@ -246,14 +304,14 @@ class DecodeProfilingTest(unittest.TestCase):
                 self.assertTrue(profiler.session_reusable)
                 manifest = result["metrics"]["profiling"]
                 self.assertEqual("failed", manifest["status"])
-                self.assertEqual([], manifest["artifacts"])
                 self.assertIn(
-                    "disk full" if failure == "copy" else "File exists",
+                    "Not a directory" if failure == "mkdir" else "disk full",
                     manifest["error"],
                 )
-                self.assertEqual(
-                    manifest, json.loads((root / manifest["manifest_path"]).read_text())
-                )
+                if failure != "manifest":
+                    stored = json.loads((root / manifest["manifest_path"]).read_text())
+                    self.assertEqual("failed", stored["status"])
+                    self.assertEqual([], stored["cases"][0]["artifacts"])
                 next_result = executor.execute(
                     decode_profiling_case_payload(decode_profiling_exact_case())
                 )

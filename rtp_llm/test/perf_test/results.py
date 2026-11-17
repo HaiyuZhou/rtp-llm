@@ -326,23 +326,7 @@ def _decode_identity(path: str, value: Mapping[str, Any]) -> None:
 def _parse_profiling(path: str, value: Any) -> Dict[str, Any]:
     raw = _object(path, value)
     _required(path, raw, {"status", "manifest_path", "error"})
-    # Profiles may embed the complete manifest or just its status and reference.
-    allowed = {
-        "status",
-        "manifest_path",
-        "error",
-        "schema_version",
-        "case_id",
-        "batch_size",
-        "input_lengths",
-        "output_length",
-        "runs",
-        "steps",
-        "enable_all_ranks",
-        "trace_name",
-        "artifacts",
-    }
-    _exact_fields(path, raw, set(raw) & allowed)
+    _exact_fields(path, raw, {"status", "manifest_path", "error"})
     if raw["status"] not in {"disabled", "completed", "failed"}:
         raise ResultSchemaError(f"{path}.status: unknown profiling status")
     if raw["status"] != "disabled":

@@ -42,6 +42,7 @@ py_library(
         "errors.py",
         "experiment.py",
         "plan.py",
+        "profiling.py",
         "prefill/__init__.py",
         "prefill/block_size.py",
         "prefill/export.py",
@@ -136,10 +137,6 @@ exports_files([
     "examples/qwen35_prefill_test.json",
     "examples/req_distribution.json",
     "main.py",
-    "multi_node/analyzer/configs/module_base.py",
-    "multi_node/analyzer/configs/module_conf.py",
-    "multi_node/analyzer/configs/qwen_480b_decode-fp8.py",
-    "multi_node/analyzer/configs/qwen_480b_prefill_fp8.py",
 ])
 
 py_library(
@@ -315,15 +312,14 @@ py_library(
     name = "perf_test_analyzer_lib",
     srcs = [
         "multi_node/analyzer/batch_analyze.py",
-        "multi_node/analyzer/merge_decode_results.py",
-        "multi_node/analyzer/trace_analyze.py",
         "multi_node/analyzer/configs/module_base.py",
         "multi_node/analyzer/configs/module_conf.py",
         "multi_node/analyzer/configs/qwen_480b_decode-fp8.py",
         "multi_node/analyzer/configs/qwen_480b_prefill_fp8.py",
+        "multi_node/analyzer/trace_analyze.py",
     ],
     deps = [
-        ":perf_test_results_lib",
+        ":perf_test_entry_lib",
     ],
 )
 

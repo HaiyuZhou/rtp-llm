@@ -109,7 +109,7 @@ class GangExecutorTest(unittest.TestCase):
                     executor._collect_master_tree(root, outputs)
                 self.assertFalse((root / "results/result.json").exists())
 
-    def test_gang_collection_retains_nonmaster_decode_trace(self):
+    def test_unassociated_nonmaster_trace_is_retained_for_diagnosis(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             outputs = root / "outputs"
@@ -120,7 +120,10 @@ class GangExecutorTest(unittest.TestCase):
             )
             GangAOneExecutor._copy_worker_traces(outputs, root / "traces", 1)
             self.assertTrue(
-                (root / "traces/shard_2/decode_in8_out2_bs2_case_1.json").is_file()
+                (
+                    root
+                    / "workload/trace_diagnostics/shard_2/decode_in8_out2_bs2_case_1.json"
+                ).is_file()
             )
 
     def _gang_flow(
@@ -222,7 +225,11 @@ class GangExecutorTest(unittest.TestCase):
             )
             self.assertEqual(RunState.FAILED, outcome.state)
             self.assertTrue((root / "workload/gang_shards/shard_2/test.log").is_file())
-            self.assertTrue((root / "traces/shard_2/decode_trace.json").is_file())
+            self.assertTrue(
+                (
+                    root / "workload/trace_diagnostics/shard_2/decode_trace.json"
+                ).is_file()
+            )
 
     def test_gang_submission_preserves_package_inputs_artifacts_and_secret(self):
         with tempfile.TemporaryDirectory() as directory:

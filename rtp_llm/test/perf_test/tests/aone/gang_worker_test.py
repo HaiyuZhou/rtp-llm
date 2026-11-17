@@ -336,22 +336,12 @@ class GangWorkerTest(unittest.TestCase):
             }
         )
 
-    def test_global_distribution_and_target_master_use_cluster_transport(self):
+    def test_global_grid_and_distribution_master_use_cluster_transport(self):
         for workload in (
             {
                 "kind": "grid",
                 "input_lengths": [8],
                 "batch": {"strategy": "fixed", "sizes": [2], "unit": "global"},
-            },
-            {
-                "kind": "grid",
-                "input_lengths": [8],
-                "batch": {
-                    "strategy": "target_tpot",
-                    "max_size": 4,
-                    "candidate_step": 1,
-                    "target_tpot_ms": 10,
-                },
             },
             {
                 "kind": "distribution",

@@ -126,7 +126,6 @@ def result_envelope_decode_result():
                         ],
                     }
                 ],
-                "search": None,
                 "distribution": None,
                 "profiling": {
                     "status": "disabled",

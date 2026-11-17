@@ -11,7 +11,6 @@ from rtp_llm.test.perf_test.decode.model import (
     DecodeBatchMeasurement,
     DecodeCaseSpec,
     ExactBatchPolicy,
-    TargetTPOTPolicy,
 )
 from rtp_llm.test.perf_test.plan import build_execution_plan, case_id, thaw
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
@@ -70,7 +69,7 @@ def decode_report_measurement(batch, inputs, output):
     )
 
 
-def decode_report_result(spec, batch, search=None):
+def decode_report_result(spec, batch):
     identity = spec.to_identity()
     return build_decode_case_result(
         {"case_id": case_id("decode", identity), **identity},
@@ -78,7 +77,6 @@ def decode_report_result(spec, batch, search=None):
             batch, spec.input_lengths[:batch], spec.output_length
         ),
         topology=decode_report_TOPOLOGY,
-        search=search,
         profiling=decode_report_DISABLED,
     )
 
@@ -99,47 +97,21 @@ def decode_report_exact_cases(inputs, outputs, batches):
     ]
 
 
-def decode_report_tpot_cases(inputs, outputs):
-    cases = []
-    for index, (input_length, output_length) in enumerate(
-        itertools.product(inputs, outputs)
-    ):
-        batch = (8, 12)[index]
-        spec = replace(
-            decode_report_exact_case(16),
-            input_lengths=(input_length,) * 16,
-            output_length=output_length,
-            batch_policy=TargetTPOTPolicy("target_tpot", 16, 4, 10.0),
-        )
-        search = {
-            "target_tpot_ms": 10.0,
-            "max_size": 16,
-            "candidate_step": 4,
-            "outcome": "found",
-            "best_batch_size": batch,
-            "observations": [{"batch_size": batch, "outcome": "satisfied"}],
-        }
-        cases.append(decode_report_result(spec, batch, search))
-    return cases
-
-
 def prefill_report_case_bytes(root):
     return {
         path.name: path.read_bytes() for path in (root / "results").glob("cases.jsonl")
     }
 
 
-def decode_multi_node_analyzer_decode_case_v2(
-    *, case_id, policy, batch, profile, search
-):
+def decode_multi_node_analyzer_decode_case_v2(*, case_id, batch, profile):
     inputs = [128] * batch
     return {
         "case_id": case_id,
         "identity": {
             "workload_kind": "grid",
-            "input_lengths": [128] * (policy.get("max_size") or batch),
+            "input_lengths": inputs,
             "output_length": 16,
-            "batch_policy": policy,
+            "batch_policy": {"strategy": "fixed", "size": batch},
             "measure_runs": 1,
             "warmup_runs": 0,
             "generate_config": {},
@@ -194,7 +166,6 @@ def decode_multi_node_analyzer_decode_case_v2(
                     ],
                 }
             ],
-            "search": search,
             "distribution": None,
             "profiling": profile,
         },
@@ -225,32 +196,16 @@ def decode_multi_node_analyzer_decode_envelope_v2():
         "cases": [
             decode_multi_node_analyzer_decode_case_v2(
                 case_id="decode-exact",
-                policy={"strategy": "fixed", "size": 4},
                 batch=4,
                 profile={"status": "disabled", "manifest_path": None, "error": None},
-                search=None,
             ),
             decode_multi_node_analyzer_decode_case_v2(
-                case_id="decode-tpot",
-                policy={
-                    "strategy": "target_tpot",
-                    "max_size": 16,
-                    "candidate_step": 4,
-                    "target_tpot_ms": 10.0,
-                },
+                case_id="decode-profiled",
                 batch=8,
                 profile={
                     "status": "failed",
-                    "manifest_path": "profiles/decode-tpot/profile_manifest.json",
+                    "manifest_path": "profiles/decode-profiled/profile_manifest.json",
                     "error": "trace flush timeout",
-                },
-                search={
-                    "target_tpot_ms": 10.0,
-                    "max_size": 16,
-                    "candidate_step": 4,
-                    "outcome": "found",
-                    "best_batch_size": 8,
-                    "observations": [{"batch_size": 8, "outcome": "satisfied"}],
                 },
             ),
         ],
@@ -262,7 +217,6 @@ def decode_multi_node_analyzer_write_collected_run(
     *,
     input_length=128,
     output_length=64,
-    strategy="target_tpot",
     batch_size=8,
     nested=False,
 ):
@@ -274,16 +228,15 @@ def decode_multi_node_analyzer_write_collected_run(
     envelope["cases"] = [envelope["cases"][1]]
     envelope["summary"].update(planned_cases=1, successful_cases=1)
     case = envelope["cases"][0]
-    case["identity"]["input_lengths"] = [input_length] * 16
+    case["identity"]["input_lengths"] = [input_length] * batch_size
     case["identity"]["output_length"] = output_length
-    case["identity"]["batch_policy"]["strategy"] = strategy
+    case["identity"]["batch_policy"]["size"] = batch_size
     case["metrics"].update(
         input_lengths=[input_length] * batch_size,
         output_length=output_length,
         global_batch_size=batch_size,
         successful_requests=batch_size,
     )
-    case["metrics"]["search"]["best_batch_size"] = batch_size
     requests = case["metrics"]["measurements"][0]["requests"]
     template = copy.deepcopy(requests[0])
     requests[:] = [

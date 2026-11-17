@@ -38,17 +38,8 @@ def decode_planner_resolved_grid(*, inputs, outputs, sizes):
     return (parse_config(payload), resolve_config(payload))
 
 
-def decode_planner_resolved_distribution(*, distribution, max_size=None, sizes=None):
-    batch = (
-        {"strategy": "fixed", "sizes": sizes}
-        if sizes is not None
-        else {
-            "strategy": "target_tpot",
-            "max_size": max_size,
-            "candidate_step": 2,
-            "target_tpot_ms": 10.0,
-        }
-    )
+def decode_planner_resolved_distribution(*, distribution, sizes):
+    batch = {"strategy": "fixed", "sizes": sizes}
     payload = decode_planner_payload(
         {
             "kind": "distribution",

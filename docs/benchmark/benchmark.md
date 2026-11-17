@@ -116,10 +116,9 @@ Use a separate JSON config for each engine-setting combination so its fingerprin
 records the settings actually measured.
 
 Decode workload axes remain in the JSON config:
-fixed workloads use `input_lengths`, `output_lengths` and
-`batch: {"strategy": "fixed", "sizes": [...]}`; TPOT workloads use
-`batch: {"strategy": "target_tpot", "max_size": ..., "candidate_step": ...,
-"target_tpot_ms": ...}`.
+grid workloads use `input_lengths`, `output_lengths` and
+`batch: {"strategy": "fixed", "sizes": [...]}`. Decode supports fixed batch
+sizes only; TPOT and throughput are measured for each configured batch.
 
 For prefill, the JSON workload can define cache grids, named grids, explicit
 request batches, random batches or a traffic distribution. The controller
@@ -147,10 +146,8 @@ Decode batches are global across all DP workers by default. Each global batch
 must be at least DP and divisible by DP; a global batch of 4 with DP=2 allocates
 2 requests to each worker. This keeps every DP worker active for collectives.
 `batch.unit="per_dp_rank"` instead specifies the size on each worker. Results
-record `global_batch_size` and each worker's local allocation. Target-TPOT search
-only attempts batches that satisfy the same rule. Top-level metrics describe
-the selected best global batch; the configured maximum and every attempted
-candidate remain in `metrics.search`. Inline profiling requires DP=1 until
+record `global_batch_size` and each worker's local allocation. Top-level metrics
+describe the configured global batch. Inline profiling requires DP=1 until
 completion can be verified for every distributed capture member.
 
 Each case retains its requested output length, batch policy, status, request

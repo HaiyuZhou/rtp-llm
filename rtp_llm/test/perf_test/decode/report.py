@@ -27,13 +27,6 @@ def _observation(index: int, result: Mapping[str, Any]) -> Dict[str, Any]:
     metrics = result.get("metrics")
     if not isinstance(metrics, Mapping):
         metrics = {}
-    search = copy.deepcopy(metrics.get("search"))
-    if search is None:
-        for error in errors:
-            details = error.get("details") if isinstance(error, Mapping) else None
-            if isinstance(details, Mapping) and "search" in details:
-                search = copy.deepcopy(details["search"])
-                break
     policy = copy.deepcopy(identity.get("batch_policy", {}))
     lengths = list(identity.get("input_lengths", []))
     row = {
@@ -50,7 +43,6 @@ def _observation(index: int, result: Mapping[str, Any]) -> Dict[str, Any]:
         "total_latency_ms": None,
         "success_rate": None,
         "errors": errors,
-        "search": search,
         "profiling": copy.deepcopy(metrics.get("profiling")),
         "distribution": copy.deepcopy(
             metrics.get("distribution", identity.get("distribution"))
@@ -76,12 +68,6 @@ def _observation(index: int, result: Mapping[str, Any]) -> Dict[str, Any]:
                 if dp_size and global_batch % dp_size == 0
                 else None
             ),
-        )
-    if policy.get("strategy") == "target_tpot":
-        search_record = search if isinstance(search, Mapping) else {}
-        row.update(
-            best_batch_size=search_record.get("best_batch_size") if valid else None,
-            search_outcome=search_record.get("outcome"),
         )
     return row
 
@@ -164,8 +150,6 @@ def generate_decode_report(case_results: Sequence[Mapping[str, Any]]) -> Dict[st
                             }
                         ],
                     }
-                    if matrix["batch_policy"].get("strategy") == "target_tpot":
-                        missing.update(best_batch_size=None, search_outcome=None)
                     matrix["cells"].append(missing)
                 else:
                     matrix["cells"].extend(positions[(input_length, output_length)])

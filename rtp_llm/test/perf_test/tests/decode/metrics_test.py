@@ -51,17 +51,10 @@ class DecodeMetricsTest(unittest.TestCase):
             partial["metrics"]["measurements"][0]["requests"][1]["success"]
         )
 
-    def test_finalize_round_trip_preserves_distribution_and_search_trajectory(self):
+    def test_finalize_round_trip_preserves_distribution_and_profile_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "run"
             case = decode_metrics_case()
-            case["input_lengths"] = [64, 128, 256, 512]
-            case["batch_policy"] = {
-                "strategy": "target_tpot",
-                "max_size": 4,
-                "candidate_step": 2,
-                "target_tpot_ms": 10.0,
-            }
             case["profiling"]["enabled"] = True
             plan = build_execution_plan(
                 mode="decode",
@@ -73,22 +66,10 @@ class DecodeMetricsTest(unittest.TestCase):
                 result_directory=str(root),
             )
             case["case_id"] = plan.cases[0].case_id
-            search = {
-                "target_tpot_ms": 10.0,
-                "max_size": 4,
-                "candidate_step": 2,
-                "outcome": "found",
-                "best_batch_size": 2,
-                "observations": [
-                    {"batch_size": 2, "outcome": "satisfied"},
-                    {"batch_size": 4, "outcome": "target_exceeded"},
-                ],
-            }
             result = build_decode_case_result(
                 case,
                 selected=decode_metrics_selected(),
                 topology=decode_metrics_TOPOLOGY,
-                search=search,
                 profiling={
                     "status": "failed",
                     "manifest_path": "profiles/test/profile_manifest.json",
@@ -114,10 +95,7 @@ class DecodeMetricsTest(unittest.TestCase):
             self.assertEqual(
                 [64, 128], metrics["distribution"]["actual_sequence_lengths"]
             )
-            self.assertEqual(
-                [2, 4],
-                [item["batch_size"] for item in metrics["search"]["observations"]],
-            )
+            self.assertNotIn("search", metrics)
             self.assertTrue((root / "results" / "result.json").is_file())
             self.assertTrue((root / "results" / "summary.json").is_file())
             report = root / "reports" / "decode_report.json"
@@ -145,16 +123,9 @@ class DecodeMetricsTest(unittest.TestCase):
                 )
             self.assertEqual(before, {path: path.read_bytes() for path in before})
 
-    def test_metrics_count_every_formal_round_and_use_selected_shape(self):
+    def test_metrics_count_every_formal_round_and_preserve_fixed_shape(self):
         case = decode_metrics_case()
         case["measure_runs"] = 2
-        case["input_lengths"] = [64, 128, 256, 512]
-        case["batch_policy"] = {
-            "strategy": "target_tpot",
-            "max_size": 4,
-            "candidate_step": 2,
-            "target_tpot_ms": 10.0,
-        }
         measurements = decode_metrics_measurements() + decode_metrics_measurements(
             second_success=False
         )

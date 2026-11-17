@@ -1,6 +1,5 @@
 """Tests for core results_test."""
 
-import copy
 import unittest
 
 from rtp_llm.test.perf_test.results import (
@@ -81,45 +80,32 @@ class ResultEnvelopeTest(unittest.TestCase):
                 with self.assertRaises(ResultSchemaError):
                     parse_result_envelope(value)
 
-    def test_failed_tpot_keeps_only_structured_search_diagnostics(self):
+    def test_decode_rejects_removed_search_policy(self):
         value = result_envelope_decode_result()
-        case = value["cases"][0]
-        case["identity"]["batch_policy"] = {
+        value["cases"][0]["identity"]["batch_policy"] = {
             "strategy": "target_tpot",
             "max_size": 4,
             "candidate_step": 4,
             "target_tpot_ms": 10.0,
         }
-        search = {
+        value["cases"][0]["metrics"]["search"] = {
             "target_tpot_ms": 10.0,
             "max_size": 4,
             "candidate_step": 4,
-            "outcome": "no_satisfying_candidate",
-            "best_batch_size": None,
-            "observations": [{"batch_size": 1, "outcome": "target_exceeded"}],
+            "outcome": "found",
+            "best_batch_size": 4,
+            "observations": [{"batch_size": 4, "outcome": "satisfied"}],
         }
-        case.update(
-            status="target_tpot_not_met",
-            metrics=None,
-            errors=[
-                {
-                    "code": "target_tpot_not_met",
-                    "message": "no candidate",
-                    "details": {"search": search},
-                }
-            ],
-        )
-        value["status"] = "partial"
-        value["summary"].update(successful_cases=0, failed_cases=1)
-        self.assertEqual(value, parse_result_envelope(value).to_dict())
-        for key, bad in (
-            ("observations", [{"batch_size": 5, "outcome": "satisfied"}]),
+        with self.assertRaisesRegex(ResultSchemaError, "batch_policy.strategy"):
+            parse_result_envelope(value)
+
+    def test_decode_rejects_removed_search_field_even_when_null(self):
+        value = result_envelope_decode_result()
+        value["cases"][0]["metrics"]["search"] = None
+        with self.assertRaisesRegex(
+            ResultSchemaError, r"metrics\.search: unknown field"
         ):
-            with self.subTest(key=key):
-                invalid = copy.deepcopy(value)
-                invalid["cases"][0]["errors"][0]["details"]["search"][key] = bad
-                with self.assertRaises(ResultSchemaError):
-                    parse_result_envelope(invalid)
+            parse_result_envelope(value)
 
     def test_prefill_envelope_round_trips_as_golden_schema(self):
         source = result_envelope_prefill_result()

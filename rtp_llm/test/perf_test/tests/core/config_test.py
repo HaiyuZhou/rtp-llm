@@ -240,17 +240,16 @@ class UnifiedConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "model\\.topology\\.cp"):
             parse_config(payload)
 
-    def test_decode_batch_strategies_are_mutually_exclusive(self):
+    def test_decode_batch_rejects_search_strategy_and_fields(self):
         for batch, path in (
             (
                 {
                     "strategy": "target_tpot",
-                    "sizes": [4],
                     "max_size": 16,
                     "candidate_step": 4,
                     "target_tpot_ms": 10.0,
                 },
-                "workload.batch.sizes",
+                "workload.batch.strategy",
             ),
             (
                 {"strategy": "fixed", "sizes": [4], "target_tpot_ms": 10.0},

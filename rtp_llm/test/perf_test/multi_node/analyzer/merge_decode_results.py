@@ -24,7 +24,6 @@ DECODE_FIELDS = [
     "output_length",
     "batch_strategy",
     "global_batch_size",
-    "best_batch_size",
     "success_rate",
     "wait_ms",
     "prefill_ms",
@@ -172,7 +171,6 @@ def merge_all_results(result_files: list) -> list:
                 )
             inputs = metrics["input_lengths"]
             strategy = case["identity"]["batch_policy"]["strategy"]
-            search = metrics.get("search") or {}
             successful = metrics["successful_requests"]
             requests = successful + metrics["failed_requests"]
             row = {
@@ -182,11 +180,6 @@ def merge_all_results(result_files: list) -> list:
                 "output_length": metrics["output_length"],
                 "batch_strategy": strategy,
                 "global_batch_size": metrics["global_batch_size"],
-                "best_batch_size": (
-                    metrics["global_batch_size"]
-                    if strategy == "fixed"
-                    else search.get("best_batch_size")
-                ),
                 "success_rate": successful / requests if requests else 0.0,
                 "throughput_tokens_per_second": metrics["throughput_tokens_per_second"],
                 "status": case["status"],

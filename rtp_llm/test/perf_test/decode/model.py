@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -12,17 +12,6 @@ class FixedBatchConfig:
     strategy: str
     sizes: Tuple[int, ...]
     unit: str = "global"
-
-
-@dataclass(frozen=True)
-class TargetTPOTConfig:
-    strategy: str
-    max_size: int
-    candidate_step: int
-    target_tpot_ms: float
-
-
-DecodeBatchConfig = Union[FixedBatchConfig, TargetTPOTConfig]
 
 
 @dataclass(frozen=True)
@@ -41,22 +30,11 @@ class ExactBatchPolicy:
 
 
 @dataclass(frozen=True)
-class TargetTPOTPolicy:
-    strategy: str
-    max_size: int
-    candidate_step: int
-    target_tpot_ms: float
-
-
-CaseBatchPolicy = Union[ExactBatchPolicy, TargetTPOTPolicy]
-
-
-@dataclass(frozen=True)
 class DecodeCaseSpec:
     workload_kind: str
     input_lengths: Tuple[int, ...]
     output_length: int
-    batch_policy: CaseBatchPolicy
+    batch_policy: ExactBatchPolicy
     measure_runs: int
     warmup_runs: int
     generate_config: Dict[str, Any] = field(default_factory=dict)
@@ -83,16 +61,9 @@ class DecodeCaseSpec:
     @classmethod
     def from_identity(cls, value: Mapping[str, Any]) -> "DecodeCaseSpec":
         raw_policy = dict(value["batch_policy"])
-        policy: CaseBatchPolicy
+        policy: ExactBatchPolicy
         if raw_policy["strategy"] == "fixed":
             policy = ExactBatchPolicy(strategy="fixed", size=int(raw_policy["size"]))
-        elif raw_policy["strategy"] == "target_tpot":
-            policy = TargetTPOTPolicy(
-                strategy="target_tpot",
-                max_size=int(raw_policy["max_size"]),
-                candidate_step=int(raw_policy["candidate_step"]),
-                target_tpot_ms=float(raw_policy["target_tpot_ms"]),
-            )
         else:
             raise ValueError(f"unknown decode batch policy: {raw_policy['strategy']!r}")
         return cls(
@@ -127,10 +98,3 @@ class DecodeBatchMeasurement:
             "worker_allocations": copy.deepcopy(list(self.worker_allocations)),
             "measurements": copy.deepcopy(list(self.measurements)),
         }
-
-
-@dataclass(frozen=True)
-class DecodeStrategyOutcome:
-    selected: Optional[DecodeBatchMeasurement]
-    search: Optional[Dict[str, Any]]
-    error_code: Optional[str] = None

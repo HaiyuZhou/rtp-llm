@@ -198,9 +198,6 @@ class DecodeCaseExecutor:
             raise RuntimeError(
                 "decode profiling session requires engine shutdown after incomplete capture"
             )
-        # Strategies depend on DecodeCapacityError; resolve after module loading.
-        from rtp_llm.test.perf_test.decode.strategy import strategy_for
-
         identity = {
             name: copy.deepcopy(value)
             for name, value in case.items()
@@ -209,30 +206,12 @@ class DecodeCaseExecutor:
         spec = DecodeCaseSpec.from_identity(identity)
         if spec.profiling.enabled and self._topology["dp"] != 1:
             raise PlanningError("decode profiling requires DP=1")
-        outcome = strategy_for(spec.batch_policy, dp_size=self._topology["dp"]).execute(
-            spec, self._batch_executor.measure
-        )
-        if outcome.selected is None:
-            return {
-                "case_id": case["case_id"],
-                "identity": identity,
-                "status": "target_tpot_not_met",
-                "runs": spec.measure_runs,
-                "errors": [
-                    {
-                        "code": outcome.error_code or "target_tpot_not_met",
-                        "message": "no candidate batch satisfied target_tpot_ms",
-                        "details": {"search": copy.deepcopy(outcome.search)},
-                    }
-                ],
-                "metrics": None,
-            }
+        selected = self._batch_executor.measure(spec, spec.batch_policy.size)
         profiling = {"status": "disabled", "manifest_path": None, "error": None}
         result = build_decode_case_result(
             case,
-            selected=outcome.selected,
+            selected=selected,
             topology=self._topology,
-            search=outcome.search,
             profiling=profiling,
         )
         if result["status"] == "ok" and spec.profiling.enabled:
@@ -241,7 +220,7 @@ class DecodeCaseExecutor:
                     "decode profiling is enabled but no profiler is configured"
                 )
             result["metrics"]["profiling"] = copy.deepcopy(
-                self._profiler.profile(spec, outcome.selected.batch_size)
+                self._profiler.profile(spec, selected.batch_size)
             )
             if not self.session_reusable:
                 # Retain formal measurements, but prevent an incomplete capture

@@ -1,13 +1,10 @@
 """Fixtures shared by tests split from prefill_profile_test."""
 
-from dataclasses import replace
-
 from rtp_llm.test.perf_test.decode.model import (
     DecodeBatchMeasurement,
     DecodeCaseSpec,
     DecodeProfilingConfig,
     ExactBatchPolicy,
-    TargetTPOTPolicy,
 )
 from rtp_llm.test.perf_test.plan import case_id
 
@@ -24,13 +21,6 @@ def decode_profiling_exact_case(*, batch=4, profile=False):
         warmup_runs=1,
         generate_config={"top_p": 0.8, "nested": {"value": 1}},
         profiling=DecodeProfilingConfig(enabled=profile),
-    )
-
-
-def decode_profiling_tpot_case(*, profile=True):
-    return replace(
-        decode_profiling_exact_case(batch=16, profile=profile),
-        batch_policy=TargetTPOTPolicy("target_tpot", 16, 4, 10.0),
     )
 
 

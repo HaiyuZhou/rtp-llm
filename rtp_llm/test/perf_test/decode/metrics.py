@@ -48,11 +48,8 @@ def _failure(
     case: Mapping[str, Any],
     status: str,
     message: str,
-    search: Optional[Mapping[str, Any]],
 ) -> Dict[str, Any]:
     error = {"code": status, "message": message}
-    if search is not None:
-        error["details"] = {"search": copy.deepcopy(dict(search))}
     return {
         "case_id": case["case_id"],
         "identity": _identity(case),
@@ -216,7 +213,6 @@ def build_decode_case_result(
     *,
     selected: DecodeBatchMeasurement,
     topology: Mapping[str, int],
-    search: Optional[Mapping[str, Any]] = None,
     profiling: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Validate raw runs and produce one common-schema decode case result."""
@@ -231,7 +227,7 @@ def build_decode_case_result(
                 "invalid_shape", "decode topology requires positive tp/dp/pp/ep"
             )
     except _MeasurementError as error:
-        return _failure(case, error.status, str(error), search)
+        return _failure(case, error.status, str(error))
 
     requests = [
         request for run in normalized_measurements for request in run["requests"]
@@ -249,7 +245,6 @@ def build_decode_case_result(
         "topology": parsed_topology,
         **summarize_decode_measurements(normalized_measurements),
         "measurements": normalized_measurements,
-        "search": None if search is None else copy.deepcopy(dict(search)),
         "distribution": distribution_details,
     }
     if profiling is not None:

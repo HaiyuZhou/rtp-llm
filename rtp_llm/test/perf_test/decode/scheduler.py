@@ -54,29 +54,6 @@ class DecodeBatchSchedule:
     workers: Tuple[WorkerAllocation, ...]
 
 
-def supported_decode_batch_sizes(
-    max_size: int, candidate_step: int, *, dp_size: int
-) -> Tuple[int, ...]:
-    """Enumerate search candidates supported by the shared DP scheduler batch."""
-    if type(dp_size) is not int or dp_size <= 0:
-        raise PlanningError("decode schedule dp_size must be a positive integer")
-    if type(max_size) is not int or max_size <= 0:
-        raise PlanningError("decode max_size must be a positive integer")
-    if type(candidate_step) is not int or candidate_step <= 0:
-        raise PlanningError("decode candidate_step must be a positive integer")
-    values = {1, max_size, *range(candidate_step, max_size + 1, candidate_step)}
-    candidates = tuple(
-        size for size in sorted(values) if size >= dp_size and size % dp_size == 0
-    )
-    if not candidates:
-        raise PlanningError(
-            "decode target-TPOT search requires a global batch at least DP size "
-            "and divisible by DP size; "
-            f"max_size={max_size}, candidate_step={candidate_step}, DP={dp_size}"
-        )
-    return candidates
-
-
 def scheduler_local_batch_size(local_batches: Sequence[int]) -> int:
     """Require an equal positive batch on every DP rank before scheduling."""
     if (

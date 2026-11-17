@@ -76,7 +76,6 @@ def _result():
                             ],
                         }
                     ],
-                    "search": None,
                     "distribution": None,
                     "profiling": {
                         "status": "disabled",

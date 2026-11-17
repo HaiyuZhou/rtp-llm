@@ -29,7 +29,6 @@ class CaseState(str, Enum):
     INVALID_SHAPE = "invalid_shape"
     INVALID_REUSE = "invalid_reuse"
     INVALID_TIMING = "invalid_timing"
-    TARGET_TPOT_NOT_MET = "target_tpot_not_met"
 
 
 @dataclass(frozen=True)

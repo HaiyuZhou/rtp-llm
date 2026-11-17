@@ -18,11 +18,9 @@ from rtp_llm.test.perf_test.decode.model import (
     DecodeBatchMeasurement,
     DecodeCaseSpec,
     ExactBatchPolicy,
-    TargetTPOTPolicy,
 )
 from rtp_llm.test.perf_test.decode.planner import plan_decode_cases
 from rtp_llm.test.perf_test.decode.scheduler import schedule_decode_requests
-from rtp_llm.test.perf_test.decode.strategy import TargetTPOTStrategy, strategy_for
 from rtp_llm.test.perf_test.decode.transport import DecodeHttpTransport
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.modes import DecodeAdapter, ModeExecutionContext
@@ -101,7 +99,7 @@ def decode_fixed_executor(measure):
     )
 
 
-def decode_strategy_exact_case(batch=4):
+def decode_fixed_case(batch=4):
     return DecodeCaseSpec(
         workload_kind="grid",
         input_lengths=(128,) * batch,
@@ -109,47 +107,6 @@ def decode_strategy_exact_case(batch=4):
         batch_policy=ExactBatchPolicy(strategy="fixed", size=batch),
         measure_runs=2,
         warmup_runs=0,
-    )
-
-
-def decode_strategy_tpot_case(max_size=16, step=4, target=10.0):
-    return replace(
-        decode_strategy_exact_case(max_size),
-        batch_policy=TargetTPOTPolicy("target_tpot", max_size, step, target),
-    )
-
-
-def decode_strategy_measurement(batch, tpot, *, failed=False):
-    return DecodeBatchMeasurement(
-        batch_size=batch,
-        input_lengths=(128,) * batch,
-        worker_allocations=(),
-        measurements=tuple(
-            (
-                {
-                    "run": run,
-                    "worker_allocations": [],
-                    "throughput_tokens_per_second": 100.0 + run,
-                    "requests": [
-                        {
-                            "request_index": index,
-                            "success": not (failed and run == 1 and (index == 0)),
-                            "input_length": 128,
-                            "output_length": 16,
-                            "latency_ms": {
-                                "wait": 1.0,
-                                "prefill": 2.0,
-                                "decode": 15.0,
-                                "tpot": tpot,
-                                "total": 17.0,
-                            },
-                        }
-                        for index in range(batch)
-                    ],
-                }
-                for run in range(2)
-            )
-        ),
     )
 
 
@@ -172,17 +129,13 @@ def decode_distribution_executor(batch_runner):
     )
 
 
-def decode_distribution_payload(*, search=False):
+def decode_distribution_payload():
     spec = DecodeCaseSpec(
         workload_kind="distribution",
-        input_lengths=(64, 128, 256, 512) if search else (64, 256),
+        input_lengths=(64, 256),
         output_length=32,
-        batch_policy=(
-            TargetTPOTPolicy("target_tpot", 4, 2, 10.0)
-            if search
-            else ExactBatchPolicy("fixed", 2)
-        ),
-        measure_runs=1 if search else 2,
+        batch_policy=ExactBatchPolicy("fixed", 2),
+        measure_runs=2,
         warmup_runs=0,
         distribution={"source_kind": "sequence_lengths"},
     )
@@ -224,7 +177,7 @@ def decode_executor_exact_case(*, batch, warmup=0, runs=1):
 
 class DecodeDistributionTest(unittest.TestCase):
 
-    def test_target_tpot_searches_distribution_prefix_batches(self):
+    def test_fixed_distribution_measures_declared_lengths(self):
 
         def execute(**kwargs):
             measurements = []
@@ -258,15 +211,17 @@ class DecodeDistributionTest(unittest.TestCase):
 
         batch_runner = Mock(side_effect=execute)
         result = decode_distribution_executor(batch_runner).execute(
-            decode_distribution_payload(search=True)
+            decode_distribution_payload()
         )
-        self.assertEqual(4, result["metrics"]["search"]["best_batch_size"])
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(2, result["metrics"]["global_batch_size"])
+        self.assertNotIn("search", result["metrics"])
         self.assertEqual(
-            [(64, 128), (64, 128, 256, 512)],
+            [(64, 256)],
             [call.kwargs["input_lengths"] for call in batch_runner.call_args_list],
         )
         self.assertEqual(
-            [64, 128, 256, 512],
+            [64, 256],
             result["metrics"]["distribution"]["actual_sequence_lengths"],
         )
 
@@ -432,7 +387,7 @@ class DecodeFixedTest(unittest.TestCase):
         from rtp_llm.test.perf_test.decode.metrics import build_decode_case_result
         from rtp_llm.test.perf_test.decode.report import generate_decode_report
 
-        spec = replace(decode_strategy_exact_case(batch=4), batch_unit="per_dp_rank")
+        spec = replace(decode_fixed_case(batch=4), batch_unit="per_dp_rank")
         case = {**spec.to_identity(), "case_id": "decode-rank-grid"}
         allocations = [
             worker.to_dict()
@@ -466,7 +421,7 @@ class DecodeFixedTest(unittest.TestCase):
         from rtp_llm.test.perf_test.decode.metrics import build_decode_case_result
         from rtp_llm.test.perf_test.results import ResultSchemaError, parse_case_result
 
-        spec = replace(decode_strategy_exact_case(batch=4), batch_unit="per_dp_rank")
+        spec = replace(decode_fixed_case(batch=4), batch_unit="per_dp_rank")
         case = {**spec.to_identity(), "case_id": "decode-rank-grid"}
         result = build_decode_case_result(
             case,
@@ -552,114 +507,6 @@ class DecodeFixedTest(unittest.TestCase):
                 (Path(temp_dir) / "checkpoints" / "decode_progress.json").read_text()
             )
             self.assertEqual(2, len(checkpoint["completed_case_ids"]))
-
-
-class DecodeStrategyTest(unittest.TestCase):
-
-    def test_distribution_capacity_failure_does_not_hide_larger_valid_batch(self):
-        transport = Mock()
-        transport.run_round.side_effect = (
-            lambda **kwargs: decode_executor_request_round(
-                kwargs["input_lengths"], kwargs["output_length"]
-            )
-        )
-        batch_executor = DecodeBatchExecutor(
-            transport,
-            engine=EngineConfig(
-                max_seq_len=128, max_batch_tokens=150, concurrency_limit=3
-            ),
-            dp_size=2,
-        )
-        case = replace(
-            decode_strategy_tpot_case(max_size=6, step=1),
-            workload_kind="distribution",
-            input_lengths=(1, 1, 100, 100, 1, 1),
-        )
-        result = DecodeCaseExecutor(
-            batch_executor, topology={"tp": 1, "dp": 2, "pp": 1, "ep": 1}
-        ).execute({"case_id": "capacity-hole", **case.to_identity()})
-        search = result["metrics"]["search"]
-        self.assertEqual(6, search["best_batch_size"])
-        self.assertIn(
-            (4, "capacity_failed"),
-            [(item["batch_size"], item["outcome"]) for item in search["observations"]],
-        )
-
-    def test_case_executor_filters_unsupported_dp_candidates_before_search(self):
-        for dp, maximum, expected in ((2, 10, 10), (2, 9, 8), (4, 3, 3)):
-            with self.subTest(dp=dp, maximum=maximum):
-                measured = []
-
-                def measure(_case, batch):
-                    measured.append(batch)
-                    if batch < dp or batch % dp:
-                        raise DecodeCapacityError("uniform local batches required")
-                    return decode_strategy_measurement(batch, 1.0)
-
-                batch_executor = Mock()
-                batch_executor.measure.side_effect = measure
-                executor = DecodeCaseExecutor(
-                    batch_executor, topology={"tp": 1, "dp": dp, "pp": 1, "ep": 1}
-                )
-                case = decode_strategy_tpot_case(max_size=maximum, step=1)
-                if maximum < dp:
-                    with self.assertRaisesRegex(PlanningError, "at least DP size"):
-                        executor.execute({"case_id": "dp-search", **case.to_identity()})
-                    self.assertEqual([], measured)
-                    continue
-                result = executor.execute(
-                    {"case_id": "dp-search", **case.to_identity()}
-                )
-                self.assertEqual(
-                    expected, result["metrics"]["search"]["best_batch_size"]
-                )
-                self.assertTrue(
-                    all(batch >= dp and batch % dp == 0 for batch in measured)
-                )
-
-    def test_tpot_promotes_cached_best_without_forcing_maximum(self):
-        measured = {}
-
-        def measure(_case, batch):
-            self.assertNotIn(batch, measured)
-            measured[batch] = decode_strategy_measurement(
-                batch, 8.0 if batch <= 8 else 12.0
-            )
-            return measured[batch]
-
-        case = decode_strategy_tpot_case()
-        outcome = strategy_for(case.batch_policy).execute(case, measure)
-        self.assertIsInstance(strategy_for(case.batch_policy), TargetTPOTStrategy)
-        self.assertIs(measured[8], outcome.selected)
-        self.assertEqual([8, 12], list(measured))
-        self.assertEqual("found", outcome.search["outcome"])
-        self.assertEqual(8, outcome.search["best_batch_size"])
-        self.assertEqual(
-            100.5, outcome.search["observations"][0]["throughput_tokens_per_second"]
-        )
-
-    def test_tpot_failure_retains_observations_without_formal_measurement(self):
-        outcome = TargetTPOTStrategy().execute(
-            decode_strategy_tpot_case(max_size=8, target=1.0),
-            lambda _case, batch: decode_strategy_measurement(batch, 20.0),
-        )
-        self.assertIsNone(outcome.selected)
-        self.assertEqual("target_tpot_not_met", outcome.error_code)
-        self.assertEqual("no_satisfying_candidate", outcome.search["outcome"])
-        self.assertEqual(
-            [4, 1], [item["batch_size"] for item in outcome.search["observations"]]
-        )
-
-    def test_tpot_requires_success_in_every_formal_round(self):
-        with self.assertRaisesRegex(
-            RuntimeError, "decode candidate batch 1 round 1 request 0 failed"
-        ):
-            TargetTPOTStrategy().execute(
-                decode_strategy_tpot_case(max_size=1),
-                lambda _case, batch: decode_strategy_measurement(
-                    batch, 1.0, failed=True
-                ),
-            )
 
 
 class DecodeTransportTest(unittest.TestCase):

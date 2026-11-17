@@ -8,12 +8,7 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Tuple, Union
 
-from rtp_llm.test.perf_test.decode.model import (
-    DecodeBatchConfig,
-    DecodeProfilingConfig,
-    FixedBatchConfig,
-    TargetTPOTConfig,
-)
+from rtp_llm.test.perf_test.decode.model import DecodeProfilingConfig, FixedBatchConfig
 from rtp_llm.test.perf_test.errors import ConfigurationError
 
 SCHEMA_VERSION = 1
@@ -275,7 +270,7 @@ class DecodeGridWorkloadConfig:
     kind: str
     input_lengths: Tuple[int, ...]
     output_lengths: Tuple[int, ...]
-    batch: DecodeBatchConfig
+    batch: FixedBatchConfig
     measure_runs: int = 3
     warmup_runs: int = 1
     generate_config: Dict[str, Any] = field(default_factory=dict)
@@ -287,7 +282,7 @@ class DecodeDistributionWorkloadConfig:
     kind: str
     distribution_file: str
     output_length: int
-    batch: DecodeBatchConfig
+    batch: FixedBatchConfig
     measure_runs: int = 3
     warmup_runs: int = 1
     generate_config: Dict[str, Any] = field(default_factory=dict)
@@ -893,7 +888,7 @@ def _parse_generated_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkload
     )
 
 
-def _parse_decode_batch(value: Any) -> DecodeBatchConfig:
+def _parse_decode_batch(value: Any) -> FixedBatchConfig:
     raw = _object("workload.batch", value)
     strategy = _non_empty_string(
         "workload.batch.strategy", _required("workload.batch", raw, "strategy")
@@ -910,28 +905,7 @@ def _parse_decode_batch(value: Any) -> DecodeBatchConfig:
             ),
             unit=unit,
         )
-    if strategy == "target_tpot":
-        _reject_unknown(
-            "workload.batch",
-            raw,
-            {"strategy", "max_size", "candidate_step", "target_tpot_ms"},
-        )
-        return TargetTPOTConfig(
-            strategy="target_tpot",
-            max_size=_positive_int(
-                "workload.batch.max_size",
-                _required("workload.batch", raw, "max_size"),
-            ),
-            candidate_step=_positive_int(
-                "workload.batch.candidate_step",
-                _required("workload.batch", raw, "candidate_step"),
-            ),
-            target_tpot_ms=_positive_number(
-                "workload.batch.target_tpot_ms",
-                _required("workload.batch", raw, "target_tpot_ms"),
-            ),
-        )
-    raise ConfigError("workload.batch.strategy: expected one of: fixed, target_tpot")
+    raise ConfigError("workload.batch.strategy: expected fixed")
 
 
 def _parse_decode_profiling(value: Any) -> DecodeProfilingConfig:

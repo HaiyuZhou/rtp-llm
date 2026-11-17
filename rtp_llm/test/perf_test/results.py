@@ -131,7 +131,6 @@ class DecodeMetrics:
     latency_ms: Dict[str, Union[int, float]]
     throughput_tokens_per_second: Union[int, float]
     measurements: Tuple[Dict[str, Any], ...]
-    search: Optional[Dict[str, Any]]
     distribution: Optional[Dict[str, Any]]
     profiling: Dict[str, Any]
 
@@ -147,7 +146,6 @@ class DecodeMetrics:
             "latency_ms": dict(self.latency_ms),
             "throughput_tokens_per_second": self.throughput_tokens_per_second,
             "measurements": copy.deepcopy(list(self.measurements)),
-            "search": copy.deepcopy(self.search),
             "distribution": copy.deepcopy(self.distribution),
             "profiling": copy.deepcopy(self.profiling),
         }
@@ -298,17 +296,6 @@ def _decode_identity(path: str, value: Mapping[str, Any]) -> None:
     if policy.get("strategy") == "fixed":
         _exact_fields(policy_path, policy, {"strategy", "size"})
         size = _positive_int(f"{policy_path}.size", policy["size"])
-    elif policy.get("strategy") == "target_tpot":
-        _exact_fields(
-            policy_path,
-            policy,
-            {"strategy", "max_size", "candidate_step", "target_tpot_ms"},
-        )
-        size = _positive_int(f"{policy_path}.max_size", policy["max_size"])
-        _positive_int(f"{policy_path}.candidate_step", policy["candidate_step"])
-        _number(
-            f"{policy_path}.target_tpot_ms", policy["target_tpot_ms"], positive=True
-        )
     else:
         raise ResultSchemaError(f"{policy_path}.strategy: unknown batch strategy")
     if value.get("batch_unit") == "per_dp_rank" and (
@@ -334,97 +321,6 @@ def _decode_identity(path: str, value: Mapping[str, Any]) -> None:
         _object(f"{path}.distribution", distribution)
     elif distribution is not None:
         raise ResultSchemaError(f"{path}.distribution: expected null for grid")
-
-
-def _parse_search(path: str, value: Any) -> Dict[str, Any]:
-    raw = _object(path, value)
-    _exact_fields(
-        path,
-        raw,
-        {
-            "target_tpot_ms",
-            "max_size",
-            "candidate_step",
-            "outcome",
-            "best_batch_size",
-            "observations",
-        },
-    )
-    target = _number(f"{path}.target_tpot_ms", raw["target_tpot_ms"], positive=True)
-    maximum = _positive_int(f"{path}.max_size", raw["max_size"])
-    step = _positive_int(f"{path}.candidate_step", raw["candidate_step"])
-    _string(f"{path}.outcome", raw["outcome"])
-    if raw["outcome"] not in {"found", "no_satisfying_candidate"}:
-        raise ResultSchemaError(f"{path}.outcome: unknown search outcome")
-    observations = _record_list(f"{path}.observations", raw["observations"])
-    if not observations:
-        raise ResultSchemaError(f"{path}.observations: expected at least one candidate")
-    seen, satisfied = set(), []
-    for index, observation in enumerate(observations):
-        observation_path = f"{path}.observations[{index}]"
-        _required(observation_path, observation, {"batch_size", "outcome"})
-        allowed = {
-            "batch_size",
-            "outcome",
-            "tpot_ms",
-            "success_rate",
-            "throughput_tokens_per_second",
-            "error",
-        }
-        _exact_fields(observation_path, observation, set(observation) & allowed)
-        batch = _positive_int(
-            f"{observation_path}.batch_size", observation["batch_size"]
-        )
-        if (
-            batch > maximum
-            or (batch not in (1, maximum) and batch % step != 0)
-            or batch in seen
-        ):
-            raise ResultSchemaError(
-                f"{observation_path}.batch_size: invalid or duplicate candidate"
-            )
-        seen.add(batch)
-        outcome = _string(f"{observation_path}.outcome", observation["outcome"])
-        if outcome not in {
-            "satisfied",
-            "target_exceeded",
-            "capacity_failed",
-            "measurement_failed",
-        }:
-            raise ResultSchemaError(
-                f"{observation_path}.outcome: unknown candidate outcome"
-            )
-        for name in ("tpot_ms", "success_rate", "throughput_tokens_per_second"):
-            if observation.get(name) is not None:
-                _number(f"{observation_path}.{name}", observation[name])
-        if (
-            observation.get("success_rate") is not None
-            and observation["success_rate"] > 1
-        ):
-            raise ResultSchemaError(
-                f"{observation_path}.success_rate: must not exceed one"
-            )
-        if "error" in observation:
-            _string(f"{observation_path}.error", observation["error"])
-        if outcome == "satisfied":
-            tpot = observation.get("tpot_ms", target)
-            if tpot is None or tpot > target or observation.get("success_rate", 1) != 1:
-                raise ResultSchemaError(
-                    f"{observation_path}: satisfied candidate must meet target with full success"
-                )
-            satisfied.append(batch)
-    best = raw["best_batch_size"]
-    if raw["outcome"] == "found":
-        _positive_int(f"{path}.best_batch_size", best)
-        if not satisfied or best != max(satisfied):
-            raise ResultSchemaError(
-                f"{path}.best_batch_size: must select largest satisfied candidate"
-            )
-    elif best is not None or satisfied:
-        raise ResultSchemaError(
-            f"{path}.best_batch_size: failed search cannot select a batch"
-        )
-    return copy.deepcopy(dict(raw))
 
 
 def _parse_profiling(path: str, value: Any) -> Dict[str, Any]:
@@ -471,7 +367,6 @@ def _parse_decode_metrics(path: str, value: Any) -> DecodeMetrics:
         "latency_ms",
         "throughput_tokens_per_second",
         "measurements",
-        "search",
         "distribution",
         "profiling",
     }
@@ -541,12 +436,9 @@ def _parse_decode_metrics(path: str, value: Any) -> DecodeMetrics:
         raise ResultSchemaError(
             f"{path}.throughput_tokens_per_second: must match raw measurements"
         )
-    optional_records = {}
-    for name in ("search", "distribution"):
-        item = raw[name]
-        if item is not None and not isinstance(item, dict):
-            raise ResultSchemaError(f"{path}.{name}: expected an object or null")
-        optional_records[name] = copy.deepcopy(item)
+    distribution = raw["distribution"]
+    if distribution is not None and not isinstance(distribution, dict):
+        raise ResultSchemaError(f"{path}.distribution: expected an object or null")
     return DecodeMetrics(
         workload_kind=kind,
         input_lengths=parsed_inputs,
@@ -558,12 +450,7 @@ def _parse_decode_metrics(path: str, value: Any) -> DecodeMetrics:
         latency_ms=parsed_latency,
         throughput_tokens_per_second=throughput,
         measurements=tuple(normalized_measurements),
-        search=(
-            None
-            if raw["search"] is None
-            else _parse_search(f"{path}.search", raw["search"])
-        ),
-        distribution=optional_records["distribution"],
+        distribution=copy.deepcopy(distribution),
         profiling=_parse_profiling(f"{path}.profiling", raw["profiling"]),
     )
 
@@ -586,8 +473,6 @@ def parse_case_result(index: int, mode: str, value: Any) -> CaseResult:
     for error_index, item in enumerate(errors):
         error_path = f"{path}.errors[{error_index}]"
         error_fields = {"code", "message"}
-        if mode == "decode" and "details" in item:
-            error_fields.add("details")
         _exact_fields(error_path, item, error_fields)
         parsed_errors.append(
             {
@@ -595,13 +480,6 @@ def parse_case_result(index: int, mode: str, value: Any) -> CaseResult:
                 "message": _string(f"{error_path}.message", item["message"]),
             }
         )
-        if "details" in item:
-            details_path = f"{error_path}.details"
-            details = _object(details_path, item["details"])
-            _exact_fields(details_path, details, {"search"})
-            parsed_errors[-1]["details"] = {
-                "search": _parse_search(f"{details_path}.search", details["search"])
-            }
     metrics_value = raw["metrics"]
     if status == CaseState.OK and metrics_value is None:
         raise ResultSchemaError(f"{path}.metrics: required for ok case")
@@ -626,29 +504,6 @@ def parse_case_result(index: int, mode: str, value: Any) -> CaseResult:
                 f"{path}.runs: must match planned and measured rounds"
             )
         policy = identity["batch_policy"]
-        search = metrics.search if metrics is not None else None
-        if status == CaseState.TARGET_TPOT_NOT_MET:
-            if metrics is not None:
-                raise ResultSchemaError(
-                    f"{path}.metrics: failed search cannot have formal metrics"
-                )
-            if not parsed_errors or "details" not in parsed_errors[0]:
-                raise ResultSchemaError(
-                    f"{path}.errors[0].details.search: required for failed search"
-                )
-            search = parsed_errors[0]["details"]["search"]
-            if search["outcome"] != "no_satisfying_candidate":
-                raise ResultSchemaError(
-                    f"{path}.errors[0].details.search.outcome: expected failed search"
-                )
-        if search is not None:
-            if policy["strategy"] != "target_tpot" or any(
-                search[name] != policy[name]
-                for name in ("target_tpot_ms", "max_size", "candidate_step")
-            ):
-                raise ResultSchemaError(
-                    f"{path}: search must match identity.batch_policy"
-                )
         if metrics is not None:
             if status == CaseState.OK and metrics.failed_requests:
                 raise ResultSchemaError(
@@ -693,45 +548,10 @@ def parse_case_result(index: int, mode: str, value: Any) -> CaseResult:
                 raise ResultSchemaError(
                     f"{path}.metrics.distribution: expected null for grid"
                 )
-            if policy["strategy"] == "fixed":
-                if batch != policy["size"] or search is not None:
-                    raise ResultSchemaError(
-                        f"{path}.metrics: fixed batch must match policy without search"
-                    )
-            elif (
-                search is None
-                or search["outcome"] != "found"
-                or search["best_batch_size"] != batch
-            ):
+            if batch != policy["size"]:
                 raise ResultSchemaError(
-                    f"{path}.metrics.search: must describe selected best batch"
+                    f"{path}.metrics: fixed batch must match policy"
                 )
-            if policy["strategy"] == "target_tpot":
-                if (
-                    metrics.latency_ms["tpot"] > policy["target_tpot_ms"]
-                    or metrics.failed_requests != 0
-                ):
-                    raise ResultSchemaError(
-                        f"{path}.metrics: selected batch must satisfy target with full success"
-                    )
-                selected_observation = next(
-                    observation
-                    for observation in search["observations"]
-                    if observation["batch_size"] == batch
-                )
-                selected_values = {
-                    "tpot_ms": metrics.latency_ms["tpot"],
-                    "success_rate": 1.0,
-                    "throughput_tokens_per_second": metrics.throughput_tokens_per_second,
-                }
-                for name, measured_value in selected_values.items():
-                    observed_value = selected_observation.get(name)
-                    if observed_value is not None and not math.isclose(
-                        observed_value, measured_value
-                    ):
-                        raise ResultSchemaError(
-                            f"{path}.metrics.search: selected observation {name} must match formal metrics"
-                        )
     return CaseResult(
         case_id=_string(f"{path}.case_id", raw["case_id"]),
         identity=copy.deepcopy(dict(identity)),

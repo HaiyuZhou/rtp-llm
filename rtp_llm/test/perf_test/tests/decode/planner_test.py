@@ -37,50 +37,6 @@ class DecodePlannerTest(unittest.TestCase):
                             resolved_workload=workload,
                         )
 
-    def test_tpot_allows_uneven_maximum_for_filtering_at_search_time(self):
-        config, resolved = decode_planner_resolved_distribution(
-            distribution=[64, 96, 128], max_size=3
-        )
-        cases = plan_decode_cases(
-            config.workload,
-            config.engine,
-            dp_size=2,
-            resolved_workload=resolved.resolved_config["workload"],
-        )
-        self.assertEqual(3, cases[0]["batch_policy"]["max_size"])
-
-    def test_tpot_capacity_uses_largest_supported_candidate(self):
-        grid = parse_config(
-            decode_planner_payload(
-                {
-                    "kind": "grid",
-                    "input_lengths": [128],
-                    "output_lengths": [16],
-                    "batch": {
-                        "strategy": "target_tpot",
-                        "max_size": 5,
-                        "candidate_step": 2,
-                        "target_tpot_ms": 10.0,
-                    },
-                }
-            )
-        )
-        distribution, resolved = decode_planner_resolved_distribution(
-            distribution=[128] * 5, max_size=5
-        )
-        for config, workload in (
-            (grid, None),
-            (distribution, resolved.resolved_config["workload"]),
-        ):
-            with self.subTest(kind=config.workload.kind):
-                cases = plan_decode_cases(
-                    config.workload,
-                    replace(config.engine, concurrency_limit=2, max_batch_tokens=256),
-                    dp_size=2,
-                    resolved_workload=workload,
-                )
-                self.assertEqual(5, len(cases[0]["input_lengths"]))
-
     def test_rank_batch_grid_is_canonical_global_batch(self):
         payload = decode_planner_payload(
             {

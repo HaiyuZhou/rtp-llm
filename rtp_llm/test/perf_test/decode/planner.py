@@ -1,4 +1,4 @@
-"""Unified planning for exact-batch and target-TPOT decode workloads."""
+"""Planning for fixed-batch decode grids and distribution workloads."""
 
 from __future__ import annotations
 
@@ -11,18 +11,10 @@ from rtp_llm.test.perf_test.config_schema import (
     EngineConfig,
 )
 from rtp_llm.test.perf_test.decode.distribution import parse_distribution_inputs
-from rtp_llm.test.perf_test.decode.model import (
-    CaseBatchPolicy,
-    DecodeBatchConfig,
-    DecodeCaseSpec,
-    ExactBatchPolicy,
-    FixedBatchConfig,
-    TargetTPOTPolicy,
-)
+from rtp_llm.test.perf_test.decode.model import DecodeCaseSpec, ExactBatchPolicy
 from rtp_llm.test.perf_test.decode.scheduler import (
     schedule_decode_requests,
     scheduler_local_batch_size,
-    supported_decode_batch_sizes,
 )
 from rtp_llm.test.perf_test.errors import PlanningError
 
@@ -34,14 +26,7 @@ def _validate_capacity(
     output: int,
     engine: EngineConfig,
     dp_size: int,
-    *,
-    batch: DecodeBatchConfig,
 ) -> None:
-    if not isinstance(batch, FixedBatchConfig):
-        maximum = supported_decode_batch_sizes(
-            batch.max_size, batch.candidate_step, dp_size=dp_size
-        )[-1]
-        inputs = inputs[:maximum]
     if any(input_length + output > engine.max_seq_len for input_length in inputs):
         raise PlanningError("decode input plus output exceeds engine.max_seq_len")
     schedule = schedule_decode_requests(inputs, dp_size=dp_size)
@@ -59,23 +44,11 @@ def _validate_capacity(
             )
 
 
-def _policy(batch: DecodeBatchConfig, size: Optional[int] = None) -> CaseBatchPolicy:
-    if isinstance(batch, FixedBatchConfig):
-        assert size is not None
-        return ExactBatchPolicy(strategy="fixed", size=size)
-    return TargetTPOTPolicy(
-        strategy="target_tpot",
-        max_size=batch.max_size,
-        candidate_step=batch.candidate_step,
-        target_tpot_ms=batch.target_tpot_ms,
-    )
-
-
 def _spec(
     workload: DecodeWorkloadConfig,
     inputs: Sequence[int],
     output: int,
-    policy: CaseBatchPolicy,
+    policy: ExactBatchPolicy,
     distribution: Optional[Dict[str, Any]] = None,
 ) -> DecodeCaseSpec:
     return DecodeCaseSpec(
@@ -88,7 +61,7 @@ def _spec(
         generate_config=copy.deepcopy(workload.generate_config),
         profiling=workload.profiling,
         distribution=distribution,
-        batch_unit=getattr(workload.batch, "unit", "global"),
+        batch_unit=workload.batch.unit,
     )
 
 
@@ -100,31 +73,19 @@ def validate_decode_frontend_lengths(
         return
     for case in cases:
         spec = DecodeCaseSpec.from_identity(case)
-        sizes = (
-            (spec.batch_policy.size,)
-            if isinstance(spec.batch_policy, ExactBatchPolicy)
-            else supported_decode_batch_sizes(
-                spec.batch_policy.max_size,
-                spec.batch_policy.candidate_step,
-                dp_size=dp_size,
-            )
-        )
-        for size in sizes:
-            workers = schedule_decode_requests(
-                spec.input_lengths[:size], dp_size=dp_size
-            ).workers
-            for offset in range(0, dp_size, local_dp_size):
-                lengths = {
-                    length
-                    for worker in workers[offset : offset + local_dp_size]
-                    for length in worker.input_lengths
-                }
-                if len(lengths) > 1:
-                    raise PlanningError(
-                        "mixed decode input lengths with multiple DP workers on one "
-                        "frontend require explicit DP routing; use one DP worker per "
-                        "node or uniform input lengths"
-                    )
+        workers = schedule_decode_requests(spec.input_lengths, dp_size=dp_size).workers
+        for offset in range(0, dp_size, local_dp_size):
+            lengths = {
+                length
+                for worker in workers[offset : offset + local_dp_size]
+                for length in worker.input_lengths
+            }
+            if len(lengths) > 1:
+                raise PlanningError(
+                    "mixed decode input lengths with multiple DP workers on one "
+                    "frontend require explicit DP routing; use one DP worker per "
+                    "node or uniform input lengths"
+                )
 
 
 def plan_decode_cases(
@@ -141,17 +102,9 @@ def plan_decode_cases(
     if isinstance(workload, DecodeGridWorkloadConfig):
         for input_length in workload.input_lengths:
             for output_length in workload.output_lengths:
-                sizes = (
-                    workload.batch.sizes
-                    if isinstance(workload.batch, FixedBatchConfig)
-                    else (workload.batch.max_size,)
-                )
-                for size in sizes:
+                for size in workload.batch.sizes:
                     global_size = (
-                        size * dp_size
-                        if isinstance(workload.batch, FixedBatchConfig)
-                        and workload.batch.unit == "per_dp_rank"
-                        else size
+                        size * dp_size if workload.batch.unit == "per_dp_rank" else size
                     )
                     inputs = (input_length,) * global_size
                     _validate_capacity(
@@ -159,14 +112,13 @@ def plan_decode_cases(
                         output_length,
                         engine,
                         dp_size,
-                        batch=workload.batch,
                     )
                     cases.append(
                         _spec(
                             workload,
                             inputs,
                             output_length,
-                            _policy(workload.batch, global_size),
+                            ExactBatchPolicy(strategy="fixed", size=global_size),
                         )
                     )
     elif isinstance(workload, DecodeDistributionWorkloadConfig):
@@ -181,15 +133,13 @@ def plan_decode_cases(
                 workload.output_length,
                 engine,
                 dp_size,
-                batch=workload.batch,
             )
-            size = len(inputs) if isinstance(workload.batch, FixedBatchConfig) else None
             cases.append(
                 _spec(
                     workload,
                     inputs,
                     workload.output_length,
-                    _policy(workload.batch, size),
+                    ExactBatchPolicy(strategy="fixed", size=len(inputs)),
                     distribution={"source_kind": source_kind},
                 )
             )

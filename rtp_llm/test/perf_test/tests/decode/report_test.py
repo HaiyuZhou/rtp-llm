@@ -4,10 +4,7 @@ import copy
 import unittest
 
 from rtp_llm.test.perf_test.decode.report import generate_decode_report
-from rtp_llm.test.perf_test.tests.support.reports import (
-    decode_report_exact_cases,
-    decode_report_tpot_cases,
-)
+from rtp_llm.test.perf_test.tests.support.reports import decode_report_exact_cases
 
 
 class DecodeReportTest(unittest.TestCase):
@@ -34,22 +31,14 @@ class DecodeReportTest(unittest.TestCase):
             [item["case_id"] for item in cases],
             [item["case_id"] for item in report["observations"]],
         )
+        for row in report["observations"]:
+            self.assertNotIn("search", row)
+        for matrix in report["matrices"]:
+            for cell in matrix["cells"]:
+                self.assertNotIn("search", cell)
         self.assertEqual(before, cases)
         first["cells"][0]["errors"].append({"message": "changed"})
         self.assertEqual([], cases[0]["errors"])
-
-    def test_tpot_report_cells_expose_selected_batch(self):
-        report = generate_decode_report(decode_report_tpot_cases((128,), (16, 64)))
-        self.assertEqual("formal", report["report_kind"])
-        self.assertEqual(1, len(report["matrices"]))
-        self.assertEqual(
-            [8, 12],
-            [cell["best_batch_size"] for cell in report["matrices"][0]["cells"]],
-        )
-        self.assertEqual(
-            ["found", "found"],
-            [cell["search_outcome"] for cell in report["matrices"][0]["cells"]],
-        )
 
 
 if __name__ == "__main__":

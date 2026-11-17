@@ -5,11 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Tuple
 
-from rtp_llm.test.perf_test.decode.model import (
-    DecodeBatchConfig,
-    FixedBatchConfig,
-    TargetTPOTConfig,
-)
+from rtp_llm.test.perf_test.decode.model import FixedBatchConfig
 from rtp_llm.test.perf_test.errors import PlanningError
 
 
@@ -25,9 +21,9 @@ def _lengths(path: str, value: Any) -> Tuple[int, ...]:
 
 
 def parse_distribution_inputs(
-    distribution: Any, batch: DecodeBatchConfig
+    distribution: Any, batch: FixedBatchConfig
 ) -> Tuple[Tuple[Tuple[int, ...], str], ...]:
-    """Materialize policy-sized input prefixes or exact fixed-batch maps."""
+    """Materialize input prefixes or exact maps for each fixed batch size."""
     if isinstance(distribution, list):
         sequence_lengths = _lengths("distribution", distribution)
     elif isinstance(distribution, Mapping) and set(distribution) == {
@@ -39,23 +35,18 @@ def parse_distribution_inputs(
     else:
         sequence_lengths = ()
     if sequence_lengths:
-        required = (
-            max(batch.sizes) if isinstance(batch, FixedBatchConfig) else batch.max_size
-        )
+        required = max(batch.sizes)
         if len(sequence_lengths) < required:
             raise PlanningError("distribution does not contain enough sequence lengths")
-        sizes = (
-            batch.sizes if isinstance(batch, FixedBatchConfig) else (batch.max_size,)
+        return tuple(
+            (sequence_lengths[:size], "sequence_lengths") for size in batch.sizes
         )
-        return tuple((sequence_lengths[:size], "sequence_lengths") for size in sizes)
     if not isinstance(distribution, Mapping) or set(distribution) != {
         "batch_seq_len_map"
     }:
         raise PlanningError(
             "distribution must contain sequence_lengths or batch_seq_len_map"
         )
-    if isinstance(batch, TargetTPOTConfig):
-        raise PlanningError("batch_seq_len_map cannot be used with target_tpot")
     raw_map = distribution["batch_seq_len_map"]
     expected_keys = {str(size) for size in batch.sizes}
     if not isinstance(raw_map, Mapping) or set(raw_map) != expected_keys:

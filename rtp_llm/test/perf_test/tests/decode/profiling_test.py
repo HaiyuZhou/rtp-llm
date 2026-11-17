@@ -16,13 +16,12 @@ from rtp_llm.test.perf_test.tests.support.decode_profiling import (
     decode_profiling_exact_case,
     decode_profiling_measurement,
     decode_profiling_TOPOLOGY,
-    decode_profiling_tpot_case,
 )
 
 
 class DecodeProfilingTest(unittest.TestCase):
 
-    def test_tpot_profiles_only_selected_batch_after_search(self):
+    def test_fixed_batch_profiles_after_formal_measurement(self):
         with tempfile.TemporaryDirectory() as directory:
             trace = Path(directory) / "trace.json"
             batch_executor = Mock()
@@ -30,7 +29,7 @@ class DecodeProfilingTest(unittest.TestCase):
 
             def measure(_case, batch):
                 events.append(("measure", batch))
-                return decode_profiling_measurement(batch, 8.0 if batch <= 8 else 12.0)
+                return decode_profiling_measurement(batch, 8.0)
 
             batch_executor.measure.side_effect = measure
 
@@ -48,8 +47,12 @@ class DecodeProfilingTest(unittest.TestCase):
             )
             result = DecodeCaseExecutor(
                 batch_executor, topology=decode_profiling_TOPOLOGY, profiler=profiler
-            ).execute(decode_profiling_case_payload(decode_profiling_tpot_case()))
-            self.assertEqual([("measure", 8), ("measure", 12), ("profile", 8)], events)
+            ).execute(
+                decode_profiling_case_payload(
+                    decode_profiling_exact_case(batch=8, profile=True)
+                )
+            )
+            self.assertEqual([("measure", 8), ("profile", 8)], events)
             self.assertEqual("ok", result["status"])
             manifest = result["metrics"]["profiling"]
             self.assertEqual("completed", manifest["status"])

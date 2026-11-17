@@ -318,7 +318,7 @@ def run_request(
     request: CliRequest, *, executor_factory: ExecutorFactory = _default_executors
 ) -> Any:
     if request.maintenance is not None:
-        from rtp_llm.test.perf_test.ssh.maintenance import maintain
+        from rtp_llm.test.perf_test.execution.ssh import maintain
 
         return maintain(request.run_dir, request.maintenance, dry_run=request.dry_run)
     if request.config:

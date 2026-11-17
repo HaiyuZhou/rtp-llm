@@ -10,8 +10,11 @@ from rtp_llm.test.perf_test.config_schema import (
     DecodeGridWorkloadConfig,
     EngineConfig,
 )
-from rtp_llm.test.perf_test.decode.distribution import parse_distribution_inputs
-from rtp_llm.test.perf_test.decode.model import DecodeCaseSpec, ExactBatchPolicy
+from rtp_llm.test.perf_test.decode.model import (
+    DecodeCaseSpec,
+    ExactBatchPolicy,
+    FixedBatchConfig,
+)
 from rtp_llm.test.perf_test.decode.scheduler import (
     schedule_decode_requests,
     scheduler_local_batch_size,
@@ -148,3 +151,65 @@ def plan_decode_cases(
     if not cases:
         raise PlanningError("decode workload generated no cases")
     return tuple(spec.to_identity() for spec in cases)
+
+
+# ---------------------------------------------------------------------------
+# Materialized decode distribution inputs (merged from decode/distribution.py).
+# ---------------------------------------------------------------------------
+
+from rtp_llm.test.perf_test.errors import PlanningError
+
+
+def _lengths(path: str, value: Any) -> Tuple[int, ...]:
+    if not isinstance(value, list) or not value:
+        raise PlanningError(f"{path} must be a non-empty array")
+    parsed = []
+    for index, item in enumerate(value):
+        if type(item) is not int or item <= 0:
+            raise PlanningError(f"{path}[{index}] must be a positive integer")
+        parsed.append(item)
+    return tuple(parsed)
+
+
+def parse_distribution_inputs(
+    distribution: Any, batch: FixedBatchConfig
+) -> Tuple[Tuple[Tuple[int, ...], str], ...]:
+    """Materialize input prefixes or exact maps for each fixed batch size."""
+    if isinstance(distribution, list):
+        sequence_lengths = _lengths("distribution", distribution)
+    elif isinstance(distribution, Mapping) and set(distribution) == {
+        "sequence_lengths"
+    }:
+        sequence_lengths = _lengths(
+            "distribution.sequence_lengths", distribution["sequence_lengths"]
+        )
+    else:
+        sequence_lengths = ()
+    if sequence_lengths:
+        required = max(batch.sizes)
+        if len(sequence_lengths) < required:
+            raise PlanningError("distribution does not contain enough sequence lengths")
+        return tuple(
+            (sequence_lengths[:size], "sequence_lengths") for size in batch.sizes
+        )
+    if not isinstance(distribution, Mapping) or set(distribution) != {
+        "batch_seq_len_map"
+    }:
+        raise PlanningError(
+            "distribution must contain sequence_lengths or batch_seq_len_map"
+        )
+    raw_map = distribution["batch_seq_len_map"]
+    expected_keys = {str(size) for size in batch.sizes}
+    if not isinstance(raw_map, Mapping) or set(raw_map) != expected_keys:
+        raise PlanningError(
+            "distribution batch map keys must exactly match fixed batch sizes"
+        )
+    result = []
+    for size in batch.sizes:
+        lengths = _lengths(f"distribution.batch_seq_len_map.{size}", raw_map[str(size)])
+        if len(lengths) != size:
+            raise PlanningError(
+                f"distribution batch {size} does not match its sequence count"
+            )
+        result.append((lengths, "batch_seq_len_map"))
+    return tuple(result)

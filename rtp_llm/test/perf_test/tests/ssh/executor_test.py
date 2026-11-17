@@ -15,7 +15,7 @@ from unittest.mock import patch
 from rtp_llm.test.perf_test.entry import plan_from_source
 from rtp_llm.test.perf_test.execution.ssh import SshExecutor
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
-from rtp_llm.test.perf_test.ssh.maintenance import maintain, read_deployment
+from rtp_llm.test.perf_test.execution.ssh import maintain, read_deployment
 from rtp_llm.test.perf_test.ssh.worker import verify_bundle
 from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
@@ -249,7 +249,7 @@ class MaintenanceTest(unittest.TestCase):
             relocated = Path(directory) / "relocated"
             shutil.copytree(original, relocated)
             with patch(
-                "rtp_llm.test.perf_test.ssh.maintenance.RemoteHost.run",
+                "rtp_llm.test.perf_test.execution.ssh.RemoteHost.run",
                 side_effect=AssertionError("no remote contact"),
             ):
                 result = maintain(relocated, "cancel", dry_run=True)

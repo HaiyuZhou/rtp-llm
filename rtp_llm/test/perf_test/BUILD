@@ -33,7 +33,6 @@ py_library(
         "config_resolver.py",
         "config_schema.py",
         "decode/__init__.py",
-        "decode/distribution.py",
         "decode/metrics.py",
         "decode/model.py",
         "decode/planner.py",
@@ -101,7 +100,6 @@ py_library(
         "prefill/probe.py",
         "prefill/profile.py",
         "prefill/report.py",
-        "prefill/restricted_symbolic.py",
         "prefill/runner.py",
         "test_util.py",
     ],
@@ -150,7 +148,7 @@ py_library(
         "execution/aone.py",
         "execution/aone_bazel.py",
         "execution/aone_gang.py",
-        "hub_download.py",
+        "engine_paths.py",
     ],
     deps = [
         ":perf_test_entry_lib",
@@ -191,7 +189,6 @@ py_library(
     name = "perf_test_ssh_lib",
     srcs = [
         "execution/ssh.py",
-        "ssh/maintenance.py",
         "ssh/remote.py",
         "ssh/worker.py",
     ],
@@ -201,7 +198,6 @@ py_library(
 py_library(
     name = "perf_test_lib",
     srcs = [
-        "engine_paths.py",
         "offline_bench_test.py",
         "offline_runner.py",
         "server.py",

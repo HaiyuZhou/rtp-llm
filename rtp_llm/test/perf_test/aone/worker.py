@@ -66,7 +66,7 @@ def resolve_remote_runtime_inputs(
             expanded = os.path.expanduser(value.strip())
             candidate = fetcher(expanded)
             if candidate == expanded and not os.path.exists(candidate):
-                from rtp_llm.test.perf_test.hub_download import is_model_repo_id
+                from rtp_llm.test.perf_test.engine_paths import is_model_repo_id
 
                 if is_model_repo_id(expanded):
                     if hub_fetcher is None:

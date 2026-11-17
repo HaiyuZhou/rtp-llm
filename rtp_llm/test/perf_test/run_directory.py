@@ -268,7 +268,7 @@ class RunDirectoryLock:
                     raise ResourceError(
                         f"legacy or incomplete writer lock {self.path}; "
                         f"{self._owner_description()}; confirm the owner has "
-                        "stopped before removing this file (see docs/reference.md)"
+                        "stopped before removing this file"
                     )
             payload = (
                 json.dumps(metadata, sort_keys=True, ensure_ascii=True) + "\n"

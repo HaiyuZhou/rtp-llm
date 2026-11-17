@@ -46,9 +46,8 @@ and offline report; local decode supports run. Model and tokenizer paths must
 already be available in the runtime. Public runs accept `execution.backend=local`
 and require no internal checkout or private Bazel configuration.
 
-See `rtp_llm/test/perf_test/docs/reference.md` for the capability matrix,
-run-directory layout, result contract and exit codes. Mode-specific examples
-are in the adjacent `docs/` and `examples/` directories.
+Mode-specific JSON examples are in `rtp_llm/test/perf_test/examples/`.
+Use `./tools/perf_test --help` to inspect the supported entry options.
 
 ## Multi-Node Benchmark
 

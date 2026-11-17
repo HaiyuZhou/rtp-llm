@@ -90,3 +90,7 @@ docs/index/dist/
 # infra details); track sanitized docs under docs/ if they must be published.
 /docs/superpowers/
 /openspec/
+
+# Local performance operator notes
+/rtp_llm/test/perf_test/docs/aone.md
+/rtp_llm/test/perf_test/docs/reference.md

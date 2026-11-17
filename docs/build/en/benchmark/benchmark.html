@@ -540,9 +540,8 @@ unified entry.</p>
 and offline report; local decode supports run. Model and tokenizer paths must
 already be available in the runtime. Public runs accept <code>execution.backend=local</code>
 and require no internal checkout or private Bazel configuration.</p>
-<p>See <code>rtp_llm/test/perf_test/docs/reference.md</code> for the capability matrix,
-run-directory layout, result contract and exit codes. Mode-specific examples
-are in the adjacent <code>docs/</code> and <code>examples/</code> directories.</p>
+<p>Mode-specific JSON examples are in <code>rtp_llm/test/perf_test/examples/</code>.
+Use <code>./tools/perf_test --help</code> to inspect the supported entry options.</p>
 <h2 id="multi-node-benchmark">Multi-Node Benchmark</h2>
 <p>The multi-node launcher starts and stops the distributed service, then executes
 the same normalized prefill or decode plan and result contract as the local entry. Only the

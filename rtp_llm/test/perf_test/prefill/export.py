@@ -1,4 +1,4 @@
-"""Export random or traffic prefill sampling into explicit request batches."""
+"""Export generated prefill requests into explicit request batches."""
 
 import argparse
 import copy
@@ -11,6 +11,9 @@ from typing import Optional, Sequence
 from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.config_schema import PrefillWorkloadConfig, parse_config
 from rtp_llm.test.perf_test.errors import ConfigurationError, PerfTestError
+from rtp_llm.test.perf_test.prefill.logarithmic_grid import (
+    generate_logarithmic_request_batches,
+)
 from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
 from rtp_llm.test.perf_test.prefill.random_batch import sample_random_request_batches
 from rtp_llm.test.perf_test.prefill.traffic_batch import materialize_traffic_source
@@ -22,10 +25,14 @@ def _freeze_workload(raw, workload: PrefillWorkloadConfig, engine) -> bool:
         for item, grid in zip(raw["grids"], workload.grids):
             changed = _freeze_workload(item, grid.workload, engine) or changed
         return changed
-    if workload.random_request_batches is None:
+    if workload.logarithmic_request_batches is not None:
+        batches = generate_logarithmic_request_batches(workload, engine)
+        raw.pop("logarithmic_request_batches")
+    elif workload.random_request_batches is not None:
+        batches = sample_random_request_batches(workload, engine)
+        raw.pop("random_request_batches")
+    else:
         return False
-    batches = sample_random_request_batches(workload, engine)
-    raw.pop("random_request_batches")
     raw["request_batches"] = [
         {"request_groups": [asdict(group) for group in batch.request_groups]}
         for batch in batches
@@ -50,7 +57,8 @@ def _freeze_config(source, *, source_dir):
         changed = True
     if not changed:
         raise ConfigurationError(
-            "export requires random_request_batches or traffic_request_batches"
+            "export requires random_request_batches, traffic_request_batches "
+            "or logarithmic_request_batches"
         )
     parsed = parse_config(frozen)
     plan_prefill_cases(parsed.workload, parsed.engine, dp_size=parsed.model.topology.dp)

@@ -289,6 +289,15 @@ def plan_prefill_cases(
             for grid in workload.grids
             for case in plan_prefill_cases(grid.workload, engine, dp_size=dp_size)
         )
+    elif workload.logarithmic_request_batches is not None:
+        from rtp_llm.test.perf_test.prefill.logarithmic_grid import (
+            generate_logarithmic_request_batches,
+        )
+
+        batches = generate_logarithmic_request_batches(workload, engine)
+        cases = _plan_grouped_cases(
+            replace(workload, request_batches=batches), engine, dp_size
+        )
     elif workload.random_request_batches is not None:
         from rtp_llm.test.perf_test.prefill.random_batch import (
             sample_random_request_batches,

@@ -226,6 +226,18 @@ class RandomRequestBatchesConfig:
 
 
 @dataclass(frozen=True)
+class LogarithmicRequestBatchesConfig:
+    min_input_tokens: int
+    max_input_tokens: int
+    batch_sizes: Tuple[int, ...] = (1,)
+    input_alignment: int = 1024
+    min_compute_tokens: int = 1024
+    input_points_per_doubling: int = 4
+    compute_points_per_doubling: int = 2
+    cache_hit_ratios: Tuple[float, ...] = (0, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99)
+
+
+@dataclass(frozen=True)
 class PrefillProfilingConfig:
     backend: str = "kineto"
     trace_timeout_seconds: float = 120.0
@@ -257,6 +269,7 @@ class PrefillWorkloadConfig:
     request_batches: Tuple[RequestBatchConfig, ...] = ()
     random_request_batches: Optional[RandomRequestBatchesConfig] = None
     traffic_request_batches: Optional[TrafficRequestBatchesConfig] = None
+    logarithmic_request_batches: Optional[LogarithmicRequestBatchesConfig] = None
     grids: Tuple[PrefillGridConfig, ...] = ()
     transport: str = DEFAULT_PREFILL_TRANSPORT
     request_timeout_seconds: float = DEFAULT_PREFILL_REQUEST_TIMEOUT_SECONDS
@@ -550,6 +563,67 @@ def _parse_random_request_batches(value: Any) -> RandomRequestBatchesConfig:
     )
 
 
+def _parse_logarithmic_request_batches(value: Any) -> LogarithmicRequestBatchesConfig:
+    path = "workload.logarithmic_request_batches"
+    raw = _object(path, value)
+    _reject_unknown(
+        path,
+        raw,
+        {
+            "min_input_tokens",
+            "max_input_tokens",
+            "batch_sizes",
+            "input_alignment",
+            "min_compute_tokens",
+            "input_points_per_doubling",
+            "compute_points_per_doubling",
+            "cache_hit_ratios",
+        },
+    )
+    minimum = _positive_int(
+        f"{path}.min_input_tokens", _required(path, raw, "min_input_tokens")
+    )
+    maximum = _positive_int(
+        f"{path}.max_input_tokens", _required(path, raw, "max_input_tokens")
+    )
+    if maximum < minimum:
+        raise ConfigError(f"{path}.max_input_tokens: must be at least min_input_tokens")
+    sizes = _int_tuple(f"{path}.batch_sizes", raw.get("batch_sizes", [1]))
+    if sizes != (1,):
+        raise ConfigError(f"{path}.batch_sizes: logarithmic grids support only [1]")
+    ratios = raw.get("cache_hit_ratios", [0, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99])
+    if not isinstance(ratios, list) or any(
+        isinstance(ratio, bool)
+        or not isinstance(ratio, (int, float))
+        or not math.isfinite(ratio)
+        or not 0 <= ratio <= 1
+        for ratio in ratios
+    ):
+        raise ConfigError(f"{path}.cache_hit_ratios: expected finite numbers in [0, 1]")
+    if len(set(ratios)) != len(ratios):
+        raise ConfigError(f"{path}.cache_hit_ratios: values must be unique")
+    return LogarithmicRequestBatchesConfig(
+        min_input_tokens=minimum,
+        max_input_tokens=maximum,
+        batch_sizes=sizes,
+        input_alignment=_positive_int(
+            f"{path}.input_alignment", raw.get("input_alignment", 1024)
+        ),
+        min_compute_tokens=_positive_int(
+            f"{path}.min_compute_tokens", raw.get("min_compute_tokens", 1024)
+        ),
+        input_points_per_doubling=_positive_int(
+            f"{path}.input_points_per_doubling",
+            raw.get("input_points_per_doubling", 4),
+        ),
+        compute_points_per_doubling=_positive_int(
+            f"{path}.compute_points_per_doubling",
+            raw.get("compute_points_per_doubling", 2),
+        ),
+        cache_hit_ratios=tuple(float(ratio) for ratio in ratios),
+    )
+
+
 def _parse_traffic_request_batches(value: Any) -> TrafficRequestBatchesConfig:
     path = "workload.traffic_request_batches"
     raw = _object(path, value)
@@ -637,6 +711,7 @@ def _parse_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
             "request_batches",
             "random_request_batches",
             "traffic_request_batches",
+            "logarithmic_request_batches",
         },
     )
     transport = raw.get("transport", DEFAULT_PREFILL_TRANSPORT)
@@ -685,7 +760,12 @@ def _parse_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
     if "grids" in raw:
         if set(raw) & (
             (generated_fields - {"seed"})
-            | {"request_batches", "random_request_batches", "traffic_request_batches"}
+            | {
+                "request_batches",
+                "random_request_batches",
+                "traffic_request_batches",
+                "logarithmic_request_batches",
+            }
         ):
             raise ConfigError(
                 "workload.grids conflicts with top-level generated fields or request_batches"
@@ -707,6 +787,7 @@ def _parse_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
                     "request_batches",
                     "random_request_batches",
                     "traffic_request_batches",
+                    "logarithmic_request_batches",
                 },
             )
             name = _non_empty_string(f"{path}.name", _required(path, item, "name"))
@@ -723,6 +804,38 @@ def _parse_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
             request_batches=(),
             random_request_batches=None,
             traffic_request_batches=None,
+            logarithmic_request_batches=None,
+            **settings,
+        )
+    if "logarithmic_request_batches" in raw:
+        if set(raw) & (
+            (generated_fields - {"seed"})
+            | {"request_batches", "random_request_batches", "traffic_request_batches"}
+        ):
+            raise ConfigError(
+                "workload.logarithmic_request_batches conflicts with other case sources"
+            )
+        if settings["workspace_tokens"] is None:
+            raise ConfigError(
+                "workload.workspace_tokens: required for logarithmic_request_batches"
+            )
+        logarithmic = _parse_logarithmic_request_batches(
+            raw["logarithmic_request_batches"]
+        )
+        base = {
+            key: value
+            for key, value in raw.items()
+            if key in shared_fields - set(settings)
+        }
+        base.update(
+            max_input_len=logarithmic.max_input_tokens,
+            compute_steps=[1],
+            batch_sizes=[1],
+            cache_lengths=[0],
+        )
+        return replace(
+            _parse_generated_prefill_workload(base),
+            logarithmic_request_batches=logarithmic,
             **settings,
         )
     if "traffic_request_batches" in raw:

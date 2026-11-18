@@ -55,6 +55,7 @@ _TESTS = {
     "policies/regression_test": ["//rtp_llm/test/perf_test:perf_test_regression_lib"],
     "prefill/dashsc_transport_test": ["//rtp_llm/test/perf_test:perf_test_runtime_lib"],
     "prefill/fingerprints_test": [],
+    "prefill/logarithmic_grid_test": ["//rtp_llm/test/perf_test:aone_lib"],
     "prefill/planner_test": [],
     "prefill/runner_test": ["//rtp_llm/test/perf_test:perf_test_runtime_lib"],
     "prefill/workload_test": [],

@@ -1106,7 +1106,7 @@ def merged_config_mode(config_path: Path) -> str:
 def _prefill_workload_source(workload: Dict[str, Any]) -> Dict[str, Any]:
     """Restore source shape from a frozen gang workload, before strict parsing.
 
-    Dataclass serialization includes all three mutually exclusive workload
+    Dataclass serialization includes mutually exclusive workload
     shapes. Named grids also wrap their child workload, unlike source JSON.
     Keep this conversion at the runfile boundary, never in source validation.
     """
@@ -1133,12 +1133,22 @@ def _prefill_workload_source(workload: Dict[str, Any]) -> Dict[str, Any]:
                 **{
                     key: value
                     for key, value in _prefill_workload_source(grid["workload"]).items()
-                    if key in generated | {"request_batches", "random_request_batches"}
+                    if key
+                    in generated
+                    | {
+                        "request_batches",
+                        "random_request_batches",
+                        "logarithmic_request_batches",
+                    }
                 },
             )
             for grid in grids
         ]
-    elif batches or source.get("random_request_batches"):
+    elif (
+        batches
+        or source.get("random_request_batches")
+        or source.get("logarithmic_request_batches")
+    ):
         source = {
             key: value
             for key, value in source.items()

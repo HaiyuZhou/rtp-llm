@@ -47,6 +47,7 @@ py_library(
         "prefill/export.py",
         "prefill/fingerprints.py",
         "prefill/measurement.py",
+        "prefill/logarithmic_grid.py",
         "prefill/planner.py",
         "prefill/prompts.py",
         "prefill/random_batch.py",

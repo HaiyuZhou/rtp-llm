@@ -1,3 +1,4 @@
+from rtp_llm.test.perf_test.tests.support.execution import default_executor_measurement
 from rtp_llm.test.perf_test.tests.support.execution import (
     default_executor_request_round as decode_executor_request_round,
 )
@@ -31,19 +32,12 @@ from rtp_llm.test.perf_test.plan import build_execution_plan
 from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.storage import RunStore
 from rtp_llm.test.perf_test.tests.support.execution import decode_transport_Response
-from rtp_llm.test.perf_test.tests.support.fixtures import (
-    fixture_engine,
-    fixture_execution,
-    fixture_model,
-)
+from rtp_llm.test.perf_test.tests.support.fixtures import fixture_config
 
 
 def decode_fixed_config(input_lengths=None, batch_sizes=None, output_length=32):
-    return {
-        "schema_version": 1,
-        "model": fixture_model(),
-        "engine": fixture_engine(),
-        "workload": {
+    return fixture_config(
+        workload={
             "kind": "grid",
             "input_lengths": input_lengths or [128, 256, 512],
             "output_lengths": [output_length],
@@ -51,47 +45,24 @@ def decode_fixed_config(input_lengths=None, batch_sizes=None, output_length=32):
             "measure_runs": 2,
             "warmup_runs": 1,
             "generate_config": {"top_k": 1},
+        }
+    )
+
+
+def decode_fixed_measurement(case, batch, *, tpot=0.1, throughput=1000.0):
+    return default_executor_measurement(
+        batch,
+        case.input_lengths[:batch],
+        case.output_length,
+        runs=case.measure_runs,
+        throughput=throughput,
+        latency={
+            "wait": 1.0,
+            "prefill": 2.0,
+            "decode": 3.0,
+            "tpot": tpot,
+            "total": 5.0,
         },
-        "execution": fixture_execution(),
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
-
-
-def decode_fixed_measurement(case, batch, *, tpot=0.1):
-    return DecodeBatchMeasurement(
-        batch_size=batch,
-        input_lengths=case.input_lengths[:batch],
-        worker_allocations=(),
-        measurements=tuple(
-            (
-                {
-                    "run": run,
-                    "throughput_tokens_per_second": 1000.0,
-                    "worker_allocations": [],
-                    "requests": [
-                        {
-                            "request_index": index,
-                            "success": True,
-                            "input_length": input_length,
-                            "output_length": case.output_length,
-                            "latency_ms": {
-                                "wait": 1.0,
-                                "prefill": 2.0,
-                                "decode": 3.0,
-                                "tpot": tpot,
-                                "total": 5.0,
-                            },
-                        }
-                        for (index, input_length) in enumerate(
-                            case.input_lengths[:batch]
-                        )
-                    ],
-                }
-                for run in range(case.measure_runs)
-            )
-        ),
     )
 
 
@@ -111,25 +82,6 @@ def decode_fixed_case(batch=4):
         batch_policy=ExactBatchPolicy(strategy="fixed", size=batch),
         measure_runs=2,
         warmup_runs=0,
-    )
-
-
-def decode_distribution_executor(batch_runner):
-
-    def measure(spec, batch):
-        inputs = spec.input_lengths[:batch]
-        raw = batch_runner(
-            input_lengths=inputs,
-            output_length=spec.output_length,
-            measure_runs=spec.measure_runs,
-            worker_allocations=[],
-        )
-        return DecodeBatchMeasurement(batch, inputs, (), tuple(raw["measurements"]))
-
-    batch_executor = Mock()
-    batch_executor.measure.side_effect = measure
-    return DecodeCaseExecutor(
-        batch_executor, topology={"tp": 1, "dp": 1, "pp": 1, "ep": 1}
     )
 
 
@@ -161,47 +113,21 @@ def decode_executor_exact_case(*, batch, warmup=0, runs=1):
 class DecodeDistributionTest(unittest.TestCase):
 
     def test_fixed_distribution_measures_declared_lengths(self):
-
-        def execute(**kwargs):
-            measurements = []
-            for run in range(kwargs["measure_runs"]):
-                measurements.append(
-                    {
-                        "run": run,
-                        "throughput_tokens_per_second": 100.0,
-                        "worker_allocations": kwargs["worker_allocations"],
-                        "requests": [
-                            {
-                                "request_index": index,
-                                "success": True,
-                                "input_length": input_length,
-                                "output_length": kwargs["output_length"],
-                                "latency_ms": {
-                                    "wait": 1.0,
-                                    "prefill": 2.0,
-                                    "decode": 3.0,
-                                    "tpot": 5.0,
-                                    "total": 5.0,
-                                },
-                            }
-                            for (index, input_length) in enumerate(
-                                kwargs["input_lengths"]
-                            )
-                        ],
-                    }
-                )
-            return {"measurements": measurements}
-
-        batch_runner = Mock(side_effect=execute)
-        result = decode_distribution_executor(batch_runner).execute(
-            decode_distribution_payload()
+        measure = Mock(
+            side_effect=lambda case, batch: decode_fixed_measurement(
+                case, batch, tpot=5.0, throughput=100.0
+            )
         )
+        result = decode_fixed_executor(measure).execute(decode_distribution_payload())
         self.assertEqual("ok", result["status"])
         self.assertEqual(2, result["metrics"]["global_batch_size"])
         self.assertNotIn("search", result["metrics"])
         self.assertEqual(
-            [(64, 256)],
-            [call.kwargs["input_lengths"] for call in batch_runner.call_args_list],
+            [((64, 256), 2)],
+            [
+                (item.args[0].input_lengths, item.args[1])
+                for item in measure.call_args_list
+            ],
         )
         self.assertEqual(
             [64, 256], result["metrics"]["distribution"]["actual_sequence_lengths"]

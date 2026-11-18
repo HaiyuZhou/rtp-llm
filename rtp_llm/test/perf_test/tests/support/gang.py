@@ -9,69 +9,43 @@ from rtp_llm.test.perf_test.config_resolver import load_resolved_config
 from rtp_llm.test.perf_test.plan import build_execution_plan, thaw
 from rtp_llm.test.perf_test.results import RESULT_SCHEMA_VERSION
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
+from rtp_llm.test.perf_test.tests.support.fixtures import (
+    fixture_config,
+    fixture_engine,
+    fixture_workload,
+)
 
 
 def _gang_source():
-    return {
-        "schema_version": 1,
-        "model": {
-            "label": "gang",
-            "type": "registered",
-            "checkpoint": "/m",
-            "tokenizer": "/m",
-            "topology": dict(TOPOLOGY),
-        },
-        "engine": {
+    source = prefill_source(
+        model={"label": "gang", "tokenizer": "/m", "topology": dict(TOPOLOGY)},
+        engine={
             "args": {"reuse_cache": 1},
             "max_seq_len": 4097,
-            "max_batch_tokens": 8192,
             "concurrency_limit": 1,
         },
-        "workload": {
-            "kind": "cache_grid",
-            "max_input_len": 2048,
-            "cache_alignment": 64,
-            "commit_tail_tokens": 64,
-            "compute_steps": [256],
-            "batch_sizes": [1],
-        },
-        "execution": {
-            "backend": "aone",
-            "resource": "daily",
-            "gpu_type": "H20",
-            "max_parallel": MACHINE_COUNT,
-            "gpus_per_machine": LOCAL_WORLD_SIZE,
-        },
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        execution={"max_parallel": MACHINE_COUNT, "gpus_per_machine": LOCAL_WORLD_SIZE},
+    )
+    source["execution"].pop("shard_count")
+    return source
 
 
 def _cases():
     return [
         {
-            "input_len": 512,
-            "cache_len": 0,
+            "input_len": input_len,
+            "cache_len": cache_len,
             "compute_len": 512,
             "batch_size": 1,
             "measure_runs": 1,
             "seed": 1,
             "prefix_policy": "shared_seed",
-        },
-        {
-            "input_len": 1024,
-            "cache_len": 512,
-            "compute_len": 512,
-            "batch_size": 1,
-            "measure_runs": 1,
-            "seed": 1,
-            "prefix_policy": "shared_seed",
-        },
+        }
+        for input_len, cache_len in ((512, 0), (1024, 512))
     ]
 
 
-def _setup_run(root, source=None):
+def _setup_run(root, source=None, *, run_id=None):
     source = _gang_source() if source is None else source
     root.parent.mkdir(parents=True, exist_ok=True)
     config_path = root.parent / "submit-host-only.json"
@@ -86,17 +60,25 @@ def _setup_run(root, source=None):
         result_directory=str(root),
     )
     initialize_run_directory(
-        root, source_config=source, plan=plan, run_id=RUN_ID, code_version="rev"
+        root,
+        source_config=source,
+        plan=plan,
+        run_id=RUN_ID if run_id is None else run_id,
+        code_version="rev",
     )
     config_path.unlink()
     return plan
 
 
 def _case_result(case, status="ok"):
-    identity = thaw(case.identity)
+    if isinstance(case, dict):
+        case_id = case["case_id"]
+        identity = {key: value for key, value in case.items() if key != "case_id"}
+    else:
+        case_id, identity = case.case_id, thaw(case.identity)
     ok = status == "ok"
     return {
-        "case_id": case.case_id,
+        "case_id": case_id,
         "identity": identity,
         "status": status,
         "runs": 1,
@@ -194,33 +176,11 @@ def prefill_source(
     *, model=None, engine=None, workload=None, execution=None, output=None
 ):
     """Fresh minimal remote prefill config; section overrides are explicit per case."""
-    source = {
-        "schema_version": 1,
-        "model": {"label": "test", "type": "registered", "checkpoint": "/m"},
-        "engine": {
-            "max_seq_len": 4096,
-            "max_batch_tokens": 8192,
-            "concurrency_limit": 2,
-        },
-        "workload": {
-            "kind": "cache_grid",
-            "max_input_len": 2048,
-            "cache_alignment": 64,
-            "commit_tail_tokens": 64,
-            "compute_steps": [256],
-            "batch_sizes": [1],
-        },
-        "execution": {
-            "backend": "aone",
-            "resource": "daily",
-            "gpu_type": "H20",
-            "max_parallel": 2,
-            "shard_count": 2,
-        },
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+    source = fixture_config(
+        engine=fixture_engine(concurrency_limit=2),
+        workload=fixture_workload(compute_steps=[256]),
+        execution=aone_execution(shard_count=2),
+    )
     for section, overrides in (
         ("model", model),
         ("engine", engine),
@@ -253,30 +213,15 @@ def aone_gang_config(execution, topology=None, mode="prefill"):
             "batch": {"strategy": "fixed", "sizes": [2]},
         }
     else:
-        workload = {
-            "kind": "cache_grid",
-            "max_input_len": 2048,
-            "cache_alignment": 64,
-            "commit_tail_tokens": 64,
-            "compute_steps": [128],
-            "batch_sizes": [1],
-        }
-    return {
-        "schema_version": 1,
-        "model": {
+        workload = fixture_workload()
+    source = prefill_source(
+        model={
             "label": "test-model",
             "type": "registered_model",
             "checkpoint": "/models/test",
             "topology": topology or {"tp": 2, "dp": 1, "pp": 1, "ep": 1},
         },
-        "engine": {
-            "max_seq_len": 4096,
-            "max_batch_tokens": 8192,
-            "concurrency_limit": 8,
-        },
-        "workload": workload,
-        "execution": execution,
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        engine={"concurrency_limit": 8},
+    )
+    source.update(workload=workload, execution=execution)
+    return source

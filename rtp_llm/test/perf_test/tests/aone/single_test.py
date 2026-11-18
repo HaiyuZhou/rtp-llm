@@ -9,28 +9,25 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.aone.collector import collect_aone_results
-from rtp_llm.test.perf_test.aone.config_schema import parse_execution
 from rtp_llm.test.perf_test.aone.package import generate_aone_package
-from rtp_llm.test.perf_test.aone.plan import plan_resources
 from rtp_llm.test.perf_test.aone.sharding import plan_shards
 from rtp_llm.test.perf_test.aone.worker import load_remote_inputs
-from rtp_llm.test.perf_test.capabilities import validate_aone_capability
-from rtp_llm.test.perf_test.config_resolver import load_resolved_config
 from rtp_llm.test.perf_test.execution.aone import AOneExecutor
 from rtp_llm.test.perf_test.execution.aone_bazel import (
     AONE_TEST_TIMEOUT_S,
     BazelAOneIntegration,
     create_default_aone_executor,
 )
-from rtp_llm.test.perf_test.plan import build_execution_plan, thaw
+from rtp_llm.test.perf_test.plan import thaw
 from rtp_llm.test.perf_test.results import parse_result_envelope
-from rtp_llm.test.perf_test.run_directory import (
-    initialize_run_directory,
-    inspect_run_directory,
-)
+from rtp_llm.test.perf_test.run_directory import inspect_run_directory
 from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
-from rtp_llm.test.perf_test.tests.support.gang import prefill_source
+from rtp_llm.test.perf_test.tests.support.gang import (
+    _case_result,
+    _setup_run,
+    prefill_source,
+)
 
 
 def _source_config(shard_count):
@@ -41,67 +38,7 @@ def _source_config(shard_count):
 
 
 def _setup(root, shard_count):
-    source = _source_config(shard_count)
-    root.parent.mkdir(parents=True, exist_ok=True)
-    config_path = root.parent / "submit-host-only.json"
-    config_path.write_text(json.dumps(source))
-    cases = [
-        {
-            "input_len": 512,
-            "cache_len": 0,
-            "compute_len": 512,
-            "batch_size": 1,
-            "measure_runs": 1,
-            "seed": 1,
-            "prefix_policy": "shared_seed",
-        },
-        {
-            "input_len": 1024,
-            "cache_len": 512,
-            "compute_len": 512,
-            "batch_size": 1,
-            "measure_runs": 1,
-            "seed": 1,
-            "prefix_policy": "shared_seed",
-        },
-    ]
-    plan = build_execution_plan(
-        resource_planner=plan_resources,
-        capability_validator=validate_aone_capability,
-        mode="prefill",
-        action="run",
-        resolved=load_resolved_config(config_path, execution_parser=parse_execution),
-        cases=cases,
-        result_directory=str(root),
-    )
-    initialize_run_directory(
-        root, source_config=source, plan=plan, run_id="run-aone", code_version="rev"
-    )
-    config_path.unlink()
-    return plan
-
-
-def _orchestrator_case_result(case):
-    identity = thaw(case.identity)
-    return {
-        "case_id": case.case_id,
-        "identity": identity,
-        "status": "ok",
-        "runs": 1,
-        "errors": [],
-        "metrics": {
-            "input_length": identity["input_len"],
-            "expected_reuse_length": identity["cache_len"],
-            "observed_reuse_length": identity["cache_len"],
-            "compute_length": identity["compute_len"],
-            "latency_ms": 10.0,
-            "throughput_tokens_per_second": 1000.0,
-            "validation": {"shape": True, "reuse": True, "timing": True},
-            "seed": 1,
-            "prefix_policy": {"kind": "shared_seed"},
-            "measurements": [{"run": 0, "latency_ms": 10.0}],
-        },
-    }
+    return _setup_run(root, _source_config(shard_count), run_id="run-aone")
 
 
 def _remote_results(plan, failed_shard=None):
@@ -121,13 +58,26 @@ def _remote_results(plan, failed_shard=None):
             "workload_fingerprint": plan.workload_fingerprint,
             "owned_case_ids": list(shard.case_ids),
             "completed_case_ids": list(completed),
-            "cases": [
-                _orchestrator_case_result(cases[case_id]) for case_id in completed
-            ],
+            "cases": [_case_result(cases[case_id]) for case_id in completed],
             "engine_diagnostics": {},
             "failure": {"type": "EngineError", "message": "remote"} if failed else None,
         }
     return payloads
+
+
+def _executor(workspace, payloads, collector=None):
+    return AOneExecutor(
+        workspace_root=workspace,
+        builder=Mock(),
+        submitter=lambda _target, shard_id: shard_id,
+        result_collector=collector or (lambda job, _shard_id: payloads[job]),
+    )
+
+
+def _collect(plan, results):
+    return collect_aone_results(
+        plan, run_id="run-aone", shard_plan=plan_shards(plan), results=results
+    )
 
 
 class AOneSingleTest(unittest.TestCase):
@@ -270,12 +220,7 @@ class AOneSingleTest(unittest.TestCase):
             root = Path(directory) / "runs/partial"
             plan = _setup(root, 2)
             payloads = _remote_results(plan, failed_shard="shard-0001")
-            outcome = AOneExecutor(
-                workspace_root=Path(directory),
-                builder=Mock(),
-                submitter=lambda target, shard_id: shard_id,
-                result_collector=lambda job, shard_id: payloads[job],
-            ).execute(plan)
+            outcome = _executor(Path(directory), payloads).execute(plan)
             self.assertEqual(RunState.PARTIAL, outcome.state)
             self.assertEqual(5, outcome.exit_code)
             self.assertEqual("diagnostic", outcome.report["report_kind"])
@@ -420,12 +365,7 @@ class AOneSingleTest(unittest.TestCase):
                 with self.subTest(kind=kind):
                     results = list(_remote_results(plan).values())
                     mutate(kind, results)
-                    outcome = collect_aone_results(
-                        plan,
-                        run_id="run-aone",
-                        shard_plan=plan_shards(plan),
-                        results=results,
-                    )
+                    outcome = _collect(plan, results)
                     self.assertEqual(RunState.FAILED, outcome.state)
                     self.assertEqual((), outcome.cases)
                     self.assertEqual(
@@ -438,12 +378,7 @@ class AOneSingleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             plan = _setup(Path(directory) / "run", 2)
             results = list(_remote_results(plan).values())
-            outcome = collect_aone_results(
-                plan,
-                run_id="run-aone",
-                shard_plan=plan_shards(plan),
-                results=results[:1],
-            )
+            outcome = _collect(plan, results[:1])
             self.assertEqual(RunState.PARTIAL, outcome.state)
             self.assertEqual(("shard-0001",), outcome.missing_shard_ids)
             self.assertEqual(
@@ -534,12 +469,7 @@ class AOneSingleTest(unittest.TestCase):
                             rejected["owned_case_ids"] = []
                         else:
                             rejected["cases"][0]["identity"]["input_len"] += 1
-                        outcome = collect_aone_results(
-                            plan,
-                            run_id="run-aone",
-                            shard_plan=plan_shards(plan),
-                            results=results,
-                        )
+                        outcome = _collect(plan, results)
                         self.assertEqual(RunState.FAILED, outcome.state)
                         self.assertEqual((), outcome.cases)
                         self.assertEqual(
@@ -561,12 +491,7 @@ class AOneSingleTest(unittest.TestCase):
                 plan = _setup(Path(directory) / "run", 2)
                 results = list(_remote_results(plan).values())
                 results[0]["status"] = status
-                outcome = collect_aone_results(
-                    plan,
-                    run_id="run-aone",
-                    shard_plan=plan_shards(plan),
-                    results=results,
-                )
+                outcome = _collect(plan, results)
                 self.assertEqual(RunState.FAILED, outcome.state)
                 self.assertEqual((), outcome.cases)
                 self.assertEqual(results[1]["cases"], list(outcome.diagnostic_cases))
@@ -587,12 +512,7 @@ class AOneSingleTest(unittest.TestCase):
                     rejected["config_fingerprint"] = "invalid"
                 else:
                     rejected["status"] = invalid
-                outcome = AOneExecutor(
-                    workspace_root=directory,
-                    builder=lambda _package: None,
-                    submitter=lambda _target, shard_id: shard_id,
-                    result_collector=lambda job, _shard_id: payloads[job],
-                ).execute(plan)
+                outcome = _executor(directory, payloads).execute(plan)
                 self.assertEqual(RunState.FAILED, outcome.state)
                 self.assertNotEqual(0, outcome.exit_code)
                 self.assertEqual((), outcome.collection.cases)
@@ -627,9 +547,7 @@ class AOneSingleTest(unittest.TestCase):
                 '{"timing": {"values": [1e999, -1e999]}}'
             )
             results[1]["config_fingerprint"] = "invalid"
-            outcome = collect_aone_results(
-                plan, run_id="run-aone", shard_plan=plan_shards(plan), results=results
-            )
+            outcome = _collect(plan, results)
             self.assertEqual(RunState.FAILED, outcome.state)
             self.assertEqual(results[0]["cases"], list(outcome.diagnostic_cases))
             safe = outcome.shard_diagnostics["shard-0000"]
@@ -643,12 +561,7 @@ class AOneSingleTest(unittest.TestCase):
             payloads = _remote_results(plan)
             payloads["shard-0000"]["engine_diagnostics"] = json.loads('{"time":1e999}')
             payloads["shard-0001"]["config_fingerprint"] = "invalid"
-            outcome = AOneExecutor(
-                workspace_root=directory,
-                builder=lambda _package: None,
-                submitter=lambda _target, shard_id: shard_id,
-                result_collector=lambda job, _shard_id: payloads[job],
-            ).execute(plan)
+            outcome = _executor(directory, payloads).execute(plan)
             self.assertEqual(RunState.FAILED, outcome.state)
             self.assertEqual("failed", inspect_run_directory(root).manifest["state"])
             artifact = json.loads((root / "results/aone_diagnostics.json").read_text())
@@ -672,12 +585,7 @@ class AOneSingleTest(unittest.TestCase):
                 plan = _setup(root, 2)
                 payloads = _remote_results(plan)
                 payloads["shard-0001"]["config_fingerprint"] = "invalid"
-                executor = AOneExecutor(
-                    workspace_root=directory,
-                    builder=lambda _package: None,
-                    submitter=lambda _target, shard_id: shard_id,
-                    result_collector=lambda job, _shard_id: payloads[job],
-                )
+                executor = _executor(directory, payloads)
                 with patch(
                     "rtp_llm.test.perf_test.execution.aone.atomic_write_json",
                     side_effect=error,
@@ -708,12 +616,7 @@ class AOneSingleTest(unittest.TestCase):
                     raise KeyboardInterrupt()
                 return payloads[job]
 
-            executor = AOneExecutor(
-                workspace_root=directory,
-                builder=lambda _package: None,
-                submitter=lambda _target, shard_id: shard_id,
-                result_collector=collect,
-            )
+            executor = _executor(directory, payloads, collect)
             with patch(
                 "rtp_llm.test.perf_test.execution.aone.atomic_write_json",
                 side_effect=OSError("diagnostics denied"),

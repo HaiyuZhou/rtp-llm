@@ -21,6 +21,7 @@ from rtp_llm.test.perf_test.storage import (
     atomic_write_json,
     read_prefill_cases,
 )
+from rtp_llm.test.perf_test.tests.support.fixtures import fixture_config
 from rtp_llm.test.perf_test.tests.support.prefill import (
     prefill_resume_config,
     prefill_resume_plan,
@@ -249,7 +250,6 @@ from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.storage import RunStore
 from rtp_llm.test.perf_test.tests.support.fixtures import (
     fixture_engine,
-    fixture_execution,
     fixture_model,
     fixture_workload,
 )
@@ -260,18 +260,11 @@ from rtp_llm.test.perf_test.tests.support.prefill import (
 
 
 def run_directory_source_config():
-    return {
-        "schema_version": 1,
-        "model": fixture_model(
+    return fixture_config(
+        model=fixture_model(
             label="test-model", type="registered_model", checkpoint="/models/test"
-        ),
-        "engine": fixture_engine(),
-        "workload": fixture_workload(),
-        "execution": fixture_execution(),
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        )
+    )
 
 
 def run_directory_plan(result_directory):
@@ -345,16 +338,10 @@ def prefill_resume_initialized(root):
 
 
 def prefill_adapter_plan(root):
-    config = {
-        "schema_version": 1,
-        "model": fixture_model(),
-        "engine": fixture_engine(max_seq_len=4097, concurrency_limit=1),
-        "workload": fixture_workload(compute_steps=[256], cache_lengths=[0]),
-        "execution": fixture_execution(),
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+    config = fixture_config(
+        engine=fixture_engine(max_seq_len=4097, concurrency_limit=1),
+        workload=fixture_workload(compute_steps=[256], cache_lengths=[0]),
+    )
     cases = [
         {
             "input_len": 512,

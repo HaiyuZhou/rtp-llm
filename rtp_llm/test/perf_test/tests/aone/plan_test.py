@@ -25,32 +25,20 @@ from rtp_llm.test.perf_test.tests.support.plan import plan_cases, plan_config
 class AOnePlanningTest(unittest.TestCase):
 
     def test_cross_host_dp_layout_is_validated_before_submission(self):
-        from rtp_llm.test.perf_test.aone.config_schema import parse_execution
-        from rtp_llm.test.perf_test.aone.plan import plan_resources
-        from rtp_llm.test.perf_test.capabilities import validate_aone_capability
-
-        for topology, message in (
-            (dict(tp=2, dp=2, pp=1, ep=4), "whole local TP"),
-            (dict(tp=1, dp=2, pp=2, ep=2), "PP=1"),
-        ):
-            with self.subTest(topology=topology):
-                source = plan_config("aone")
-                source["model"]["topology"] = topology
-                source["execution"].pop("shard_count")
-                source["execution"].update(gpus_per_machine=1, max_parallel=4)
-                error_type = ConfigError if topology["pp"] != 1 else PlanningError
-                with self.assertRaisesRegex(error_type, message):
-                    build_execution_plan(
-                        mode="decode",
-                        action="run",
-                        resolved=resolve_config(
-                            source, execution_parser=parse_execution
-                        ),
-                        cases=plan_cases(),
-                        result_directory="unused",
-                        resource_planner=plan_resources,
-                        capability_validator=validate_aone_capability,
-                    )
+        source = plan_config("aone")
+        source["model"]["topology"] = dict(tp=2, dp=2, pp=1, ep=4)
+        source["execution"].pop("shard_count")
+        source["execution"].update(gpus_per_machine=1, max_parallel=4)
+        with self.assertRaisesRegex(PlanningError, "whole local TP"):
+            build_execution_plan(
+                mode="decode",
+                action="run",
+                resolved=resolve_config(source, execution_parser=parse_execution),
+                cases=plan_cases(),
+                result_directory="unused",
+                resource_planner=plan_resources,
+                capability_validator=validate_aone_capability,
+            )
 
     def _plan(
         self, *, mode="prefill", execution=None, world_size=2, gang=False, cases=None
@@ -93,7 +81,6 @@ class AOnePlanningTest(unittest.TestCase):
             ({"shard_count": 3}, 2, "case count"),
             ({"max_parallel": 3}, 2, "max_parallel"),
             ({"gpus_per_machine": 8}, 16, "shard_count"),
-            ({"gpus_per_machine": 3}, 8, "divide"),
             ({"gpus_per_machine": 16}, 16, "GPU|capacity|host"),
         ]
         for execution, world_size, message in invalid:

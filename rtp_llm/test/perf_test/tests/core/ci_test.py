@@ -7,7 +7,10 @@ import unittest
 from pathlib import Path
 
 from rtp_llm.test.perf_test.ci_delivery import deliver_config
-from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
+from rtp_llm.test.perf_test.tests.support.fixtures import (
+    PERF_TEST_ROOT,
+    fixture_envelope,
+)
 
 
 class CiDeliveryTest(unittest.TestCase):
@@ -246,22 +249,17 @@ class PrefillVerificationTest(unittest.TestCase):
                     metrics=metrics,
                 )
             )
-        self.result = dict(
-            schema_version=2,
+        self.result = fixture_envelope(
+            "prefill",
+            self.cases,
             run_id="prefill-test",
-            mode="prefill",
             backend="aone",
-            status="completed",
-            config_fingerprint="a" * 64,
-            workload_fingerprint="b" * 64,
             model=dict(
                 label="test",
                 type="test",
                 checkpoint="/m",
                 topology=dict(tp=2, dp=1, pp=1, ep=1),
             ),
-            summary=dict(planned_cases=30, successful_cases=30, failed_cases=0),
-            cases=self.cases,
         )
         self.write(
             "resolved_config.json", dict(workload=dict(transport="dashsc_input_ids"))

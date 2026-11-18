@@ -10,6 +10,13 @@ from rtp_llm.test.perf_test.plan import build_execution_plan
 from rtp_llm.test.perf_test.prefill.runner import PrefillRunner
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.storage import RunStore
+from rtp_llm.test.perf_test.tests.support.fixtures import (
+    fixture_config,
+    fixture_engine,
+    fixture_execution,
+    fixture_model,
+    fixture_workload,
+)
 
 
 def prefill_external_run_through_session(plan, session, run_root):
@@ -94,6 +101,17 @@ def prefill_runner_case(cache_len=8, batch_size=1, measure_runs=2):
     }
 
 
+def prefill_runner_run(client, case=None, **kwargs):
+    """Run a scripted case with the common tokenizer and admission limits."""
+    return PrefillRunner(
+        client,
+        prefill_runner_Tokenizer(),
+        commit_tail_tokens=4,
+        max_batch_tokens=4096,
+        **kwargs,
+    ).run_case(case or prefill_runner_case())
+
+
 def prefill_runner_grouped_case():
     return dict(
         prefill_runner_case(batch_size=3, measure_runs=1),
@@ -159,26 +177,11 @@ class SeedBatchClient:
 
 
 def prefill_profile_setup(root):
-    config = {
-        "schema_version": 1,
-        "model": fixture_model(),
-        "engine": fixture_engine(max_seq_len=4097, concurrency_limit=1),
-        "workload": fixture_workload(compute_steps=[256], cache_lengths=[0]),
-        "execution": fixture_execution(),
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
-    identity = {
-        "input_len": 512,
-        "cache_len": 0,
-        "compute_len": 512,
-        "batch_size": 1,
-        "measure_runs": 1,
-        "seed": 1,
-        "prefix_policy": "shared_seed",
-    }
-    identity["measurement_contract"] = "concurrent_batch_v1"
+    config = fixture_config(
+        engine=fixture_engine(max_seq_len=4097, concurrency_limit=1),
+        workload=fixture_workload(compute_steps=[256], cache_lengths=[0]),
+    )
+    identity = dict(prefill_resume_CASES[0], measurement_contract="concurrent_batch_v1")
     plan = build_execution_plan(
         mode="prefill",
         action="run",
@@ -210,18 +213,12 @@ def prefill_profile_formal_bytes(root):
 
 
 def prefill_resume_config(extra_engine_args=None):
-    return {
-        "schema_version": 1,
-        "model": fixture_model(),
-        "engine": fixture_engine(
+    return fixture_config(
+        engine=fixture_engine(
             max_seq_len=4097, concurrency_limit=1, args=extra_engine_args or {}
         ),
-        "workload": fixture_workload(compute_steps=[256], cache_lengths=[0]),
-        "execution": fixture_execution(),
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        workload=fixture_workload(compute_steps=[256], cache_lengths=[0]),
+    )
 
 
 prefill_resume_CASES = [
@@ -266,17 +263,14 @@ prefill_external_CASE_CACHE_LEN = 16
 
 
 def prefill_external_prefill_source(result_root):
-    return {
-        "schema_version": 1,
-        "model": fixture_model(
+    return fixture_config(
+        model=fixture_model(
             label="external-prefill",
             tokenizer="/m",
             topology=dict(prefill_external_TOPOLOGY),
         ),
-        "engine": fixture_engine(
-            max_seq_len=64, max_batch_tokens=64, concurrency_limit=1
-        ),
-        "workload": fixture_workload(
+        engine=fixture_engine(max_seq_len=64, max_batch_tokens=64, concurrency_limit=1),
+        workload=fixture_workload(
             transport="http_text",
             max_input_len=24,
             cache_alignment=8,
@@ -286,11 +280,9 @@ def prefill_external_prefill_source(result_root):
             measure_runs=1,
             seed=7,
         ),
-        "execution": fixture_execution(devices=[0, 1]),
-        "output": {"result_root": str(result_root)},
-        "regression": {},
-        "publish": {},
-    }
+        execution=fixture_execution(devices=[0, 1]),
+        output={"result_root": str(result_root)},
+    )
 
 
 def prefill_external_write_prefill_config(root):
@@ -301,10 +293,7 @@ def prefill_external_write_prefill_config(root):
     return path
 
 
-class prefill_external_Tokenizer:
-
-    def encode(self, text):
-        return text.split()
+prefill_external_Tokenizer = prefill_runner_Tokenizer
 
 
 def prefill_external_aux(input_len, reuse_len, latency_ms):
@@ -361,11 +350,3 @@ class prefill_external_FakeModelServer:
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5)
-
-
-from rtp_llm.test.perf_test.tests.support.fixtures import (
-    fixture_engine,
-    fixture_execution,
-    fixture_model,
-    fixture_workload,
-)

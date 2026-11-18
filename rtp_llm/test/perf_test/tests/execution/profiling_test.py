@@ -10,7 +10,6 @@ from unittest.mock import Mock, call, patch
 
 from rtp_llm.test.perf_test.decode.executor import DecodeCaseExecutor
 from rtp_llm.test.perf_test.decode.model import (
-    DecodeBatchMeasurement,
     DecodeCaseSpec,
     DecodeProfilingConfig,
     ExactBatchPolicy,
@@ -24,6 +23,7 @@ from rtp_llm.test.perf_test.prefill.profile import (
     TraceClient,
 )
 from rtp_llm.test.perf_test.storage import atomic_write_json
+from rtp_llm.test.perf_test.tests.support.execution import default_executor_measurement
 from rtp_llm.test.perf_test.tests.support.prefill import prefill_profile_formal_bytes
 from rtp_llm.test.perf_test.tests.support.prefill import prefill_profile_setup
 from rtp_llm.test.perf_test.tests.support.prefill import prefill_profile_setup as _setup
@@ -430,36 +430,18 @@ def decode_profiling_case_payload(case):
 
 
 def decode_profiling_measurement(batch, tpot=1.0):
-    return DecodeBatchMeasurement(
-        batch_size=batch,
-        input_lengths=(128,) * batch,
-        worker_allocations=(),
-        measurements=tuple(
-            (
-                {
-                    "run": run,
-                    "worker_allocations": [],
-                    "throughput_tokens_per_second": 100.0,
-                    "requests": [
-                        {
-                            "request_index": index,
-                            "success": True,
-                            "input_length": 128,
-                            "output_length": 16,
-                            "latency_ms": {
-                                "wait": 1.0,
-                                "prefill": 2.0,
-                                "decode": 15.0,
-                                "tpot": tpot,
-                                "total": 17.0,
-                            },
-                        }
-                        for index in range(batch)
-                    ],
-                }
-                for run in range(2)
-            )
-        ),
+    return default_executor_measurement(
+        batch,
+        (128,) * batch,
+        16,
+        runs=2,
+        latency={
+            "wait": 1.0,
+            "prefill": 2.0,
+            "decode": 15.0,
+            "tpot": tpot,
+            "total": 17.0,
+        },
     )
 
 

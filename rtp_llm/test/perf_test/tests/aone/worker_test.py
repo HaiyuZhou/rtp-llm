@@ -18,7 +18,11 @@ from rtp_llm.test.perf_test.execution.engine_session import EngineDiagnostics
 from rtp_llm.test.perf_test.modes import PrefillAdapter
 from rtp_llm.test.perf_test.plan import build_execution_plan
 from rtp_llm.test.perf_test.state import RunState
-from rtp_llm.test.perf_test.tests.support.gang import prefill_source
+from rtp_llm.test.perf_test.tests.support.gang import (
+    _case_result,
+    _cases,
+    prefill_source,
+)
 
 
 def _worker_plan(root):
@@ -27,33 +31,13 @@ def _worker_plan(root):
         workload={"cache_lengths": [0, 512]},
         execution={"max_parallel": 1, "shard_count": 1},
     )
-    cases = [
-        {
-            "input_len": 512,
-            "cache_len": 0,
-            "compute_len": 512,
-            "batch_size": 1,
-            "measure_runs": 1,
-            "seed": 1,
-            "prefix_policy": "shared_seed",
-        },
-        {
-            "input_len": 1024,
-            "cache_len": 512,
-            "compute_len": 512,
-            "batch_size": 1,
-            "measure_runs": 1,
-            "seed": 1,
-            "prefix_policy": "shared_seed",
-        },
-    ]
     return build_execution_plan(
         resource_planner=plan_resources,
         capability_validator=validate_aone_capability,
         mode="prefill",
         action="run",
         resolved=resolve_config(config, execution_parser=parse_execution),
-        cases=cases,
+        cases=_cases(),
         result_directory=str(root / "formal-results"),
     )
 
@@ -73,29 +57,29 @@ class _FakeSession:
         self.exit_calls += 1
 
 
-def _worker_result(case):
-    return {
-        "case_id": case["case_id"],
-        "identity": {key: value for (key, value) in case.items() if key != "case_id"},
-        "status": "ok",
-        "runs": 1,
-        "errors": [],
-        "metrics": {
-            "input_length": case["input_len"],
-            "expected_reuse_length": case["cache_len"],
-            "observed_reuse_length": case["cache_len"],
-            "compute_length": case["compute_len"],
-            "latency_ms": 10.0,
-            "throughput_tokens_per_second": 1000.0,
-            "validation": {"shape": True, "reuse": True, "timing": True},
-            "seed": 1,
-            "prefix_policy": {"kind": "shared_seed"},
-            "measurements": [{"run": 0, "latency_ms": 10.0}],
-        },
-    }
+def _worker_args(package, output=None):
+    args = [
+        f"--resolved-config={package.resolved_config}",
+        f"--resolved-workload={package.resolved_workload}",
+        f"--shard-plan={package.shard_plan}",
+        "--shard-id=shard-0000",
+    ]
+    if output is not None:
+        args.append(f"--output-dir={output}")
+    return args
 
 
 class AOneWorkerTest(unittest.TestCase):
+
+    def _package(self, root, run_id="worker"):
+        plan = _worker_plan(root)
+        package = generate_aone_package(
+            root / "generated",
+            plan,
+            run_id=run_id,
+            ownership=[[case.case_id for case in plan.cases]],
+        )
+        return plan, package
 
     def test_remote_prefill_runner_uses_physical_cache_block_size(self):
         from rtp_llm.test.perf_test.aone.worker import _default_executor
@@ -125,22 +109,10 @@ class AOneWorkerTest(unittest.TestCase):
     def test_worker_setup_failure_still_writes_an_owned_failure_result(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            plan = _worker_plan(root)
-            package = generate_aone_package(
-                root / "generated",
-                plan,
-                run_id="run-setup-failure",
-                ownership=[[case.case_id for case in plan.cases]],
-            )
+            plan, package = self._package(root, "run-setup-failure")
             output = root / "remote-output"
             exit_code = worker_main(
-                [
-                    f"--resolved-config={package.resolved_config}",
-                    f"--resolved-workload={package.resolved_workload}",
-                    f"--shard-plan={package.shard_plan}",
-                    "--shard-id=shard-0000",
-                    f"--output-dir={output}",
-                ],
+                _worker_args(package, output),
                 executor_factory=Mock(side_effect=RuntimeError("tokenizer missing")),
             )
             self.assertEqual(5, exit_code)
@@ -159,17 +131,11 @@ class AOneWorkerTest(unittest.TestCase):
     def test_multi_case_shard_uses_one_session_and_returns_atomic_claims(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            plan = _worker_plan(root)
-            package = generate_aone_package(
-                root / "generated",
-                plan,
-                run_id="run-remote",
-                ownership=[[case.case_id for case in plan.cases]],
-            )
+            plan, package = self._package(root, "run-remote")
             session = _FakeSession()
             session_factory = Mock(return_value=session)
             runner = Mock()
-            runner.run_case.side_effect = _worker_result
+            runner.run_case.side_effect = _case_result
             executor = RemoteShardExecutor(
                 session_factory=session_factory,
                 adapter=PrefillAdapter(lambda _context: runner),
@@ -177,13 +143,7 @@ class AOneWorkerTest(unittest.TestCase):
             output = root / "remote-output"
             factory = Mock(return_value=executor)
             code = worker_main(
-                [
-                    f"--resolved-config={package.resolved_config}",
-                    f"--resolved-workload={package.resolved_workload}",
-                    f"--shard-plan={package.shard_plan}",
-                    "--shard-id=shard-0000",
-                    f"--output-dir={output}",
-                ],
+                _worker_args(package, output),
                 executor_factory=factory,
             )
             self.assertEqual(0, code)
@@ -216,13 +176,7 @@ class AOneWorkerTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            plan = _worker_plan(root)
-            package = generate_aone_package(
-                root / "generated",
-                plan,
-                run_id="worker",
-                ownership=[[case.case_id for case in plan.cases]],
-            )
+            plan, package = self._package(root, "worker")
             package.resolved_workload.write_text("{}")
             with self.assertRaisesRegex(ConfigurationError, "fingerprint"):
                 load_remote_inputs(
@@ -235,22 +189,11 @@ class AOneWorkerTest(unittest.TestCase):
     def test_worker_uses_bazel_undeclared_output_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            plan = _worker_plan(root)
-            package = generate_aone_package(
-                root / "generated",
-                plan,
-                run_id="worker",
-                ownership=[[case.case_id for case in plan.cases]],
-            )
+            plan, package = self._package(root, "worker")
             output = root / "undeclared"
             with patch.dict("os.environ", {"TEST_UNDECLARED_OUTPUTS_DIR": str(output)}):
                 code = worker_main(
-                    [
-                        f"--resolved-config={package.resolved_config}",
-                        f"--resolved-workload={package.resolved_workload}",
-                        f"--shard-plan={package.shard_plan}",
-                        "--shard-id=shard-0000",
-                    ],
+                    _worker_args(package),
                     executor_factory=Mock(side_effect=RuntimeError("setup failed")),
                 )
             self.assertEqual(5, code)
@@ -263,13 +206,7 @@ class AOneWorkerTest(unittest.TestCase):
     def test_partial_worker_preserves_successful_case_and_failure_claim(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            plan = _worker_plan(root)
-            package = generate_aone_package(
-                root / "generated",
-                plan,
-                run_id="partial-worker",
-                ownership=[[case.case_id for case in plan.cases]],
-            )
+            plan, package = self._package(root, "partial-worker")
             inputs = load_remote_inputs(
                 resolved_config=package.resolved_config,
                 resolved_workload=package.resolved_workload,
@@ -284,7 +221,7 @@ class AOneWorkerTest(unittest.TestCase):
                     calls.append(case["case_id"])
                     if len(calls) == 2:
                         raise RuntimeError("request failed")
-                    return _worker_result(case)
+                    return _case_result(case)
 
             result = RemoteShardExecutor(
                 session_factory=lambda _plan: _FakeSession(),

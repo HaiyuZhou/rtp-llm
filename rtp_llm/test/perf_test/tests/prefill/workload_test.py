@@ -22,7 +22,16 @@ from rtp_llm.test.perf_test.prefill.traffic_batch import sample_traffic_batches
 from rtp_llm.test.perf_test.prefill.traffic_distribution import (
     parse_length_distribution,
 )
+from rtp_llm.test.perf_test.tests.support.fixtures import (
+    config_resolution_base_config,
+    fixture_config,
+    fixture_engine,
+    fixture_model,
+)
 from rtp_llm.test.perf_test.tests.support.prefill import prefill_external_prefill_source
+from rtp_llm.test.perf_test.tests.support.prefill import (
+    prefill_runner_Tokenizer as prefill_prompt_WhitespaceTokenizer,
+)
 
 
 class SeedPreparationTest(unittest.TestCase):
@@ -159,16 +168,19 @@ class SeedPreparationTest(unittest.TestCase):
 
 class TrafficBatchTest(unittest.TestCase):
 
-    def test_sampling_cycles_and_preserves_input_and_projection(self):
-        raw = traffic_batch_config()
-        raw["workload"]["traffic_request_batches"]["max_input_tokens"] = 100
+    def sample(self, raw):
         parsed = parse_config(raw)
-        sample = sample_traffic_batches(
+        return sample_traffic_batches(
             parsed.workload,
             parsed.engine,
             parse_length_distribution(traffic_distribution_payload()),
             dp_size=1,
         )
+
+    def test_sampling_cycles_and_preserves_input_and_projection(self):
+        raw = traffic_batch_config()
+        raw["workload"]["traffic_request_batches"]["max_input_tokens"] = 100
+        sample = self.sample(raw)
         self.assertEqual([1, 2, 1], [len(b.request_groups) for b in sample.batches])
         self.assertEqual([1, 2, 3], [b.sample_index for b in sample.batches])
         for batch in sample.batches:
@@ -204,13 +216,7 @@ class TrafficBatchTest(unittest.TestCase):
         raw["workload"]["workspace_tokens"] = 300
         spec = raw["workload"]["traffic_request_batches"]
         spec.update(num_cases=2, batch_sizes=[1, 2], max_input_tokens=199)
-        parsed = parse_config(raw)
-        sample = sample_traffic_batches(
-            parsed.workload,
-            parsed.engine,
-            parse_length_distribution(traffic_distribution_payload()),
-            dp_size=1,
-        )
+        sample = self.sample(raw)
         for batch in sample.batches:
             limit = 300 // len(batch.request_groups)
             for group in batch.request_groups:
@@ -221,14 +227,8 @@ class TrafficBatchTest(unittest.TestCase):
         raw["workload"]["workspace_tokens"] = 199
         spec = raw["workload"]["traffic_request_batches"]
         spec.update(num_cases=1, batch_sizes=[2], max_input_tokens=199)
-        parsed = parse_config(raw)
         with self.assertRaisesRegex(PlanningError, "admits no input lengths"):
-            sample_traffic_batches(
-                parsed.workload,
-                parsed.engine,
-                parse_length_distribution(traffic_distribution_payload()),
-                dp_size=1,
-            )
+            self.sample(raw)
 
     def test_budget_limits_and_retry_exhaustion(self):
         for field, value in [
@@ -247,16 +247,10 @@ class TrafficBatchTest(unittest.TestCase):
                 raw["workload"][field] = value
             else:
                 spec[field] = value
-            parsed = parse_config(raw)
             with self.subTest(field=field), self.assertRaisesRegex(
                 PlanningError, "retry limit"
             ):
-                sample_traffic_batches(
-                    parsed.workload,
-                    parsed.engine,
-                    parse_length_distribution(traffic_distribution_payload()),
-                    dp_size=1,
-                )
+                self.sample(raw)
 
 
 class RandomBatchExportTest(unittest.TestCase):
@@ -267,24 +261,10 @@ class RandomBatchExportTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.source = self.root / "source.json"
 
-    def invoke(self, source, *arguments, success=True):
+    def invoke(self, source, *arguments):
         self.source.write_text(json.dumps(source), encoding="utf-8")
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                random_batch_export_MODULE,
-                "--config",
-                str(self.source),
-                *map(str, arguments),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if success:
-            self.assertEqual(0, result.returncode, result.stderr)
-        else:
-            self.assertNotEqual(0, result.returncode)
+        result = export_config(self.source, *arguments)
+        self.assertEqual(0, result.returncode, result.stderr)
         return result
 
     def test_mixed_export_freezes_all_sampled_groups_and_preserves_full_config(self):
@@ -352,16 +332,7 @@ class TrafficBatchExportTest(unittest.TestCase):
     def test_export_round_trip_and_refuses_overwrite(self):
         self.write_source(named=True)
         dest = self.root / "frozen.json"
-        command = [
-            sys.executable,
-            "-m",
-            traffic_batch_export_MODULE,
-            "--config",
-            str(self.source),
-            "--output",
-            str(dest),
-        ]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = export_config(self.source, "--output", dest)
         self.assertEqual(0, result.returncode, result.stderr)
         content = dest.read_text()
         self.assertNotIn("distribution_file", content)
@@ -370,7 +341,7 @@ class TrafficBatchExportTest(unittest.TestCase):
             [case.case_id for case in self.plan(self.source).cases],
             [case.case_id for case in self.plan(dest).cases],
         )
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = export_config(self.source, "--output", dest)
         self.assertNotEqual(0, result.returncode)
         self.assertIn("refusing to overwrite", result.stderr)
         self.assertEqual(content, dest.read_text())
@@ -457,42 +428,33 @@ class GroupedPrefillPlanningTest(unittest.TestCase):
         self.assertEqual(2, case["request_groups"][0]["count"])
 
 
-import json
-import tempfile
-from pathlib import Path
-
-from rtp_llm.test.perf_test.config_schema import parse_config
-from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
-from rtp_llm.test.perf_test.tests.support.fixtures import (
-    config_resolution_base_config,
-    fixture_engine,
-    fixture_execution,
-    fixture_model,
-)
-
-
-class prefill_prompt_WhitespaceTokenizer:
-
-    def encode(self, text):
-        return text.split()
-
-
-random_batch_export_MODULE = "rtp_llm.test.perf_test.prefill.export"
+def export_config(source, *arguments):
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "rtp_llm.test.perf_test.prefill.export",
+            "--config",
+            str(source),
+            *map(str, arguments),
+        ],
+        capture_output=True,
+        text=True,
+    )
 
 
 def random_batch_export_random_config():
-    return {
-        "schema_version": 1,
-        "model": fixture_model(
+    return fixture_config(
+        model=fixture_model(
             label="random-test",
             type="qwen_2",
             checkpoint="/models/test",
             tokenizer="/models/test",
         ),
-        "engine": fixture_engine(
+        engine=fixture_engine(
             max_seq_len=4097, max_batch_tokens=16384, concurrency_limit=4
         ),
-        "workload": {
+        workload={
             "kind": "cache_grid",
             "cache_alignment": 64,
             "commit_tail_tokens": 64,
@@ -507,11 +469,8 @@ def random_batch_export_random_config():
                 "batch_input_limits": {"4": 1024},
             },
         },
-        "execution": fixture_execution(),
-        "output": {"result_root": "perf_test_results"},
-        "regression": {},
-        "publish": {},
-    }
+        output={"result_root": "perf_test_results"},
+    )
 
 
 def random_batch_export_planned(source):
@@ -519,9 +478,6 @@ def random_batch_export_planned(source):
     return plan_prefill_cases(
         config.workload, config.engine, dp_size=config.model.topology.dp
     )
-
-
-traffic_batch_export_MODULE = "rtp_llm.test.perf_test.prefill.export"
 
 
 def traffic_batch_config():

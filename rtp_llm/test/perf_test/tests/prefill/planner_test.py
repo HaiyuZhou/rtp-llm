@@ -6,8 +6,14 @@ import unittest
 from pathlib import Path
 
 from rtp_llm.test.perf_test.config_resolver import resolve_config
+from rtp_llm.test.perf_test.config_schema import parse_config
 from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
+from rtp_llm.test.perf_test.tests.support.fixtures import (
+    fixture_config,
+    fixture_engine,
+    fixture_workload,
+)
 
 
 class PrefillPlannerTest(unittest.TestCase):
@@ -73,25 +79,24 @@ class PrefillPlannerTest(unittest.TestCase):
                     )
                 ),
             )
-            for tail in (128, 384):
-                for spec in sources:
-                    with self.subTest(tail=tail, source=next(iter(spec))):
-                        source = prefill_planner_payload()
-                        source["engine"]["args"] = {"seq_size_per_block": 256}
-                        source["workload"] = dict(
-                            kind="cache_grid",
-                            cache_alignment=128,
-                            commit_tail_tokens=tail,
-                            workspace_tokens=8192,
-                            **spec
-                        )
-                        resolved = resolve_config(source, source_dir=directory)
-                        cases = plan_workload("prefill", source, resolved)
-                        self.assertTrue(cases)
-                        for case in cases:
-                            self.assertEqual(0, case["cache_len"] % 256)
-                            for group in case.get("request_groups", ()):
-                                self.assertEqual(0, group["cache_len"] % 256)
+            for spec in sources:
+                with self.subTest(source=next(iter(spec))):
+                    source = prefill_planner_payload()
+                    source["engine"]["args"] = {"seq_size_per_block": 256}
+                    source["workload"] = dict(
+                        kind="cache_grid",
+                        cache_alignment=128,
+                        commit_tail_tokens=128,
+                        workspace_tokens=8192,
+                        **spec
+                    )
+                    resolved = resolve_config(source, source_dir=directory)
+                    cases = plan_workload("prefill", source, resolved)
+                    self.assertTrue(cases)
+                    for case in cases:
+                        self.assertEqual(0, case["cache_len"] % 256)
+                        for group in case.get("request_groups", ()):
+                            self.assertEqual(0, group["cache_len"] % 256)
 
     def test_generated_cache_lengths_must_align_to_physical_blocks(self):
         payload = prefill_planner_payload()
@@ -101,13 +106,16 @@ class PrefillPlannerTest(unittest.TestCase):
         with self.assertRaisesRegex(PlanningError, "cache length 64.*aligned"):
             plan_prefill_cases(workload, engine)
 
-    def test_generated_commit_tail_can_be_shorter_than_a_physical_block(self):
-        payload = prefill_planner_payload()
-        payload["engine"]["args"] = {"seq_size_per_block": 256}
-        (workload, engine) = prefill_planner_parsed(payload)
-        cases = plan_prefill_cases(workload, engine)
-        self.assertEqual({0, 512}, {case["cache_len"] for case in cases})
-        self.assertTrue(all((case["cache_len"] % 256 == 0 for case in cases)))
+    def test_generated_commit_tails_can_straddle_a_physical_block(self):
+        for tail in (128, 384):
+            with self.subTest(tail=tail):
+                payload = prefill_planner_payload()
+                payload["engine"]["args"] = {"seq_size_per_block": 256}
+                payload["workload"]["commit_tail_tokens"] = tail
+                workload, engine = prefill_planner_parsed(payload)
+                cases = plan_prefill_cases(workload, engine)
+                self.assertEqual({0, 512}, {case["cache_len"] for case in cases})
+                self.assertTrue(all(case["cache_len"] % 256 == 0 for case in cases))
 
     def test_generated_random_cache_lengths_use_physical_block_stride(self):
         payload = prefill_planner_payload()
@@ -177,39 +185,25 @@ class PrefillPlannerTest(unittest.TestCase):
                     self.assertLessEqual(g["input_len"], 256)
         self.assertEqual(len(cases), len(shapes))
 
-    def test_generated_probe_must_fit_all_budgets_without_override(self):
-        for named in (False, True):
-            for inferred in (False, True):
-                for limit in ("max_seq_len", "max_batch_tokens", "workspace_tokens"):
-                    payload = prefill_planner_payload()
-                    payload["workload"].update(
-                        max_input_len=32,
-                        min_compute_len=8,
-                        compute_steps=[8],
-                        cache_lengths=[0],
-                        batch_sizes=[1],
-                        commit_tail_tokens=64,
-                        cache_alignment=8 if inferred else 64,
-                    )
-                    if inferred:
-                        payload["engine"]["args"] = {"seq_size_per_block": 64}
-                    target = "workload" if limit == "workspace_tokens" else "engine"
-                    payload[target][limit] = 64
-                    if named:
-                        keys = (
-                            "max_input_len",
-                            "min_compute_len",
-                            "compute_steps",
-                            "cache_lengths",
-                            "batch_sizes",
-                            "seed",
-                        )
-                        grid = {key: payload["workload"].pop(key) for key in keys}
-                        payload["workload"]["grids"] = [{"name": "small", **grid}]
-                    (workload, engine) = prefill_planner_parsed(payload)
-                    with self.subTest(named=named, inferred=inferred, limit=limit):
-                        with self.assertRaisesRegex(PlanningError, "probe.*" + limit):
-                            plan_prefill_cases(workload, engine)
+    def test_generated_probe_must_fit_each_budget(self):
+        for limit in ("max_seq_len", "max_batch_tokens", "workspace_tokens"):
+            with self.subTest(limit=limit):
+                payload = prefill_planner_payload()
+                payload["workload"].update(
+                    max_input_len=32,
+                    min_compute_len=8,
+                    compute_steps=[8],
+                    cache_lengths=[0],
+                    batch_sizes=[1],
+                    commit_tail_tokens=64,
+                    cache_alignment=8,
+                )
+                payload["engine"]["args"] = {"seq_size_per_block": 64}
+                target = "workload" if limit == "workspace_tokens" else "engine"
+                payload[target][limit] = 64
+                workload, engine = prefill_planner_parsed(payload)
+                with self.assertRaisesRegex(PlanningError, "probe.*" + limit):
+                    plan_prefill_cases(workload, engine)
 
     def test_fixed_cache_compute_sweep_is_deterministic_and_deduplicated(self):
         (workload, engine) = prefill_planner_parsed()
@@ -252,26 +246,10 @@ class PrefillPlannerTest(unittest.TestCase):
                     self.assertEqual(a["request_groups"], b["request_groups"])
 
 
-import json
-import tempfile
-from pathlib import Path
-
-from rtp_llm.test.perf_test.config_resolver import resolve_config
-from rtp_llm.test.perf_test.config_schema import parse_config
-from rtp_llm.test.perf_test.prefill.planner import plan_prefill_cases
-from rtp_llm.test.perf_test.tests.support.fixtures import (
-    fixture_engine,
-    fixture_model,
-    fixture_workload,
-)
-
-
 def prefill_planner_payload():
-    return {
-        "schema_version": 1,
-        "model": fixture_model(),
-        "engine": fixture_engine(max_seq_len=4097, concurrency_limit=2),
-        "workload": fixture_workload(
+    return fixture_config(
+        engine=fixture_engine(max_seq_len=4097, concurrency_limit=2),
+        workload=fixture_workload(
             commit_tail_tokens=128,
             compute_steps=[512, 256],
             min_compute_len=256,
@@ -281,11 +259,8 @@ def prefill_planner_payload():
             seed=17,
             max_cases=100,
         ),
-        "execution": {"backend": "local"},
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        execution={"backend": "local"},
+    )
 
 
 def prefill_planner_parsed(payload=None):

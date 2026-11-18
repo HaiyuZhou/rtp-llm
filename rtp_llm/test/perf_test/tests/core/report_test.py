@@ -20,7 +20,7 @@ from rtp_llm.test.perf_test.multi_node.analyzer.trace_analyze import analyze_tra
 from rtp_llm.test.perf_test.prefill.report import generate_prefill_report
 from rtp_llm.test.perf_test.tests.support.fixtures import (
     PERF_TEST_ROOT,
-    fixture_engine,
+    fixture_config,
     fixture_execution,
     fixture_model,
     fixture_workload,
@@ -30,6 +30,15 @@ from rtp_llm.test.perf_test.tests.support.reports import (
     decode_report_exact_cases,
     prefill_report_case_bytes,
 )
+
+
+def kernel_trace(*events):
+    return {
+        "traceEvents": [
+            {"cat": "kernel", "ph": "X", "name": name, "ts": start, "dur": duration}
+            for name, start, duration in events
+        ]
+    }
 
 
 class PrefillReportTest(unittest.TestCase):
@@ -167,15 +176,11 @@ class TraceReportTest(unittest.TestCase):
         format="chrome_trace",
         tp=1,
     ):
-        source = {
-            "schema_version": 1,
-            "regression": {},
-            "publish": {},
-            "model": fixture_model(topology={"tp": tp, "dp": 1, "pp": 1, "ep": tp}),
-            "engine": fixture_engine(),
-            "execution": fixture_execution(devices=list(range(tp))),
-            "output": {"result_root": str(root.parent)},
-            "workload": (
+        source = fixture_config(
+            model=fixture_model(topology={"tp": tp, "dp": 1, "pp": 1, "ep": tp}),
+            execution=fixture_execution(devices=list(range(tp))),
+            output={"result_root": str(root.parent)},
+            workload=(
                 fixture_workload(
                     cache_lengths=[0], min_compute_len=128, max_input_len=128
                 )
@@ -188,7 +193,7 @@ class TraceReportTest(unittest.TestCase):
                     "profiling": {"enabled": True, "steps": 2},
                 }
             ),
-        }
+        )
         plan, _ = plan_from_source(
             source, source_dir=root.parent, result_directory=str(root)
         )
@@ -198,33 +203,7 @@ class TraceReportTest(unittest.TestCase):
         trace = root / "traces" / session / case_id / "trace_wr0_1.json"
         trace.parent.mkdir(parents=True)
         trace.write_text(
-            json.dumps(
-                {
-                    "traceEvents": [
-                        {
-                            "cat": "kernel",
-                            "ph": "X",
-                            "name": "gemm",
-                            "ts": 0,
-                            "dur": 10,
-                        },
-                        {
-                            "cat": "kernel",
-                            "ph": "X",
-                            "name": "gemm",
-                            "ts": 5,
-                            "dur": 20,
-                        },
-                        {
-                            "cat": "kernel",
-                            "ph": "X",
-                            "name": "rare",
-                            "ts": 30,
-                            "dur": 2,
-                        },
-                    ]
-                }
-            )
+            json.dumps(kernel_trace(("gemm", 0, 10), ("gemm", 5, 20), ("rare", 30, 2)))
         )
         manifest = {
             "schema_version": 2,
@@ -396,14 +375,9 @@ class TraceReportTest(unittest.TestCase):
                 self.assertIn(field, report["skipped"][0]["reason"])
 
     def test_module_totals_include_rare_kernels_and_use_actual_event_counts(self):
-        trace = {
-            "traceEvents": [
-                {"cat": "kernel", "ph": "X", "name": "gemm_a", "ts": 0, "dur": 10},
-                {"cat": "kernel", "ph": "X", "name": "gemm_a", "ts": 10, "dur": 10},
-                {"cat": "kernel", "ph": "X", "name": "gemm_b", "ts": 20, "dur": 7},
-                {"cat": "kernel", "ph": "X", "name": "other", "ts": 27, "dur": 3},
-            ]
-        }
+        trace = kernel_trace(
+            ("gemm_a", 0, 10), ("gemm_a", 10, 10), ("gemm_b", 20, 7), ("other", 27, 3)
+        )
         result = analyze_trace(
             trace, min_occurrences=2, module_config={"gemm": "gemm_"}
         )
@@ -497,11 +471,7 @@ class TraceReportTest(unittest.TestCase):
         )
 
         self.assertEqual(41, calc_gemm_mem_io(2, 3, 5, 1, 2))
-        trace = {
-            "traceEvents": [
-                {"cat": "kernel", "ph": "X", "name": "gemm", "ts": 0, "dur": 10}
-            ]
-        }
+        trace = kernel_trace(("gemm", 0, 10))
         config = {
             "gemm": ModuleConf(name_pattern="gemm", num_flop_calc_func=lambda setup: -1)
         }
@@ -535,13 +505,7 @@ class TraceReportTest(unittest.TestCase):
         self.assertIn("heterogeneous", setup.estimation_error)
 
     def test_kernel_filter_preserves_raw_span_and_rejects_nonfinite_timing(self):
-        trace = {
-            "traceEvents": [
-                {"cat": "kernel", "ph": "X", "name": "long", "ts": 0, "dur": 100},
-                {"cat": "kernel", "ph": "X", "name": "short", "ts": 1, "dur": 2},
-                {"cat": "kernel", "ph": "X", "name": "short", "ts": 5, "dur": 2},
-            ]
-        }
+        trace = kernel_trace(("long", 0, 100), ("short", 1, 2), ("short", 5, 2))
         stats = analyze_trace(trace, min_occurrences=2)
         self.assertEqual(104, stats["kernel_time_us"])
         self.assertEqual(100, stats["kernel_span_us"])

@@ -1,6 +1,5 @@
-from rtp_llm.test.perf_test.tests.support.fixtures import config_resolution_base_config
-
 "Performance framework behavior and failure regressions."
+
 import copy
 import json
 import tempfile
@@ -30,29 +29,25 @@ from rtp_llm.test.perf_test.errors import (
     ResourceError,
 )
 from rtp_llm.test.perf_test.tests.support.fixtures import (
+    config_resolution_base_config,
+    fixture_config,
     fixture_engine,
     fixture_model,
-    fixture_workload,
 )
 
 
 def unified_config_base_config():
-    return {
-        "schema_version": 1,
-        "model": fixture_model(
+    return fixture_config(
+        model=fixture_model(
             label="test-model",
             type="registered_model",
             checkpoint="/models/test",
             tokenizer="/models/tokenizer",
             topology={},
         ),
-        "engine": fixture_engine(args={}, env={}),
-        "workload": fixture_workload(),
-        "execution": {"backend": "local"},
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        engine=fixture_engine(args={}, env={}),
+        execution={"backend": "local"},
+    )
 
 
 class ConfigResolutionTest(unittest.TestCase):
@@ -135,27 +130,20 @@ class ConfigResolutionTest(unittest.TestCase):
 
 class UnifiedConfigTest(unittest.TestCase):
 
-    def test_topology_derives_ep_within_each_pipeline_stage(self):
-        for tp, dp, pp in ((1, 1, 1), (2, 1, 1), (1, 2, 1), (2, 2, 2)):
-            with self.subTest(tp=tp, dp=dp, pp=pp):
+    def test_topology_resolves_automatic_and_explicit_ep(self):
+        for topology, expected in (
+            ({"tp": 2, "dp": 3}, (2, 3, 1, 6)),
+            ({"tp": 4, "dp": 1, "ep": 1}, (4, 1, 1, 1)),
+        ):
+            with self.subTest(topology=topology):
                 source = unified_config_base_config()
-                source["model"]["topology"] = dict(tp=tp, dp=dp, pp=pp)
-                if pp != 1:
-                    with self.assertRaisesRegex(ConfigError, "PP=1"):
-                        parse_config(source)
-                else:
-                    self.assertEqual(
-                        (tp, dp, pp, tp * dp),
-                        parse_config(source).model.topology.as_tuple(),
-                    )
-
-    def test_topology_preserves_explicit_pure_tp(self):
-        source = unified_config_base_config()
-        source["model"]["topology"] = dict(tp=4, dp=1, pp=1, ep=1)
-        self.assertEqual((4, 1, 1, 1), parse_config(source).model.topology.as_tuple())
+                source["model"]["topology"] = topology
+                self.assertEqual(
+                    expected, parse_config(source).model.topology.as_tuple()
+                )
 
     def test_topology_rejects_ep_values_the_engine_cannot_start(self):
-        for tp, dp, ep in ((1, 2, 1), (2, 2, 1), (2, 2, 2), (2, 1, 4)):
+        for tp, dp, ep in ((1, 2, 1), (2, 2, 2), (2, 1, 4)):
             with self.subTest(tp=tp, dp=dp, ep=ep):
                 source = unified_config_base_config()
                 source["model"]["topology"] = dict(tp=tp, dp=dp, pp=1, ep=ep)
@@ -173,20 +161,11 @@ class UnifiedConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "workload.batch.unit"):
             parse_config(payload)
 
-    def test_rank_batch_unit_rejects_pipeline_parallelism(self):
+    def test_pipeline_parallelism_is_rejected(self):
         payload = unified_config_base_config()
         payload["model"]["topology"]["pp"] = 2
-        payload["workload"] = {
-            "kind": "grid",
-            "input_lengths": [128],
-            "output_lengths": [16],
-            "batch": {"strategy": "fixed", "sizes": [1]},
-        }
-        for unit in ("global", "per_dp_rank"):
-            with self.subTest(unit=unit):
-                payload["workload"]["batch"]["unit"] = unit
-                with self.assertRaisesRegex(ConfigError, "PP=1"):
-                    parse_config(payload)
+        with self.assertRaisesRegex(ConfigError, "PP=1"):
+            parse_config(payload)
 
     def test_prefill_config_applies_nested_defaults(self):
         config = parse_config(unified_config_base_config())

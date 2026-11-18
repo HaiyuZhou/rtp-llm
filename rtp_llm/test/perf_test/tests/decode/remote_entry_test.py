@@ -12,12 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from rtp_llm.test.perf_test.tests.support.fixtures import (
-    PERF_TEST_ROOT,
-    fixture_engine,
-    fixture_execution,
-    fixture_model,
-)
+from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT, fixture_config
 
 
 class DecodeRemoteTest(unittest.TestCase):
@@ -33,11 +28,8 @@ class DecodeRemoteTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.config = self.root / "config.json"
         self.outputs = self.root / "outputs"
-        self.source = {
-            "schema_version": 1,
-            "model": fixture_model(),
-            "engine": fixture_engine(),
-            "workload": {
+        self.source = fixture_config(
+            workload={
                 "kind": "grid",
                 "input_lengths": [128, 256],
                 "output_lengths": [32],
@@ -46,11 +38,8 @@ class DecodeRemoteTest(unittest.TestCase):
                 "warmup_runs": 0,
                 "generate_config": {"top_k": 1},
             },
-            "execution": fixture_execution(),
-            "output": {"result_root": str(self.root / "must-not-be-used")},
-            "regression": {},
-            "publish": {},
-        }
+            output={"result_root": str(self.root / "must-not-be-used")},
+        )
         self.plans = []
         self.exit_code = 0
 

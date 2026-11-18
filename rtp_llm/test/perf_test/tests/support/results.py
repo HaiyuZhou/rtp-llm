@@ -8,31 +8,41 @@ from rtp_llm.test.perf_test.decode.model import (
 )
 from rtp_llm.test.perf_test.plan import build_execution_plan
 from rtp_llm.test.perf_test.tests.support.fixtures import (
+    fixture_config,
     fixture_engine,
+    fixture_envelope,
     fixture_execution,
     fixture_model,
     fixture_workload,
 )
 
 
+def default_executor_request_round(input_lengths, output_length, *, latency=None):
+    return tuple(
+        {
+            "request_index": index,
+            "success": True,
+            "input_length": input_length,
+            "output_length": output_length,
+            "latency_ms": dict(
+                latency
+                or {
+                    "wait": 1.0,
+                    "prefill": 2.0,
+                    "decode": 15.0,
+                    "tpot": 1.0,
+                    "total": 17.0,
+                }
+            ),
+        }
+        for index, input_length in enumerate(input_lengths)
+    )
+
+
 def result_envelope_base_result(mode):
-    return {
-        "schema_version": 2,
-        "run_id": "run-001",
-        "mode": mode,
-        "backend": "local",
-        "status": "completed",
-        "config_fingerprint": "a" * 64,
-        "workload_fingerprint": "b" * 64,
-        "model": {
-            "label": "test-model",
-            "type": "registered_model",
-            "checkpoint": "/models/test",
-            "topology": {"tp": 1, "dp": 1, "pp": 1, "ep": 1},
-        },
-        "summary": {"planned_cases": 1, "successful_cases": 1, "failed_cases": 0},
-        "cases": [],
-    }
+    return fixture_envelope(
+        mode, [], summary={"planned_cases": 1, "successful_cases": 1, "failed_cases": 0}
+    )
 
 
 def result_envelope_prefill_result():
@@ -62,6 +72,7 @@ def result_envelope_prefill_result():
 
 
 def result_envelope_decode_result():
+    latency = {"wait": 1.0, "prefill": 2.0, "decode": 8.0, "tpot": 0.5, "total": 11.0}
     value = result_envelope_base_result("decode")
     value["summary"]["profiling_failed_cases"] = 0
     value["cases"] = [
@@ -95,35 +106,18 @@ def result_envelope_decode_result():
                 "topology": {"tp": 1, "dp": 2, "pp": 1, "ep": 1},
                 "successful_requests": 4,
                 "failed_requests": 0,
-                "latency_ms": {
-                    "wait": 1.0,
-                    "prefill": 2.0,
-                    "decode": 8.0,
-                    "tpot": 0.5,
-                    "total": 11.0,
-                },
+                "latency_ms": dict(latency),
                 "throughput_tokens_per_second": 8000.0,
                 "measurements": [
                     {
                         "run": 0,
                         "throughput_tokens_per_second": 8000.0,
                         "worker_allocations": [],
-                        "requests": [
-                            {
-                                "request_index": index,
-                                "success": True,
-                                "input_length": 128,
-                                "output_length": 16,
-                                "latency_ms": {
-                                    "wait": 1.0,
-                                    "prefill": 2.0,
-                                    "decode": 8.0,
-                                    "tpot": 0.5,
-                                    "total": 11.0,
-                                },
-                            }
-                            for index in range(4)
-                        ],
+                        "requests": list(
+                            default_executor_request_round(
+                                (128,) * 4, 16, latency=latency
+                            )
+                        ),
                     }
                 ],
                 "distribution": None,
@@ -203,36 +197,27 @@ def decode_metrics_measurements(second_success=True):
 
 
 def decode_metrics_source():
-    return {
-        "schema_version": 1,
-        "model": fixture_model(topology=decode_metrics_TOPOLOGY),
-        "engine": fixture_engine(concurrency_limit=2),
-        "workload": {
+    return fixture_config(
+        model=fixture_model(topology=decode_metrics_TOPOLOGY),
+        engine=fixture_engine(concurrency_limit=2),
+        workload={
             "kind": "grid",
             "input_lengths": [64],
             "output_lengths": [4],
             "batch": {"strategy": "fixed", "sizes": [2]},
         },
-        "execution": fixture_execution(devices=[0, 1, 2, 3]),
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        execution=fixture_execution(devices=[0, 1, 2, 3]),
+    )
 
 
 def prefill_adapter_finalize_plan(root):
-    config = {
-        "schema_version": 1,
-        "model": fixture_model(label="model"),
-        "engine": fixture_engine(
+    config = fixture_config(
+        model=fixture_model(label="model"),
+        engine=fixture_engine(
             max_seq_len=1024, max_batch_tokens=1024, concurrency_limit=1
         ),
-        "workload": fixture_workload(max_input_len=512, cache_lengths=[0]),
-        "execution": fixture_execution(),
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        workload=fixture_workload(max_input_len=512, cache_lengths=[0]),
+    )
     return build_execution_plan(
         mode="prefill",
         action="run",

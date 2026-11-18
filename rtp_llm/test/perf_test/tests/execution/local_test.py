@@ -40,10 +40,17 @@ from rtp_llm.test.perf_test.tests.support.execution import (
 
 class DefaultExecutorTest(unittest.TestCase):
 
+    def _artifact_bytes(self, root):
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file() and path.name != ".writer.lock"
+        }
+
     def test_signal_interrupt_keeps_signal_and_closes_real_engine_session(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "run"
-            plan = replace(self._resume_plan(root), action="run")
+            plan = self._run_plan(root)
             handle = engine_session_FakeHandle()
             session = EngineSession(
                 launcher=lambda: handle,
@@ -79,11 +86,7 @@ class DefaultExecutorTest(unittest.TestCase):
                     value = json.loads(checkpoint.read_text())
                     value["workload_fingerprint"] = "invalid"
                     checkpoint.write_text(json.dumps(value))
-                before = {
-                    str(p.relative_to(root)): p.read_bytes()
-                    for p in root.rglob("*")
-                    if p.is_file() and p.name != ".writer.lock"
-                }
+                before = self._artifact_bytes(root)
                 factory = Mock(return_value=default_executor_Session())
                 tokenizer = Mock(return_value=default_executor_Tokenizer())
                 executor = UnifiedLocalExecutor(
@@ -95,11 +98,7 @@ class DefaultExecutorTest(unittest.TestCase):
                 tokenizer.assert_not_called()
                 self.assertEqual(
                     before,
-                    {
-                        str(p.relative_to(root)): p.read_bytes()
-                        for p in root.rglob("*")
-                        if p.is_file() and p.name != ".writer.lock"
-                    },
+                    self._artifact_bytes(root),
                 )
 
     def test_preflight_probe_and_interrupt_leave_terminal_state_and_close_engine(self):
@@ -112,7 +111,7 @@ class DefaultExecutorTest(unittest.TestCase):
                 stage=stage, state=state
             ), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory) / "run"
-                plan = replace(self._resume_plan(root), action="run")
+                plan = self._run_plan(root)
                 session = default_executor_Session()
                 executor = UnifiedLocalExecutor(session_factory=lambda _: session)
                 runner = Mock()
@@ -136,7 +135,7 @@ class DefaultExecutorTest(unittest.TestCase):
     def test_report_failure_leaves_failed_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "run"
-            plan = replace(self._resume_plan(root), action="run")
+            plan = self._run_plan(root)
             session = default_executor_Session()
             executor = UnifiedLocalExecutor(
                 session_factory=lambda _: session,
@@ -153,7 +152,7 @@ class DefaultExecutorTest(unittest.TestCase):
             )
             self.assertEqual((1, 1), (session.entered, session.exited))
 
-    def _resume_plan(self, root):
+    def _run_plan(self, root, *, run_id="resume", contract=True):
         source = default_executor_source(root.parent)
         plan = build_execution_plan(
             mode="prefill",
@@ -161,7 +160,11 @@ class DefaultExecutorTest(unittest.TestCase):
             resolved=resolve_config(source),
             cases=[
                 {
-                    "measurement_contract": "concurrent_batch_v1",
+                    **(
+                        {"measurement_contract": "concurrent_batch_v1"}
+                        if contract
+                        else {}
+                    ),
                     "input_len": 16,
                     "cache_len": 0,
                     "compute_len": 16,
@@ -174,9 +177,12 @@ class DefaultExecutorTest(unittest.TestCase):
             result_directory=str(root),
         )
         initialize_run_directory(
-            root, source_config=source, plan=plan, run_id="resume", code_version="test"
+            root, source_config=source, plan=plan, run_id=run_id, code_version="test"
         )
-        return replace(plan, action="resume")
+        return plan
+
+    def _resume_plan(self, root):
+        return replace(self._run_plan(root), action="resume")
 
     def test_resume_lock_rejection_preserves_artifacts_and_does_not_start_engine(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -188,20 +194,12 @@ class DefaultExecutorTest(unittest.TestCase):
                 tokenizer_loader=lambda _plan: default_executor_Tokenizer(),
             )
             with RunDirectoryLock(root, action="active-profile"):
-                before = {
-                    str(path.relative_to(root)): path.read_bytes()
-                    for path in root.rglob("*")
-                    if path.is_file() and path.name != ".writer.lock"
-                }
+                before = self._artifact_bytes(root)
                 with self.assertRaises(ResourceError):
                     executor(plan)
                 self.assertEqual(
                     before,
-                    {
-                        str(path.relative_to(root)): path.read_bytes()
-                        for path in root.rglob("*")
-                        if path.is_file() and path.name != ".writer.lock"
-                    },
+                    self._artifact_bytes(root),
                 )
                 self.assertEqual(0, session.entered)
 
@@ -283,31 +281,7 @@ class DefaultExecutorTest(unittest.TestCase):
     def test_prefill_run_uses_one_session_and_finalizes_all_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "run"
-            source = default_executor_source(root.parent)
-            plan = build_execution_plan(
-                mode="prefill",
-                action="run",
-                resolved=resolve_config(source),
-                cases=[
-                    {
-                        "input_len": 16,
-                        "cache_len": 0,
-                        "compute_len": 16,
-                        "batch_size": 1,
-                        "measure_runs": 1,
-                        "seed": 1,
-                        "prefix_policy": "shared_seed",
-                    }
-                ],
-                result_directory=str(root),
-            )
-            initialize_run_directory(
-                root,
-                source_config=source,
-                plan=plan,
-                run_id="run-local",
-                code_version="test",
-            )
+            plan = self._run_plan(root, run_id="run-local", contract=False)
             session = default_executor_Session()
             executor = UnifiedLocalExecutor(
                 session_factory=Mock(return_value=session),
@@ -333,31 +307,7 @@ class DefaultExecutorTest(unittest.TestCase):
     def test_engine_failure_preserves_typed_outcome_without_finalizing_cases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "run"
-            source = default_executor_source(root.parent)
-            plan = build_execution_plan(
-                mode="prefill",
-                action="run",
-                resolved=resolve_config(source),
-                cases=[
-                    {
-                        "input_len": 16,
-                        "cache_len": 0,
-                        "compute_len": 16,
-                        "batch_size": 1,
-                        "measure_runs": 1,
-                        "seed": 1,
-                        "prefix_policy": "shared_seed",
-                    }
-                ],
-                result_directory=str(root),
-            )
-            initialize_run_directory(
-                root,
-                source_config=source,
-                plan=plan,
-                run_id="run-engine-failure",
-                code_version="test",
-            )
+            plan = self._run_plan(root, run_id="run-engine-failure", contract=False)
             executor = UnifiedLocalExecutor(
                 session_factory=Mock(return_value=default_executor_FailingSession()),
                 tokenizer_loader=lambda _plan: default_executor_Tokenizer(),

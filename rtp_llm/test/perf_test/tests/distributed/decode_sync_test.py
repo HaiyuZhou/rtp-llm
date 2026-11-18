@@ -15,20 +15,19 @@ from rtp_llm.test.perf_test.errors import PlanningError
 from rtp_llm.test.perf_test.execution.distributed.decode import execute_master_decode
 from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.tests.support.fixtures import (
-    fixture_engine,
+    fixture_config,
     fixture_execution,
     fixture_model,
 )
+from rtp_llm.test.perf_test.tests.support.results import default_executor_request_round
 
 
 def decode_multi_node_decode_source(*, inputs=(128,), outputs=(16, 64), batch=None):
-    return {
-        "schema_version": 1,
-        "model": fixture_model(
+    return fixture_config(
+        model=fixture_model(
             label="external-decode", topology={"tp": 1, "dp": 2, "pp": 1, "ep": 2}
         ),
-        "engine": fixture_engine(),
-        "workload": {
+        workload={
             "kind": "grid",
             "input_lengths": list(inputs),
             "output_lengths": list(outputs),
@@ -36,11 +35,8 @@ def decode_multi_node_decode_source(*, inputs=(128,), outputs=(16, 64), batch=No
             "measure_runs": 1,
             "warmup_runs": 0,
         },
-        "execution": fixture_execution(devices=[0, 1]),
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        execution=fixture_execution(devices=[0, 1]),
+    )
 
 
 def decode_multi_node_write_decode_config(root, *, dp=2):
@@ -91,22 +87,6 @@ class DistributedRuntimeTest(unittest.TestCase):
             silent_peer.close()
             failed_peer.close()
 
-    def test_rank_batch_plan_rejects_pipeline_parallelism(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = decode_multi_node_decode_source(
-                batch={"strategy": "fixed", "sizes": [1], "unit": "per_dp_rank"}
-            )
-            source["model"]["topology"]["pp"] = 2
-            path = root / "config.json"
-            path.write_text(json.dumps(source), encoding="utf-8")
-            with self.assertRaisesRegex(ConfigError, "PP=1"):
-                plan_from_source(
-                    json.loads(Path(path).read_text()),
-                    source_dir=Path(path).parent,
-                    result_directory=str(root / "run"),
-                )
-
     def test_decode_worker_rejects_rank_outside_dp_layout_before_connecting(self):
         from rtp_llm.test.perf_test.execution.distributed.decode_sync import (
             serve_decode_worker,
@@ -143,23 +123,16 @@ class DistributedRuntimeTest(unittest.TestCase):
 
             def run_round(self, *, input_lengths, output_length, generate_config):
                 self.rounds.append(tuple(input_lengths))
-                return tuple(
-                    (
-                        {
-                            "request_index": index,
-                            "success": True,
-                            "input_length": length,
-                            "output_length": output_length,
-                            "latency_ms": {
-                                "wait": 0.0,
-                                "prefill": 1.0,
-                                "decode": 4.0,
-                                "tpot": 1.0,
-                                "total": 5.0,
-                            },
-                        }
-                        for (index, length) in enumerate(input_lengths)
-                    )
+                return default_executor_request_round(
+                    input_lengths,
+                    output_length,
+                    latency={
+                        "wait": 0.0,
+                        "prefill": 1.0,
+                        "decode": 4.0,
+                        "tpot": 1.0,
+                        "total": 5.0,
+                    },
                 )
 
         master_local = LocalTransport()

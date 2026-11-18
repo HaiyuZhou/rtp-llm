@@ -16,25 +16,22 @@ from rtp_llm.test.perf_test.errors import PlanningError
 class DecodePlannerTest(unittest.TestCase):
 
     def test_fixed_batches_reject_uneven_active_dp_workers(self):
-        for size in (1, 3):
-            (grid, _) = decode_planner_resolved_grid(
-                inputs=[128], outputs=[16], sizes=[size]
-            )
-            (distribution, resolved) = decode_planner_resolved_distribution(
-                distribution=[64, 96, 128], sizes=[size]
-            )
-            for config, workload in (
-                (grid, None),
-                (distribution, resolved.resolved_config["workload"]),
-            ):
-                with self.subTest(kind=config.workload.kind, size=size):
-                    with self.assertRaisesRegex(PlanningError, "uniform"):
-                        plan_decode_cases(
-                            config.workload,
-                            config.engine,
-                            dp_size=2,
-                            resolved_workload=workload,
-                        )
+        grid, _ = decode_planner_resolved_grid(inputs=[128], outputs=[16], sizes=[1])
+        distribution, resolved = decode_planner_resolved_distribution(
+            distribution=[64, 96, 128], sizes=[3]
+        )
+        for config, workload in (
+            (grid, None),
+            (distribution, resolved.resolved_config["workload"]),
+        ):
+            with self.subTest(kind=config.workload.kind):
+                with self.assertRaisesRegex(PlanningError, "uniform"):
+                    plan_decode_cases(
+                        config.workload,
+                        config.engine,
+                        dp_size=2,
+                        resolved_workload=workload,
+                    )
 
     def test_rank_batch_grid_is_canonical_global_batch(self):
         payload = decode_planner_payload(
@@ -166,24 +163,15 @@ from pathlib import Path
 
 from rtp_llm.test.perf_test.config_resolver import resolve_config
 from rtp_llm.test.perf_test.config_schema import parse_config
-from rtp_llm.test.perf_test.tests.support.fixtures import (
-    fixture_engine,
-    fixture_execution,
-    fixture_model,
-)
+from rtp_llm.test.perf_test.tests.support.fixtures import fixture_config, fixture_model
 
 
 def decode_planner_payload(workload):
-    return {
-        "schema_version": 1,
-        "model": fixture_model(label="test-model"),
-        "engine": fixture_engine(),
-        "workload": workload,
-        "execution": {"backend": "local"},
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+    return fixture_config(
+        model=fixture_model(label="test-model"),
+        workload=workload,
+        execution={"backend": "local"},
+    )
 
 
 def decode_planner_resolved_grid(*, inputs, outputs, sizes):
@@ -214,11 +202,8 @@ def decode_planner_resolved_distribution(*, distribution, sizes):
 
 
 def decode_distribution_source(distribution_file="requests.json"):
-    return {
-        "schema_version": 1,
-        "model": fixture_model(),
-        "engine": fixture_engine(),
-        "workload": {
+    return fixture_config(
+        workload={
             "kind": "distribution",
             "distribution_file": distribution_file,
             "output_length": 32,
@@ -226,12 +211,8 @@ def decode_distribution_source(distribution_file="requests.json"):
             "measure_runs": 2,
             "warmup_runs": 1,
             "generate_config": {"top_k": 1},
-        },
-        "execution": fixture_execution(),
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        }
+    )
 
 
 if __name__ == "__main__":

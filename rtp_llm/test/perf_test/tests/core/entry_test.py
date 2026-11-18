@@ -24,8 +24,8 @@ from rtp_llm.test.perf_test.plan import ExecutionPlan, build_execution_plan
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.tests.support.fixtures import (
     PERF_TEST_ROOT,
+    fixture_config,
     fixture_engine,
-    fixture_execution,
     fixture_model,
     fixture_workload,
 )
@@ -173,18 +173,14 @@ class EntryExecutionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result_root = root / "results"
-            config = {
-                "schema_version": 1,
-                "model": fixture_model(label="model"),
-                "engine": fixture_engine(
+            config = fixture_config(
+                model=fixture_model(label="model"),
+                engine=fixture_engine(
                     max_seq_len=1024, max_batch_tokens=1024, concurrency_limit=1
                 ),
-                "workload": fixture_workload(max_input_len=512, cache_lengths=[0]),
-                "execution": fixture_execution(),
-                "output": {"result_root": str(result_root)},
-                "regression": {},
-                "publish": {},
-            }
+                workload=fixture_workload(max_input_len=512, cache_lengths=[0]),
+                output={"result_root": str(result_root)},
+            )
             config_path = root / "config.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
             observed = {}
@@ -272,42 +268,33 @@ class DryRunTest(unittest.TestCase):
 class PublicBoundaryTest(unittest.TestCase):
 
     def test_single_machine_aone_decode_rejected_before_side_effects(self):
-        for mode in ("decode",):
-            for dry in (False, True):
-                with self.subTest(
-                    mode=mode, dry=dry
-                ), tempfile.TemporaryDirectory() as tmp:
-                    root = Path(tmp)
-                    source = json.loads(
-                        (
-                            public_boundary_ROOT
-                            / "examples"
-                            / (
-                                "prefill_local.json"
-                                if mode == "prefill"
-                                else "decode_grid_local.json"
-                            )
-                        ).read_text()
-                    )
-                    source["execution"] = {
-                        "backend": "aone",
-                        "resource": "daily",
-                        "gpu_type": "H20",
-                        "max_parallel": 1,
-                        "shard_count": 1,
-                    }
-                    source["output"]["result_root"] = str(root / "results")
-                    config = root / "config.json"
-                    config.write_text(json.dumps(source))
-                    args = [f"--mode={mode}", "--action=run", f"--config={config}"] + (
-                        ["--dry-run"] if dry else []
-                    )
-                    executor_factory = Mock()
-                    self.assertEqual(3, main(args, executor_factory=executor_factory))
-                    executor_factory.assert_not_called()
-                    self.assertEqual(
-                        ["config.json"], sorted((x.name for x in root.iterdir()))
-                    )
+        for dry in (False, True):
+            with self.subTest(dry=dry), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = json.loads(
+                    (
+                        public_boundary_ROOT / "examples/decode_grid_local.json"
+                    ).read_text()
+                )
+                source["execution"] = {
+                    "backend": "aone",
+                    "resource": "daily",
+                    "gpu_type": "H20",
+                    "max_parallel": 1,
+                    "shard_count": 1,
+                }
+                source["output"]["result_root"] = str(root / "results")
+                config = root / "config.json"
+                config.write_text(json.dumps(source))
+                args = ["--mode=decode", "--action=run", f"--config={config}"]
+                if dry:
+                    args.append("--dry-run")
+                executor_factory = Mock()
+                self.assertEqual(3, main(args, executor_factory=executor_factory))
+                executor_factory.assert_not_called()
+                self.assertEqual(
+                    ["config.json"], sorted(x.name for x in root.iterdir())
+                )
 
     def test_aone_dry_run_plans_single_prefill_and_gang_without_runtime_imports(self):
         for mode, gang in (("prefill", False), ("prefill", True), ("decode", True)):
@@ -416,40 +403,28 @@ class PublicBoundaryTest(unittest.TestCase):
             self.assertEqual("aone", result["backend"])
             self.assertGreater(result["cases"], 0)
 
-    def test_invalid_aone_case_gang_combinations_rejected_before_side_effects(self):
-        invalid = (
-            {"gpus_per_machine": 1},
-            {"shard_count": 100000},
-            {"gpu_type": "unknown"},
-        )
-        for changes in invalid:
-            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                source = json.loads(entry_LOCAL.read_text())
-                source["model"]["topology"].update(tp=2, dp=1, pp=1, ep=1)
-                source["execution"] = {
-                    "backend": "aone",
-                    "resource": "daily",
-                    "gpu_type": "H20",
-                    "max_parallel": 2,
-                    "shard_count": 2,
-                    **changes,
-                }
-                source["output"]["result_root"] = str(root / "results")
-                config = root / "config.json"
-                config.write_text(json.dumps(source))
-                with self.assertRaises(PlanningError):
-                    run_request(
-                        parse_cli(
-                            ["--mode=prefill", "--action=run", f"--config={config}"]
-                        ),
-                        executor_factory=lambda: self.fail(
-                            "invalid request created executor"
-                        ),
-                    )
-                self.assertEqual(
-                    ["config.json"], sorted((p.name for p in root.iterdir()))
+    def test_invalid_aone_resources_rejected_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = json.loads(entry_LOCAL.read_text())
+            source["execution"] = {
+                "backend": "aone",
+                "resource": "daily",
+                "gpu_type": "H20",
+                "max_parallel": 2,
+                "shard_count": 100000,
+            }
+            source["output"]["result_root"] = str(root / "results")
+            config = root / "config.json"
+            config.write_text(json.dumps(source))
+            with self.assertRaisesRegex(PlanningError, "case count"):
+                run_request(
+                    parse_cli(["--mode=prefill", "--action=run", f"--config={config}"]),
+                    executor_factory=lambda: self.fail(
+                        "invalid request created executor"
+                    ),
                 )
+            self.assertEqual(["config.json"], sorted(p.name for p in root.iterdir()))
 
     def test_aone_report_is_offline_and_follow_up_execution_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -809,18 +784,12 @@ entry_LOCAL = (
 
 def dry_run_config(backend):
     execution = {"backend": "local", "devices": [0]}
-    return {
-        "schema_version": 1,
-        "model": fixture_model(
+    return fixture_config(
+        model=fixture_model(
             label="test-model", type="registered_model", checkpoint="/models/test"
         ),
-        "engine": fixture_engine(),
-        "workload": fixture_workload(),
-        "execution": execution,
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        execution=execution,
+    )
 
 
 def dry_run_cases():

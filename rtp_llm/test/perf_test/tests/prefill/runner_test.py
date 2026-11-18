@@ -30,6 +30,7 @@ from rtp_llm.test.perf_test.tests.support.prefill import (
     prefill_runner_Client,
     prefill_runner_grouped_case,
     prefill_runner_response,
+    prefill_runner_run,
     prefill_runner_Tokenizer,
 )
 
@@ -425,13 +426,11 @@ class PrefillWarmupTest(unittest.TestCase):
                             wait_time_ms=9999 if phase == "warmup" else 2,
                         )
 
-                result = PrefillRunner(
+                result = prefill_runner_run(
                     Client(),
-                    prefill_runner_Tokenizer(),
-                    commit_tail_tokens=4,
-                    max_batch_tokens=4096,
+                    prefill_runner_case(cache_len=cache_len, batch_size=2),
                     monotonic=iter([0.0, 0.2, 1.0, 1.5]).__next__,
-                ).run_case(prefill_runner_case(cache_len=cache_len, batch_size=2))
+                )
                 self.assertEqual("ok", result["status"], result)
                 warmup = [r for r in requests if r["phase"] == "warmup"]
                 formal = [r for r in requests if r["phase"] == "measure"]
@@ -496,12 +495,9 @@ class PrefillWarmupTest(unittest.TestCase):
                         finally:
                             completed.add(request["request_index"])
 
-                result = PrefillRunner(
-                    Client(),
-                    prefill_runner_Tokenizer(),
-                    commit_tail_tokens=4,
-                    max_batch_tokens=4096,
-                ).run_case(prefill_runner_case(cache_len=0, batch_size=2))
+                result = prefill_runner_run(
+                    Client(), prefill_runner_case(cache_len=0, batch_size=2)
+                )
                 self.assertNotEqual("ok", result["status"])
                 self.assertIsNone(result["metrics"])
                 self.assertEqual({0, 1}, completed)
@@ -524,12 +520,9 @@ class PrefillRunnerTest(unittest.TestCase):
             [prefill_runner_response(12, 0)] * 4 + [prefill_runner_response(16, 8)] * 4,
             4,
         )
-        result = PrefillRunner(
-            client,
-            prefill_runner_Tokenizer(),
-            commit_tail_tokens=4,
-            max_batch_tokens=4096,
-        ).run_case(prefill_runner_case(batch_size=4, measure_runs=1))
+        result = prefill_runner_run(
+            client, prefill_runner_case(batch_size=4, measure_runs=1)
+        )
         self.assertEqual("ok", result["status"])
         self.assertEqual([4, 4], client.scheduler_calls)
         self.assertEqual(["seed"] * 4, [r["phase"] for r in client.requests[:4]])
@@ -538,12 +531,9 @@ class PrefillRunnerTest(unittest.TestCase):
         client = prefill_runner_Client(
             [prefill_runner_response(12, 0, success=False)] * 4, 4
         )
-        result = PrefillRunner(
-            client,
-            prefill_runner_Tokenizer(),
-            commit_tail_tokens=4,
-            max_batch_tokens=4096,
-        ).run_case(prefill_runner_case(batch_size=4, measure_runs=1))
+        result = prefill_runner_run(
+            client, prefill_runner_case(batch_size=4, measure_runs=1)
+        )
         self.assertEqual("request_failed", result["status"])
         self.assertEqual([4], client.scheduler_calls)
         self.assertEqual(["seed"] * 4, [r["phase"] for r in client.requests])
@@ -573,16 +563,12 @@ class PrefillRunnerTest(unittest.TestCase):
                 def run():
                     try:
                         results.append(
-                            PrefillRunner(
+                            prefill_runner_run(
                                 client,
-                                prefill_runner_Tokenizer(),
-                                commit_tail_tokens=4,
-                                max_batch_tokens=4096,
-                                monotonic=monotonic,
-                            ).run_case(
                                 prefill_runner_case(
                                     cache_len=0, batch_size=4, measure_runs=1
-                                )
+                                ),
+                                monotonic=monotonic,
                             )
                         )
                     except Exception as error:
@@ -620,13 +606,9 @@ class PrefillRunnerTest(unittest.TestCase):
         client = prefill_runner_Client(
             [prefill_runner_response(12, 0)] + [prefill_runner_response(16, 8)] * 2
         )
-        result = PrefillRunner(
-            client,
-            prefill_runner_Tokenizer(),
-            commit_tail_tokens=4,
-            max_batch_tokens=4096,
-            monotonic=lambda: next(times),
-        ).run_case(prefill_runner_case())
+        result = prefill_runner_run(
+            client, prefill_runner_case(), monotonic=lambda: next(times)
+        )
         self.assertEqual(28.0, result["metrics"]["throughput_tokens_per_second"])
 
     def test_valid_cached_case_seeds_then_measures_exact_reuse(self):
@@ -645,13 +627,7 @@ class PrefillRunnerTest(unittest.TestCase):
                 ),
             ]
         )
-        runner = PrefillRunner(
-            client,
-            prefill_runner_Tokenizer(),
-            commit_tail_tokens=4,
-            max_batch_tokens=4096,
-        )
-        result = runner.run_case(prefill_runner_case())
+        result = prefill_runner_run(client)
         self.assertEqual("ok", result["status"])
         self.assertEqual(4, len(client.requests))
         self.assertEqual("seed", client.requests[0]["phase"])
@@ -671,12 +647,7 @@ class PrefillRunnerTest(unittest.TestCase):
         client = prefill_runner_Client(
             [prefill_runner_response(16, 0), prefill_runner_response(16, 0)]
         )
-        result = PrefillRunner(
-            client,
-            prefill_runner_Tokenizer(),
-            commit_tail_tokens=4,
-            max_batch_tokens=4096,
-        ).run_case(prefill_runner_case(cache_len=0))
+        result = prefill_runner_run(client, prefill_runner_case(cache_len=0))
         self.assertEqual("ok", result["status"])
         self.assertEqual(
             ["warmup", "measure", "measure"], [r["phase"] for r in client.requests]
@@ -708,13 +679,9 @@ class GroupedRunnerTest(unittest.TestCase):
 
         client = Client([])
         times = iter([0, 0.2])
-        result = PrefillRunner(
-            client,
-            prefill_runner_Tokenizer(),
-            commit_tail_tokens=4,
-            max_batch_tokens=4096,
-            monotonic=lambda: next(times),
-        ).run_case(prefill_runner_grouped_case())
+        result = prefill_runner_run(
+            client, prefill_runner_grouped_case(), monotonic=lambda: next(times)
+        )
         return (client, result)
 
     def test_grouped_members_use_own_geometry_and_round_wall_time(self):

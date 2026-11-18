@@ -13,9 +13,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rtp_llm.test.perf_test.entry import plan_from_source
-from rtp_llm.test.perf_test.execution.ssh import SshExecutor
+from rtp_llm.test.perf_test.execution.ssh import SshExecutor, maintain, read_deployment
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
-from rtp_llm.test.perf_test.execution.ssh import maintain, read_deployment
 from rtp_llm.test.perf_test.ssh.worker import verify_bundle
 from rtp_llm.test.perf_test.state import RunState
 from rtp_llm.test.perf_test.tests.support.fixtures import PERF_TEST_ROOT
@@ -235,15 +234,19 @@ class SshExecutorTest(unittest.TestCase):
 
 class MaintenanceTest(unittest.TestCase):
 
+    def completed_plan(self, directory):
+        plan = SshExecutorTest().setup_plan(directory)
+        transport = LocalTransport(plan)
+        self.assertEqual(
+            SshExecutor(host_factory=lambda *args: transport)(plan).exit_code, 0
+        )
+        return plan
+
     def test_relocated_deployment_supports_dry_run_without_rewriting_original_manifest(
         self,
     ):
         with tempfile.TemporaryDirectory() as directory:
-            plan = SshExecutorTest().setup_plan(directory)
-            transport = LocalTransport(plan)
-            self.assertEqual(
-                SshExecutor(host_factory=lambda *args: transport)(plan).exit_code, 0
-            )
+            plan = self.completed_plan(directory)
             original = Path(plan.result_directory)
             original_bytes = (original / "manifest.json").read_bytes()
             relocated = Path(directory) / "relocated"
@@ -259,11 +262,7 @@ class MaintenanceTest(unittest.TestCase):
 
     def test_modified_host_is_rejected_before_any_network_call(self):
         with tempfile.TemporaryDirectory() as directory:
-            plan = SshExecutorTest().setup_plan(directory)
-            transport = LocalTransport(plan)
-            self.assertEqual(
-                SshExecutor(host_factory=lambda *args: transport)(plan).exit_code, 0
-            )
+            plan = self.completed_plan(directory)
             path = Path(plan.result_directory) / "execution/ssh/members.json"
             deployment = json.loads(path.read_text())
             deployment["members"][0]["ssh_target"] = "unexpected-machine"
@@ -273,11 +272,7 @@ class MaintenanceTest(unittest.TestCase):
 
     def test_invalid_member_indices_and_bound_paths_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
-            plan = SshExecutorTest().setup_plan(directory)
-            transport = LocalTransport(plan)
-            self.assertEqual(
-                SshExecutor(host_factory=lambda *args: transport)(plan).exit_code, 0
-            )
+            plan = self.completed_plan(directory)
             path = Path(plan.result_directory) / "execution/ssh/members.json"
             baseline = json.loads(path.read_text())
             for field, value in [

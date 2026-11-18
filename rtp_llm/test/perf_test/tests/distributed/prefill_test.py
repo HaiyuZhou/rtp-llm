@@ -25,6 +25,15 @@ from rtp_llm.test.perf_test.tests.support.prefill import (
 )
 
 
+def external_plan(root):
+    path = Path(prefill_external_write_prefill_config(root))
+    return plan_from_source(
+        json.loads(path.read_text()),
+        source_dir=path.parent,
+        result_directory=str(root / "run"),
+    )
+
+
 class DistributedRuntimeTest(unittest.TestCase):
 
     def test_external_prefill_uses_same_deadline_for_http_and_dashsc(self):
@@ -78,13 +87,7 @@ class DistributedRuntimeTest(unittest.TestCase):
     def test_external_prefill_master_completes_against_http_service(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (plan, source) = plan_from_source(
-                json.loads(
-                    Path(prefill_external_write_prefill_config(root)).read_text()
-                ),
-                source_dir=Path(prefill_external_write_prefill_config(root)).parent,
-                result_directory=str(root / "run"),
-            )
+            (plan, source) = external_plan(root)
             with prefill_external_FakeModelServer(
                 [
                     prefill_external_aux(16, 0, 5.0),
@@ -127,12 +130,7 @@ class ExternalPrefillSessionTest(unittest.TestCase):
     def test_prefill_runner_completes_through_the_external_session(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            path = prefill_external_write_prefill_config(root)
-            (plan, _source) = plan_from_source(
-                json.loads(Path(path).read_text()),
-                source_dir=Path(path).parent,
-                result_directory=str(str(root / "run")),
-            )
+            (plan, _source) = external_plan(root)
             with prefill_external_FakeModelServer(
                 [
                     prefill_external_aux(prefill_external_CASE_INPUT_LEN, 0, 5.0),
@@ -192,12 +190,7 @@ class ExternalPrefillSessionTest(unittest.TestCase):
     def test_prefill_runner_flags_invalid_reuse_through_the_external_session(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            path = prefill_external_write_prefill_config(root)
-            (plan, _source) = plan_from_source(
-                json.loads(Path(path).read_text()),
-                source_dir=Path(path).parent,
-                result_directory=str(str(root / "run")),
-            )
+            (plan, _source) = external_plan(root)
             with prefill_external_FakeModelServer(
                 [
                     prefill_external_aux(prefill_external_CASE_INPUT_LEN, 0, 5.0),

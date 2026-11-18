@@ -14,10 +14,13 @@ from rtp_llm.test.perf_test.errors import EngineLifecycleError
 from rtp_llm.test.perf_test.execution.engine_session import EngineDiagnostics
 from rtp_llm.test.perf_test.plan import build_execution_plan
 from rtp_llm.test.perf_test.tests.support.fixtures import (
+    fixture_config,
     fixture_engine,
-    fixture_execution,
     fixture_model,
     fixture_workload,
+)
+from rtp_llm.test.perf_test.tests.support.results import (
+    default_executor_request_round as default_executor_request_round,
 )
 
 
@@ -99,13 +102,10 @@ class default_executor_FailingSession:
 
 
 def default_executor_source(result_root):
-    return {
-        "schema_version": 1,
-        "model": fixture_model(label="model"),
-        "engine": fixture_engine(
-            max_seq_len=64, max_batch_tokens=64, concurrency_limit=1
-        ),
-        "workload": fixture_workload(
+    return fixture_config(
+        model=fixture_model(label="model"),
+        engine=fixture_engine(max_seq_len=64, max_batch_tokens=64, concurrency_limit=1),
+        workload=fixture_workload(
             max_input_len=16,
             cache_alignment=4,
             commit_tail_tokens=4,
@@ -113,11 +113,8 @@ def default_executor_source(result_root):
             cache_lengths=[0],
             measure_runs=1,
         ),
-        "execution": fixture_execution(),
-        "output": {"result_root": str(result_root)},
-        "regression": {},
-        "publish": {},
-    }
+        output={"result_root": str(result_root)},
+    )
 
 
 def default_executor_decode_source_and_plan(root, workload=None):
@@ -152,39 +149,23 @@ def default_executor_decode_source_and_plan(root, workload=None):
     )
 
 
-def default_executor_request_round(input_lengths, output_length):
-    return tuple(
-        (
-            {
-                "request_index": index,
-                "success": True,
-                "input_length": input_length,
-                "output_length": output_length,
-                "latency_ms": {
-                    "wait": 1.0,
-                    "prefill": 2.0,
-                    "decode": 15.0,
-                    "tpot": 1.0,
-                    "total": 17.0,
-                },
-            }
-            for (index, input_length) in enumerate(input_lengths)
-        )
-    )
-
-
-def default_executor_measurement(batch, inputs, output):
+def default_executor_measurement(
+    batch, inputs, output, *, runs=1, throughput=100.0, latency=None
+):
     return DecodeBatchMeasurement(
         batch_size=batch,
         input_lengths=inputs,
         worker_allocations=(),
-        measurements=(
+        measurements=tuple(
             {
-                "run": 0,
-                "throughput_tokens_per_second": 100.0,
+                "run": run,
+                "throughput_tokens_per_second": throughput,
                 "worker_allocations": [],
-                "requests": list(default_executor_request_round(inputs, output)),
-            },
+                "requests": list(
+                    default_executor_request_round(inputs, output, latency=latency)
+                ),
+            }
+            for run in range(runs)
         ),
     )
 
@@ -205,16 +186,7 @@ def local_executor_config(mode):
             "output_lengths": [16],
             "batch": {"strategy": "fixed", "sizes": [1]},
         }
-    return {
-        "schema_version": 1,
-        "model": fixture_model(),
-        "engine": fixture_engine(),
-        "workload": workload,
-        "execution": fixture_execution(),
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+    return fixture_config(workload=workload)
 
 
 def local_executor_plan(mode):
@@ -259,27 +231,26 @@ def runtime_adapter_plan(backend="local", transport="http_text", topology=None):
     if topology is None:
         topology = {"tp": 2, "dp": 1, "pp": 1, "ep": 2}
     world_size = topology.get("tp", 1) * topology.get("dp", 1) * topology.get("pp", 1)
-    source = {
-        "schema_version": 1,
-        "model": fixture_model(
+    source = fixture_config(
+        model=fixture_model(
             label="model",
             type="qwen_2",
             checkpoint="/models/qwen",
             tokenizer="/models/qwen-tokenizer",
             topology=topology,
         ),
-        "engine": fixture_engine(
+        engine=fixture_engine(
             concurrency_limit=4,
             args={"reuse_cache": 1, "enable_cuda_graph": 0},
             env={"TOKENIZERS_PARALLELISM": "false"},
         ),
-        "workload": fixture_workload(
+        workload=fixture_workload(
             transport=transport,
             max_input_len=1024,
             compute_steps=[256],
             cache_lengths=[0],
         ),
-        "execution": (
+        execution=(
             {
                 "backend": "local",
                 "devices": [3, 5] if world_size == 2 else list(range(world_size)),
@@ -293,10 +264,8 @@ def runtime_adapter_plan(backend="local", transport="http_text", topology=None):
                 "shard_count": 1,
             }
         ),
-        "output": {"result_root": "/tmp/results"},
-        "regression": {},
-        "publish": {},
-    }
+        output={"result_root": "/tmp/results"},
+    )
     return build_execution_plan(
         mode="prefill",
         action="run",

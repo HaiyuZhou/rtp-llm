@@ -186,14 +186,6 @@ class GangWorkerTest(unittest.TestCase):
                 cache_lengths=[0],
                 batch_sizes=[1],
             )
-        else:
-            source["workload"].update(
-                input_lengths=[8],
-                output_lengths=[2],
-                warmup_runs=0,
-                measure_runs=1,
-                profiling={"enabled": False},
-            )
         self._freeze_source(source)
         return source
 
@@ -246,6 +238,14 @@ class GangWorkerTest(unittest.TestCase):
         self.assertEqual("2", kwargs["engine_environment"]["WORLD_SIZE"])
         self.assertEqual("4", kwargs["engine_environment"]["CUDA_VISIBLE_DEVICES"])
 
+    def _execute_master(self, output, executor=_default_master_executor, context=None):
+        return executor(
+            self.handle,
+            context=self.context if context is None else context,
+            config_path=str(self.config_path),
+            result_directory=str(output),
+        )
+
     def test_prefill_master_executes_cases_probe_and_finalizes_owned_results(self):
         source = self._example("prefill")
         client = Mock()
@@ -277,12 +277,7 @@ class GangWorkerTest(unittest.TestCase):
             "rtp_llm.test.perf_test.execution.distributed.prefill.ExternalPrefillSession",
             return_value=session,
         ):
-            code = _default_prefill_master_executor(
-                self.handle,
-                context=self.context,
-                config_path=str(self.config_path),
-                result_directory=str(output),
-            )
+            code = self._execute_master(output, _default_prefill_master_executor)
         self.assertEqual(0, code)
         parsed = parse_result_envelope(
             json.loads((output / "results/result.json").read_text())
@@ -304,12 +299,7 @@ class GangWorkerTest(unittest.TestCase):
             side_effect=ValueError("tokenizer unavailable"),
         ):
             with self.assertRaisesRegex(ValueError, "tokenizer unavailable"):
-                _default_prefill_master_executor(
-                    self.handle,
-                    context=self.context,
-                    config_path=str(self.config_path),
-                    result_directory=str(output),
-                )
+                self._execute_master(output, _default_prefill_master_executor)
         self.assertEqual(
             "failed", json.loads((output / "manifest.json").read_text())["state"]
         )
@@ -339,12 +329,7 @@ class GangWorkerTest(unittest.TestCase):
             "rtp_llm.test.perf_test.execution.distributed.decode.DecodeHttpTransport",
             return_value=transport,
         ) as factory:
-            code = _default_master_executor(
-                self.handle,
-                context=self.context,
-                config_path=str(self.config_path),
-                result_directory=str(output),
-            )
+            code = self._execute_master(output)
         self.assertEqual(0, code)
         parsed = parse_result_envelope(
             json.loads((output / "results/result.json").read_text())
@@ -401,12 +386,7 @@ class GangWorkerTest(unittest.TestCase):
             "rtp_llm.test.perf_test.execution.distributed.decode.execute_master_decode",
             return_value=SimpleNamespace(state=RunState.COMPLETED),
         ) as execute:
-            code = _default_master_executor(
-                self.handle,
-                context=context,
-                config_path=str(self.config_path),
-                result_directory=str(self.root / "run"),
-            )
+            code = self._execute_master(self.root / "run", context=context)
         self.assertEqual(0, code)
         cluster.connect_workers.assert_called_once()
         cluster.close.assert_called_once()

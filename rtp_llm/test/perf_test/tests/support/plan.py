@@ -1,10 +1,6 @@
 """Performance framework behavior and failure regressions."""
 
-from rtp_llm.test.perf_test.tests.support.fixtures import (
-    fixture_engine,
-    fixture_model,
-    fixture_workload,
-)
+from rtp_llm.test.perf_test.tests.support.fixtures import fixture_config, fixture_model
 
 
 def plan_config(backend="local"):
@@ -17,21 +13,15 @@ def plan_config(backend="local"):
             "max_parallel": 2,
             "shard_count": 2,
         }
-    return {
-        "schema_version": 1,
-        "model": fixture_model(
+    return fixture_config(
+        model=fixture_model(
             label="test-model",
             type="registered_model",
             checkpoint="/models/test",
             topology={"tp": 2, "dp": 1, "pp": 1, "ep": 2},
         ),
-        "engine": fixture_engine(),
-        "workload": fixture_workload(),
-        "execution": execution,
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+        execution=execution,
+    )
 
 
 def plan_cases():

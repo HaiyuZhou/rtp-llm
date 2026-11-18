@@ -15,9 +15,8 @@ from rtp_llm.test.perf_test.plan import build_execution_plan, case_id, thaw
 from rtp_llm.test.perf_test.run_directory import initialize_run_directory
 from rtp_llm.test.perf_test.storage import RunStore
 from rtp_llm.test.perf_test.tests.support.fixtures import (
+    fixture_config,
     fixture_engine,
-    fixture_execution,
-    fixture_model,
     fixture_workload,
 )
 
@@ -104,16 +103,10 @@ def prefill_report_case_bytes(root):
 def _setup_prefill_report_run(
     root, statuses=("ok", "ok"), *, concurrent=False, measure_runs=1, grid_names=None
 ):
-    config = {
-        "schema_version": 1,
-        "model": fixture_model(),
-        "engine": fixture_engine(max_seq_len=4097, concurrency_limit=1),
-        "workload": fixture_workload(compute_steps=[256], cache_lengths=[0]),
-        "execution": fixture_execution(),
-        "output": {},
-        "regression": {},
-        "publish": {},
-    }
+    config = fixture_config(
+        engine=fixture_engine(max_seq_len=4097, concurrency_limit=1),
+        workload=fixture_workload(compute_steps=[256], cache_lengths=[0]),
+    )
     identities = [
         {"input_len": 512, "cache_len": 0, "compute_len": 512, "batch_size": 1},
         {"input_len": 1024, "cache_len": 512, "compute_len": 512, "batch_size": 1},

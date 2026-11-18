@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 import threading
 import time
@@ -19,14 +18,15 @@ from rtp_llm.test.perf_test.storage import RunStore
 def begin_master_run(root, plan, *, source_config, run_context=None):
     """Initialize a master run directory and flip its manifest into running state."""
     run_context = run_context or {}
+    revisions = run_context.get("repository_revisions", {})
     run_id = run_context.get("run_id", root.name)
     initialize_run_directory(
         root,
         source_config=source_config,
         plan=plan,
         run_id=run_id,
-        code_version=os.environ.get("BUILD_SCM_REVISION", "unknown"),
-        repository_revisions=run_context.get("repository_revisions", {}),
+        code_version=revisions.get("public", "unknown"),
+        repository_revisions=revisions,
     )
     store = RunStore(root)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))

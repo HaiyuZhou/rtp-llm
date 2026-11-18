@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -290,18 +289,23 @@ def execute_plan(
             for command in preview["commands"]:
                 command["argv"][1:1] = request.bazel_startup_args
                 command["argv"].extend(request.bazel_args)
+                if command["stage"] == "remote-test":
+                    command["argv"].append(
+                        f"--test_timeout={plan.resolved_config['execution']['test_timeout_seconds']}"
+                    )
             if request.broker_host and "gang" in preview:
                 preview["gang"]["broker_host"] = request.broker_host
         return preview
     if plan.action == "run":
         run_context = read_run_context(request.run_context if request else None)
+        revisions = run_context.get("repository_revisions", {})
         initialize_run_directory(
             plan.result_directory,
             source_config=source,
             plan=plan,
             run_id=Path(plan.result_directory).name,
-            code_version=os.environ.get("BUILD_SCM_REVISION", "unknown"),
-            repository_revisions=run_context.get("repository_revisions", {}),
+            code_version=revisions.get("public", "unknown"),
+            repository_revisions=revisions,
         )
     executors = (
         _default_executors(request, backend=plan.backend)

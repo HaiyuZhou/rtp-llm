@@ -1,8 +1,5 @@
-# Keep in sync with execution/aone_bazel.py:AONE_TEST_TIMEOUT_S. The GPU wrapper
-# otherwise kills the action after its default 1800s, before the declared budget.
-# Generators pass an explicit watchdog_seconds (from RTP_AONE_TEST_TIMEOUT_S on
-# the submit host) so raised --test_timeout budgets stay aligned with the
-# worker-side watchdog.
+# Static CI targets keep this default; generated packages pass the frozen
+# execution.test_timeout_seconds to both this watchdog and Bazel --test_timeout.
 _PERF_TEST_WATCHDOG_SECONDS = "7000"
 
 def unified_prefill_ci_test(name, config, gpu_type, gpu_count, data = [], deps = [], watchdog_seconds = _PERF_TEST_WATCHDOG_SECONDS):
@@ -77,7 +74,7 @@ def perf_test_gang_shard(name, resolved_config, resolved_workload, gang_plan, gp
     shard requests the full registered per-host GPU count so each member
     occupies a whole machine. No world-size env is set here: the gang
     worker computes it from the gang plan. The submit side runs these
-    targets with ``--test_timeout=7000``.
+    targets with the frozen ``execution.test_timeout_seconds`` budget.
     """
     native.py_test(
         name = name,

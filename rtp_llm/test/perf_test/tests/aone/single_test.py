@@ -10,12 +10,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from rtp_llm.test.perf_test.aone.collector import collect_aone_results
+from rtp_llm.test.perf_test.aone.config_schema import DEFAULT_AONE_TEST_TIMEOUT_SECONDS
 from rtp_llm.test.perf_test.aone.package import generate_aone_package
 from rtp_llm.test.perf_test.aone.sharding import plan_shards
 from rtp_llm.test.perf_test.aone.worker import load_remote_inputs
 from rtp_llm.test.perf_test.execution.aone import AOneExecutor
 from rtp_llm.test.perf_test.execution.aone_bazel import (
-    AONE_TEST_TIMEOUT_S,
     BazelAOneIntegration,
     create_default_aone_executor,
 )
@@ -31,15 +31,21 @@ from rtp_llm.test.perf_test.tests.support.gang import (
 )
 
 
-def _source_config(shard_count):
+def _source_config(shard_count, test_timeout_seconds=7000):
     return prefill_source(
         engine={"max_seq_len": 4097, "concurrency_limit": 1},
-        execution={"max_parallel": shard_count, "shard_count": shard_count},
+        execution={
+            "max_parallel": shard_count,
+            "shard_count": shard_count,
+            "test_timeout_seconds": test_timeout_seconds,
+        },
     )
 
 
-def _setup(root, shard_count):
-    return _setup_run(root, _source_config(shard_count), run_id="run-aone")
+def _setup(root, shard_count, test_timeout_seconds=7000):
+    return _setup_run(
+        root, _source_config(shard_count, test_timeout_seconds), run_id="run-aone"
+    )
 
 
 def _remote_results(plan, failed_shard=None):
@@ -114,7 +120,7 @@ class AOneSingleTest(unittest.TestCase):
                     environment.get("WORLD_SIZE", environment.get("GPU_COUNT", "1")),
                 )
                 self.assertEqual(
-                    AONE_TEST_TIMEOUT_S,
+                    DEFAULT_AONE_TEST_TIMEOUT_SECONDS,
                     int(action.get("env", {}).get("RTP_TEST_WATCHDOG_SECONDS", 1800)),
                 )
         # Generators raise the watchdog with the test budget: an explicit
@@ -133,29 +139,11 @@ class AOneSingleTest(unittest.TestCase):
         )
         self.assertEqual("19500", raised[0]["env"]["RTP_TEST_WATCHDOG_SECONDS"])
 
-    def test_generated_build_bakes_env_overridden_watchdog(self):
-        from rtp_llm.test.perf_test.aone.package import _build_file
-        from rtp_llm.test.perf_test.plan import AOneResourcePlan
-
-        resource = AOneResourcePlan(
-            backend="aone",
-            resource="daily",
-            gpu_type="H20_CU13",
-            gpus_per_shard=4,
-            shard_count=2,
-            max_parallel=2,
-        )
-        default_text = _build_file(resource, (("a",), ("b",)))
-        self.assertIn('watchdog_seconds = "7000"', default_text)
-        with patch.dict(os.environ, {"RTP_AONE_TEST_TIMEOUT_S": "19500"}):
-            raised_text = _build_file(resource, (("a",), ("b",)))
-        self.assertIn('watchdog_seconds = "19500"', raised_text)
-
     def test_normal_submission_collects_portable_shards_and_formal_report(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             root = workspace / "runs/normal"
-            plan = _setup(root, 2)
+            plan = _setup(root, 2, test_timeout_seconds=19500)
             payloads = _remote_results(plan)
             commands = []
             process = Mock()
@@ -205,7 +193,9 @@ class AOneSingleTest(unittest.TestCase):
                 side_effect=integration_factory,
             ):
                 outcome = create_default_aone_executor(
-                    plan, startup_args=("--batch",), common_args=("--announce_rc",)
+                    plan,
+                    startup_args=("--batch",),
+                    common_args=("--announce_rc", "--test_timeout=1"),
                 )
             self.assertEqual(RunState.COMPLETED, outcome.state)
             self.assertEqual(0, outcome.exit_code)
@@ -223,6 +213,13 @@ class AOneSingleTest(unittest.TestCase):
             self.assertIn("--strategy=TestRunner=remote", commands[1])
             process.wait.assert_called_once()
             generated = root / "workload/aone_package"
+            self.assertEqual("--test_timeout=19500", commands[1][-1])
+            self.assertIn(
+                'watchdog_seconds = "19500"', (generated / "BUILD.bazel").read_text()
+            )
+            self.assertEqual(
+                19500, plan.resolved_config["execution"]["test_timeout_seconds"]
+            )
             for index, case in enumerate(plan_shards(plan).shards):
                 loaded = load_remote_inputs(
                     resolved_config=generated / "resolved_config.json",

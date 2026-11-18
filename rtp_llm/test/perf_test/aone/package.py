@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from rtp_llm.test.perf_test.aone.plan import AONE_GPU_HOSTS
+from rtp_llm.test.perf_test.config_schema import _positive_int
 from rtp_llm.test.perf_test.errors import PlanningError, PostExecutionError
 from rtp_llm.test.perf_test.plan import AOneResourcePlan, ExecutionPlan, thaw
 from rtp_llm.test.perf_test.storage import atomic_write_json
@@ -48,6 +49,7 @@ class GeneratedAOnePackage:
     shard_plan: Path
     build_file: Path
     targets: Tuple[str, ...]
+    test_timeout_seconds: int
 
 
 def _validated_ownership(
@@ -86,27 +88,12 @@ def _validated_ownership(
     return tuple(normalized)
 
 
-def _watchdog_seconds() -> str:
-    """Submit-side watchdog budget baked into generated shard targets.
-
-    Reads ``RTP_AONE_TEST_TIMEOUT_S`` so one environment variable keeps the
-    worker-side hang watchdog aligned with the entry's ``--test_timeout``
-    (see execution/aone_bazel.py); defaults to the historical 7000s budget.
-    """
-    raw = os.environ.get("RTP_AONE_TEST_TIMEOUT_S", "").strip()
-    if not raw:
-        return "7000"
-    try:
-        seconds = int(raw)
-    except ValueError:
-        raise PlanningError(f"RTP_AONE_TEST_TIMEOUT_S must be an integer, got {raw!r}")
-    if seconds <= 0:
-        raise PlanningError("RTP_AONE_TEST_TIMEOUT_S must be positive")
-    return str(seconds)
-
-
-def _build_file(resource: AOneResourcePlan, ownership: Iterable[Sequence[str]]) -> str:
-    watchdog = _watchdog_seconds()
+def _build_file(
+    resource: AOneResourcePlan,
+    ownership: Iterable[Sequence[str]],
+    *,
+    test_timeout_seconds: int,
+) -> str:
     lines = [
         'load("//rtp_llm/test/perf_test:aone_defs.bzl", "perf_test_aone_shard")',
         "",
@@ -122,7 +109,7 @@ def _build_file(resource: AOneResourcePlan, ownership: Iterable[Sequence[str]]) 
                 f'    shard_id = "shard-{index:04d}",',
                 f'    gpu_type = "{resource.gpu_type}",',
                 f"    gpu_count = {resource.gpus_per_shard},",
-                f'    watchdog_seconds = "{watchdog}",',
+                f'    watchdog_seconds = "{test_timeout_seconds}",',
                 ")",
                 "",
             ]
@@ -195,7 +182,13 @@ def generate_aone_package(
         package=package,
         payload=shard_payload,
         payload_name="shard_plan.json",
-        build_text=_build_file(resource, normalized_ownership),
+        build_text=_build_file(
+            resource,
+            normalized_ownership,
+            test_timeout_seconds=plan.resolved_config["execution"][
+                "test_timeout_seconds"
+            ],
+        ),
         target_names=tuple(
             f"shard_{index:04d}" for index in range(len(normalized_ownership))
         ),
@@ -218,6 +211,9 @@ def _write_package(
     """Write the frozen inputs and generated BUILD."""
     resolved = thaw(plan.resolved_config)
     workload = resolved.pop("workload")
+    test_timeout_seconds = _positive_int(
+        "execution.test_timeout_seconds", resolved["execution"]["test_timeout_seconds"]
+    )
     if omit_null_shard_count and resolved["execution"].get("shard_count") is None:
         resolved["execution"].pop("shard_count", None)
     output = Path(root)
@@ -247,6 +243,7 @@ def _write_package(
         shard_plan=shard_plan,
         build_file=build_file,
         targets=tuple(f"//{package_name}:{name}" for name in target_names),
+        test_timeout_seconds=test_timeout_seconds,
     )
 
 
@@ -297,7 +294,7 @@ def build_gang_plan_payload(plan: ExecutionPlan, run_id: str) -> Dict[str, Any]:
     }
 
 
-def _gang_build_file(resource: AOneResourcePlan) -> str:
+def _gang_build_file(resource: AOneResourcePlan, *, test_timeout_seconds: int) -> str:
     lines = [
         'load("//rtp_llm/test/perf_test:aone_defs.bzl", "perf_test_gang_shard")',
         "",
@@ -309,7 +306,7 @@ def _gang_build_file(resource: AOneResourcePlan) -> str:
         f'    gpu_type = "{resource.gpu_type}",',
         f"    gpus_per_host = {_per_host_gpu_count(resource.gpu_type)},",
         f"    machine_count = {resource.machine_count},",
-        f'    watchdog_seconds = "{_watchdog_seconds()}",',
+        f'    watchdog_seconds = "{test_timeout_seconds}",',
         ")",
         "",
         "test_suite(",
@@ -342,7 +339,12 @@ def generate_gang_package(
         package=package,
         payload=gang_payload,
         payload_name="gang_plan.json",
-        build_text=_gang_build_file(resource),
+        build_text=_gang_build_file(
+            resource,
+            test_timeout_seconds=plan.resolved_config["execution"][
+                "test_timeout_seconds"
+            ],
+        ),
         target_names=("gang",),
         description="gang",
         omit_null_shard_count=True,

@@ -99,6 +99,14 @@ class AOnePlanningTest(unittest.TestCase):
 
     def test_oversized_machine_setting_normalizes_and_round_trips(self):
         plan = self._plan(execution={"gpus_per_machine": 8})
+        changed = self._plan(
+            execution={"gpus_per_machine": 8, "test_timeout_seconds": 19500}
+        )
+        self.assertEqual(
+            7000, plan.resolved_config["execution"]["test_timeout_seconds"]
+        )
+        self.assertNotEqual(plan.config_fingerprint, changed.config_fingerprint)
+        self.assertEqual(changed, ExecutionPlan.from_dict(changed.to_dict()))
         self.assertEqual(2, plan.resource_plan.gpus_per_machine)
         self.assertEqual(plan, ExecutionPlan.from_dict(plan.to_dict()))
 
@@ -193,6 +201,8 @@ class AOnePlanningTest(unittest.TestCase):
 
         for changes in (
             {"max_parallel": True},
+            {"test_timeout_seconds": 0},
+            {"test_timeout_seconds": True},
             {"gpus_per_machine": 0},
             {"shard_count": None},
             {"devices": [0]},

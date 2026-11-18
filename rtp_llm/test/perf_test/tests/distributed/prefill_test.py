@@ -116,7 +116,10 @@ class DistributedRuntimeTest(unittest.TestCase):
                         tokenizer_path="/m",
                         server_log_path=None,
                         profiler_directory=root,
+                        run_context={"repository_revisions": {"public": "a" * 40}},
                     )
+            manifest = json.loads((root / "run/manifest.json").read_text())
+            self.assertEqual("a" * 40, manifest["code_version"])
             self.assertEqual("completed", result.state.value)
             self.assertEqual(
                 "completed",

@@ -14,6 +14,8 @@ from rtp_llm.test.perf_test.config_schema import (
     _required,
 )
 
+DEFAULT_AONE_TEST_TIMEOUT_SECONDS = 7000
+
 
 @dataclass(frozen=True)
 class AOneExecutionConfig:
@@ -23,6 +25,7 @@ class AOneExecutionConfig:
     max_parallel: int
     shard_count: Optional[int]
     gpus_per_machine: Optional[int] = None
+    test_timeout_seconds: int = DEFAULT_AONE_TEST_TIMEOUT_SECONDS
 
 
 def parse_execution(value: Any) -> AOneExecutionConfig:
@@ -41,6 +44,7 @@ def parse_execution(value: Any) -> AOneExecutionConfig:
                 "max_parallel",
                 "shard_count",
                 "gpus_per_machine",
+                "test_timeout_seconds",
             },
         )
         gpus_per_machine = (
@@ -72,5 +76,9 @@ def parse_execution(value: Any) -> AOneExecutionConfig:
             ),
             shard_count=shard_count,
             gpus_per_machine=gpus_per_machine,
+            test_timeout_seconds=_positive_int(
+                "execution.test_timeout_seconds",
+                raw.get("test_timeout_seconds", DEFAULT_AONE_TEST_TIMEOUT_SECONDS),
+            ),
         )
     raise ConfigError("execution.backend: expected aone")

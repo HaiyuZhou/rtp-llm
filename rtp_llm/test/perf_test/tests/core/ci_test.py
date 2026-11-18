@@ -40,6 +40,7 @@ class CiDeliveryTest(unittest.TestCase):
         base["model"]["checkpoint"] = "/configured/model"
         base["model"]["tokenizer"] = "/configured/tokenizer"
         base["execution"]["backend"] = "local"
+        base["execution"]["test_timeout_seconds"] = 19500
         config = self.deliver(MODE="prefill", CONFIG=json.dumps(base))
         self.assertEqual(config["model"], base["model"])
         self.assertEqual(
@@ -50,6 +51,7 @@ class CiDeliveryTest(unittest.TestCase):
                 gpu_type="H20_CU13",
                 max_parallel=2,
                 gpus_per_machine=1,
+                test_timeout_seconds=19500,
             ),
         )
         self.assertEqual(config["workload"], base["workload"])

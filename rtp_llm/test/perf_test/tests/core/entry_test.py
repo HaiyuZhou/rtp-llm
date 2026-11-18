@@ -625,18 +625,13 @@ class RepositoryProvenanceTest(unittest.TestCase):
                     request,
                     run_context=run_context_path(root, repository_revisions=revisions),
                 )
-                with patch.dict(
-                    "os.environ", {"BUILD_SCM_REVISION": revisions["public"]}
-                ):
-                    if failure:
-                        with self.assertRaisesRegex(OSError, "execution failed"):
-                            run_request(
-                                request, executor_factory=lambda: {"local": execute}
-                            )
-                    else:
+                if failure:
+                    with self.assertRaisesRegex(OSError, "execution failed"):
                         run_request(
                             request, executor_factory=lambda: {"local": execute}
                         )
+                else:
+                    run_request(request, executor_factory=lambda: {"local": execute})
                 manifest = json.loads(
                     next((root / "results").glob("*/manifest.json")).read_text()
                 )

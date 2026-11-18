@@ -79,14 +79,19 @@ class BrokerProxyTest(unittest.TestCase):
 
 class GangExecutorTest(unittest.TestCase):
 
-    def test_timeout_override_reaches_bazel_and_generated_watchdog(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            "os.environ", {"RTP_AONE_TEST_TIMEOUT_S": "19500"}
-        ):
-            root, _, outcome, calls = self._gang_flow(Path(directory))
+    def test_config_timeout_reaches_bazel_and_generated_watchdog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = _gang_source()
+            source["execution"]["test_timeout_seconds"] = 19500
+            root, plan, outcome, calls = self._gang_flow(
+                Path(directory), source=source, common_args=("--test_timeout=1",)
+            )
+            self.assertEqual(
+                19500, plan.resolved_config["execution"]["test_timeout_seconds"]
+            )
             self.assertEqual(RunState.COMPLETED, outcome.state)
             command = next(command for command, _ in calls if "test" in command)
-            self.assertIn("--test_timeout=19500", command)
+            self.assertEqual("--test_timeout=19500", command[-1])
             actions = []
             scope = {
                 "native": SimpleNamespace(py_test=lambda **kw: actions.append(kw)),
@@ -151,9 +156,11 @@ class GangExecutorTest(unittest.TestCase):
         remote_exit=0,
         member_failure=False,
         missing_master=False,
+        source=None,
+        common_args=(),
     ):
         root = workspace / "runs/gang"
-        plan = _setup_run(root)
+        plan = _setup_run(root, source)
         base = workspace / "bazel-testlogs/runs/gang/workload/aone_package/gang"
         _write_testlogs_tree(base, plan, status=status, master=not missing_master)
         trace = base / "shard_2_of_2/test.outputs/TEST_OUTPUT_worker/decode_trace.json"
@@ -218,7 +225,7 @@ class GangExecutorTest(unittest.TestCase):
                 plan,
                 broker_host="127.0.0.1",
                 startup_args=("--batch",),
-                common_args=("--announce_rc",),
+                common_args=("--announce_rc", *common_args),
             )
         for command, _kwargs in calls:
             self.assertEqual(["bazelisk", "--batch"], command[:2])

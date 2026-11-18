@@ -3,6 +3,12 @@ py_test_deps = [
 ]
 
 py_test(
+    name = "test_phase_load_method",
+    srcs = ["test_phase_load_method.py"],
+    deps = py_test_deps,
+)
+
+py_test(
     name = "test_stacked_moe_weight",
     srcs = ["test_stacked_moe_weight.py"],
     deps = py_test_deps,

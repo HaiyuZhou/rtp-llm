@@ -35,7 +35,11 @@ from rtp_llm.model_factory_register import register_model
 from rtp_llm.model_loader.attn_weight import AttnAtomicWeight, AttnConfig
 from rtp_llm.model_loader.ffn_weight import MoeAtomicWeight, MoeConfig, MoeWeight
 from rtp_llm.model_loader.model_weight_info import ModelWeightInfo
-from rtp_llm.model_loader.weight_module import AtomicWeight, WeightModule
+from rtp_llm.model_loader.weight_module import (
+    AtomicWeight,
+    CompositeWeight,
+    WeightModule,
+)
 from rtp_llm.models.deepseek_v2 import (
     DeepSeekV2,
     DeepSeekV2Weight,
@@ -113,7 +117,10 @@ def detect_fp4_expert_storage(weight_keys) -> "str | None":
     does not declare ``expert_dtype``.
     """
     for key in weight_keys:
-        if key.endswith((".w1.scale", ".w2.scale", ".w3.scale")) and ".ffn.experts." in key:
+        if (
+            key.endswith((".w1.scale", ".w2.scale", ".w3.scale"))
+            and ".ffn.experts." in key
+        ):
             return "fp4"
     return None
 
@@ -733,12 +740,25 @@ class DeepSeekV4(DeepSeekV2):
 
         model_config.kv_cache_spec_descs = descs
 
+    def _validate_phase_allocator(self):
+        if (
+            type(self) not in (DeepSeekV4, DeepSeekV4Mtp)
+            or _is_ppu_flash(self.model_config)
+            or self.hw_kernel_config.enable_cuda_graph
+        ):
+            raise ValueError(
+                "DSV4_PHASE_ALLOCATOR currently requires CUDA DeepSeekV4 or ordinary "
+                "DeepSeekV4Mtp and enable_cuda_graph=0"
+            )
+
     def create_model_loader(self):
         if _is_ppu_flash(self.model_config):
+            from rtp_llm.models_py.modules.dsv4.ppu.manifest import (
+                validate_cache_config,
+            )
             from rtp_llm.models_py.modules.dsv4.ppu.metadata.cache import (
                 configure_indexer_cache,
             )
-            from rtp_llm.models_py.modules.dsv4.ppu.manifest import validate_cache_config
 
             validate_cache_config(self.kv_cache_config)
             configure_indexer_cache(self.model_config)
@@ -1016,6 +1036,32 @@ class DeepSeekV4MtpWeight(DeepSeekV4Weight, DeepSeekV3MtpWeight):
         super()._process_meta(meta_dict, weight_keys)
         self._num_hash_layers = 0
 
+    def get_weight_info(self) -> ModelWeightInfo:
+        info = super().get_weight_info()
+        # Quantization adds the checkpoint scale to each projection composite.
+        # A standalone AtomicWeight would load that same scale as BF16 and
+        # overwrite it on SCRATCH, while fast loading repairs it in fallback.
+        # Resolve ownership after quantization so both paths retain UE8M0 bytes.
+        owned_scales = {
+            scale
+            for kernel, scale in (
+                (W.v4_mtp_e_proj_w, W.v4_mtp_e_proj_s),
+                (W.v4_mtp_h_proj_w, W.v4_mtp_h_proj_s),
+            )
+            if any(
+                isinstance(weight, CompositeWeight)
+                and weight.name == kernel
+                and scale in weight.sub_weights
+                for weight in info.weights
+            )
+        }
+        info.weights = [
+            weight
+            for weight in info.weights
+            if not (isinstance(weight, AtomicWeight) and weight.name in owned_scales)
+        ]
+        return info
+
     def _get_weight_info(self) -> ModelWeightInfo:
         # Per-layer entries are inherited from DeepSeekV4Weight as-is — the
         # MTP draft is a single regular V4 Block.  All MTP-only tensors
@@ -1068,7 +1114,8 @@ class DeepSeekV4MtpWeight(DeepSeekV4Weight, DeepSeekV3MtpWeight):
         if _is_ppu_flash(self.model_config):
             # Quantized projections already own these scale bytes.
             weights = [
-                w for w in weights
+                w
+                for w in weights
                 if w.name not in (W.v4_mtp_e_proj_s, W.v4_mtp_h_proj_s)
             ]
         return ModelWeightInfo(layer_weights=layer_weights, weights=weights)
@@ -1091,7 +1138,9 @@ class DeepSeekV4Mtp(DeepSeekV4, DeepSeekV3Mtp):
                 PpuDeepSeekV4MtpModel as DeepSeekV4MtpModel,
             )
         else:
-            from rtp_llm.models_py.model_desc.deepseek_v4_mtp_model import DeepSeekV4MtpModel
+            from rtp_llm.models_py.model_desc.deepseek_v4_mtp_model import (
+                DeepSeekV4MtpModel,
+            )
 
         self.py_model = DeepSeekV4MtpModel(
             self.model_config,

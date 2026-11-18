@@ -189,6 +189,32 @@ class BaseModel(object):
         self.model_weights_loader = self.create_model_loader()
         self.py_eplb = self.model_weights_loader._py_eplb
         device_str = self._get_device_str()
+        from contextlib import nullcontext
+
+        from rtp_llm.utils.phase_allocator import (
+            get_phase_allocator,
+            phase_allocator_enabled,
+        )
+
+        lifecycle = None
+        if phase_allocator_enabled():
+            self._validate_phase_allocator()
+            if skip_python_model:
+                raise ValueError(
+                    "Phase allocation requires a Python model startup lifecycle"
+                )
+            from rtp_llm.utils.model_startup import ModelStartupLifecycle
+
+            lifecycle = ModelStartupLifecycle(get_phase_allocator(device_str))
+        with lifecycle.loading_weights() if lifecycle else nullcontext():
+            self._load_and_create_python_model(device_str, skip_python_model)
+            if lifecycle is not None:
+                self.py_model._startup_lifecycle = lifecycle
+
+    def _validate_phase_allocator(self):
+        raise ValueError(f"Phase allocation is not supported by {type(self).__name__}")
+
+    def _load_and_create_python_model(self, device_str, skip_python_model):
         self._load(device_str)
         from rtp_llm.model_loader.weight_manager import WeightManager
 

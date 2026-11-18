@@ -168,14 +168,46 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
         checker.check(_mega_moe_available())
 
     def setup_weights(self, layer_weights: Dict) -> None:
-        """Keep the MegaMoE-resident weights and register the symm-mem buffer."""
+        """Prepare resident weights, optionally deferring runtime resources."""
         import deep_gemm
+
+        cfg = self.cfg
+        inter = _mega_intermediate_size(cfg)
+        device = self._transform_routed_weights(layer_weights, deep_gemm, inter)
+        self._finish_weight_setup(device)
+
+    def _finish_weight_setup(self, device: torch.device) -> None:
+        from rtp_llm.utils.phase_allocator import phase_allocator_enabled
+
+        self._mega_device = device
+        self._mega_runtime_ready = False
+        if not phase_allocator_enabled():
+            self.initialize_runtime()
+
+    def initialize_runtime(self) -> None:
+        """Create staging buffers and prewarm once, after weight conversion."""
+        from rtp_llm.utils.phase_allocator import get_phase_allocator
+
+        if self._mega_runtime_ready:
+            return
+        allocator = get_phase_allocator(self._mega_device)
+        if allocator is not None:
+            if allocator.state != "runtime":
+                raise RuntimeError(
+                    "MegaMoE runtime setup requires weight loading to finish"
+                )
+            allocator.check_runtime()
+        self._initialize_runtime_buffers()
+        self._maybe_warmup_jit_once()
+        self._mega_runtime_ready = True
+
+    def _initialize_runtime_buffers(self) -> None:
         import torch.distributed as dist
 
         cfg = self.cfg
         D = cfg.dim
         inter = _mega_intermediate_size(cfg)
-        device = self._transform_routed_weights(layer_weights, deep_gemm, inter)
+        device = self._mega_device
 
         # (4) Allocate the symmetric-memory buffer.  Uses
         # ``torch.distributed.group.WORLD`` because our DP+EP layout has
@@ -207,7 +239,6 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
             device,
         )
         self._input_packer = get_mega_moe_input_packer()
-        self._maybe_warmup_jit_once()
 
     def _transform_routed_weights(
         self, layer_weights: Dict, deep_gemm, inter: int

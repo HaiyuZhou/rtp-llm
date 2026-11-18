@@ -68,6 +68,7 @@ The core features include:
    backend/speculative_decoding.md
    backend/reuse_kv_cache.md
    backend/kv_cache_event_publisher.md
+   backend/phase_allocator.md
    backend/function_calling.ipynb
    backend/separate_reasoning.ipynb
    backend/quantization.md

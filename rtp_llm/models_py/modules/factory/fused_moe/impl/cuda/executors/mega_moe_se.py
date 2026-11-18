@@ -90,7 +90,6 @@ class MegaMoeSEExecutor(MegaMoeExecutor):
 
     def setup_weights(self, layer_weights: Dict) -> None:
         import deep_gemm
-        import torch.distributed as dist
 
         cfg = self.cfg
         D = cfg.dim
@@ -106,6 +105,15 @@ class MegaMoeSEExecutor(MegaMoeExecutor):
         device = self._transform_routed_weights(layer_weights, deep_gemm, inter)
 
         self._setup_shared_expert_weights(layer_weights, deep_gemm, D, inter)
+        self._finish_weight_setup(device)
+
+    def _initialize_runtime_buffers(self) -> None:
+        import torch.distributed as dist
+
+        cfg = self.cfg
+        D = cfg.dim
+        inter = _mega_intermediate_size(cfg)
+        device = self._mega_device
 
         group = _get_validated_world_ep_group(cfg, dist)
         self._mega_group = group
@@ -126,7 +134,6 @@ class MegaMoeSEExecutor(MegaMoeExecutor):
             device,
         )
         self._input_packer = get_mega_moe_se_input_packer()
-        self._maybe_warmup_jit_once()
 
     def _setup_shared_expert_weights(self, layer_weights, deep_gemm, D, inter):
         w13_fp8 = layer_weights.pop(W.ffn_w13)

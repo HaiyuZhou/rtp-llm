@@ -317,6 +317,24 @@ class ModelLoader:
             else:
                 load_method = LoadMethod.SCRATCH
 
+            if torch.distributed.is_initialized():
+                # The fast loader broadcasts over WORLD. Memory availability
+                # can differ after target loading, so a local AUTO decision
+                # could leave some ranks in scratch while peers broadcast.
+                dist = torch.distributed
+                vote_device = device if dist.get_backend() == "nccl" else "cpu"
+                eligible = torch.tensor(
+                    int(load_method == LoadMethod.FASTSAFETENSORS),
+                    dtype=torch.int32,
+                    device=vote_device,
+                )
+                dist.all_reduce(eligible, op=dist.ReduceOp.MIN)
+                load_method = (
+                    LoadMethod.FASTSAFETENSORS
+                    if eligible.item()
+                    else LoadMethod.SCRATCH
+                )
+
         logging.info(
             f"load method: {load_method}, finally choose load method: {load_method}"
         )

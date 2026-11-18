@@ -242,6 +242,9 @@ class PrefillFastPathTest(_PrefillForwardTestBase):
                 )
                 model = DeepSeekV4Model.__new__(DeepSeekV4Model)
                 nn.Module.__init__(model)
+                model._startup_lifecycle = (
+                    None  # Fixture bypasses GptModelBase.__init__.
+                )
                 model.v4 = v4
                 model.kv_cache = object()
                 model.parallelism_config = SimpleNamespace()
@@ -322,9 +325,7 @@ class PrefillFastPathTest(_PrefillForwardTestBase):
         v4 = _FakeV4()
         with patch.object(_profiler, "_RANGES_ENABLED", True), patch.dict(
             prefill_forward.os.environ, {"DSV4_PREFILL_FAST_PATH": "1"}
-        ), patch.object(
-            prefill_forward, "PrefillWorkspace"
-        ), patch.object(
+        ), patch.object(prefill_forward, "PrefillWorkspace"), patch.object(
             prefill_forward, "build_and_propagate_prefill_meta_fp8"
         ), patch.object(
             prefill_forward, "clear_prefill_meta_shared_fp8"
@@ -981,9 +982,7 @@ class PrefillFastPathTest(_PrefillForwardTestBase):
         for enabled in (False, True, False):
             with self.subTest(capture=enabled), patch.dict(
                 prefill_forward.os.environ, {}, clear=True
-            ), patch.object(
-                v4, "norm", wraps=v4.norm
-            ) as norm:
+            ), patch.object(v4, "norm", wraps=v4.norm) as norm:
                 out = prefill_forward.forward_layers(
                     v4,
                     kv_cache=None,
@@ -1018,9 +1017,7 @@ class PrefillFastPathTest(_PrefillForwardTestBase):
 
         with patch.dict(prefill_forward.os.environ, {}, clear=True), patch.object(
             prefill_forward, "build_and_propagate_prefill_meta_fp8"
-        ) as build_meta, patch.object(
-            prefill_forward, "clear_prefill_meta_shared_fp8"
-        ):
+        ) as build_meta, patch.object(prefill_forward, "clear_prefill_meta_shared_fp8"):
             out = prefill_forward.forward_layers(
                 v4,
                 kv_cache=None,
@@ -1072,9 +1069,7 @@ class PrefillFastPathTest(_PrefillForwardTestBase):
 
         with patch.dict(prefill_forward.os.environ, {}, clear=True), patch.object(
             prefill_forward, "build_and_propagate_prefill_meta_fp8"
-        ) as build_meta, patch.object(
-            prefill_forward, "clear_prefill_meta_shared_fp8"
-        ):
+        ) as build_meta, patch.object(prefill_forward, "clear_prefill_meta_shared_fp8"):
             prefill_forward.forward_layers(
                 v4,
                 kv_cache=None,

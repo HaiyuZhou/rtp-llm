@@ -54,6 +54,7 @@ class GptModelBase(nn.Module):
         self.vocab_size: int = config.vocab_size
 
         self.kv_cache: Optional[KVCache] = None
+        self._startup_lifecycle = None
         self.device_type: DeviceType = get_device_type()
         self._mtp_aux_capture_layer_ids = tuple(
             config.capture_aux_hidden_layer_ids or ()
@@ -133,6 +134,11 @@ class GptModelBase(nn.Module):
         return {"hidden_states": hidden_template}
 
     def initialize(self, init_resource: PyModelInitResources) -> bool:
+        if self._startup_lifecycle is not None:
+            return self._startup_lifecycle.initialize(self, init_resource)
+        return self._bind_init_resources(init_resource)
+
+    def _bind_init_resources(self, init_resource: PyModelInitResources) -> bool:
         self.kv_cache = init_resource.kv_cache
         if self.kv_cache is not None:
             num_layers = self.kv_cache.layer_count
@@ -151,6 +157,52 @@ class GptModelBase(nn.Module):
                 f"layer0_scale_groups={layer0_scale_count}, "
             )
         return True
+
+    def startup_tensors(self):
+        from rtp_llm.utils.model_startup import iter_module_tensors
+
+        yield from iter_module_tensors(self)
+
+    def startup_kv_tensors(self):
+        if self.kv_cache is None:
+            return
+        if self.kv_cache.layer_count <= 0:
+            raise RuntimeError("Production KV has no layers")
+        for layer in range(self.kv_cache.layer_count):
+            groups = self.kv_cache.get_layer_cache_groups(layer)
+            tags = [str(group.tag) for group in groups]
+            if not tags or any(not tag for tag in tags) or len(set(tags)) != len(tags):
+                raise RuntimeError(
+                    f"Production KV layer {layer} has missing or duplicate groups"
+                )
+            for group in groups:
+                if group.kv_cache_base is None or group.kv_cache_base.numel() == 0:
+                    raise RuntimeError(
+                        f"Production KV layer {layer} group {group.tag} is empty"
+                    )
+                for field in ("kv_cache_base", "kv_scale_base"):
+                    tensor = getattr(group, field, None)
+                    if tensor is not None:
+                        yield f"kv.{layer}.{group.tag}.{field}", tensor
+
+    def startup_forward_kind(self, inputs):
+        if self.kv_cache is None:
+            return "warmup"
+        attention = get_attention_inputs_value(inputs)
+        if isinstance(attention, Mapping):
+            attention = next(iter(attention.values()))
+        # Speculative target verification has prefill-shaped lengths but
+        # executes multi-token decode and must exercise the decode audit.
+        if getattr(attention, "is_target_verify", False):
+            return "decode"
+        return "prefill" if attention.is_prefill else "decode"
+
+    def startup_forward(self, callback, inputs, *args, **kwargs):
+        if self._startup_lifecycle is not None:
+            return self._startup_lifecycle.forward(
+                self, callback, inputs, *args, **kwargs
+            )
+        return callback(inputs, *args, **kwargs)
 
     def prepare_fmha_impl(
         self,

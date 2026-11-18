@@ -155,3 +155,15 @@ cc_test(
         ("async", "1"),
     ]
 ]
+
+cc_test(
+    name = "engine_model_startup_test",
+    srcs = ["EngineModelStartupTest.cc"],
+    copts = test_copts,
+    deps = [
+        "//rtp_llm/cpp/normal_engine:normal_engine",
+        "@com_google_googletest//:gtest",
+    ] + torch_deps() + cuda13_torch_link_deps,
+    env = device_test_envs(),
+    tags = ["manual"],
+)

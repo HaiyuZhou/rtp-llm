@@ -21,6 +21,15 @@ py_test(
 )
 
 py_test(
+    name = "deepseek_v4_mtp_weight_test",
+    srcs = ["deepseek_v4_mtp_weight_test.py"],
+    deps = ["//rtp_llm:testlib"],
+    target_compatible_with = _DSV4_CUDA13_ONLY,
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
+)
+
+py_test(
     name = "moe_config_propagation_test",
     srcs = ["moe_config_propagation_test.py"],
     deps = ["//rtp_llm:testlib"],

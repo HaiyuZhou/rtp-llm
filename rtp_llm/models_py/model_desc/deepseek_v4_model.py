@@ -513,6 +513,8 @@ class DeepSeekV4Model(GptModelBase):
 
     def initialize(self, init_resource: PyModelInitResources) -> bool:
         try:
+            if self._startup_lifecycle is not None:
+                return super().initialize(init_resource)
             return self._initialize_impl(init_resource)
         except BaseException as e:
             import traceback
@@ -662,18 +664,55 @@ class DeepSeekV4Model(GptModelBase):
                 mtp_last_hidden_capacity,
             )
 
-    def _initialize_impl(self, init_resource: PyModelInitResources) -> bool:
-        # Called by the engine after construction and before forward.
-        super().initialize(init_resource)
-        if self._materialized:
-            return True
+    def _materialize_weights(self, device_str: str) -> None:
+        # ``self.weight`` is a framework ``ModelWeights`` populated by the
+        # ``DeepSeekV4Weight`` descriptor (see ``rtp_llm/models/deepseek_v4.py``)
+        # via the fastsafetensors loader.  Each dsv4 sub-module's factory
+        # mode reads tensors directly from ``mw.global_weights[W.*]`` and
+        # ``mw.weights[layer_id][W.v4_*]`` — see the per-module __init__
+        # for the W tags consumed.
+        logging.info(
+            "[DeepSeekV4Model] building V4Transformer via factory "
+            "(layers=%d, globals=%d) ...",
+            len(self.weight.weights),
+            len(self.weight.global_weights),
+        )
+        # Construct under meta device so the nn.Embedding / nn.Linear /
+        # QuantizedLinear placeholder allocations inside the module tree
+        # skip real RAM. Each module's factory branch then reassigns
+        # `.weight`/`.scale` to the cuda tensors from the weights dict.
+        prev_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            with torch.device("meta"):
+                self.v4 = V4Transformer(self._v4_args, mw=self.weight)
+        finally:
+            torch.set_default_dtype(prev_dtype)
+        if self._captures_aux_hidden:
+            self.v4.set_aux_hidden_capture_layer_ids(self._capture_aux_hidden_layer_ids)
 
+        # Recompute RoPE on the real device and prebuild the compressors'
+        # shared cos_sin_cache before runtime memory allocation starts.
+        for layer in self.v4.layers:
+            layer.attn.init_rope_cache(device=device_str)
+
+        # Subclass hook: lift any model-level weights (e.g. MTP fusion
+        # norms / projections) off the ModelWeights wrapper before we
+        # discard it.  Default impl is a no-op.
+        self._load_extra_weights(self.weight)
+
+        # Drop the ModelWeights wrapper — per-tensor refs are now held
+        # only by the V4Transformer modules (or were popped during
+        # MoE._setup_mega_moe / per-expert routed init).
+        del self.weight
+
+    def _prepare_startup(self, init_resource: PyModelInitResources) -> None:
         device = (
             next(iter(self.weight.global_weights.values())).device
             if self.weight.global_weights
             else "cuda:0"
         )
-        device_str = str(device)
+        self._startup_device_str = str(device)
 
         self._is_speculative = bool(init_resource.is_speculative)
         self._is_decode_role = bool(init_resource.is_decode_role)
@@ -717,49 +756,32 @@ class DeepSeekV4Model(GptModelBase):
             )
             self._v4_args.max_tokens_per_rank = runtime_resolved_max_tokens_per_rank
 
+    def _materialize_startup_weights(self) -> None:
+        self._materialize_weights(self._startup_device_str)
+
+    def _initialize_impl(self, init_resource: PyModelInitResources) -> bool:
+        super().initialize(init_resource)
+        if self._materialized:
+            return True
+        self._prepare_startup(init_resource)
         if bool(getattr(self._v4_args, "commit_only", False)):
-            return self._initialize_commit_only(init_resource, device_str)
+            return self._initialize_commit_only(init_resource, self._startup_device_str)
+        self._materialize_startup_weights()
+        self._initialize_startup_runtime()
+        return True
 
-        # ``self.weight`` is a framework ``ModelWeights`` populated by the
-        # ``DeepSeekV4Weight`` descriptor (see ``rtp_llm/models/deepseek_v4.py``)
-        # via the fastsafetensors loader.  Each dsv4 sub-module's factory
-        # mode reads tensors directly from ``mw.global_weights[W.*]`` and
-        # ``mw.weights[layer_id][W.v4_*]`` — see the per-module __init__
-        # for the W tags consumed.
-        logging.info(
-            "[DeepSeekV4Model] building V4Transformer via factory "
-            "(layers=%d, globals=%d) ...",
-            len(self.weight.weights),
-            len(self.weight.global_weights),
-        )
-        # Construct under meta device so the nn.Embedding / nn.Linear /
-        # QuantizedLinear placeholder allocations inside the module tree
-        # skip real RAM. Each module's factory branch then reassigns
-        # `.weight`/`.scale` to the cuda tensors from the weights dict.
-        prev_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(torch.bfloat16)
-        try:
-            with torch.device("meta"):
-                self.v4 = V4Transformer(self._v4_args, mw=self.weight)
-        finally:
-            torch.set_default_dtype(prev_dtype)
-        if self._captures_aux_hidden:
-            self.v4.set_aux_hidden_capture_layer_ids(self._capture_aux_hidden_layer_ids)
+    def _initialize_startup_runtime(self) -> None:
+        device_str = self._startup_device_str
+        if self._startup_lifecycle is not None:
+            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe import (
+                MegaMoeExecutor,
+            )
 
-        # Recompute RoPE on the real device and prebuild the compressors'
-        # shared cos_sin_cache before runtime memory allocation starts.
-        for layer in self.v4.layers:
-            layer.attn.init_rope_cache(device=device_str)
-
-        # Subclass hook: lift any model-level weights (e.g. MTP fusion
-        # norms / projections) off the ModelWeights wrapper before we
-        # discard it.  Default impl is a no-op.
-        self._load_extra_weights(self.weight)
-
-        # Drop the ModelWeights wrapper — per-tensor refs are now held
-        # only by the V4Transformer modules (or were popped during
-        # MoE._setup_mega_moe / per-expert routed init).
-        del self.weight
+            executors = [m for m in self.v4.modules() if isinstance(m, MegaMoeExecutor)]
+            if not executors:
+                raise ValueError("DSV4_PHASE_ALLOCATOR requires a MegaMoE executor")
+            for executor in executors:
+                executor.initialize_runtime()
 
         if torch.cuda.is_available() and device_str.startswith("cuda"):
             gpu_mem_gb = torch.cuda.memory_allocated(torch.device(device_str)) / 1024**3
@@ -1117,7 +1139,14 @@ class DeepSeekV4Model(GptModelBase):
 
         self._materialized = True
 
-        return True
+    def startup_tensors(self):
+        yield from super().startup_tensors()
+        if self._shared_runtime_buffers is not None:
+            from rtp_llm.utils.model_startup import iter_tensor_values
+
+            yield from iter_tensor_values(
+                "shared_runtime", vars(self._shared_runtime_buffers)
+            )
 
     def _should_capture_cuda_graph(self, attn: Any, is_target_verify: bool) -> bool:
         """Default: capture decode + verify, skip plain prefill.  MTP
@@ -1333,6 +1362,11 @@ class DeepSeekV4Model(GptModelBase):
         return buf[:requested]
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
+        return self.startup_forward(self._forward_impl, inputs, fmha_impl)
+
+    def _forward_impl(
+        self, inputs: PyModelInputs, fmha_impl: Any = None
+    ) -> PyModelOutputs:
         """qwen3-style dispatcher — per-arm orchestration lives in the
         prefill / decode runtime modules.
 

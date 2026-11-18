@@ -3,6 +3,7 @@
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
 #include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
 #include "rtp_llm/cpp/normal_engine/NormalEngine.h"
+#include "rtp_llm/cpp/normal_engine/EngineModelStartup.h"
 #include "rtp_llm/cpp/normal_engine/pipeline/PPExecutor.h"
 #include "rtp_llm/cpp/normal_engine/pipeline/PPTransport.h"
 #include "rtp_llm/cpp/normal_engine/accuracy/AccuracyChecker.h"
@@ -278,6 +279,9 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
     RTP_LLM_LOG_INFO("ROCm NormalEngine ctor: set device to %d", parallelism_config.local_rank);
 #endif
 
+    // Every participating Python model must finish weight conversion before
+    // warmup can create even a temporary cache, including warm_up=0 startup.
+    prepareEngineModelStartup(params);
     std::optional<WarmUpResult> warm_up_result = std::nullopt;
 #if USING_CUDA
     if (runtime_config.warm_up && (!model_config_.mm_model_config.is_multimodal)) {
@@ -306,6 +310,7 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
         }
         dynamic_decode_gate_enabled_ = gate_result.value();
     }
+    assertEngineModelStartupReady(params);
     initCacheManager(warm_up_result);
     RTP_LLM_LOG_INFO("create cache manager done");
 
@@ -621,10 +626,9 @@ WarmUpResult NormalEngine::prefillWarmUp(const EngineInitParams& params) {
     RTP_LLM_FAIL("prefillWarmUp is not supported on non-CUDA platforms");
     return {};
 #else
-    const int64_t token_budget = runtime_config.fifo_scheduler_config.prefill_chunk_size;
-    const bool    use_global_budget_warmup =
-        token_budget > 0 && !runtime_config.warm_up_with_loss;
-    const int64_t token_heavy_seq_len = std::max<int64_t>(1, static_cast<int64_t>(getWarmUpInputLength()));
+    const int64_t token_budget             = runtime_config.fifo_scheduler_config.prefill_chunk_size;
+    const bool    use_global_budget_warmup = token_budget > 0 && !runtime_config.warm_up_with_loss;
+    const int64_t token_heavy_seq_len      = std::max<int64_t>(1, static_cast<int64_t>(getWarmUpInputLength()));
 
     auto fake_input = makeFakeInput(static_cast<size_t>(token_heavy_seq_len));
     fake_input->generate_config->num_return_sequences =
@@ -753,6 +757,7 @@ WarmUpResult NormalEngine::prefillWarmUp(const EngineInitParams& params) {
             pybind11::gil_scoped_acquire gil;
             params.py_model.attr("initialize")(torch_ext::PyModelInitResources{});
         }
+        releaseEngineWarmupKV(params);
         (void)executor_.reset(nullptr);
     }
     cudaDeviceSynchronize();
@@ -784,6 +789,12 @@ WarmUpResult NormalEngine::decodeWarmUp(const EngineInitParams& params) {
     }
     const auto max_consumed = getGpuExecStatus().device_memory_status.max_consumed_bytes;
     (void)executor_.reset(nullptr);
+    // Once Python drops its cache references, release the temporary owner too,
+    // so the production KV budget observes free pages rather than warmup KV.
+    // Preserve the existing disabled path's lifetime until return.
+    if (releaseEngineWarmupKV(params)) {
+        cache_manager.reset();
+    }
     cudaDeviceSynchronize();
     c10::cuda::CUDACachingAllocator::emptyCache();
     const auto device_status = getGpuExecStatus();
@@ -859,16 +870,16 @@ void NormalEngine::initializeAndPublishCacheManager(ResourceContext&            
 }
 
 #if USING_CUDA
-std::vector<AccuracyScenario> NormalEngine::accuracyScenariosForStartup(const ModelConfig& model_config,
-                                                                      const RuntimeConfig& runtime_config,
-                                                                      const KVCacheConfig& cache_config,
-                                                                      size_t block_size,
-                                                                      size_t temporary_block_num) {
+std::vector<AccuracyScenario> NormalEngine::accuracyScenariosForStartup(const ModelConfig&   model_config,
+                                                                        const RuntimeConfig& runtime_config,
+                                                                        const KVCacheConfig& cache_config,
+                                                                        size_t               block_size,
+                                                                        size_t               temporary_block_num) {
     const auto executable = [&](const AccuracyScenario& scenario) {
         size_t max_plain = 0, max_seq = 0;
         for (const auto& seq : scenario.seqs) {
             max_plain = std::max(max_plain, seq.prefix_len + seq.chunk_len);
-            max_seq = std::max(max_seq, seq.prefix_len + seq.chunk_len + seq.decode_steps);
+            max_seq   = std::max(max_seq, seq.prefix_len + seq.chunk_len + seq.decode_steps);
         }
         // Match runCheck(), including its strict token-budget comparison.
         const auto token_budget = runtime_config.fifo_scheduler_config.max_batch_tokens_size;
@@ -876,21 +887,22 @@ std::vector<AccuracyScenario> NormalEngine::accuracyScenariosForStartup(const Mo
                && scenario.seqs.size() <= static_cast<size_t>(runtime_config.max_generate_batch_size)
                && (token_budget == 0 || max_plain * scenario.seqs.size() < static_cast<size_t>(token_budget))
                && max_seq <= static_cast<size_t>(model_config.max_seq_len) && max_seq <= 65536
-               && AccuracyChecker::computeTemporaryBlockNum(block_size, cache_config, {scenario}) <= temporary_block_num;
+               && AccuracyChecker::computeTemporaryBlockNum(block_size, cache_config, {scenario})
+                      <= temporary_block_num;
     };
     std::vector<AccuracyScenario> scenarios;
-    bool has_decode = false;
+    bool                          has_decode = false;
     for (const auto& scenario : AccuracyChecker::defaultScenarios()) {
         if (executable(scenario)) {
             scenarios.push_back(scenario);
-            has_decode |= std::any_of(scenario.seqs.begin(), scenario.seqs.end(),
-                                      [](const auto& seq) { return seq.decode_steps > 0; });
+            has_decode |= std::any_of(
+                scenario.seqs.begin(), scenario.seqs.end(), [](const auto& seq) { return seq.decode_steps > 0; });
         }
     }
     if (!has_decode) {
         AccuracyScenario minimal{{{0, 1, 1}}};
         RTP_LLM_CHECK_WITH_INFO(executable(minimal),
-                               "accuracy check requires capacity for batch 1, one prompt token and one decode step");
+                                "accuracy check requires capacity for batch 1, one prompt token and one decode step");
         scenarios.push_back(std::move(minimal));
     }
     return scenarios;
@@ -938,14 +950,19 @@ absl::StatusOr<bool> NormalEngine::runAttentionAccuracyCheck(const EngineInitPar
                             "attention accuracy check requires one FULL KV cache group");
         return false;
     }
-    auto accuracy_scenarios = accuracyScenariosForStartup(
-        model_config_, runtime_config, check_config, cache_config.seq_size_per_block, std::numeric_limits<size_t>::max());
+    auto accuracy_scenarios = accuracyScenariosForStartup(model_config_,
+                                                          runtime_config,
+                                                          check_config,
+                                                          cache_config.seq_size_per_block,
+                                                          std::numeric_limits<size_t>::max());
     cache_config.finalizeBlockNums(
         AccuracyChecker::computeTemporaryBlockNum(cache_config.seq_size_per_block, check_config, accuracy_scenarios),
         runtime_config);
-    accuracy_scenarios = accuracyScenariosForStartup(
-        model_config_, runtime_config, check_config, cache_config.seq_size_per_block,
-        cache_config.topology().groups().front().block_num);
+    accuracy_scenarios = accuracyScenariosForStartup(model_config_,
+                                                     runtime_config,
+                                                     check_config,
+                                                     cache_config.seq_size_per_block,
+                                                     cache_config.topology().groups().front().block_num);
     ResourceContext check_context;
     check_context.initCacheConfig(check_config);
     check_context.role_type  = pd_sep_config.role_type;
@@ -1111,7 +1128,7 @@ absl::Status NormalEngine::stop() {
         return absl::OkStatus();
     }
     RTP_LLM_LOG_INFO("stop normal engine");
-    running_ = false;
+    running_                    = false;
     const auto scheduler_status = scheduler_->stop();
     // Ask rank 0 to stop at a step boundary. Receivers must finish all model
     // collectives for inputs that rank 0 has already published before exiting.

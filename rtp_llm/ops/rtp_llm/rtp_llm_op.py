@@ -33,6 +33,7 @@ class RtpLLMOp:
         self.mm_process_engine = mm_process_engine
 
     def start(self):
+        self._register_startup_models()
         self.weight = self.model.weight
         logging.info("engine_config: %s", self.engine_config.to_string())
         from rtp_llm.telemetry.config import load_trace_config
@@ -49,6 +50,15 @@ class RtpLLMOp:
             self.mm_process_engine,
             trace_config,
         )
+
+    def _register_startup_models(self):
+        models = [self.model.py_model]
+        if self.propose_model is not None and self.propose_model.model is not None:
+            models.append(self.propose_model.model.py_model)
+        if any(getattr(model, "_startup_lifecycle", None) is not None for model in models):
+            from rtp_llm.utils.model_startup import register_engine_models
+
+            register_engine_models(models)
 
     def stop(self):
         self.ft_op.stop()  # type: ignore

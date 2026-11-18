@@ -178,6 +178,50 @@ py_test(
     deps = ["//rtp_llm:warmup"],
 )
 
+# Requires the native Torch wheel with large_segment_size_mb support.
+py_test(
+    name = "phase_allocator_test",
+    srcs = ["phase_allocator_test.py"],
+    deps = ["//rtp_llm:utils"],
+    tags = ["gpu", "manual"],
+)
+
+py_test(
+    name = "model_startup_test",
+    srcs = ["model_startup_test.py"],
+    deps = ["//rtp_llm:utils"],
+)
+
+py_test(
+    name = "model_startup_group_test",
+    srcs = ["model_startup_group_test.py", "model_startup_test.py"],
+    deps = ["//rtp_llm:utils"],
+)
+
+py_test(
+    name = "engine_startup_registration_test",
+    srcs = ["engine_startup_registration_test.py", "model_startup_test.py"],
+    data = ["//rtp_llm:ops/rtp_llm/rtp_llm_op.py"],
+    deps = ["//rtp_llm:utils"],
+)
+
+py_test(
+    name = "model_startup_cuda_test",
+    srcs = ["model_startup_cuda_test.py", "phase_allocator_test.py"],
+    deps = ["//rtp_llm:utils"],
+    tags = ["gpu", "manual"],
+)
+
+py_test(
+    name = "model_startup_integration_test",
+    srcs = ["model_startup_integration_test.py", "model_startup_test.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+    tags = ["manual"],
+)
+
 py_test(
     name = "hot_hook_runtime_test",
     srcs = [

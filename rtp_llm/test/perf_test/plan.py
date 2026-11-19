@@ -365,14 +365,16 @@ def _validate_persisted_resource_plan(
         )
     else:
         execution = resolved_config["execution"]
-        per_machine = execution.get("gpus_per_machine")
-        if per_machine is None:
-            per_machine = world_size
+        requested = execution.get("gpus_per_machine")
+        per_machine = world_size if requested is None else requested
         if type(per_machine) is not int or per_machine <= 0:
             raise ResourceError("persisted resource topology is invalid")
-        # Resource planners normalize a per-machine upper bound to model width.
-        per_machine = min(per_machine, world_size)
-        if world_size % per_machine:
+        # Mirror aone.plan._aone_resource_plan: machine_count uses ceiling
+        # division, and the raw requested gpus_per_machine is preserved as
+        # the scheduler allocation request even when it exceeds world_size
+        # (single-machine shards may occupy more GPUs than the engine uses).
+        machine_count = -(-world_size // per_machine)
+        if machine_count > 1 and world_size % per_machine:
             raise ResourceError("persisted resource topology is invalid")
         expected = AOneResourcePlan(
             backend="aone",
@@ -382,9 +384,14 @@ def _validate_persisted_resource_plan(
             shard_count=execution.get("shard_count"),
             max_parallel=execution["max_parallel"],
             gpus_per_machine=per_machine,
-            machine_count=world_size // per_machine,
-            local_world_size=per_machine,
+            machine_count=machine_count,
+            local_world_size=world_size // machine_count,
         )
+        # Older single-machine plans stored the engine width in this field.
+        if per_machine > world_size and resource_plan == replace(
+            expected, gpus_per_machine=world_size
+        ):
+            return
     if resource_plan != expected:
         raise ResourceError(
             "resource plan does not match the resolved execution configuration"

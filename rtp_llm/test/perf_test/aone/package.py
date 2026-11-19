@@ -94,6 +94,15 @@ def _build_file(
     *,
     test_timeout_seconds: int,
 ) -> str:
+    # Single-machine shards may reserve more GPUs than the engine world size
+    # so the scheduler keeps neighbors off the host; the worker still locks
+    # only WORLD_SIZE devices (device_resource.py prefers WORLD_SIZE).
+    alloc_gpus = (
+        resource.gpus_per_machine
+        if resource.machine_count == 1
+        and resource.gpus_per_machine > resource.gpus_per_shard
+        else None
+    )
     lines = [
         'load("//rtp_llm/test/perf_test:aone_defs.bzl", "perf_test_aone_shard")',
         "",
@@ -110,10 +119,11 @@ def _build_file(
                 f'    gpu_type = "{resource.gpu_type}",',
                 f"    gpu_count = {resource.gpus_per_shard},",
                 f'    watchdog_seconds = "{test_timeout_seconds}",',
-                ")",
-                "",
             ]
         )
+        if alloc_gpus is not None:
+            lines.append(f"    alloc_gpu_count = {alloc_gpus},")
+        lines.extend([")", ""])
     targets = ", ".join(f'":shard_{index:04d}"' for index, _ in enumerate(ownership))
     lines.extend(
         [

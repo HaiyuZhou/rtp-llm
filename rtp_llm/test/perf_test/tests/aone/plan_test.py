@@ -97,7 +97,7 @@ class AOnePlanningTest(unittest.TestCase):
         with self.assertRaisesRegex(PlanningError, "shard_count"):
             self._plan(world_size=8, gang=True)
 
-    def test_oversized_machine_setting_normalizes_and_round_trips(self):
+    def test_oversized_machine_setting_is_preserved_and_round_trips(self):
         plan = self._plan(execution={"gpus_per_machine": 8})
         changed = self._plan(
             execution={"gpus_per_machine": 8, "test_timeout_seconds": 19500}
@@ -107,8 +107,14 @@ class AOnePlanningTest(unittest.TestCase):
         )
         self.assertNotEqual(plan.config_fingerprint, changed.config_fingerprint)
         self.assertEqual(changed, ExecutionPlan.from_dict(changed.to_dict()))
-        self.assertEqual(2, plan.resource_plan.gpus_per_machine)
+        self.assertEqual(8, plan.resource_plan.gpus_per_machine)
+        self.assertEqual(2, plan.resource_plan.local_world_size)
         self.assertEqual(plan, ExecutionPlan.from_dict(plan.to_dict()))
+
+    def test_legacy_oversized_machine_setting_still_loads(self):
+        payload = self._plan(execution={"gpus_per_machine": 8}).to_dict()
+        payload["resource_plan"]["gpus_per_machine"] = 2
+        self.assertEqual(payload, ExecutionPlan.from_dict(payload).to_dict())
 
     def test_persisted_machine_setting_rejects_non_positive_and_non_integers(self):
         for value in (0, -1, True, "2", 1.5):

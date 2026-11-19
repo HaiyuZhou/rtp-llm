@@ -35,8 +35,14 @@ def unified_prefill_ci_test(name, config, gpu_type, gpu_count, data = [], deps =
     return name
 
 
-def perf_test_aone_shard(name, resolved_config, resolved_workload, shard_plan, shard_id, gpu_type, gpu_count, watchdog_seconds = _PERF_TEST_WATCHDOG_SECONDS):
-    """Define one unified prefill shard using only declared runfiles."""
+def perf_test_aone_shard(name, resolved_config, resolved_workload, shard_plan, shard_id, gpu_type, gpu_count, watchdog_seconds = _PERF_TEST_WATCHDOG_SECONDS, alloc_gpu_count = None):
+    """Define one unified prefill shard using only declared runfiles.
+
+    ``gpu_count`` is the engine world size (WORLD_SIZE); ``alloc_gpu_count``
+    optionally requests more GPUs from the scheduler so a single-machine
+    shard can hold the whole host's slots while the engine still only uses
+    ``gpu_count`` devices.
+    """
     native.py_test(
         name = name,
         main = "//rtp_llm/test/perf_test:aone/worker.py",
@@ -58,7 +64,7 @@ def perf_test_aone_shard(name, resolved_config, resolved_workload, shard_plan, s
         tags = ["manual", gpu_type],
         exec_properties = {
             "gpu": gpu_type,
-            "gpu_count": str(gpu_count),
+            "gpu_count": str(alloc_gpu_count or gpu_count),
         },
         env = {
             "WORLD_SIZE": str(gpu_count),

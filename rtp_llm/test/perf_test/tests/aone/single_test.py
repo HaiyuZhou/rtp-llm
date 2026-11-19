@@ -143,7 +143,9 @@ class AOneSingleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             root = workspace / "runs/normal"
-            plan = _setup(root, 2, test_timeout_seconds=19500)
+            source = _source_config(2, test_timeout_seconds=19500)
+            source["execution"]["gpus_per_machine"] = 8
+            plan = _setup_run(root, source, run_id="run-aone")
             payloads = _remote_results(plan)
             commands = []
             process = Mock()
@@ -214,9 +216,10 @@ class AOneSingleTest(unittest.TestCase):
             process.wait.assert_called_once()
             generated = root / "workload/aone_package"
             self.assertEqual("--test_timeout=19500", commands[1][-1])
-            self.assertIn(
-                'watchdog_seconds = "19500"', (generated / "BUILD.bazel").read_text()
-            )
+            build_text = (generated / "BUILD.bazel").read_text()
+            self.assertEqual(2, build_text.count('watchdog_seconds = "19500"'))
+            self.assertEqual(2, build_text.count("alloc_gpu_count = 8"))
+            self.assertEqual(2, build_text.count("    gpu_count = 1"))
             self.assertEqual(
                 19500, plan.resolved_config["execution"]["test_timeout_seconds"]
             )

@@ -80,7 +80,13 @@ def _aone_resource_plan(
         gpus_per_shard=world_size,
         shard_count=shard_count,
         max_parallel=max_parallel,
-        gpus_per_machine=gang.gpus_per_machine,
+        # Preserve the raw requested gpus_per_machine: derive_gang_topology
+        # normalizes oversized values down to world_size, but the shard
+        # package uses the raw value as the scheduler allocation request so
+        # a single-machine shard can occupy more GPUs than its world size.
+        gpus_per_machine=(
+            gpus_per_machine if gpus_per_machine is not None else gang.gpus_per_machine
+        ),
         machine_count=gang.machine_count,
         local_world_size=gang.local_world_size,
     )

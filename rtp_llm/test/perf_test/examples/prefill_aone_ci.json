@@ -458,7 +458,6 @@
   },
   "execution": {
     "backend": "aone",
-    "test_timeout_seconds": 7000,
     "resource": "daily",
     "gpu_type": "H20_CU13",
     "max_parallel": 2,

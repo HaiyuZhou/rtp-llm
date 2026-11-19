@@ -38,8 +38,11 @@
       "DG_JIT_PRINT_COMPILER_COMMAND": "1",
       "DG_JIT_PRINT_LOAD_TIME": "1",
       "DSV4_CHUNK_TOKENS": "12288",
+      "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+      "PREFILL_CACHE_HIT_METRIC_ENABLE": "1",
       "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,large_segment_size_mb:1024",
-      "DG_MEGA_MOE_NVLINK_BARRIER_TIMEOUT_SECS": "300"
+      "DG_MEGA_MOE_NVLINK_BARRIER_TIMEOUT_SECS": "300",
+      "NVCC_PREPEND_FLAGS": "-ccbin=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
     }
   },
   "workload": {
@@ -63,7 +66,7 @@
     "backend": "aone",
     "test_timeout_seconds": 19500,
     "resource": "daily",
-    "gpu_type": "SM103_CU13",
+    "gpu_type": "SM100_ARM_CU13",
     "shard_count": 1,
     "max_parallel": 1
   },

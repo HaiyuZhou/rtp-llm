@@ -28,6 +28,51 @@ creating a run directory, contacting hosts, building or starting a model.
 uses fixed global batches divisible by DP. Current model-level measurements
 require PP=1. Profiling restrictions are checked during planning.
 
+## Local execution with the Bazel platform environment
+
+Run the local backend as a Bazel test to reuse the platform's toolchain,
+Python dependencies, generated protobufs and NVIDIA library wrapper:
+
+```bash
+bazelisk test //rtp_llm/test/perf_test:perf_test_local \
+  --config=cuda13_arm \
+  --test_strategy=local \
+  --nocache_test_results \
+  --test_output=streamed \
+  --test_timeout=7200 \
+  --test_env=GPU_COUNT=4 \
+  --test_env=RTP_TEST_WATCHDOG_SECONDS=7200 \
+  --test_arg=--mode=prefill \
+  --test_arg=--action=run \
+  --test_arg="--config=$PWD/prefill_deepseek_v4_flash_b1_logarithmic_local.json"
+```
+
+Keep `execution.backend="local"`. `--config=cuda13_arm` selects Bazel's
+platform configuration; `--test_arg=--config=...` selects the benchmark JSON.
+The target is manual and local, so it is not included by wildcard test runs
+and is never scheduled on a remote worker. Use absolute config, model and
+external workload paths for files outside runfiles. `--dry-run` can be passed
+as `--test_arg=--dry-run` to preview without starting the engine.
+
+Set `GPU_COUNT` to the number of devices required by the config (default 1).
+The existing GPU wrapper locks physical devices; `execution.devices` then
+indexes those allocated devices. Avoid an inherited `WORLD_SIZE` override:
+the wrapper gives it precedence over `GPU_COUNT`. The timeout flags bound
+both Bazel and the GPU wrapper; increase both for a longer grid.
+
+The existing mode/action/config arguments are unchanged. Resume, profile and
+report also accept `--test_arg=--run-dir=/absolute/path/to/run`. Relative CLI
+input paths resolve from Bazel's runfiles directory. Relative result roots
+(default `perf_test_results`) are saved under `TEST_UNDECLARED_OUTPUTS_DIR`
+and retained in this target's `bazel-testlogs` undeclared outputs. Set an
+absolute `output.result_root` in JSON to keep results at a persistent local
+path, especially for resume/profile. `--nocache_test_results` ensures the
+benchmark runs again even when its inputs are unchanged.
+
+Platform toolchain environment belongs to `.bazelrc`; `engine.env` is only
+needed for benchmark-specific settings or deliberate overrides. The direct
+`python tools/perf_test` entry still uses the current process environment.
+
 ## Prefill batches
 
 `examples/prefill_multi_grid_local.json` contains named cold, explicit mixed,

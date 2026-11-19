@@ -35,6 +35,7 @@ _TESTS = {
     "core/build_closure_test": [],
     "core/ci_test": ["//rtp_llm/test/perf_test:ci_helpers", "//rtp_llm/test/perf_test:perf_test_runtime_lib"],
     "core/config_test": [],
+    "core/local_entry_test": [],
     "core/entry_test": ["//rtp_llm/test/perf_test:perf_test_runtime_lib"],
     "core/plan_test": [],
     "core/report_test": ["//rtp_llm/test/perf_test:perf_test_analyzer_lib", "//rtp_llm/test/perf_test:perf_test_runtime_lib"],
@@ -78,6 +79,7 @@ _RUNTIME_SUPPORT_TESTS = [
 ]
 
 _EXTRA_SOURCES = {
+    "core/local_entry_test": ["//rtp_llm/test/perf_test:local_main.py"],
     "core/build_closure_test": ["//rtp_llm/test/perf_test:main.py"],
     "core/entry_test": ["//rtp_llm/test/perf_test:main.py"],
     "decode/remote_entry_test": ["//rtp_llm/test/perf_test:decode_remote_test.py"],

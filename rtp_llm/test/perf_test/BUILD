@@ -136,6 +136,7 @@ exports_files([
     "examples/qwen35_prefill_test.json",
     "examples/req_distribution.json",
     "main.py",
+    "local_main.py",
 ])
 
 py_library(
@@ -250,6 +251,25 @@ py_binary(
     name = "perf_test",
     main = "main.py",
     srcs = ["main.py"],
+    deps = [
+        ":aone_lib",
+        ":perf_test_entry_lib",
+        ":perf_test_runtime_lib",
+    ],
+)
+
+# Arbitrary local configs are passed as absolute paths through --test_arg.
+# Reuse .bazelrc test_env and run_under instead of duplicating toolchain setup.
+py_test(
+    name = "perf_test_local",
+    srcs = ["local_main.py"],
+    main = "local_main.py",
+    timeout = "eternal",
+    tags = ["manual", "local"],
+    data = [
+        "//rtp_llm:sdk",
+        ":perf_test_examples",
+    ],
     deps = [
         ":aone_lib",
         ":perf_test_entry_lib",

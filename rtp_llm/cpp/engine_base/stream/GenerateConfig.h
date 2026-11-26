@@ -97,11 +97,12 @@ public:
     bool                          sp_edit                   = false;
     bool                          force_disable_sp_run      = false;
     bool                          force_sp_accept           = false;
-    ReturnAllProbsMode            return_all_probs          = ReturnAllProbsMode::NONE;
-    bool                          return_logprobs           = false;
-    int                           top_logprobs              = 0;
-    bool                          return_softmax_probs      = false;
-    bool                          aux_info                  = true;
+    std::optional<int>            force_reuse_length;
+    ReturnAllProbsMode            return_all_probs     = ReturnAllProbsMode::NONE;
+    bool                          return_logprobs      = false;
+    int                           top_logprobs         = 0;
+    bool                          return_softmax_probs = false;
+    bool                          aux_info             = true;
     std::vector<std::vector<int>> stop_words_list;
     std::vector<std::string>      stop_words_str;
     bool                          print_stop_words = false;
@@ -278,6 +279,8 @@ public:
                      << ", is_streaming:" << is_streaming << ", frontend_metric_streaming:" << frontend_metric_streaming
                      << ", timeout_ms:" << timeout_ms << ", top_k:" << top_k << ", top_p:" << top_p
                      << ", force_disable_sp_run: " << force_disable_sp_run << ", force_sp_accept: " << force_sp_accept
+                     << ", force_reuse_length: "
+                     << (force_reuse_length.has_value() ? std::to_string(*force_reuse_length) : std::string("<unset>"))
                      << ", return_all_probs: " << static_cast<int>(return_all_probs)
                      << ", json_schema: " << summarize_optional_string(json_schema)
                      << ", regex: " << summarize_optional_string(regex) << ", ebnf: " << summarize_optional_string(ebnf)
@@ -376,6 +379,7 @@ public:
         JSONIZE(sp_edit);
         JSONIZE(force_disable_sp_run);
         JSONIZE(force_sp_accept);
+        JSONIZE_OPTIONAL(force_reuse_length);
         // autil JSONIZE doesn't handle enum class; round-trip through int.
         // Back-compat: old SDK clients send return_all_probs as a JSON bool. Try int
         // first (new wire format); on parse failure, fall back to bool: true→DEFAULT,

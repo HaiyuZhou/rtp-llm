@@ -232,6 +232,7 @@ class GenerateConfig(BaseModel):
     sp_edit: bool = False
     force_disable_sp_run: bool = False
     force_sp_accept: bool = False
+    force_reuse_length: Optional[int] = None
     return_cum_log_probs: bool = False
     return_all_probs: int = ReturnAllProbsMode.NONE
     return_logprobs: bool = False

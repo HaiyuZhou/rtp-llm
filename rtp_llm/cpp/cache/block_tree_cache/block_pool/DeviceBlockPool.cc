@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <limits>
+#include <random>
 #include <unordered_map>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,7 @@
 
 #if USING_CUDA
 #include <cuda_runtime.h>
+#include <torch/cuda.h>
 #elif USING_ROCM
 #include <hip/hip_runtime.h>
 #include <torch/cuda.h>
@@ -41,6 +43,199 @@ const char* memoryTypeName(MemoryType memory_type) {
     return "UNKNOWN";
 }
 
+// Deterministic symmetric non-zero FP8 E4M3 finite byte:
+// 0x30..0x3F => +[0.5 .. 1.875], 0xB0..0xBF => -[0.5 .. 1.875].
+uint8_t nextFiniteFp8E4M3Byte(std::mt19937& rng) {
+    const uint32_t v = rng() & 0x1Fu;
+    return static_cast<uint8_t>(((v & 0x10u) ? 0xB0u : 0x30u) | (v & 0x0Fu));
+}
+
+float nextSmallFiniteFloat(std::mt19937& rng, float bound = 0.05f) {
+    // Map uniform 24-bit integer to [-bound, +bound] avoiding exact zero.
+    const float u = (static_cast<float>(rng() & 0xFFFFFFu) + 0.5f) / static_cast<float>(0x1000000u);
+    return (2.0f * u - 1.0f) * bound;
+}
+
+void copyTileAcrossBuffer(torch::Tensor& dst_bytes, const torch::Tensor& host_tile, size_t unit_bytes) {
+    const int64_t total_bytes = dst_bytes.numel();
+    const int64_t tile_bytes  = host_tile.numel();
+    if (total_bytes <= 0 || tile_bytes <= 0) {
+        return;
+    }
+    torch::Tensor dev_tile   = host_tile.to(dst_bytes.device(), /*non_blocking=*/false);
+    int64_t       offset     = 0;
+    size_t        chunk_id   = 0;
+    const size_t  tile_units = (unit_bytes > 0 && static_cast<size_t>(tile_bytes) >= unit_bytes) ?
+                                   (static_cast<size_t>(tile_bytes) / unit_bytes) :
+                                   1;
+    while (offset < total_bytes) {
+        const int64_t chunk_bytes = std::min(tile_bytes, total_bytes - offset);
+        // Rotate starting unit per chunk when tiling whole chunks so long contexts
+        // do not repeat identical blocks back-to-back.
+        const size_t  shift_units = (tile_units > 1) ? ((chunk_id * 17u) % tile_units) : 0;
+        const int64_t shift_bytes = static_cast<int64_t>(shift_units * unit_bytes);
+        if (shift_bytes > 0 && chunk_bytes == tile_bytes) {
+            const int64_t first_part = tile_bytes - shift_bytes;
+            dst_bytes.narrow(0, offset, first_part).copy_(dev_tile.narrow(0, shift_bytes, first_part));
+            dst_bytes.narrow(0, offset + first_part, shift_bytes).copy_(dev_tile.narrow(0, 0, shift_bytes));
+        } else {
+            dst_bytes.narrow(0, offset, chunk_bytes).copy_(dev_tile.narrow(0, 0, chunk_bytes));
+        }
+        offset += chunk_bytes;
+        ++chunk_id;
+    }
+}
+
+void fillSyntheticFiniteStorage(torch::Tensor& full_buffer, const DeviceBlockPoolConfig& cfg) {
+    static constexpr size_t  kMaxTileBytes      = 16ULL * 1024ULL * 1024ULL;
+    static constexpr size_t  kDsv4IndexerEntry  = 132;
+    static constexpr size_t  kDsv4Fp8KvEntry    = 584;
+    static constexpr size_t  kDsv4Fp8NopeBytes  = 448;
+    static constexpr size_t  kDsv4Bf16RopeElems = 64;
+    static constexpr size_t  kDsv4Ue8m0Scales   = 8;
+    static constexpr uint8_t kDsv4Ue8m0ScaleVal = 123;  // 2^(123 - 127) = 0.0625
+
+    const auto start_us = currentTimeUs();
+    for (size_t layout_idx = 0; layout_idx < cfg.memory_layouts.size(); ++layout_idx) {
+        const auto& layout = cfg.memory_layouts[layout_idx];
+        if (layout.kv_block_pool_size_bytes == 0) {
+            continue;
+        }
+        // Leave state ring / recurrent buffers (OpaqueState / LinearAttention) cleanly zero-initialized.
+        if (layout.cache_type == KVCacheSpecType::OpaqueState
+            || layout.cache_type == KVCacheSpecType::LinearAttention) {
+            continue;
+        }
+        if (layout.kv_cache_offset_bytes + layout.kv_block_pool_size_bytes > static_cast<size_t>(full_buffer.numel())) {
+            continue;
+        }
+        torch::Tensor  kv_bytes = full_buffer.narrow(0,
+                                                    static_cast<int64_t>(layout.kv_cache_offset_bytes),
+                                                    static_cast<int64_t>(layout.kv_block_pool_size_bytes));
+        const uint32_t seed     = static_cast<uint32_t>(std::hash<std::string>{}(cfg.pool_name))
+                              ^ static_cast<uint32_t>(0x5A17C0DEu + layout_idx * 131u);
+        std::mt19937 rng(seed);
+
+        const char* mode = nullptr;
+        if (layout.dtype == DataType::TYPE_UINT8 && layout.cache_type == KVCacheSpecType::OpaqueKV
+            && layout.opaque_entry_size_bytes == kDsv4IndexerEntry
+            && layout.kv_block_pool_size_bytes % kDsv4IndexerEntry == 0) {
+            // DSV4 FP8 indexer_kv: 128B FP8 E4M3 + 4B FP32 scale per slot.
+            // Finite non-zero random keys avoid +0.0 tie-break collapse in Top-K kernels.
+            const size_t total_entries = layout.kv_block_pool_size_bytes / kDsv4IndexerEntry;
+            const size_t tile_entries = std::min(total_entries, std::max<size_t>(1, kMaxTileBytes / kDsv4IndexerEntry));
+            auto         host_tile    = torch::empty({static_cast<int64_t>(tile_entries * kDsv4IndexerEntry)},
+                                          torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+            uint8_t*     ptr          = host_tile.data_ptr<uint8_t>();
+            for (size_t e = 0; e < tile_entries; ++e) {
+                uint8_t* entry = ptr + e * kDsv4IndexerEntry;
+                for (size_t i = 0; i < 128; ++i) {
+                    entry[i] = nextFiniteFp8E4M3Byte(rng);
+                }
+                const float scale = 0.05f + nextSmallFiniteFloat(rng, 0.01f);
+                std::memcpy(entry + 128, &scale, sizeof(float));
+            }
+            copyTileAcrossBuffer(kv_bytes, host_tile, kDsv4IndexerEntry);
+            mode = "dsv4_fp8_indexer_132B";
+        } else if (layout.dtype == DataType::TYPE_UINT8 && layout.cache_type == KVCacheSpecType::OpaqueKV
+                   && layout.opaque_entry_size_bytes == kDsv4Fp8KvEntry && layout.kv_block_stride_bytes > 0) {
+            // DSV4 FP8 csa_kv / hca_kv: 448B FP8 NoPE + 64 BF16 RoPE + 8B UE8M0 scales,
+            // with per-kernel-page 576B alignment padding kept at zero.
+            const size_t kernel_blocks = std::max<size_t>(1, layout.kernel_blocks_per_kv_block);
+            if (layout.kv_block_stride_bytes % kernel_blocks == 0
+                && layout.kv_block_pool_size_bytes % layout.kv_block_stride_bytes == 0) {
+                const size_t page_stride      = layout.kv_block_stride_bytes / kernel_blocks;
+                const size_t entries_per_page = page_stride / kDsv4Fp8KvEntry;
+                const size_t total_pages      = layout.kv_block_pool_size_bytes / page_stride;
+                if (entries_per_page > 0 && total_pages > 0) {
+                    const size_t tile_pages = std::min(total_pages, std::max<size_t>(1, kMaxTileBytes / page_stride));
+                    auto         host_tile  = torch::zeros({static_cast<int64_t>(tile_pages * page_stride)},
+                                                  torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+                    uint8_t*     ptr        = host_tile.data_ptr<uint8_t>();
+                    for (size_t p = 0; p < tile_pages; ++p) {
+                        uint8_t* page_ptr = ptr + p * page_stride;
+                        for (size_t e = 0; e < entries_per_page; ++e) {
+                            uint8_t* entry = page_ptr + e * kDsv4Fp8KvEntry;
+                            for (size_t i = 0; i < kDsv4Fp8NopeBytes; ++i) {
+                                entry[i] = nextFiniteFp8E4M3Byte(rng);
+                            }
+                            auto* rope_ptr = reinterpret_cast<c10::BFloat16*>(entry + kDsv4Fp8NopeBytes);
+                            for (size_t i = 0; i < kDsv4Bf16RopeElems; ++i) {
+                                rope_ptr[i] = c10::BFloat16(nextSmallFiniteFloat(rng, 0.05f));
+                            }
+                            std::memset(entry + kDsv4Fp8NopeBytes + kDsv4Bf16RopeElems * sizeof(c10::BFloat16),
+                                        kDsv4Ue8m0ScaleVal,
+                                        kDsv4Ue8m0Scales);
+                        }
+                    }
+                    copyTileAcrossBuffer(kv_bytes, host_tile, page_stride);
+                    mode = "dsv4_fp8_kv_584B";
+                }
+            }
+        } else if (layout.dtype == DataType::TYPE_BF16
+                   || (layout.dtype == DataType::TYPE_UINT8 && layout.cache_type == KVCacheSpecType::OpaqueKV
+                       && (layout.opaque_entry_size_bytes == 256 || layout.opaque_entry_size_bytes == 1024))) {
+            const size_t total_elems = layout.kv_block_pool_size_bytes / sizeof(c10::BFloat16);
+            if (total_elems > 0 && layout.kv_block_pool_size_bytes % sizeof(c10::BFloat16) == 0) {
+                const size_t tile_elems = std::min(total_elems, kMaxTileBytes / sizeof(c10::BFloat16));
+                auto         host_tile  = torch::empty({static_cast<int64_t>(tile_elems * sizeof(c10::BFloat16))},
+                                              torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+                auto*        ptr        = reinterpret_cast<c10::BFloat16*>(host_tile.data_ptr<uint8_t>());
+                for (size_t i = 0; i < tile_elems; ++i) {
+                    ptr[i] = c10::BFloat16(nextSmallFiniteFloat(rng, 0.05f));
+                }
+                copyTileAcrossBuffer(kv_bytes, host_tile, sizeof(c10::BFloat16) * 256);
+                mode = "bf16_finite";
+            }
+        } else if (layout.dtype == DataType::TYPE_FP16) {
+            const size_t total_elems = layout.kv_block_pool_size_bytes / sizeof(c10::Half);
+            if (total_elems > 0 && layout.kv_block_pool_size_bytes % sizeof(c10::Half) == 0) {
+                const size_t tile_elems = std::min(total_elems, kMaxTileBytes / sizeof(c10::Half));
+                auto         host_tile  = torch::empty({static_cast<int64_t>(tile_elems * sizeof(c10::Half))},
+                                              torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+                auto*        ptr        = reinterpret_cast<c10::Half*>(host_tile.data_ptr<uint8_t>());
+                for (size_t i = 0; i < tile_elems; ++i) {
+                    ptr[i] = c10::Half(nextSmallFiniteFloat(rng, 0.05f));
+                }
+                copyTileAcrossBuffer(kv_bytes, host_tile, sizeof(c10::Half) * 256);
+                mode = "fp16_finite";
+            }
+        } else if (layout.dtype == DataType::TYPE_FP32) {
+            const size_t total_elems = layout.kv_block_pool_size_bytes / sizeof(float);
+            if (total_elems > 0 && layout.kv_block_pool_size_bytes % sizeof(float) == 0) {
+                const size_t tile_elems = std::min(total_elems, kMaxTileBytes / sizeof(float));
+                auto         host_tile  = torch::empty({static_cast<int64_t>(tile_elems * sizeof(float))},
+                                              torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+                auto*        ptr        = reinterpret_cast<float*>(host_tile.data_ptr<uint8_t>());
+                for (size_t i = 0; i < tile_elems; ++i) {
+                    ptr[i] = nextSmallFiniteFloat(rng, 0.05f);
+                }
+                copyTileAcrossBuffer(kv_bytes, host_tile, sizeof(float) * 256);
+                mode = "fp32_finite";
+            }
+        } else if (layout.dtype == DataType::TYPE_FP8_E4M3) {
+            const size_t tile_bytes = std::min(layout.kv_block_pool_size_bytes, kMaxTileBytes);
+            auto         host_tile  = torch::empty({static_cast<int64_t>(tile_bytes)},
+                                          torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+            uint8_t*     ptr        = host_tile.data_ptr<uint8_t>();
+            for (size_t i = 0; i < tile_bytes; ++i) {
+                ptr[i] = nextFiniteFp8E4M3Byte(rng);
+            }
+            copyTileAcrossBuffer(kv_bytes, host_tile, 256);
+            mode = "fp8_e4m3_finite";
+        }
+        if (mode != nullptr) {
+            RTP_LLM_LOG_INFO(
+                "synthetic finite init applied: pool_name=%s layout[%zu] mode=%s bytes=%zu elapsed_ms=%.2f",
+                cfg.pool_name.c_str(),
+                layout_idx,
+                mode,
+                layout.kv_block_pool_size_bytes,
+                static_cast<double>(currentTimeUs() - start_us) / 1000.0);
+        }
+    }
+}
+
 }  // namespace
 
 DeviceBlockPool::DeviceBlockPool(std::shared_ptr<const DeviceBlockPoolConfig> config):
@@ -58,13 +253,11 @@ std::function<void()> DeviceBlockPool::pinForStorageIo(BlockIdxType block) {
     // At most all usable block IDs can be returned to the free list.
     // Reserve before pin acquisition so release never allocates.
     reserveAllReleasedBlocksNoLock();
-    auto notify = capacityChangeCallbackNoLock();
-    std::function<void()> release = [this, block, notify = std::move(notify)] {
-        releaseStorageIoPin(block, notify);
-    };
-    const auto type = static_cast<size_t>(DeviceBlockRefType::REMOTE_CONNECTOR);
-    const bool was_active = isActiveNoLock(block);
-    const bool was_available = isAvailableNoLock(block);
+    auto                  notify  = capacityChangeCallbackNoLock();
+    std::function<void()> release = [this, block, notify = std::move(notify)] { releaseStorageIoPin(block, notify); };
+    const auto            type    = static_cast<size_t>(DeviceBlockRefType::REMOTE_CONNECTOR);
+    const bool            was_active    = isActiveNoLock(block);
+    const bool            was_available = isAvailableNoLock(block);
     ++refcounts_[block];
     if (refcounts_by_type_[type][block]++ == 0) {
         ++referenced_block_counts_[type];
@@ -81,8 +274,8 @@ void DeviceBlockPool::releaseStorageIoPin(BlockIdxType block, const std::functio
         checkAllocatedNoLock(block);
         const auto type = static_cast<size_t>(DeviceBlockRefType::REMOTE_CONNECTOR);
         RTP_LLM_CHECK(refcounts_by_type_[type][block] > 0);
-        const auto free_before = availableFreeBlocksNoLock();
-        const bool was_active = isActiveNoLock(block);
+        const auto free_before   = availableFreeBlocksNoLock();
+        const bool was_active    = isActiveNoLock(block);
         const bool was_available = isAvailableNoLock(block);
         --refcounts_[block];
         if (--refcounts_by_type_[type][block] == 0) {
@@ -114,8 +307,8 @@ void DeviceBlockPool::incRef(const BlockIdList& blocks, DeviceBlockRefType ref_t
         blocks,
         [](BlockIdxType) {},
         [this, type_index](BlockIdxType block) {
-            const bool was_active     = isActiveNoLock(block);
-            const bool was_available  = isAvailableNoLock(block);
+            const bool was_active    = isActiveNoLock(block);
+            const bool was_available = isAvailableNoLock(block);
             ++refcounts_[block];
             if (refcounts_by_type_[type_index][block]++ == 0) {
                 ++referenced_block_counts_[type_index];
@@ -243,8 +436,8 @@ bool DeviceBlockPool::tryReplaceRequestReferences(const std::vector<RequestRefer
             capacity_increased |= !was_available && isAvailableNoLock(block);
         }
         for (const auto block : *fresh_blocks) {
-            const bool was_active = isActiveNoLock(block);
-            refcounts_[block]     = 1;
+            const bool was_active                                                       = isActiveNoLock(block);
+            refcounts_[block]                                                           = 1;
             refcounts_by_type_[static_cast<size_t>(DeviceBlockRefType::REQUEST)][block] = 1;
             ++referenced_block_counts_[static_cast<size_t>(DeviceBlockRefType::REQUEST)];
             updateActiveBlocksNumNoLock(block, was_active);
@@ -374,7 +567,7 @@ const DeviceBlockPoolConfig& DeviceBlockPool::config() const {
 }
 
 void DeviceBlockPool::initializeCacheBuffer() {
-    const auto& cfg = config();
+    const auto& cfg                   = config();
     allocation_size_bytes_            = 0;
     uses_dedicated_device_allocation_ = false;
     RTP_LLM_CHECK_WITH_INFO(
@@ -388,7 +581,7 @@ void DeviceBlockPool::initializeCacheBuffer() {
     } else if (cfg.use_device_malloc_backing) {
         initializeDeviceMallocBuffer();
     } else {
-        cache_aligned_buffer_ = torch::empty({static_cast<int64_t>(cfg.total_size_bytes)},
+        cache_aligned_buffer_  = torch::empty({static_cast<int64_t>(cfg.total_size_bytes)},
                                              torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
         allocation_size_bytes_ = cfg.total_size_bytes;
     }
@@ -396,11 +589,19 @@ void DeviceBlockPool::initializeCacheBuffer() {
     // Gluon PA can load logically unused V-cache lanes: NaN * 0 is still NaN.
     // Initialize every backing mode once, before publishing the pool. Finite
     // writes/reuse preserve this invariant; imported non-finite data does not.
-    cache_aligned_buffer_.zero_();
-    if (cache_aligned_buffer_.is_cuda()) {
-        torch::cuda::synchronize(cache_aligned_buffer_.get_device());
-    }
+    const bool should_zero_init = true;
+#else
+    // Perf-test synthetic reuse skips prefill on the prefix blocks; zero-init
+    // the backing pool once at startup so reads never encounter NaN/Inf/subnormal
+    // garbage from raw CUDA allocations.
+    const bool should_zero_init = cfg.zero_init_storage;
 #endif
+    if (should_zero_init) {
+        cache_aligned_buffer_.zero_();
+        if (cache_aligned_buffer_.is_cuda()) {
+            torch::cuda::synchronize(cache_aligned_buffer_.get_device());
+        }
+    }
     cache_base_ptr_ = cache_aligned_buffer_.data_ptr();
     RTP_LLM_CHECK_WITH_INFO(cache_base_ptr_ != nullptr,
                             "device block pool [%s] allocate cache aligned buffer is null",
@@ -454,9 +655,8 @@ void DeviceBlockPool::initializeDeviceMallocBuffer() {
 
     const long page_size = sysconf(_SC_PAGESIZE);
     RTP_LLM_CHECK_WITH_INFO(page_size > 0, "failed to query host page size for GDR allocation");
-    const size_t allocation_size =
-        (cfg.total_size_bytes + static_cast<size_t>(page_size) - 1) / static_cast<size_t>(page_size)
-        * static_cast<size_t>(page_size);
+    const size_t allocation_size = (cfg.total_size_bytes + static_cast<size_t>(page_size) - 1)
+                                   / static_cast<size_t>(page_size) * static_cast<size_t>(page_size);
     void*      ptr = nullptr;
     const auto err = cudaMalloc(&ptr, allocation_size);
     RTP_LLM_CHECK_WITH_INFO(err == cudaSuccess,
@@ -484,7 +684,7 @@ void DeviceBlockPool::initializeDeviceMallocBuffer() {
                          {static_cast<int64_t>(cfg.total_size_bytes)},
                          std::move(deleter),
                          torch::TensorOptions().dtype(torch::kUInt8).device(torch::Device(torch::kCUDA, device_id)));
-    allocation_size_bytes_ = allocation_size;
+    allocation_size_bytes_            = allocation_size;
     uses_dedicated_device_allocation_ = true;
     RTP_LLM_LOG_INFO("cudaMalloc block pool backing allocated, pool_name=%s, ptr=%p, logical_size=%zu bytes, "
                      "allocation_size=%zu bytes, device=%d",
@@ -530,7 +730,7 @@ void DeviceBlockPool::initializeDeviceMallocBuffer() {
                          {static_cast<int64_t>(cfg.total_size_bytes)},
                          std::move(deleter),
                          torch::TensorOptions().dtype(torch::kUInt8).device(torch::Device(torch::kCUDA, device_id)));
-    allocation_size_bytes_ = cfg.total_size_bytes;
+    allocation_size_bytes_            = cfg.total_size_bytes;
     uses_dedicated_device_allocation_ = true;
     RTP_LLM_LOG_INFO("hipMalloc block pool backing allocated, pool_name=%s, ptr=%p, total_size=%zu bytes, device=%d",
                      cfg.pool_name.c_str(),
@@ -657,6 +857,12 @@ bool DeviceBlockPool::init() {
         initializeCacheBuffer();
         initializeLayerMappings();
         initializeLayoutStrategies();
+        if (cfg.zero_init_storage) {
+            fillSyntheticFiniteStorage(cache_aligned_buffer_, cfg);
+            if (cache_aligned_buffer_.is_cuda()) {
+                torch::cuda::synchronize(cache_aligned_buffer_.get_device());
+            }
+        }
     }
 
     markInitialized();

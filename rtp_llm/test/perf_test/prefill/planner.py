@@ -121,20 +121,24 @@ def _plan_generated_cases(
     cache_step = _validate_contract(workload, engine)
     cache_lengths = _cache_lengths(workload, cache_step)
     block_size = expected_probe_block_size(workload, engine)
-    for cache_len in cache_lengths:
-        if not cache_len:
-            continue
-        seed_tokens = cache_len + workload.commit_tail_tokens + 1
-        if seed_tokens > engine.max_seq_len or seed_tokens > engine.max_batch_tokens:
-            raise PlanningError(
-                "cache seed plus output reserve exceeds engine capacity"
-            )
-        rounded_seed = (seed_tokens + block_size - 1) // block_size * block_size
-        if (
-            workload.workspace_tokens is not None
-            and rounded_seed > workload.workspace_tokens
-        ):
-            raise PlanningError("cache seed exceeds workload.workspace_tokens")
+    if not workload.synthetic_cache_reuse:
+        for cache_len in cache_lengths:
+            if not cache_len:
+                continue
+            seed_tokens = cache_len + workload.commit_tail_tokens + 1
+            if (
+                seed_tokens > engine.max_seq_len
+                or seed_tokens > engine.max_batch_tokens
+            ):
+                raise PlanningError(
+                    "cache seed plus output reserve exceeds engine capacity"
+                )
+            rounded_seed = (seed_tokens + block_size - 1) // block_size * block_size
+            if (
+                workload.workspace_tokens is not None
+                and rounded_seed > workload.workspace_tokens
+            ):
+                raise PlanningError("cache seed exceeds workload.workspace_tokens")
     cases: List[Dict[str, object]] = []
     seen = set()
     compute_floor = max(workload.min_compute_len, workload.commit_tail_tokens)
@@ -216,8 +220,9 @@ def _plan_grouped_cases(
                 raise PlanningError(
                     "group cache_len must be aligned to physical cache blocks"
                 )
-            if group.cache_len > group.input_len or (
-                group.cache_len
+            if group.cache_len >= group.input_len or (
+                not workload.synthetic_cache_reuse
+                and group.cache_len
                 and group.input_len - group.cache_len < workload.commit_tail_tokens
             ):
                 raise PlanningError(
@@ -237,22 +242,25 @@ def _plan_grouped_cases(
             raise PlanningError(
                 "block-padded grouped batch exceeds workload.workspace_tokens"
             )
-        # Check individual seed feasibility; the runner forms concurrent batches
-        # bounded by max_batch_tokens and block-padded workspace_tokens.
-        for group in groups:
-            if group.cache_len:
-                seed_tokens = group.cache_len + workload.commit_tail_tokens + 1
-                if (
-                    seed_tokens > engine.max_seq_len
-                    or seed_tokens > engine.max_batch_tokens
-                ):
-                    raise PlanningError("individual seed exceeds engine token limits")
-                if (
-                    seed_tokens + block_size - 1
-                ) // block_size * block_size > workload.workspace_tokens:
-                    raise PlanningError(
-                        "individual seed exceeds workload.workspace_tokens"
-                    )
+        if not workload.synthetic_cache_reuse:
+            # Check individual seed feasibility; the runner forms concurrent batches
+            # bounded by max_batch_tokens and block-padded workspace_tokens.
+            for group in groups:
+                if group.cache_len:
+                    seed_tokens = group.cache_len + workload.commit_tail_tokens + 1
+                    if (
+                        seed_tokens > engine.max_seq_len
+                        or seed_tokens > engine.max_batch_tokens
+                    ):
+                        raise PlanningError(
+                            "individual seed exceeds engine token limits"
+                        )
+                    if (
+                        seed_tokens + block_size - 1
+                    ) // block_size * block_size > workload.workspace_tokens:
+                        raise PlanningError(
+                            "individual seed exceeds workload.workspace_tokens"
+                        )
         input_len = max(group.input_len for group in groups)
         cache_len = max(group.cache_len for group in groups)
         cases.append(

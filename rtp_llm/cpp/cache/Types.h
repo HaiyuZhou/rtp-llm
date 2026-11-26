@@ -88,7 +88,7 @@ struct MallocInfo {
     bool enable_remove_skipped_blocks = true;
     // Override for incrMalloc's seqLength read; -1 = fall back to complete_token_ids->seqLength().
     // Lets the state machine feed the publish-time value instead of racing with the async worker.
-    int incr_seq_len_override = -1;
+    int  incr_seq_len_override  = -1;
     bool enable_storage_backend = true;
     // Verified PD decode handoff: keep FULL prefix reuse, but do not match,
     // materialize, or publish LINEAR checkpoint blocks.  Keep this field after
@@ -109,6 +109,10 @@ struct MallocInfo {
     // Reserve every intervening destination up to the length bound without
     // pruning pages that an unfinished decode round may still use.
     bool preserve_inflight = false;
+
+    // Perf-test-only: when set, skip BlockTreeCache lookup and synthesize a
+    // device prefix hit of this many tokens (must be reuse-unit aligned).
+    std::optional<int> force_reuse_length;
 
     int incrSeqLen() const;
 };

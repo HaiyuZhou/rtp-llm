@@ -50,6 +50,7 @@ class PrefillRunner:
         warmup_deviation_threshold: float = 0.25,
         warmup_sweep_budget_s: float = 1200.0,
         warmup_sweep_profiles: int = 3,
+        synthetic_cache_reuse: bool = False,
     ):
         if not 0.0 < float(warmup_deviation_threshold) <= 1.0:
             raise ValueError(
@@ -71,6 +72,7 @@ class PrefillRunner:
         self.warmup_deviation_threshold = float(warmup_deviation_threshold)
         self.warmup_sweep_budget_s = float(warmup_sweep_budget_s)
         self.warmup_sweep_profiles = int(warmup_sweep_profiles)
+        self.synthetic_cache_reuse = bool(synthetic_cache_reuse)
         self._validated_cases: set[str] = set()
         self._warmed_shapes: set[int] = set()
 
@@ -134,7 +136,13 @@ class PrefillRunner:
 
     def _validation_key(self, case: Dict[str, Any]) -> str:
         data = json.dumps(
-            (case, self.commit_tail_tokens, self.cache_block_size, self.input_ids_only),
+            (
+                case,
+                self.commit_tail_tokens,
+                self.cache_block_size,
+                self.input_ids_only,
+                self.synthetic_cache_reuse,
+            ),
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
@@ -163,7 +171,7 @@ class PrefillRunner:
                         or len(prompts.run_texts) != run_count
                     ):
                         raise ValueError("prompt shape does not match plan")
-                    if member["cache_len"]:
+                    if member["cache_len"] and not self.synthetic_cache_reuse:
                         seed_text, seed_ids = self.factory.build_seed_and_ids(
                             member["prefix_id"],
                             prompts,
@@ -359,14 +367,15 @@ class PrefillRunner:
                 for member in range(batch_size)
             ]
         )
-        try:
-            seed_batches = self._seed_batches(members)
-        except ValueError as error:
-            return self._failure(case, "request_failed", error_message(error))
-        for batch in seed_batches:
-            invalid = self._seed_batch(case, members, batch)
-            if invalid is not None:
-                return self._failure(case, *invalid)
+        if not self.synthetic_cache_reuse:
+            try:
+                seed_batches = self._seed_batches(members)
+            except ValueError as error:
+                return self._failure(case, "request_failed", error_message(error))
+            for batch in seed_batches:
+                invalid = self._seed_batch(case, members, batch)
+                if invalid is not None:
+                    return self._failure(case, *invalid)
 
         try:
             self.client.configure_scheduler(batch_size, mode="prefill")
@@ -396,6 +405,11 @@ class PrefillRunner:
                     if aborted:
                         raise RuntimeError("round setup aborted")
                     prompts = members[member]["prompts"]
+                    extra_kwargs = (
+                        {"force_reuse_length": int(members[member]["cache_len"])}
+                        if self.synthetic_cache_reuse
+                        else {}
+                    )
                     return self.client.request(
                         phase="warmup" if warmup else "measure",
                         case_id=case["case_id"],
@@ -404,6 +418,7 @@ class PrefillRunner:
                         prompt=prompts.run_texts[prompt_index],
                         input_ids=prompts.run_ids[prompt_index],
                         output_length=1,
+                        **extra_kwargs,
                     )
 
                 futures = []

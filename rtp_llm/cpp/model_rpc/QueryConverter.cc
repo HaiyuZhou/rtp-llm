@@ -140,6 +140,10 @@ std::shared_ptr<GenerateConfig> QueryConverter::transGenerateConfig(const Genera
     generate_config->sp_edit              = config_proto->sp_edit();
     generate_config->force_disable_sp_run = config_proto->force_disable_sp_run();
     generate_config->force_sp_accept      = config_proto->force_sp_accept();
+    TRANS_OPTIONAL(force_reuse_length);
+    if (generate_config->force_reuse_length.has_value() && *generate_config->force_reuse_length < 0) {
+        throw std::invalid_argument("force_reuse_length must be non-negative");
+    }
     generate_config->return_cum_log_probs = config_proto->return_cum_log_probs();
     if (config_proto->return_all_probs_mode() != 0) {
         // new client: explicit mode (offset 1). Clamp out-of-range values to NONE

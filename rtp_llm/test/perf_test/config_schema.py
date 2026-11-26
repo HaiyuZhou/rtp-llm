@@ -306,6 +306,7 @@ class PrefillWorkloadConfig:
     warmup_deviation_threshold: float = 0.25
     warmup_sweep_budget_s: float = 1200.0
     warmup_sweep_profiles: int = 3
+    synthetic_cache_reuse: bool = False
 
 
 @dataclass(frozen=True)
@@ -718,6 +719,7 @@ def _parse_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
         "warmup_deviation_threshold",
         "warmup_sweep_budget_s",
         "warmup_sweep_profiles",
+        "synthetic_cache_reuse",
     }
     generated_fields = {
         "max_input_len",
@@ -784,6 +786,10 @@ def _parse_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkloadConfig:
             None
             if "workspace_tokens" not in raw
             else _positive_int("workload.workspace_tokens", raw["workspace_tokens"])
+        ),
+        synthetic_cache_reuse=_boolean(
+            "workload.synthetic_cache_reuse",
+            raw.get("synthetic_cache_reuse", False),
         ),
     )
     if "grids" in raw:
@@ -979,6 +985,7 @@ def _parse_generated_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkload
         "warmup_deviation_threshold",
         "warmup_sweep_budget_s",
         "warmup_sweep_profiles",
+        "synthetic_cache_reuse",
     }
     _reject_unknown("workload", raw, allowed)
     compute_steps = _int_tuple(
@@ -1051,6 +1058,10 @@ def _parse_generated_prefill_workload(raw: Mapping[str, Any]) -> PrefillWorkload
         ),
         warmup_sweep_profiles=_positive_int(
             "workload.warmup_sweep_profiles", raw.get("warmup_sweep_profiles", 3)
+        ),
+        synthetic_cache_reuse=_boolean(
+            "workload.synthetic_cache_reuse",
+            raw.get("synthetic_cache_reuse", False),
         ),
     )
 

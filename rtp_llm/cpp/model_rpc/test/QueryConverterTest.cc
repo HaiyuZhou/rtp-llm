@@ -908,4 +908,26 @@ TEST_F(QueryConverterTest, CompactTerminalMatchesLegacyProtocolIncludingAuxAndSc
     }
 }
 
+TEST_F(QueryConverterTest, ForceReuseLengthRoundTripAndValidation) {
+    GenerateConfigPB unset_pb;
+    auto             unset_cfg = QueryConverter::transGenerateConfig(&unset_pb);
+    EXPECT_FALSE(unset_cfg->force_reuse_length.has_value());
+
+    GenerateConfigPB valid_pb;
+    valid_pb.mutable_force_reuse_length()->set_value(4096);
+    auto valid_cfg = QueryConverter::transGenerateConfig(&valid_pb);
+    ASSERT_TRUE(valid_cfg->force_reuse_length.has_value());
+    EXPECT_EQ(*valid_cfg->force_reuse_length, 4096);
+
+    GenerateConfigPB zero_pb;
+    zero_pb.mutable_force_reuse_length()->set_value(0);
+    auto zero_cfg = QueryConverter::transGenerateConfig(&zero_pb);
+    ASSERT_TRUE(zero_cfg->force_reuse_length.has_value());
+    EXPECT_EQ(*zero_cfg->force_reuse_length, 0);
+
+    GenerateConfigPB negative_pb;
+    negative_pb.mutable_force_reuse_length()->set_value(-1);
+    EXPECT_THROW(QueryConverter::transGenerateConfig(&negative_pb), std::invalid_argument);
+}
+
 }  // namespace rtp_llm

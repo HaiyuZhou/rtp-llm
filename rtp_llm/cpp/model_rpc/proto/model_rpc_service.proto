@@ -171,6 +171,8 @@ message GenerateConfigPB {
     google.protobuf.Int32Value logits_index = 78;
     uint32 top_logprobs = 79;
     bool return_logprobs = 80;
+    // Perf-test-only: synthesize a prefix cache hit of this many tokens without seeding.
+    google.protobuf.Int32Value force_reuse_length = 81;
 }
 
 message MMPreprocessConfigPB {

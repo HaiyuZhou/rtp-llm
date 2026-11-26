@@ -948,6 +948,8 @@ def _apply_dash_sc_controls_to_generate_config(
 ) -> None:
     """Apply DashSC request controls over the deployment THINK_MODE default."""
     generate_config.force_sp_accept = bool(request_controls.force_sp_accept)
+    if request_controls.force_reuse_length is not None:
+        generate_config.force_reuse_length = int(request_controls.force_reuse_length)
     request_max_think = sampling.max_new_think_tokens
     if request_max_think is None:
         request_max_think = request_controls.max_new_think_tokens

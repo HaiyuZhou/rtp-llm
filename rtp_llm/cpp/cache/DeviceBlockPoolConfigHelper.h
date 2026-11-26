@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rtp_llm/cpp/cache/CacheConfig.h"
+#include "rtp_llm/cpp/cache/OpaqueKVCacheSpec.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/block_pool/DeviceBlockPool.h"
 
 #include <algorithm>
@@ -50,7 +51,7 @@ public:
 
         const auto& group_layer_ids = cache_config.layerIdsForGroup(group.tag);
         config.allocate_storage     = !group_layer_ids.empty();
-        const auto  main_layer_num  = static_cast<uint32_t>(
+        const auto main_layer_num   = static_cast<uint32_t>(
             std::count_if(group_layer_ids.begin(), group_layer_ids.end(), [&cache_config](int layer_id) {
                 return layer_id >= 0 && static_cast<uint32_t>(layer_id) < cache_config.layer_num;
             }));
@@ -91,12 +92,16 @@ private:
         cfg.k_scale_stride_bytes  = spec->k_scale_block_size_bytes();
         cfg.v_scale_stride_bytes  = spec->v_scale_block_size_bytes();
 
-        cfg.enable_kv_scale         = cfg.kv_scale_stride_bytes > 0;
-        cfg.dtype                   = spec->memoryLayoutDType();
+        cfg.enable_kv_scale            = cfg.kv_scale_stride_bytes > 0;
+        cfg.dtype                      = spec->memoryLayoutDType();
         cfg.cache_type                 = spec->type;
         cfg.local_head_num_kv          = group.localKvHeadNum();
         cfg.seq_size_per_block         = group.seqSizePerBlock();
         cfg.kernel_blocks_per_kv_block = group.kernelBlocksPerKvBlock();
+        if (const auto* opaque_spec = dynamic_cast<const OpaqueKVCacheSpec*>(spec.get());
+            opaque_spec != nullptr && opaque_spec->entriesPerBlock() > 0) {
+            cfg.opaque_entry_size_bytes = spec->block_payload_bytes() / opaque_spec->entriesPerBlock();
+        }
 
         cfg.kv_block_pool_size_bytes =
             static_cast<size_t>(layer_num) * static_cast<size_t>(cfg.block_num) * cfg.kv_block_stride_bytes;

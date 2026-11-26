@@ -28,6 +28,7 @@ struct DeviceBlockPoolConfig: public BlockPoolConfigBase {
     std::vector<MemoryLayoutConfig> memory_layouts;
     bool                            use_pinned_cpu_backing{false};
     bool                            use_device_malloc_backing{false};
+    bool                            zero_init_storage{false};
 };
 
 class DeviceBlockPool;
@@ -175,7 +176,7 @@ private:
 
 private:
     static constexpr size_t                          kRefTypeCount = static_cast<size_t>(DeviceBlockRefType::COUNT);
-    std::vector<uint32_t> refcounts_;
+    std::vector<uint32_t>                            refcounts_;
     std::array<std::vector<uint32_t>, kRefTypeCount> refcounts_by_type_;
     std::array<size_t, kRefTypeCount>                referenced_block_counts_{};
 

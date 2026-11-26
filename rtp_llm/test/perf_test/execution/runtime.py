@@ -184,16 +184,20 @@ class HttpPrefillClient:
         prompt: str,
         input_ids: Any,
         output_length: int,
+        force_reuse_length: Optional[int] = None,
     ) -> Dict[str, Any]:
         del phase, input_ids
+        generate_config = {
+            "max_new_tokens": output_length,
+            "min_new_tokens": output_length,
+            "force_sp_accept": True,
+            "top_k": 1,
+        }
+        if force_reuse_length is not None:
+            generate_config["force_reuse_length"] = int(force_reuse_length)
         body = {
             "prompt": prompt,
-            "generate_config": {
-                "max_new_tokens": output_length,
-                "min_new_tokens": output_length,
-                "force_sp_accept": True,
-                "top_k": 1,
-            },
+            "generate_config": generate_config,
         }
         self._health_check()
         try:

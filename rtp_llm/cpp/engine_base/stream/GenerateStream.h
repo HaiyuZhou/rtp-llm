@@ -232,10 +232,10 @@ public:
     // Observe Engine release and Connector lease completion during cancellation.
     bool hasPendingLocalCleanup() const;
     // Callbacks may run on the Engine or transport thread and should only enqueue work.
-    void                 onLocalCleanupProgress(std::function<void()> callback);
-    int                  nextNeedBlockNums(int reserve_step) const;
-    int                  estimateInitialNeedBlocks(const std::string& pool_tag = {}) const;
-    int                  estimatePeakNeedBlocks(int remaining_tokens, const std::string& pool_tag = {}) const;
+    void onLocalCleanupProgress(std::function<void()> callback);
+    int  nextNeedBlockNums(int reserve_step) const;
+    int  estimateInitialNeedBlocks(const std::string& pool_tag = {}) const;
+    int  estimatePeakNeedBlocks(int remaining_tokens, const std::string& pool_tag = {}) const;
     // Scheduler boundary: commit pending output work, then expose reclaimed
     // history through the allocator's real available-block count for admission.
     void                 drainLinearHistoryForAdmission();
@@ -667,6 +667,10 @@ public:
         return generate_input_->generate_config->force_sp_accept;
     }
 
+    std::optional<int> forceReuseLength() const {
+        return generate_input_->generate_config->force_reuse_length;
+    }
+
     std::string traceId() const {
         if (!generate_input_->request_info.trace_id.empty()) {
             return generate_input_->request_info.trace_id;
@@ -732,10 +736,10 @@ public:
     using LinearReplayWindow = rtp_llm::LinearReplayWindow;
     using LinearReplayRound  = rtp_llm::LinearReplayRound;
 
-    absl::StatusOr<LinearReplayRound> prepareLinearReplayRound();
-    void publishLinearReplayWindow(std::shared_ptr<const LinearReplayWindow> window);
+    absl::StatusOr<LinearReplayRound>      prepareLinearReplayRound();
+    void                                   publishLinearReplayWindow(std::shared_ptr<const LinearReplayWindow> window);
     std::shared_ptr<LinearReplayBlockHold> linearReplayStateBlockHold() const;
-    void clearLinearReplayWindow();
+    void                                   clearLinearReplayWindow();
 
     // Per-stream CUDA state used to prepare the next MTP decode step while host
     // bookkeeping may still be in flight. It carries accept_len/tokens,
@@ -1049,8 +1053,8 @@ protected:
     bool         consumerFinishedWithoutLock() const;
     virtual bool consumerReadyWithoutLock() const;
 
-    int estimateKVNeedBlocks(int remaining_tokens, int target_batch_size, const std::string& pool_tag = {}) const;
-    bool                     reportUpdateErrorWithoutLock(const std::optional<ErrorInfo>& error_info);
+    int  estimateKVNeedBlocks(int remaining_tokens, int target_batch_size, const std::string& pool_tag = {}) const;
+    bool reportUpdateErrorWithoutLock(const std::optional<ErrorInfo>& error_info);
     bool prepareUpdateWithoutLock(const std::optional<ErrorInfo>& error_info, bool force_update_info);
     std::optional<ErrorInfo> updateNormalLogitProcessorStatus(const StreamUpdateInfo& update_info);
     std::optional<ErrorInfo> updateLogitProcessorStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens);

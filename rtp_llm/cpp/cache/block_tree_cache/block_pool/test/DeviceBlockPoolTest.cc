@@ -1,5 +1,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/block_pool/DeviceBlockPool.h"
 
+#include <cmath>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <type_traits>
@@ -592,6 +594,105 @@ TEST(DeviceBlockPoolTest, MallocAllocatesLowestBlockFirst) {
     EXPECT_EQ(*b1, 1);
     EXPECT_EQ(*b2, 2);
     EXPECT_EQ(*b3, 3);
+}
+
+TEST(DeviceBlockPoolTest, SyntheticFiniteInitPopulatesDsv4AndStandardPoolsWithoutNaN) {
+    // 1) DSV4 FP8 indexer_kv (132B/entry: 128B FP8 E4M3 + 4B FP32 scale)
+    {
+        auto config                    = std::make_shared<DeviceBlockPoolConfig>();
+        config->pool_type              = BlockPoolType::DEVICE;
+        config->pool_name              = "indexer_kv";
+        config->physical_block_count   = 4;
+        config->use_pinned_cpu_backing = true;
+        config->zero_init_storage      = true;
+        MemoryLayoutConfig layout;
+        layout.layer_num                  = 2;
+        layout.block_num                  = 4;
+        layout.dtype                      = DataType::TYPE_UINT8;
+        layout.cache_type                 = KVCacheSpecType::OpaqueKV;
+        layout.opaque_entry_size_bytes    = 132;
+        layout.kernel_blocks_per_kv_block = 2;
+        layout.kv_block_stride_bytes      = 64 * 132;
+        layout.k_block_stride_bytes       = layout.kv_block_stride_bytes;
+        layout.block_stride_bytes         = layout.kv_block_stride_bytes;
+        layout.kv_block_pool_size_bytes =
+            static_cast<size_t>(layout.layer_num) * layout.block_num * layout.kv_block_stride_bytes;
+        layout.total_size_bytes  = layout.kv_block_pool_size_bytes;
+        config->total_size_bytes = layout.total_size_bytes;
+        config->memory_layouts   = {layout};
+
+        DeviceBlockPool pool(config);
+        ASSERT_TRUE(pool.init());
+        const auto* base = static_cast<const uint8_t*>(pool.getBaseAddress());
+        ASSERT_NE(base, nullptr);
+        const size_t total_entries = layout.kv_block_pool_size_bytes / 132;
+        for (size_t e = 0; e < total_entries; ++e) {
+            const uint8_t* entry = base + e * 132;
+            for (size_t i = 0; i < 128; ++i) {
+                EXPECT_NE(entry[i], 0x00);
+                EXPECT_NE(entry[i], 0x7F);
+                EXPECT_NE(entry[i], 0xFF);
+            }
+            float scale = 0.0f;
+            std::memcpy(&scale, entry + 128, sizeof(float));
+            EXPECT_TRUE(std::isfinite(scale));
+            EXPECT_GT(scale, 0.03f);
+            EXPECT_LT(scale, 0.07f);
+        }
+    }
+
+    // 2) DSV4 FP8 csa_kv (584B/entry + 576B kernel page alignment padding kept zero)
+    {
+        constexpr size_t kPageStride   = 19008;  // 32 * 584 = 18688, aligned up to 576 -> 19008 (320B pad)
+        auto             config        = std::make_shared<DeviceBlockPoolConfig>();
+        config->pool_type              = BlockPoolType::DEVICE;
+        config->pool_name              = "csa_kv";
+        config->physical_block_count   = 2;
+        config->use_pinned_cpu_backing = true;
+        config->zero_init_storage      = true;
+        MemoryLayoutConfig layout;
+        layout.layer_num                  = 1;
+        layout.block_num                  = 2;
+        layout.dtype                      = DataType::TYPE_UINT8;
+        layout.cache_type                 = KVCacheSpecType::OpaqueKV;
+        layout.opaque_entry_size_bytes    = 584;
+        layout.kernel_blocks_per_kv_block = 2;
+        layout.kv_block_stride_bytes      = 2 * kPageStride;
+        layout.k_block_stride_bytes       = layout.kv_block_stride_bytes;
+        layout.block_stride_bytes         = layout.kv_block_stride_bytes;
+        layout.kv_block_pool_size_bytes =
+            static_cast<size_t>(layout.layer_num) * layout.block_num * layout.kv_block_stride_bytes;
+        layout.total_size_bytes  = layout.kv_block_pool_size_bytes;
+        config->total_size_bytes = layout.total_size_bytes;
+        config->memory_layouts   = {layout};
+
+        DeviceBlockPool pool(config);
+        ASSERT_TRUE(pool.init());
+        const auto* base = static_cast<const uint8_t*>(pool.getBaseAddress());
+        ASSERT_NE(base, nullptr);
+        for (size_t p = 0; p < 4; ++p) {
+            const uint8_t* page = base + p * kPageStride;
+            for (size_t e = 0; e < 32; ++e) {
+                const uint8_t* entry = page + e * 584;
+                for (size_t i = 0; i < 448; ++i) {
+                    EXPECT_NE(entry[i], 0x7F);
+                    EXPECT_NE(entry[i], 0xFF);
+                }
+                const auto* rope = reinterpret_cast<const c10::BFloat16*>(entry + 448);
+                for (size_t i = 0; i < 64; ++i) {
+                    const float v = static_cast<float>(rope[i]);
+                    EXPECT_TRUE(std::isfinite(v));
+                    EXPECT_LE(std::fabs(v), 0.06f);
+                }
+                for (size_t i = 576; i < 584; ++i) {
+                    EXPECT_EQ(entry[i], 123);
+                }
+            }
+            for (size_t pad = 32 * 584; pad < kPageStride; ++pad) {
+                EXPECT_EQ(page[pad], 0);
+            }
+        }
+    }
 }
 
 }  // namespace rtp_llm

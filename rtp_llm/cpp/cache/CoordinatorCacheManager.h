@@ -57,10 +57,10 @@ public:
 
     virtual ~CoordinatorCacheManager();
 
-    bool                           init();
-    virtual void                   free(const FreeInfo& free_info);
-    void reclaimLinearHistory(const BatchKVCacheResourcePtr& resource, int committed_tokens, bool reuse_cache);
-    virtual void                   insertIntoCache(const InsertInfo& insert_info, size_t& resident_prefix_length);
+    bool         init();
+    virtual void free(const FreeInfo& free_info);
+    void         reclaimLinearHistory(const BatchKVCacheResourcePtr& resource, int committed_tokens, bool reuse_cache);
+    virtual void insertIntoCache(const InsertInfo& insert_info, size_t& resident_prefix_length);
     virtual BlockAddrInfo          convertIndexToAddr(int layer_id, int block_id) const;
     virtual std::vector<BlockInfo> convertIndexToBuffer(int layer_id, int block_id) const;
     virtual std::vector<BlockInfo>
@@ -126,6 +126,10 @@ public:
         use_device_malloc_block_pool_ = use_device_malloc_block_pool;
     }
 
+    void setZeroInitDeviceBlockPool(bool zero_init_device_block_pool) {
+        zero_init_device_block_pool_ = zero_init_device_block_pool;
+    }
+
     void setSkipRemoteReusedWrite(bool skip_remote_reused_write) {
         skip_remote_reused_write_ = skip_remote_reused_write;
     }
@@ -146,17 +150,17 @@ public:
         return reserve_block_num_;
     }
 
-    virtual void                 regUserMr(size_t model_id, std::shared_ptr<CacheStore> cache_store = nullptr);
-    virtual int64_t              getMrCostTimeMs() const;
-    virtual size_t               freeBlocksNum() const;
-    virtual size_t               availableBlocksNum() const;
-    virtual size_t               availableTokensNum() const;
-    virtual size_t               totalTokensNum() const;
-    virtual size_t               totalBlocksNum() const;
-    virtual size_t               maxAvailableTokensNum() const;
-    virtual KVCacheTokenCapacity tokenCapacity(size_t default_seq_size_per_block) const;
-    virtual std::vector<CachePoolMetrics>          poolMetrics() const;
-    std::vector<KVCachePoolCapacity>                poolCapacities() const;
+    virtual void                          regUserMr(size_t model_id, std::shared_ptr<CacheStore> cache_store = nullptr);
+    virtual int64_t                       getMrCostTimeMs() const;
+    virtual size_t                        freeBlocksNum() const;
+    virtual size_t                        availableBlocksNum() const;
+    virtual size_t                        availableTokensNum() const;
+    virtual size_t                        totalTokensNum() const;
+    virtual size_t                        totalBlocksNum() const;
+    virtual size_t                        maxAvailableTokensNum() const;
+    virtual KVCacheTokenCapacity          tokenCapacity(size_t default_seq_size_per_block) const;
+    virtual std::vector<CachePoolMetrics> poolMetrics() const;
+    std::vector<KVCachePoolCapacity>      poolCapacities() const;
     /// Returns global layer id; std::numeric_limits<uint32_t>::max() indicates invalid (caller must check).
     uint32_t convertToGlobalLayerId(size_t model_id, int local_layer_id) const;
 
@@ -230,6 +234,7 @@ protected:
     std::shared_ptr<CPSlotMapper>      cp_slot_mapper_;
     const kmonitor::MetricsReporterPtr metrics_reporter_             = nullptr;
     bool                               use_device_malloc_block_pool_ = false;
+    bool                               zero_init_device_block_pool_  = false;
 
     size_t  reserve_block_num_{0};
     int64_t reserve_block_ratio_{0};
@@ -244,6 +249,7 @@ protected:
     struct PreparedKVCache {
         size_t                         matched_device_blocks = 0;
         size_t                         total_logical_blocks  = 0;
+        bool                           synthetic_reuse       = false;
         std::vector<RequiredPositions> required_positions;
         std::vector<BlockIndicesType>  referenced_blocks;
         std::vector<size_t>            original_sizes;
@@ -257,7 +263,7 @@ protected:
                                                      const std::function<bool(size_t)>&   valid_prefix           = {},
                                                      bool                                 enable_storage_backend = true,
                                                      std::optional<int64_t>               request_id             = {},
-                                                     bool                                 skip_linear            = false);
+                                                     bool                                 skip_linear = false);
     bool                              materializeInitialBlocks(const MallocInfo& malloc_info,
                                                                PreparedKVCache&  prepared,
                                                                LoadAsyncContext* context,

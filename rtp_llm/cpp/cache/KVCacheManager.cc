@@ -339,6 +339,10 @@ bool KVCacheManager::init() {
         RTP_LLM_LOG_INFO("use raw device malloc KV cache block-pool backing");
         coordinator_manager_->setUseDeviceMallocBlockPool(true);
     }
+    if (runtime_config_.use_batch_decode_scheduler) {
+        RTP_LLM_LOG_INFO("perf-test scheduler active: zero-initializing KV cache device block pools");
+        coordinator_manager_->setZeroInitDeviceBlockPool(true);
+    }
 
     coordinator_manager_->setCPSlotMapper(cp_slot_mapper_);
     coordinator_manager_->setSkipRemoteReusedWrite(pd_sep_config_.role_type == RoleType::PREFILL);
@@ -500,6 +504,10 @@ std::shared_ptr<BroadcastManager> KVCacheManager::createMultiRankBlockTransferMa
 
 const CacheConfig& KVCacheManager::cacheConfig() const {
     return config_;
+}
+
+int KVCacheManager::reuseUnitTokens() const {
+    return cp_slot_mapper_ ? cp_slot_mapper_->reuseBlockTokens(config_) : static_cast<int>(config_.seq_size_per_block);
 }
 
 const CacheConfig& KVCacheManager::getMTPModuleCacheConfig(int mtp_module_id) const {
@@ -797,16 +805,16 @@ void KVCacheManager::initLinearReplayPool() {
     const auto layout = coordinator_manager_->allLayerCacheBase();
     const auto slots  = plan.slotCount();
     for (const int group_id : config_.linear_replay.group_ids) {
-        const auto& group = config_.groups().at(static_cast<size_t>(group_id));
-        auto& layers = linear_replay_by_tag_[group.tag];
+        const auto& group  = config_.groups().at(static_cast<size_t>(group_id));
+        auto&       layers = linear_replay_by_tag_[group.tag];
         layers.resize(config_.layer_num);
         for (const int layer_id : config_.layerIdsForGroup(group.tag)) {
             if (layer_id < 0 || layer_id >= static_cast<int>(config_.layer_num)) {
                 continue;
             }
             const auto& base = layout.at(group.tag, static_cast<size_t>(layer_id)).kv_addr;
-            RTP_LLM_CHECK_WITH_INFO(base.defined(), "LINEAR replay layer %d tag=%s has no cache buffer",
-                                    layer_id, group.tag.c_str());
+            RTP_LLM_CHECK_WITH_INFO(
+                base.defined(), "LINEAR replay layer %d tag=%s has no cache buffer", layer_id, group.tag.c_str());
             auto                              f32 = torch::TensorOptions().device(base.device()).dtype(torch::kFloat32);
             torch_ext::LinearReplayLayerCache replay;
             replay.k = torch::empty(c10::IntArrayRef(plan.k_shape.data(), plan.k_shape.size()), f32);
@@ -818,7 +826,7 @@ void KVCacheManager::initLinearReplayPool() {
             layers[static_cast<size_t>(layer_id)] = std::move(replay);
         }
     }
-    linear_replay_slots_ = std::make_shared<LinearReplaySlotPool>(static_cast<size_t>(slots));
+    linear_replay_slots_      = std::make_shared<LinearReplaySlotPool>(static_cast<size_t>(slots));
     linear_replay_retirement_ = std::make_shared<LinearReplayRetirementQueue>();
 }
 
@@ -838,11 +846,11 @@ std::shared_ptr<LinearReplayBlockHold> KVCacheManager::holdLinearReplayBlocks(co
     std::vector<std::pair<DeviceBlockPoolPtr, BlockIndicesType>> held;
     for (const int group_id : config_.linear_replay.group_ids) {
         const auto& group = config_.groups().at(static_cast<size_t>(group_id));
-        const auto& pool = coordinator_manager_->groupBlockPools().at(static_cast<size_t>(group_id));
+        const auto& pool  = coordinator_manager_->groupBlockPools().at(static_cast<size_t>(group_id));
         std::unordered_set<BlockIdxType> unique;
         for (int batch = 0; batch < resource->batchSize(); ++batch) {
             const auto& blocks = resource->blocks(batch, group.tag);
-            size_t begin = resource->cacheResource(batch).linearReplayActiveBegin(group.tag, blocks.size());
+            size_t      begin  = resource->cacheResource(batch).linearReplayActiveBegin(group.tag, blocks.size());
             size_t      end    = blocks.size();
             if (state_token_position >= 0) {
                 begin = static_cast<size_t>(state_token_position) / group.seqSizePerBlock();
@@ -893,22 +901,26 @@ bool KVCacheManager::makeLinearReplayTailsPrivate(
         }
     }
     struct Replacement {
-        int batch;
-        std::string tag;
-        size_t position;
-        BlockIdxType source;
-        BlockIdxType destination;
+        int                batch;
+        std::string        tag;
+        size_t             position;
+        BlockIdxType       source;
+        BlockIdxType       destination;
         DeviceBlockPoolPtr pool;
     };
     std::vector<Replacement> replacements;
-    struct ActiveBegin { int batch; std::string tag; size_t begin; };
+    struct ActiveBegin {
+        int         batch;
+        std::string tag;
+        size_t      begin;
+    };
     std::vector<ActiveBegin> active_begins;
     for (const int group_id : config_.linear_replay.group_ids) {
         const auto& group = config_.groups().at(static_cast<size_t>(group_id));
-        const auto& pool = coordinator_manager_->groupBlockPools().at(static_cast<size_t>(group_id));
+        const auto& pool  = coordinator_manager_->groupBlockPools().at(static_cast<size_t>(group_id));
         for (int batch = 0; batch < resource->batchSize(); ++batch) {
             const auto& blocks = resource->blocks(batch, group.tag);
-            size_t begin = blocks.size() > 2 ? blocks.size() - 2 : 0;
+            size_t      begin  = blocks.size() > 2 ? blocks.size() - 2 : 0;
             if (min_processed_length >= 0) {
                 // Capacity checks require two tail slots at seqLength (processed + 1).
                 // Proposal slots and previous reservations must not move that tail forward.
@@ -918,7 +930,7 @@ bool KVCacheManager::makeLinearReplayTailsPrivate(
             }
             active_begins.push_back({batch, group.tag, begin});
             for (size_t position = begin; position < blocks.size(); ++position) {
-                const auto source = blocks[position];
+                const auto source           = blocks[position];
                 uint32_t   owned_references = 1;
                 for (const auto* hold : owned_holds) {
                     owned_references += hold->contains(pool.get(), source);
@@ -940,8 +952,12 @@ bool KVCacheManager::makeLinearReplayTailsPrivate(
                 if (!destination) {
                     RTP_LLM_LOG_WARNING("LINEAR replay tail copy failed tag=%s batch=%d position=%zu free=%zu "
                                         "total=%zu staged=%zu",
-                                        group.tag.c_str(), batch, position, pool->freeBlocksNum(),
-                                        pool->totalBlocksNum(), replacements.size());
+                                        group.tag.c_str(),
+                                        batch,
+                                        position,
+                                        pool->freeBlocksNum(),
+                                        pool->totalBlocksNum(),
+                                        replacements.size());
                     for (const auto& item : replacements) {
                         item.pool->decRef(item.destination);
                     }
@@ -970,7 +986,7 @@ void KVCacheManager::markLinearReplayStarted(const BatchKVCacheResourcePtr& reso
         return;
     }
     for (const int group_id : config_.linear_replay.group_ids) {
-        const auto& group = config_.groups().at(static_cast<size_t>(group_id));
+        const auto&  group    = config_.groups().at(static_cast<size_t>(group_id));
         const size_t position = static_cast<size_t>(std::max(0, processed_length)) / group.seqSizePerBlock();
         for (int batch = 0; batch < resource->batchSize(); ++batch) {
             resource->cacheResource(batch).restrictLinearReplayPrefix(group.tag, position);
@@ -1482,10 +1498,8 @@ bool KVCacheManager::executeFunction(const FunctionRequestPB& request, FunctionR
     std::vector<TransferDescriptor> descriptors;
     std::vector<size_t>             wire_item_indices;
     const bool                      is_pp = parallelism_config_.pp_size > 1;
-    if (!BlockTransferRequestConverter::decodeTransfer(request.mem_request(),
-                                                       descriptors,
-                                                       block_tree_cache_->groupSets(),
-                                                       is_pp ? &wire_item_indices : nullptr)) {
+    if (!BlockTransferRequestConverter::decodeTransfer(
+            request.mem_request(), descriptors, block_tree_cache_->groupSets(), is_pp ? &wire_item_indices : nullptr)) {
         RTP_LLM_LOG_WARNING("KVCacheManager::executeFunction: invalid grouped transfer request");
         return true;
     }

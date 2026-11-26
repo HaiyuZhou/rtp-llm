@@ -290,7 +290,7 @@ void StreamCacheResource::init(int batch_size) {
                               resource_context_.cache_manager->cacheConfig().topologyPtr() :
                               warmupCacheTopology();
     batch_kv_cache_resource_->initGroups(topology);
-    resource_released_ = false;
+    resource_released_                       = false;
     pending_linear_history_committed_tokens_ = 0;
 }
 
@@ -322,8 +322,7 @@ bool StreamCacheResource::copyChunkKernelBlocks(int batch, const std::string& ta
     const bool reuse = reuseCache();
     const int  group_reserve =
         config.isLinearReplayGroup(static_cast<int>(config.topology().groupIdForTag(tag))) ? 0 : stream_->reserveStep();
-    const auto banks =
-        group.chunkCacheBlockCount(stream_->seqLength(), stream_->maxChunkSize(), reuse, group_reserve);
+    const auto banks = group.chunkCacheBlockCount(stream_->seqLength(), stream_->maxChunkSize(), reuse, group_reserve);
     if (banks == 0) {
         return false;
     }
@@ -433,8 +432,8 @@ int StreamCacheResource::tryReleaseKVBlock(size_t nums) {
     if (total_blocks > 0) {
         const bool side_channel_only = resource_context_.role_type == RoleType::DECODE && stream_->queryPdSep()
                                        && !stream_->needsDecodeAfterPrefill();
-        if (!side_channel_only && reuseCache() && !stream_->hasErrorWithoutLock()
-            && stream_->getStatus() == StreamState::FINISHED) {
+        if (!side_channel_only && reuseCache() && !stream_->forceReuseLength().has_value()
+            && !stream_->hasErrorWithoutLock() && stream_->getStatus() == StreamState::FINISHED) {
             const Tier target_tier = insertTarget();
             RTP_LLM_LOG_DEBUG("tryReleaseKVBlock: stream=%ld, inserting cache, curBlocksNum=%d, target_tier=%s",
                               stream_->streamId(),
@@ -444,7 +443,7 @@ int StreamCacheResource::tryReleaseKVBlock(size_t nums) {
                 InsertInfo insert_info{
                     batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), false, target_tier, stream_->streamId()};
                 insert_info.pd_decode_linear_tail_only = pd_decode_linear_tail_only_;
-                size_t resident_prefix_length = 0;
+                size_t resident_prefix_length          = 0;
                 resource_context_.cache_manager->insertIntoCache(insert_info, resident_prefix_length);
             }
         } else {
@@ -532,15 +531,36 @@ absl::Status StreamCacheResource::initKVBlock() {
         malloc_info.complete_token_ids->setReserveStep(stream_->reserveStep());
         malloc_info.incr_seq_len_override = stream_->seqLength();
     }
-    malloc_info.request_id              = stream_->streamId();
-    malloc_info.verbose                 = malloc_failed_times_ >= 10 ? malloc_failed_times_ % 100 == 0 : true;
+    malloc_info.request_id = stream_->streamId();
+    malloc_info.verbose    = malloc_failed_times_ >= 10 ? malloc_failed_times_ % 100 == 0 : true;
 
     const bool disable_first_malloc_reuse =
         resource_context_.cache_manager->cacheConfig().disable_decode_first_malloc_device_reuse;
     const bool is_decode_role  = (resource_context_.role_type == RoleType::DECODE);
     const bool is_first_malloc = (batch_kv_cache_resource_->curBlocksNum() == 0);
 
-    if (disable_first_malloc_reuse && is_decode_role && is_first_malloc) {
+    if (const auto forced_reuse = stream_->forceReuseLength(); forced_reuse.has_value()) {
+        if (!resource_context_.enable_synthetic_reuse) {
+            return absl::InvalidArgumentError("force_reuse_length requires use_batch_decode_scheduler");
+        }
+        const auto& cache_config = resource_context_.cache_manager->cacheConfig();
+        const int   seq_len      = malloc_info.complete_token_ids->seqLength();
+        const int   unit_tokens  = std::max(1, resource_context_.cache_manager->reuseUnitTokens());
+        const int   max_reuse    = cache_config.maxPrefixReuseTokens(seq_len);
+        if (*forced_reuse < 0 || *forced_reuse > max_reuse || (*forced_reuse > 0 && *forced_reuse % unit_tokens != 0)
+            || (*forced_reuse > 0
+                && !malloc_info.complete_token_ids->isValidReuseLength(*forced_reuse,
+                                                                       cache_config.cache_min_replay_tokens))) {
+            return absl::InvalidArgumentError("invalid force_reuse_length=" + std::to_string(*forced_reuse)
+                                              + " for seq_len=" + std::to_string(seq_len)
+                                              + " (max_reuse=" + std::to_string(max_reuse)
+                                              + ", reuse_unit_tokens=" + std::to_string(unit_tokens) + ")");
+        }
+        malloc_info.reuse_cache            = true;
+        malloc_info.enable_cache_lookup    = false;
+        malloc_info.enable_storage_backend = false;
+        malloc_info.force_reuse_length     = *forced_reuse;
+    } else if (disable_first_malloc_reuse && is_decode_role && is_first_malloc) {
         malloc_info.reuse_cache         = false;
         malloc_info.enable_cache_lookup = false;
     } else {
@@ -548,8 +568,10 @@ absl::Status StreamCacheResource::initKVBlock() {
         malloc_info.enable_cache_lookup = enableCacheLookup();
     }
     malloc_info.enable_remove_skipped_blocks = false;
-    malloc_info.enable_storage_backend     = !skip_remote_cache_;
-    malloc_info.pd_decode_linear_tail_only  = pd_decode_linear_tail_only_;
+    if (!malloc_info.force_reuse_length.has_value()) {
+        malloc_info.enable_storage_backend = !skip_remote_cache_;
+    }
+    malloc_info.pd_decode_linear_tail_only = pd_decode_linear_tail_only_;
     malloc_info.max_chunk_tokens =
         stream_->chunkedPrefillEnabled() && stream_->isContextStream() ? stream_->maxChunkSize() : 0;
 
@@ -844,7 +866,7 @@ void StreamCacheResource::publishPrefillCache(int processed_length) {
     const auto& manager     = resource_context_.cache_manager;
     const auto  target_tier = insertTarget();
     if (fake_inited_ || !manager || !manager->cacheConfig().linear_replay.enabled() || !reuseCache()
-        || target_tier == Tier::NONE || processed_length <= 0) {
+        || stream_->forceReuseLength().has_value() || target_tier == Tier::NONE || processed_length <= 0) {
         return;
     }
     // Called by completed Prefill bookkeeping before Decode can prune the
@@ -859,7 +881,7 @@ void StreamCacheResource::publishPrefillCache(int processed_length) {
     prefix->setLastBlockAligned(true);
     InsertInfo insert_info{prefix, stream_->completeTokenIdsPtr(), false, target_tier};
     insert_info.pd_decode_linear_tail_only = pd_decode_linear_tail_only_;
-    size_t resident_prefix_length = 0;
+    size_t resident_prefix_length          = 0;
     manager->insertIntoCache(insert_info, resident_prefix_length);
 }
 
@@ -913,9 +935,9 @@ absl::Status StreamCacheResource::prepareLinearReplayResources(bool prepare_tail
             linear_replay_.initial_state_hold =
                 manager->holdLinearReplayBlocks(batch_kv_cache_resource_, processed - 1);
             for (const int group_id : config.linear_replay.group_ids) {
-                const auto& group = config.groups().at(static_cast<size_t>(group_id));
+                const auto&  group    = config.groups().at(static_cast<size_t>(group_id));
                 const size_t position = static_cast<size_t>(processed - 1) / group.seqSizePerBlock();
-                const auto& blocks = batch_kv_cache_resource_->blocks(0, group.tag);
+                const auto&  blocks   = batch_kv_cache_resource_->blocks(0, group.tag);
                 if (position >= blocks.size() || blocks[position] <= 0) {
                     linear_replay_.lease.reset();
                     linear_replay_.clearInitialState();
@@ -983,7 +1005,7 @@ void StreamCacheResource::drainLinearHistory() {
         return;
     }
     const bool reuse_cache = reuseCache();
-    const int committed_tokens =
+    const int  committed_tokens =
         std::min(pending_linear_history_committed_tokens_, std::max(0, stream_->seqLength() - 1));
     updateCacheKeys(batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), seqSizePerBlock());
     resource_context_.cache_manager->reclaimLinearHistory(batch_kv_cache_resource_, committed_tokens, reuse_cache);
@@ -1163,7 +1185,7 @@ BatchKVCacheResource& StreamCacheResource::kvCacheMutable() {
 }
 
 void StreamCacheResource::setKVCache(const BatchKVCacheResource& kv_cache_resource) {
-    *batch_kv_cache_resource_ = kv_cache_resource;
+    *batch_kv_cache_resource_                = kv_cache_resource;
     pending_linear_history_committed_tokens_ = 0;
 }
 

@@ -1033,7 +1033,7 @@ TEST_F(StreamCacheResourceTest, testWarmUpFakeInitUsesTaggedTopology) {
 }
 
 TEST_F(StreamCacheResourceTest, LinearReplayLeaseFollowsExecutorConfigAcrossRequestFlags) {
-    auto config = test::makeSimpleHybridMhaCacheConfig(4, 16, 2, DataType::TYPE_FP16, 2);
+    auto       config       = test::makeSimpleHybridMhaCacheConfig(4, 16, 2, DataType::TYPE_FP16, 2);
     const auto linear_group = static_cast<int>(config.topology().groupIdForTag("linear"));
     config.linear_replay =
         LinearReplayPlan::create({linear_group}, 2, 4, {1, 1}, {1, 1}, false, DataType::TYPE_FP16, 1);
@@ -1090,7 +1090,7 @@ TEST_F(StreamCacheResourceTest, CancelledReplayRoundRetainsLeaseUntilBookkeeping
     EXPECT_EQ(resource.linear_replay_.window, nullptr);
     EXPECT_EQ(cache_manager_->acquireLinearReplaySlot(), nullptr);
 
-    round            = absl::FailedPreconditionError("round ownership released");
+    round = absl::FailedPreconditionError("round ownership released");
     EXPECT_EQ(cache_manager_->acquireLinearReplaySlot(), nullptr);
     late_window.reset();
     EXPECT_TRUE(previous_lease.expired());
@@ -1413,15 +1413,15 @@ TEST_F(StreamCacheResourceTest, BeamForkCapturesWrittenKvLengthBeforeNextDecode)
 }
 
 TEST_F(StreamCacheResourceTest, SpeculativeLinearSwapSkipsReplayGroupsAcrossCheckpointBoundary) {
-    auto config = test::makeSimpleHybridMhaCacheConfig(4, 9, 2, DataType::TYPE_FP16, 2);
-    auto groups = config.topology().groups();
+    auto       config = test::makeSimpleHybridMhaCacheConfig(4, 9, 2, DataType::TYPE_FP16, 2);
+    auto       groups = config.topology().groups();
     const auto layers = config.topology().layers();
     for (size_t group_id = 0; group_id < groups.size(); ++group_id) {
         auto& group = groups[group_id];
         if (group.policy.group_type == CacheGroupType::LINEAR) {
-            auto spec = group.spec->clone();
+            auto spec                = group.spec->clone();
             spec->seq_size_per_block = 32768;
-            group.spec = std::move(spec);
+            group.spec               = std::move(spec);
             config.linear_replay.group_ids.push_back(static_cast<int>(group_id));
         }
     }
@@ -1618,8 +1618,8 @@ TEST_F(StreamCacheResourceTest, testStreamCacheResourceReuseCacheMethod) {
 TEST_F(StreamCacheResourceTest, testPrefillOnlyDisablesPrefixAndDeviceCacheReuseForAllocation) {
     for (const bool ignore_request_switches : {false, true}) {
         for (const int chunk_size : {0, 4}) {
-            SCOPED_TRACE(testing::Message() << "ignore_request_switches=" << ignore_request_switches
-                                           << ", chunk_size=" << chunk_size);
+            SCOPED_TRACE(testing::Message()
+                         << "ignore_request_switches=" << ignore_request_switches << ", chunk_size=" << chunk_size);
             prepareResource(/*reuse_cache=*/true);
             auto& resource = stream_->streamCacheResource();
             stream_->setChunkSize(chunk_size);
@@ -3881,8 +3881,8 @@ TEST_F(StreamCacheResourceTest, testP2PFirstTokenOutputsRoundTripThroughStartLoa
             SCOPED_TRACE(::testing::Message()
                          << "requested=" << requested << ", hybrid=" << hybrid << ", eos=" << eos
                          << ", prompt_scores=" << prompt_scores << ", speculative=" << speculative);
-            const bool compact = hybrid && !requested;
-            const std::string key = "first-token-outputs";
+            const bool        compact = hybrid && !requested;
+            const std::string key     = "first-token-outputs";
             ASSERT_NO_FATAL_FAILURE(prepareP2PRegistrationResource(true, key, hybrid));
             auto&      prefill_connector = *cache_manager_->p2p_connector_->prefill_;
             const auto deadline_ms       = stream_->generateInput()->request_deadline_ms;
@@ -3941,8 +3941,8 @@ TEST_F(StreamCacheResourceTest, testP2PFirstTokenOutputsRoundTripThroughStartLoa
             scores.topk_token_ids = torch::arange(6, torch::kInt32).reshape({3, 2});
             if (!eos)
                 scores.target_logprobs = torch::arange(3, torch::kFloat32);
-            scores.start_pos        = 1;
-            scores.end_pos          = 4;
+            scores.start_pos                    = 1;
+            scores.end_pos                      = 4;
             const auto             graph_status = speculative ? GenerationPrefillCudaGraphStatus::NOT_REQUESTED :
                                                                 (eos ? GenerationPrefillCudaGraphStatus::REPLAYED :
                                                                        GenerationPrefillCudaGraphStatus::CAPTURE_UNAVAILABLE);
@@ -4224,6 +4224,58 @@ TEST_F(StreamCacheResourceTest, testFailedP2PLoadRetainsPhysicalLeaseProof) {
     EXPECT_TRUE(stream_->streamCacheResource().p2pReleasePending());
     context->lease_hold_pending_.store(false);
     EXPECT_FALSE(stream_->streamCacheResource().p2pReleasePending());
+}
+
+TEST_F(StreamCacheResourceTest, SyntheticReuseHybridAllocatesAndSkipsBlockTreePollution) {
+    auto config = test::makeSimpleHybridMhaCacheConfig(4, 64, 2, DataType::TYPE_FP16);
+    prepareResourceWithCacheConfig(
+        config, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, /*reuse_cache=*/true, RoleType::PDFUSION, {}, 1, 32);
+    auto& resource                                    = stream_->streamCacheResource();
+    resource.resource_context_.enable_device_cache    = true;
+    resource.resource_context_.enable_synthetic_reuse = false;
+    stream_->generateConfig()->force_reuse_length     = 8;
+
+    // Gate must reject force_reuse_length when synthetic reuse is disabled.
+    EXPECT_TRUE(absl::IsInvalidArgument(resource.initKVBlock()));
+
+    // Unaligned or out-of-range values must fail fast even when enabled.
+    resource.resource_context_.enable_synthetic_reuse = true;
+    stream_->generateConfig()->force_reuse_length     = 3;
+    EXPECT_TRUE(absl::IsInvalidArgument(resource.initKVBlock()));
+    stream_->generateConfig()->force_reuse_length = 12;
+    EXPECT_TRUE(absl::IsInvalidArgument(resource.initKVBlock()));
+
+    // Valid block-aligned synthetic reuse: seq_len=12, block_size=2, force_reuse_length=8 (4 blocks).
+    stream_->generateConfig()->force_reuse_length = 8;
+    ASSERT_TRUE(resource.initKVBlock().ok());
+    EXPECT_EQ(stream_->reuseLength(), 8);
+    EXPECT_EQ(stream_->initialReuseLength(), 8);
+    EXPECT_EQ(stream_->deviceReuseLength(), 8);
+    EXPECT_EQ(stream_->prefixLength(), 8);
+    EXPECT_EQ(stream_->contextLength(), 4);
+
+    // Full group must have valid non-NULL physical blocks for all 6 slots.
+    const auto& full_blocks = resource.kvCache().blocks(0, "full1");
+    ASSERT_EQ(full_blocks.size(), 6u);
+    for (const auto block_id : full_blocks) {
+        EXPECT_FALSE(isNullBlockIdx(block_id));
+    }
+    // Linear group must have valid checkpoint at prefix tail (slot 3 = (8-1)/2) and active suffix tail (slot 5).
+    const auto& linear_blocks = resource.kvCache().blocks(0, "linear");
+    ASSERT_EQ(linear_blocks.size(), 6u);
+    EXPECT_FALSE(isNullBlockIdx(linear_blocks[3]));
+    EXPECT_FALSE(isNullBlockIdx(linear_blocks[5]));
+
+    // Finishing and releasing must NOT pollute BlockTreeCache and must return all pool references.
+    stream_->generate_status_->status = StreamState::FINISHED;
+    stream_->releaseResource();
+    EXPECT_EQ(resource.curBlocksNum(), 0);
+    for (const auto& pool : cache_manager_->coordinator_manager_->groupBlockPools()) {
+        EXPECT_EQ(pool->referencedBlocksNum(), 0u);
+    }
+    if (auto tree = cache_manager_->coordinator_manager_->blockTreeCache()) {
+        EXPECT_EQ(tree->getStats().tree_node_count, 0u);
+    }
 }
 
 }  // namespace rtp_llm

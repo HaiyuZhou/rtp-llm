@@ -94,10 +94,16 @@ class DashScPrefillClient:
         prompt: str,
         input_ids: Any,
         output_length: int,
+        force_reuse_length: Optional[int] = None,
     ) -> Dict[str, Any]:
         del prompt
         request_id = f"{case_id}/{phase}/{request_index}/{run_index}"
         try:
+            extra_kwargs = (
+                {"force_reuse_length": int(force_reuse_length)}
+                if force_reuse_length is not None
+                else {}
+            )
             request = self._build_request(
                 request_id=request_id,
                 model_name="rtp_llm",
@@ -107,6 +113,7 @@ class DashScPrefillClient:
                 ),
                 enable_thinking=False,
                 force_sp_accept=True,
+                **extra_kwargs,
             )
             values = {}
             output_len = 0

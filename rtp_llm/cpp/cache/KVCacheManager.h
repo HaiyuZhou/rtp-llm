@@ -67,6 +67,7 @@ public:
 
     const CacheConfig& cacheConfig() const;
     const CacheConfig& getMTPModuleCacheConfig(int mtp_module_id) const;
+    int                reuseUnitTokens() const;
 
     // 显存管理和缓存分配
     MallocResult malloc(const MallocInfo& malloc_info);
@@ -143,9 +144,9 @@ public:
     // per group; -1 retains the complete active tail.
     std::shared_ptr<LinearReplayBlockHold> holdLinearReplayBlocks(const BatchKVCacheResourcePtr& resource,
                                                                   int state_token_position = -1);
-    bool makeLinearReplayTailsPrivate(const BatchKVCacheResourcePtr& resource,
-                                      int                            min_processed_length                      = -1,
-                                      const std::vector<std::shared_ptr<LinearReplayBlockHold>>& request_holds = {});
+    bool                                   makeLinearReplayTailsPrivate(const BatchKVCacheResourcePtr& resource,
+                                                                        int                            min_processed_length = -1,
+                                                                        const std::vector<std::shared_ptr<LinearReplayBlockHold>>& request_holds = {});
     void markLinearReplayStarted(const BatchKVCacheResourcePtr& resource, int processed_length);
 
     // 资源统计和信息查询
@@ -251,11 +252,11 @@ private:
     void                               stopFrozenTaskRecovery() noexcept;
 
     // 成员变量
-    CacheConfig                config_;
-    CoordinatorCacheManagerPtr coordinator_manager_;
+    CacheConfig                                                                          config_;
+    CoordinatorCacheManagerPtr                                                           coordinator_manager_;
     std::map<std::string, std::vector<std::optional<torch_ext::LinearReplayLayerCache>>> linear_replay_by_tag_;
-    std::shared_ptr<LinearReplaySlotPool>        linear_replay_slots_;
-    std::shared_ptr<LinearReplayRetirementQueue> linear_replay_retirement_;
+    std::shared_ptr<LinearReplaySlotPool>                                                linear_replay_slots_;
+    std::shared_ptr<LinearReplayRetirementQueue>                                         linear_replay_retirement_;
 
     const kmonitor::MetricsReporterPtr metrics_reporter_;
     const KVCacheConfig                kv_cache_config_;

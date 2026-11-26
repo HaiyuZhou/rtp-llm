@@ -246,6 +246,7 @@ def create_prefill_adapter(config: Mapping[str, Any], tokenizer: Any) -> Prefill
     workload = config["workload"]
     commit_tail = int(workload["commit_tail_tokens"])
     block_size = resolve_probe_block_size(config)
+    synthetic_cache_reuse = bool(workload.get("synthetic_cache_reuse", False))
     return PrefillAdapter(
         lambda context: PrefillRunner(
             context.session.client,
@@ -256,9 +257,14 @@ def create_prefill_adapter(config: Mapping[str, Any], tokenizer: Any) -> Prefill
             input_ids_only=workload.get("transport", DEFAULT_PREFILL_TRANSPORT)
             == "dashsc_input_ids",
             cache_block_size=block_size,
+            synthetic_cache_reuse=synthetic_cache_reuse,
             **resolve_warmup_settings(workload),
         ),
         probe=lambda context: probe_cache_block(
-            context.session.client, tokenizer, block_size, commit_tail
+            context.session.client,
+            tokenizer,
+            block_size,
+            commit_tail,
+            synthetic_cache_reuse=synthetic_cache_reuse,
         ),
     )

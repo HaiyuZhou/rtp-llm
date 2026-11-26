@@ -1084,5 +1084,59 @@ class WarmupSweepAdapterTest(unittest.TestCase):
             self.assertFalse(case_result["metrics"]["warmup_used"])
 
 
+class SyntheticCacheReuseRunnerTest(unittest.TestCase):
+    def test_synthetic_cache_reuse_skips_seeds_and_passes_force_reuse_length(self):
+        requests = []
+
+        class SyntheticClient:
+            def configure_scheduler(self, batch_size, mode="prefill"):
+                pass
+
+            def request(self, **request):
+                requests.append(request)
+                return {
+                    "success": True,
+                    "input_len": len(request["input_ids"]),
+                    "output_len": request["output_length"],
+                    "reuse_len": request["force_reuse_length"],
+                    "latency_ms": 12.5,
+                    "ttft_ms": 12.5,
+                    "wait_time_ms": 0.5,
+                }
+
+        runner = PrefillRunner(
+            SyntheticClient(),
+            prefill_runner_Tokenizer(),
+            commit_tail_tokens=4,
+            max_batch_tokens=256,
+            synthetic_cache_reuse=True,
+        )
+        case = {
+            "case_id": "synthetic-grouped",
+            "batch_size": 2,
+            "input_len": 20,
+            "cache_len": 12,
+            "compute_len": 8,
+            "measure_runs": 2,
+            "seed": 1,
+            "prefix_policy": "independent",
+            "request_groups": [
+                {"count": 1, "input_len": 20, "cache_len": 12},
+                {"count": 1, "input_len": 16, "cache_len": 4},
+            ],
+        }
+        result = runner.run_case(case)
+        self.assertEqual("ok", result["status"])
+        self.assertFalse(any(req["phase"] == "seed" for req in requests))
+        # 1 warmup round + 2 measure rounds = 3 rounds * 2 members = 6 requests
+        self.assertEqual(6, len(requests))
+        forced_by_member = {
+            req["request_index"]: req["force_reuse_length"]
+            for req in requests
+            if req["phase"] == "measure"
+        }
+        self.assertEqual({0: 12, 1: 4}, forced_by_member)
+
+
 if __name__ == "__main__":
     unittest.main()

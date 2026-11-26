@@ -19,40 +19,70 @@ def resolve_probe_block_size(config: Mapping[str, Any]) -> int:
     )
 
 
-def probe_cache_block(client, tokenizer, block_size, commit_tail_tokens):
+def probe_cache_block(
+    client,
+    tokenizer,
+    block_size,
+    commit_tail_tokens,
+    *,
+    synthetic_cache_reuse: bool = False,
+):
     if type(block_size) is not int or block_size <= 0:
         raise ValueError("probe block size must be a positive integer")
     factory = PrefixPromptFactory(tokenizer)
     case_id = f"cache_probe_{uuid4().hex}"
     prompts = factory.build_case_prompts(case_id, 2 * block_size, block_size, 1)
-    seed_text, seed_ids = factory.make_seed_and_ids(
-        case_id, prompts.seed_text, block_size, commit_tail_tokens
-    )
     client.configure_scheduler(1, mode="prefill")
     responses = {}
-    for phase, text, ids, reuse in (
-        ("seed", seed_text, seed_ids, 0),
-        ("measure", prompts.run_texts[0], prompts.run_ids[0], block_size),
-    ):
+    if synthetic_cache_reuse:
         response = client.request(
-            phase=phase,
+            phase="measure",
             case_id=case_id,
             request_index=0,
-            run_index=None if phase == "seed" else 0,
-            prompt=text,
-            input_ids=ids,
+            run_index=0,
+            prompt=prompts.run_texts[0],
+            input_ids=prompts.run_ids[0],
             output_length=1,
+            force_reuse_length=block_size,
         )
         invalid = PrefillRunner._validate(
-            response, input_len=len(ids), expected_reuse=reuse
+            response, input_len=len(prompts.run_ids[0]), expected_reuse=block_size
         )
         if invalid:
-            raise ValueError(f"cache block probe {phase}: {invalid[0]}: {invalid[1]}")
-        responses[phase] = response
+            raise ValueError(
+                f"cache block probe synthetic_measure: {invalid[0]}: {invalid[1]}"
+            )
+        responses["measure"] = response
+    else:
+        seed_text, seed_ids = factory.make_seed_and_ids(
+            case_id, prompts.seed_text, block_size, commit_tail_tokens
+        )
+        for phase, text, ids, reuse in (
+            ("seed", seed_text, seed_ids, 0),
+            ("measure", prompts.run_texts[0], prompts.run_ids[0], block_size),
+        ):
+            response = client.request(
+                phase=phase,
+                case_id=case_id,
+                request_index=0,
+                run_index=None if phase == "seed" else 0,
+                prompt=text,
+                input_ids=ids,
+                output_length=1,
+            )
+            invalid = PrefillRunner._validate(
+                response, input_len=len(ids), expected_reuse=reuse
+            )
+            if invalid:
+                raise ValueError(
+                    f"cache block probe {phase}: {invalid[0]}: {invalid[1]}"
+                )
+            responses[phase] = response
     return {
         "schema_version": 1,
         "status": "ok",
         "block_size": block_size,
         "commit_tail_tokens": commit_tail_tokens,
+        "synthetic_cache_reuse": bool(synthetic_cache_reuse),
         "responses": responses,
     }

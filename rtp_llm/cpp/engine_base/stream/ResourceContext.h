@@ -17,7 +17,7 @@ struct ResourceContext {
     std::shared_ptr<SystemPrompt>   system_prompt;
 
     RoleType role_type{RoleType::PDFUSION};
-    bool defer_grammar_to_pp_tail{false};
+    bool     defer_grammar_to_pp_tail{false};
 
     bool reuse_cache{false};
     bool enable_device_cache{true};
@@ -25,6 +25,7 @@ struct ResourceContext {
     bool enable_disk_cache{false};
     bool enable_remote_cache{false};
     bool ignore_request_cache_switches{false};
+    bool enable_synthetic_reuse{false};
 
     void initCacheConfig(const KVCacheConfig& kv_cache_config);
 };

@@ -375,6 +375,9 @@ class ProfiledRunner:
                 )
                 == "dashsc_input_ids",
                 cache_block_size=resolve_probe_block_size(self.config),
+                synthetic_cache_reuse=bool(
+                    self.config["workload"].get("synthetic_cache_reuse", False)
+                ),
             ).run_case(diagnostic)
             if result["status"] == "ok":
                 files = capture.finish()

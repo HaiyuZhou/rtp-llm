@@ -42,7 +42,11 @@ struct MemoryLayoutConfig {
     // kernel-page projection; MemoryLayoutStrategy retains physical block IDs.
     size_t kernel_blocks_per_kv_block = 1;
 
-    bool enable_kv_scale         = false;
+    // For OpaqueKVCacheSpec layouts, bytes per logical entry (e.g. 132B for
+    // DSV4 FP8 indexer_kv, 584B for DSV4 FP8 csa_kv/hca_kv). Zero otherwise.
+    size_t opaque_entry_size_bytes = 0;
+
+    bool enable_kv_scale = false;
 
     bool hasScale() const {
         return enable_kv_scale && kv_scale_pool_size_bytes > 0;

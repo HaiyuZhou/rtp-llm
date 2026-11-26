@@ -166,6 +166,7 @@ def build_model_infer_request(
     return_input_ids: bool = False,
     enable_thinking: bool | None = None,
     force_sp_accept: bool = False,
+    force_reuse_length: int | None = None,
 ) -> predict_v2_pb2.ModelInferRequest:
     """Build ``ModelInferRequest`` for ``ModelStreamInfer`` (sampling tensors + ``input_ids``)."""
     request = predict_v2_pb2.ModelInferRequest()
@@ -177,6 +178,8 @@ def build_model_infer_request(
         request.parameters["enable_thinking"].bool_param = bool(enable_thinking)
     if force_sp_accept:
         request.parameters["force_sp_accept"].bool_param = True
+    if force_reuse_length is not None:
+        request.parameters["force_reuse_length"].int64_param = int(force_reuse_length)
     append_input_ids_to_model_infer_request(request, input_ids)
     return request
 

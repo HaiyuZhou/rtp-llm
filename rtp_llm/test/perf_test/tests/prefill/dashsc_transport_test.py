@@ -142,6 +142,35 @@ class DashScTransportTest(unittest.TestCase):
     def test_business_error_after_valid_frame_invalidates_request(self):
         self._assert_business_error_stream(valid_first=True)
 
+    def test_force_reuse_length_propagated_to_dashsc_request(self):
+        from rtp_llm.dash_sc.proto import predict_v2_pb2
+
+        valid = predict_v2_pb2.ModelStreamInferResponse()
+        infer = valid.infer_response
+        infer.parameters["engine_first_token_cost_time_us"].int64_param = 8000
+        for name, value in (
+            ("prompt_token_num", 16),
+            ("prompt_cached_token_num", 8),
+            ("generated_ids", 42),
+        ):
+            output = infer.outputs.add(name=name, datatype="INT32")
+            output.shape.append(1)
+            infer.raw_output_contents.append(struct.pack("<i", value))
+        client, requests, _ = self._client([valid])
+        result = client.request(
+            phase="measure",
+            case_id="c1",
+            request_index=0,
+            run_index=0,
+            prompt="ignored",
+            input_ids=list(range(16)),
+            output_length=1,
+            force_reuse_length=8,
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(8, result["reuse_len"])
+        self.assertEqual(8, requests[0].parameters["force_reuse_length"].int64_param)
+
 
 if __name__ == "__main__":
     unittest.main()

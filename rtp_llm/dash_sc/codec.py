@@ -723,6 +723,7 @@ class DashScRequestControls:
 
     return_input_ids: bool = False
     force_sp_accept: bool = False
+    force_reuse_length: int | None = None
     enable_thinking: bool | None = None
     max_new_think_tokens: int | None = None
     timeout_ms: int | None = None
@@ -1048,6 +1049,11 @@ def parse_request_controls(
     force_sp_accept = bool(
         _parse_optional_parameter_bool(request, "force_sp_accept") or False
     )
+    force_reuse_length = _parse_optional_parameter_int(request, "force_reuse_length")
+    if force_reuse_length is not None:
+        force_reuse_length = int(force_reuse_length)
+        if force_reuse_length < 0:
+            raise DashScParameterError("force_reuse_length must be non-negative")
     ds_attrs = ds_attrs if ds_attrs is not None else parse_ds_header_attributes(request)
     enable_thinking = _parse_optional_parameter_bool(request, "enable_thinking")
     if enable_thinking is None:
@@ -1125,6 +1131,7 @@ def parse_request_controls(
     return DashScRequestControls(
         return_input_ids=return_input_ids,
         force_sp_accept=force_sp_accept,
+        force_reuse_length=force_reuse_length,
         enable_thinking=enable_thinking,
         max_new_think_tokens=max_new_think_tokens,
         timeout_ms=timeout_ms,

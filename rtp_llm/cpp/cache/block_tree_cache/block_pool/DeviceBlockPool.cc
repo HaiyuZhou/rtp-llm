@@ -118,30 +118,44 @@ void fillSyntheticFiniteStorage(torch::Tensor& full_buffer, const DeviceBlockPoo
 
         const char* mode = nullptr;
         if (layout.dtype == DataType::TYPE_UINT8 && layout.cache_type == KVCacheSpecType::OpaqueKV
-            && layout.opaque_entry_size_bytes == kDsv4IndexerEntry
-            && layout.kv_block_pool_size_bytes % kDsv4IndexerEntry == 0) {
-            // DSV4 FP8 indexer_kv: 128B FP8 E4M3 + 4B FP32 scale per slot.
+            && layout.opaque_entry_size_bytes == kDsv4IndexerEntry && layout.kv_block_stride_bytes > 0) {
+            // DSV4 FP8 indexer_kv is per-kernel-page striped:
+            //   [bs * 128B FP8 E4M3 K | bs * 4B FP32 scales] (+ optional tail padding = 0).
             // Finite non-zero random keys avoid +0.0 tie-break collapse in Top-K kernels.
-            const size_t total_entries = layout.kv_block_pool_size_bytes / kDsv4IndexerEntry;
-            const size_t tile_entries = std::min(total_entries, std::max<size_t>(1, kMaxTileBytes / kDsv4IndexerEntry));
-            auto         host_tile    = torch::empty({static_cast<int64_t>(tile_entries * kDsv4IndexerEntry)},
-                                          torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
-            uint8_t*     ptr          = host_tile.data_ptr<uint8_t>();
-            for (size_t e = 0; e < tile_entries; ++e) {
-                uint8_t* entry = ptr + e * kDsv4IndexerEntry;
-                for (size_t i = 0; i < 128; ++i) {
-                    entry[i] = nextFiniteFp8E4M3Byte(rng);
+            const size_t kernel_blocks = std::max<size_t>(1, layout.kernel_blocks_per_kv_block);
+            if (layout.kv_block_stride_bytes % kernel_blocks == 0
+                && layout.kv_block_pool_size_bytes % layout.kv_block_stride_bytes == 0) {
+                const size_t page_stride      = layout.kv_block_stride_bytes / kernel_blocks;
+                const size_t entries_per_page = page_stride / kDsv4IndexerEntry;
+                const size_t total_pages      = layout.kv_block_pool_size_bytes / page_stride;
+                if (entries_per_page > 0 && total_pages > 0) {
+                    const size_t tile_pages = std::min(total_pages, std::max<size_t>(1, kMaxTileBytes / page_stride));
+                    auto         host_tile  = torch::zeros({static_cast<int64_t>(tile_pages * page_stride)},
+                                                  torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+                    uint8_t*     ptr        = host_tile.data_ptr<uint8_t>();
+                    for (size_t p = 0; p < tile_pages; ++p) {
+                        uint8_t* page_ptr   = ptr + p * page_stride;
+                        uint8_t* scales_ptr = page_ptr + entries_per_page * 128;
+                        for (size_t e = 0; e < entries_per_page; ++e) {
+                            uint8_t* k_row = page_ptr + e * 128;
+                            for (size_t i = 0; i < 128; ++i) {
+                                k_row[i] = nextFiniteFp8E4M3Byte(rng);
+                            }
+                            const float scale = 0.05f + nextSmallFiniteFloat(rng, 0.01f);
+                            std::memcpy(scales_ptr + e * sizeof(float), &scale, sizeof(float));
+                        }
+                    }
+                    copyTileAcrossBuffer(kv_bytes, host_tile, page_stride);
+                    mode = "dsv4_fp8_indexer_132B_striped";
                 }
-                const float scale = 0.05f + nextSmallFiniteFloat(rng, 0.01f);
-                std::memcpy(entry + 128, &scale, sizeof(float));
             }
-            copyTileAcrossBuffer(kv_bytes, host_tile, kDsv4IndexerEntry);
-            mode = "dsv4_fp8_indexer_132B";
         } else if (layout.dtype == DataType::TYPE_UINT8 && layout.cache_type == KVCacheSpecType::OpaqueKV
                    && layout.opaque_entry_size_bytes == kDsv4Fp8KvEntry && layout.kv_block_stride_bytes > 0) {
-            // DSV4 FP8 csa_kv / hca_kv: 448B FP8 NoPE + 64 BF16 RoPE + 8B UE8M0 scales,
+            // DSV4 FP8 csa_kv / hca_kv is per-kernel-page striped:
+            //   [bs * 576B (448B FP8 NoPE + 64 BF16 RoPE) | bs * 8B (7 UE8M0 scales + 1 pad)]
             // with per-kernel-page 576B alignment padding kept at zero.
-            const size_t kernel_blocks = std::max<size_t>(1, layout.kernel_blocks_per_kv_block);
+            constexpr size_t kTokenDataBytes = kDsv4Fp8NopeBytes + kDsv4Bf16RopeElems * sizeof(c10::BFloat16);  // 576
+            const size_t     kernel_blocks   = std::max<size_t>(1, layout.kernel_blocks_per_kv_block);
             if (layout.kv_block_stride_bytes % kernel_blocks == 0
                 && layout.kv_block_pool_size_bytes % layout.kv_block_stride_bytes == 0) {
                 const size_t page_stride      = layout.kv_block_stride_bytes / kernel_blocks;
@@ -153,23 +167,24 @@ void fillSyntheticFiniteStorage(torch::Tensor& full_buffer, const DeviceBlockPoo
                                                   torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
                     uint8_t*     ptr        = host_tile.data_ptr<uint8_t>();
                     for (size_t p = 0; p < tile_pages; ++p) {
-                        uint8_t* page_ptr = ptr + p * page_stride;
+                        uint8_t* page_ptr   = ptr + p * page_stride;
+                        uint8_t* scales_ptr = page_ptr + entries_per_page * kTokenDataBytes;
                         for (size_t e = 0; e < entries_per_page; ++e) {
-                            uint8_t* entry = page_ptr + e * kDsv4Fp8KvEntry;
+                            uint8_t* data_row = page_ptr + e * kTokenDataBytes;
                             for (size_t i = 0; i < kDsv4Fp8NopeBytes; ++i) {
-                                entry[i] = nextFiniteFp8E4M3Byte(rng);
+                                data_row[i] = nextFiniteFp8E4M3Byte(rng);
                             }
-                            auto* rope_ptr = reinterpret_cast<c10::BFloat16*>(entry + kDsv4Fp8NopeBytes);
+                            auto* rope_ptr = reinterpret_cast<c10::BFloat16*>(data_row + kDsv4Fp8NopeBytes);
                             for (size_t i = 0; i < kDsv4Bf16RopeElems; ++i) {
                                 rope_ptr[i] = c10::BFloat16(nextSmallFiniteFloat(rng, 0.05f));
                             }
-                            std::memset(entry + kDsv4Fp8NopeBytes + kDsv4Bf16RopeElems * sizeof(c10::BFloat16),
-                                        kDsv4Ue8m0ScaleVal,
-                                        kDsv4Ue8m0Scales);
+                            uint8_t* scale_row = scales_ptr + e * kDsv4Ue8m0Scales;
+                            std::memset(scale_row, kDsv4Ue8m0ScaleVal, 7);
+                            scale_row[7] = 0;
                         }
                     }
                     copyTileAcrossBuffer(kv_bytes, host_tile, page_stride);
-                    mode = "dsv4_fp8_kv_584B";
+                    mode = "dsv4_fp8_kv_584B_striped";
                 }
             }
         } else if (layout.dtype == DataType::TYPE_BF16

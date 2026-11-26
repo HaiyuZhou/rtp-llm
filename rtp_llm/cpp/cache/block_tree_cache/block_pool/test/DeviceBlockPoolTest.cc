@@ -625,23 +625,29 @@ TEST(DeviceBlockPoolTest, SyntheticFiniteInitPopulatesDsv4AndStandardPoolsWithou
         ASSERT_TRUE(pool.init());
         const auto* base = static_cast<const uint8_t*>(pool.getBaseAddress());
         ASSERT_NE(base, nullptr);
-        const size_t total_entries = layout.kv_block_pool_size_bytes / 132;
-        for (size_t e = 0; e < total_entries; ++e) {
-            const uint8_t* entry = base + e * 132;
-            for (size_t i = 0; i < 128; ++i) {
-                EXPECT_NE(entry[i], 0x00);
-                EXPECT_NE(entry[i], 0x7F);
-                EXPECT_NE(entry[i], 0xFF);
+        constexpr size_t kEntriesPerPage = 32;
+        constexpr size_t kPageStride     = kEntriesPerPage * 132;
+        const size_t     total_pages     = layout.kv_block_pool_size_bytes / kPageStride;
+        for (size_t p = 0; p < total_pages; ++p) {
+            const uint8_t* page       = base + p * kPageStride;
+            const uint8_t* scales_ptr = page + kEntriesPerPage * 128;
+            for (size_t e = 0; e < kEntriesPerPage; ++e) {
+                const uint8_t* k_row = page + e * 128;
+                for (size_t i = 0; i < 128; ++i) {
+                    EXPECT_NE(k_row[i], 0x00);
+                    EXPECT_NE(k_row[i], 0x7F);
+                    EXPECT_NE(k_row[i], 0xFF);
+                }
+                float scale = 0.0f;
+                std::memcpy(&scale, scales_ptr + e * sizeof(float), sizeof(float));
+                EXPECT_TRUE(std::isfinite(scale));
+                EXPECT_GT(scale, 0.03f);
+                EXPECT_LT(scale, 0.07f);
             }
-            float scale = 0.0f;
-            std::memcpy(&scale, entry + 128, sizeof(float));
-            EXPECT_TRUE(std::isfinite(scale));
-            EXPECT_GT(scale, 0.03f);
-            EXPECT_LT(scale, 0.07f);
         }
     }
 
-    // 2) DSV4 FP8 csa_kv (584B/entry + 576B kernel page alignment padding kept zero)
+    // 2) DSV4 FP8 csa_kv (per-page striped: [32*576B data | 32*8B scales | 320B zero pad])
     {
         constexpr size_t kPageStride   = 19008;  // 32 * 584 = 18688, aligned up to 576 -> 19008 (320B pad)
         auto             config        = std::make_shared<DeviceBlockPoolConfig>();
@@ -671,22 +677,25 @@ TEST(DeviceBlockPoolTest, SyntheticFiniteInitPopulatesDsv4AndStandardPoolsWithou
         const auto* base = static_cast<const uint8_t*>(pool.getBaseAddress());
         ASSERT_NE(base, nullptr);
         for (size_t p = 0; p < 4; ++p) {
-            const uint8_t* page = base + p * kPageStride;
+            const uint8_t* page       = base + p * kPageStride;
+            const uint8_t* scales_ptr = page + 32 * 576;
             for (size_t e = 0; e < 32; ++e) {
-                const uint8_t* entry = page + e * 584;
+                const uint8_t* data_row = page + e * 576;
                 for (size_t i = 0; i < 448; ++i) {
-                    EXPECT_NE(entry[i], 0x7F);
-                    EXPECT_NE(entry[i], 0xFF);
+                    EXPECT_NE(data_row[i], 0x7F);
+                    EXPECT_NE(data_row[i], 0xFF);
                 }
-                const auto* rope = reinterpret_cast<const c10::BFloat16*>(entry + 448);
+                const auto* rope = reinterpret_cast<const c10::BFloat16*>(data_row + 448);
                 for (size_t i = 0; i < 64; ++i) {
                     const float v = static_cast<float>(rope[i]);
                     EXPECT_TRUE(std::isfinite(v));
                     EXPECT_LE(std::fabs(v), 0.06f);
                 }
-                for (size_t i = 576; i < 584; ++i) {
-                    EXPECT_EQ(entry[i], 123);
+                const uint8_t* scale_row = scales_ptr + e * 8;
+                for (size_t i = 0; i < 7; ++i) {
+                    EXPECT_EQ(scale_row[i], 123);
                 }
+                EXPECT_EQ(scale_row[7], 0);
             }
             for (size_t pad = 32 * 584; pad < kPageStride; ++pad) {
                 EXPECT_EQ(page[pad], 0);

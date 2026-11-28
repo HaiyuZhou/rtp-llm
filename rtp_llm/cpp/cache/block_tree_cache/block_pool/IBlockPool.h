@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,7 @@ struct BlockPoolConfigBase {
     std::string   pool_name;
     size_t        physical_block_count{0};
     bool          allocate_storage{true};
+    bool          randomize_free_blocks{false};
 };
 
 // IBlockPool owns allocation and Tree-internal lifetime shared by Device, Host, and Disk.
@@ -204,6 +206,7 @@ private:
     size_t                                                    free_head_{0};
     size_t                                                    active_blocks_num_{0};
     size_t                                                    available_blocks_num_{0};
+    std::mt19937                                              free_block_rng_;
 };
 
 }  // namespace rtp_llm

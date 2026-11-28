@@ -7,7 +7,9 @@
 
 namespace rtp_llm {
 
-IBlockPool::IBlockPool(std::shared_ptr<const BlockPoolConfigBase> config): config_(std::move(config)) {
+IBlockPool::IBlockPool(std::shared_ptr<const BlockPoolConfigBase> config):
+    config_(std::move(config)),
+    free_block_rng_(static_cast<uint32_t>(std::hash<std::string>{}(config_ ? config_->pool_name : "")) ^ 0x9E3779B9u) {
     RTP_LLM_CHECK(config_ != nullptr);
     RTP_LLM_CHECK(config_->physical_block_count > 1);
     allocated_.assign(config_->physical_block_count, 0);
@@ -18,6 +20,9 @@ IBlockPool::IBlockPool(std::shared_ptr<const BlockPoolConfigBase> config): confi
     free_blocks_.reserve(config_->physical_block_count - 1);
     for (BlockIdxType block = 1; block < static_cast<BlockIdxType>(config_->physical_block_count); ++block) {
         free_blocks_.push_back(block);
+    }
+    if (config_->randomize_free_blocks) {
+        std::shuffle(free_blocks_.begin(), free_blocks_.end(), free_block_rng_);
     }
     available_blocks_num_ = free_blocks_.size();
 }
@@ -34,14 +39,13 @@ const std::string& IBlockPool::poolName() const {
 std::string IBlockPool::debugString() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::ostringstream          oss;
-    const size_t free_blocks = availableFreeBlocksNoLock();
-    const size_t used_blocks = totalBlocksNumNoLock() - free_blocks;
+    const size_t                free_blocks = availableFreeBlocksNoLock();
+    const size_t                used_blocks = totalBlocksNumNoLock() - free_blocks;
     oss << "IBlockPool{name=" << config_->pool_name << ", total=" << totalBlocksNumNoLock() << ", used=" << used_blocks
         << ", free=" << free_blocks << ", available=" << available_blocks_num_
         << ", cache_ref_blocks=" << tree_referenced_block_counts_[treeRefTypeIndex(BlockTreeRefType::CACHE)]
         << ", load_ref_blocks=" << tree_referenced_block_counts_[treeRefTypeIndex(BlockTreeRefType::LOAD)]
-        << ", eviction_ref_blocks="
-        << tree_referenced_block_counts_[treeRefTypeIndex(BlockTreeRefType::EVICT)]
+        << ", eviction_ref_blocks=" << tree_referenced_block_counts_[treeRefTypeIndex(BlockTreeRefType::EVICT)]
         << ", frozen_ref_blocks=" << tree_referenced_block_counts_[treeRefTypeIndex(BlockTreeRefType::FROZEN)] << "}";
     return oss.str();
 }
@@ -347,6 +351,9 @@ void IBlockPool::refillAscendingFreeBlocksNoLock() {
     merged.insert(merged.end(), released_blocks_.begin(), released_blocks_.end());
     std::sort(merged.begin(), merged.end());
     merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+    if (config_->randomize_free_blocks) {
+        std::shuffle(merged.begin(), merged.end(), free_block_rng_);
+    }
     free_blocks_ = std::move(merged);
     free_head_   = 0;
     released_blocks_.clear();

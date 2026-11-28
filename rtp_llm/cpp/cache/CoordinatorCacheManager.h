@@ -130,6 +130,10 @@ public:
         zero_init_device_block_pool_ = zero_init_device_block_pool;
     }
 
+    void setRandomizeDeviceBlockPool(bool randomize_device_block_pool) {
+        randomize_device_block_pool_ = randomize_device_block_pool;
+    }
+
     void setSkipRemoteReusedWrite(bool skip_remote_reused_write) {
         skip_remote_reused_write_ = skip_remote_reused_write;
     }
@@ -235,6 +239,7 @@ protected:
     const kmonitor::MetricsReporterPtr metrics_reporter_             = nullptr;
     bool                               use_device_malloc_block_pool_ = false;
     bool                               zero_init_device_block_pool_  = false;
+    bool                               randomize_device_block_pool_  = false;
 
     size_t  reserve_block_num_{0};
     int64_t reserve_block_ratio_{0};

@@ -2056,11 +2056,13 @@ bool CoordinatorCacheManager::doInit() {
             pool_config.use_pinned_cpu_backing = allocation_type_ == AllocationType::HOST;
             pool_config.use_device_malloc_backing =
                 use_device_malloc_block_pool_ && allocation_type_ == AllocationType::DEVICE;
-            pool_config.zero_init_storage = zero_init_device_block_pool_;
+            pool_config.zero_init_storage     = zero_init_device_block_pool_;
+            pool_config.randomize_free_blocks = randomize_device_block_pool_;
         } else if (policy.memory_placement == CacheMemoryPlacement::HOST_PINNED) {
             pool_config.use_pinned_cpu_backing    = true;
             pool_config.use_device_malloc_backing = false;
             pool_config.zero_init_storage         = zero_init_device_block_pool_;
+            pool_config.randomize_free_blocks     = randomize_device_block_pool_;
         } else {
             RTP_LLM_LOG_ERROR("unsupported cache memory placement=%d for group=%d",
                               static_cast<int>(policy.memory_placement),

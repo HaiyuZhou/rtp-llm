@@ -704,4 +704,33 @@ TEST(DeviceBlockPoolTest, SyntheticFiniteInitPopulatesDsv4AndStandardPoolsWithou
     }
 }
 
+TEST(DeviceBlockPoolTest, RandomizeFreeBlocksScattersAllocationsWithoutDuplicates) {
+    auto config                   = makeConfig();
+    config->randomize_free_blocks = true;
+    DeviceBlockPool pool(config);
+    ASSERT_TRUE(pool.init());
+
+    const size_t total = pool.totalBlocksNum();
+    auto         first = pool.malloc(total);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_EQ(first->size(), total);
+
+    std::vector<BlockIdxType> sorted = *first;
+    std::sort(sorted.begin(), sorted.end());
+    for (size_t i = 0; i < total; ++i) {
+        EXPECT_EQ(sorted[i], static_cast<BlockIdxType>(i + 1));
+    }
+    EXPECT_NE(*first, sorted);
+
+    pool.incRef(*first);
+    pool.decRef(*first);
+
+    auto second = pool.malloc(total);
+    ASSERT_TRUE(second.has_value());
+    ASSERT_EQ(second->size(), total);
+    std::vector<BlockIdxType> sorted2 = *second;
+    std::sort(sorted2.begin(), sorted2.end());
+    EXPECT_EQ(sorted2, sorted);
+}
+
 }  // namespace rtp_llm

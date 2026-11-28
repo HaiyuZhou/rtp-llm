@@ -340,8 +340,17 @@ bool KVCacheManager::init() {
         coordinator_manager_->setUseDeviceMallocBlockPool(true);
     }
     if (runtime_config_.use_batch_decode_scheduler) {
-        RTP_LLM_LOG_INFO("perf-test scheduler active: zero-initializing KV cache device block pools");
-        coordinator_manager_->setZeroInitDeviceBlockPool(true);
+        const char*       env_mode = std::getenv("RTP_SYNTHETIC_REUSE_POOL_MODE");
+        const std::string mode =
+            (env_mode != nullptr && env_mode[0] != '\0') ? std::string(env_mode) : "striped_random";
+        const bool enable_finite_init = (mode != "raw_random" && mode != "raw_sequential");
+        const bool enable_randomize   = (mode == "raw_random" || mode == "striped_random");
+        RTP_LLM_LOG_INFO("perf-test scheduler active: synthetic reuse pool mode=%s finite_init=%d randomize_blocks=%d",
+                         mode.c_str(),
+                         enable_finite_init,
+                         enable_randomize);
+        coordinator_manager_->setZeroInitDeviceBlockPool(enable_finite_init);
+        coordinator_manager_->setRandomizeDeviceBlockPool(enable_randomize);
     }
 
     coordinator_manager_->setCPSlotMapper(cp_slot_mapper_);
